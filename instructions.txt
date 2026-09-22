@@ -1,21 +1,25 @@
-HOW TO USE BONSAI 2 (local model)
+HOW TO USE BONSAI 2 (local model + assistant)
 
-1) START THE SERVER
-   Double-click:  C:\Users\drago\Desktop\bonsai2\run.cmd
-   -> wait until "Bonsai 2 is READY" appears.
-   If it is already running, run.cmd will not start another one (it checks first).
+1) START EVERYTHING (ONE CLICK)
+   Double-click:  C:\Users\drago\Desktop\bonsai2\run.bat
+   -> starts the assistant UI at http://localhost:8081
+   -> also starts the Bonsai 2 model server on port 8080 automatically
+      (the model loads into RAM on your first message, ~1 min on first start).
 
-2) USE IT FROM OPENCODE
+2) USE IT IN OPENCODE
    opencode --model llama.cpp/bonsai2
-   Or: open opencode, type /models and pick "Bonsai 2 27B ternary".
+   (Run run.bat first so the model server is up, or start the app and
+    compare answers. opencode config: ~/.config/opencode/opencode.jsonc,
+    provider "llama.cpp" - restart opencode after changing it.)
 
-3) STOP THE SERVER (optional)
+3) STOP THE MODEL SERVER (optional)
    Double-click:  C:\Users\drago\Desktop\bonsai2\stop.cmd
+   (The UI panel can keep running; the model just loads again on next message.)
 
 DETAILS
    - Local API:        http://127.0.0.1:8080/v1
    - Model id:         bonsai2
-   - opencode config:  ~/.config/opencode/opencode.jsonc  (provider "llama.cpp")
-   - Restart opencode if you change the config (a new provider only loads on restart).
-   - If you see a connection error in opencode -> the server is off, run run.cmd.
-   - Server account: 32k context, ~48 tok/s on an RTX 4070.
+   - While I reply, SEND turns into STOP (cut me off) and QUEUE holds a
+     follow-up message that is answered right after the current reply.
+   - That is the only launcher: run.cmd / start-server.ps1 are gone.
+   - Server profile: 32k context, ~48 tok/s on an RTX 4070.

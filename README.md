@@ -16,6 +16,8 @@
   - 👁️ **Vision** — attach an image and it understands it (red t-shirt, screenshots, documents…).
   - 🌐 **Web lookup** — when it's not sure or you ask for something current, it can `web_search` and `web_fetch` to document itself from the internet before answering.
   - 📁 **Workspace picker** — choose any folder on your PC as the working directory (📁 button in the header), directly from a native folder dialog.
+- 💻 **Shell + sandbox** — the `run_command` tool executes real Windows commands (build, install, debug, inspect); the `run_code` tool runs short Python/Node snippets in a sandboxed, network-less environment with a 30s timeout.
+- ⏹️ **STOP + QUEUE** — the SEND button turns into STOP while I'm replying so you can cut me off; QUEUE holds a follow-up message that gets answered right after the current reply.
 - 🔵 **Reactive HUD** — the arc reactor reacts to what it's doing:
   - 🔵 **Blue** – idle (rotating reactor)
   - 🟡 **Yellow** – thinking / processing the command
@@ -39,19 +41,9 @@
 
 ## How to run
 
-Everything lives in this folder — the model files, the server scripts and the assistant app.
+Everything lives in this folder — the model files, the model server scripts and the assistant app.
 
-### 1. Start the Bonsai 2 model server (port 8080)
-
-Double-click `run.cmd` and wait until you see **"Bonsai 2 is READY"** (takes ~1 min). If it's already running, `run.cmd` won't start a second one. To stop it, double-click `stop.cmd`.
-
-### 2. Start the assistant (port 8081)
-
-Double-click `run.bat` — it starts the app and opens **http://localhost:8081** in your browser. Or run it directly:
-
-```
-python bonsai_web.py
-```
+Double-click **`run.bat`** — it starts the assistant, auto-starts the Bonsai 2 model server on port 8080 if it isn't running yet, and opens the UI at **http://localhost:8081**. To stop the model server, double-click `stop.cmd`.
 
 You're in. Type a command, e.g.:
 
@@ -60,6 +52,8 @@ Open Notepad and start YouTube
 What is the CPU doing?
 Tell me a joke
 ```
+
+The SEND button becomes **STOP** while I'm replying, so you can cut me off. There's also a **QUEUE** button: type a follow-up while I'm busy and hit QUEUE — it gets answered right after the current reply (QUEUE saves up a backlog in order).
 
 ### Configuration (optional)
 
@@ -96,8 +90,7 @@ Useful links:
 
 ```
 bonsai_web.py                     ← the whole assistant (single file: backend + UI)
-run.bat                           ← assistant launcher
-run.cmd / start-server.ps1        ← Bonsai 2 model server launcher
+run.bat                           ← the ONE launcher: starts UI + model server
 stop.cmd                          ← stops the model server
 tools/                            ← helper scripts (screenshot, clipboard, scraper, OCR)
 tools.json                        ← tool-call spec reference

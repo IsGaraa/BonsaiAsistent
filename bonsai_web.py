@@ -3,8 +3,11 @@ import html
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -31,6 +34,8 @@ MODE_PLAN = "plan"
 WORKDIR = os.path.realpath(os.environ.get("PC_WORKDIR", r"C:\Users\drago\Desktop\workspace"))
 
 CREATE_NO_WINDOW = 0x08000000
+
+_BONSAI_LOCK = threading.Lock()
 
 PF = "C:\\Program Files"
 PF86 = "C:\\Program Files (x86)"
@@ -789,6 +794,94 @@ FILE_TOOLS = {
 }
 
 
+def _run_command(command, workdir=None, timeout=45):
+    cmd = str(command or "").strip()
+    if not cmd:
+        return {"error": "command is required"}
+    cwd = os.path.realpath(WORKDIR)
+    if workdir:
+        wd = str(workdir).strip()
+        cwd = os.path.realpath(wd) if os.path.isabs(wd) else _safe_path(wd)
+    if not os.path.isdir(cwd):
+        return {"error": f"not a directory: {cwd}"}
+    try:
+        proc = subprocess.run(cmd, shell=True, cwd=cwd, capture_output=True,
+                              text=True, timeout=timeout,
+                              creationflags=CREATE_NO_WINDOW)
+        pieces = [proc.stdout or ""]
+        if proc.stderr:
+            pieces.append(proc.stderr)
+        out = "\n".join(pieces).strip()
+        if len(out) > 8000:
+            out = out[:8000] + "\n[... output truncated ...]"
+        return {"result": "ok", "command": cmd, "workdir": cwd,
+                "exit_code": proc.returncode, "output": out}
+    except subprocess.TimeoutExpired:
+        return {"error": f"command timed out after {timeout}s", "command": cmd}
+    except Exception as exc:
+        return {"error": f"could not run command: {exc}", "command": cmd}
+
+
+_CODE_TIMEOUT = 30
+_CODE_CAP = 8000
+_CODE_RUNNERS = {
+    "python": {"cmd": [sys.executable], "ext": ".py"},
+    "py": {"cmd": [sys.executable], "ext": ".py"},
+    "node": {"cmd": None, "ext": ".js"},
+    "js": {"cmd": None, "ext": ".js"},
+    "javascript": {"cmd": None, "ext": ".js"},
+}
+
+
+def _code_runner(lang):
+    key = str(lang or "python").strip().lower()
+    spec = _CODE_RUNNERS.get(key)
+    if not spec:
+        return None, None
+    cmd = spec["cmd"]
+    if cmd is None:
+        found = shutil.which("node")
+        if not found:
+            return None, None
+        cmd = [found]
+    return list(cmd), spec["ext"]
+
+
+def _run_code(language, code, timeout=_CODE_TIMEOUT):
+    runner, ext = _code_runner(language)
+    if not runner:
+        return {"error": f"code runner not available for '{language}' "
+                         "(I can run python and node)"}
+    snippet = str(code or "").strip()
+    if not snippet:
+        return {"error": "code is required"}
+    sandbox = tempfile.mkdtemp(prefix="bonsai_sandbox_")
+    script = os.path.join(sandbox, "snippet" + ext)
+    try:
+        with open(script, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(snippet)
+        proc = subprocess.run(runner + [script], capture_output=True,
+                              text=True, timeout=timeout, cwd=sandbox,
+                              creationflags=CREATE_NO_WINDOW)
+        pieces = [proc.stdout or ""]
+        if proc.stderr:
+            pieces.append("STDERR:\n" + proc.stderr)
+        out = "\n".join(pieces).strip()
+        if len(out) > _CODE_CAP:
+            out = out[:_CODE_CAP] + "\n[... output truncated ...]"
+        return {"result": "ok", "language": str(language or "python"),
+                "exit_code": proc.returncode, "output": out}
+    except subprocess.TimeoutExpired:
+        return {"error": f"code timed out after {timeout}s"}
+    except Exception as exc:
+        return {"error": f"could not run code: {exc}"}
+    finally:
+        try:
+            shutil.rmtree(sandbox, ignore_errors=True)
+        except Exception:
+            pass
+
+
 def _clip_result(res):
     if isinstance(res, dict) and res.get("content") and isinstance(res["content"], str):
         if len(res["content"]) > 12000:
@@ -825,7 +918,10 @@ SYSTEM = ("You are the friendly assistant living on the user's Windows PC. Reply
           "files inside the workspace folder. When you are not sure about "
           "something, are asked for recent/current information, or want to "
           "double-check a fact, you may search the web (web_search) and read "
-          "pages (web_fetch) to document yourself before answering.")
+          "pages (web_fetch) to document yourself before answering. When the "
+          "user asks you to build, test, install or inspect something on the "
+          "PC, you can run shell commands (run_command) and read their output "
+          "to actually do it instead of only describing it.")
 
 PLAN_MODE_SYSTEM = ("\nMODE: PLAN. The user only wants a PLAN right now - do NOT "
                     "write, edit, create or delete any files, and do NOT launch "
@@ -870,8 +966,11 @@ def _start_bonsai():
 def _ensure_bonsai():
     if _bonsai_ready():
         return True
-    print("Bonsai 2 server not running - starting it...", flush=True)
-    return _start_bonsai()
+    with _BONSAI_LOCK:
+        if _bonsai_ready():
+            return True
+        print("Bonsai 2 server not running - starting it...", flush=True)
+        return _start_bonsai()
 
 
 def _http_json(url, payload, timeout=300):
@@ -884,12 +983,66 @@ def _http_json(url, payload, timeout=300):
 
 WEB_SPECS = [WEB_TOOLS["web_search"], WEB_TOOLS["web_fetch"]]
 
+SHELL_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "run_command",
+        "description": "Run a shell command on this Windows PC and return its "
+                       "output. Use it to build, test, install, debug or check "
+                       "system info: python, pip, git, npm, node, dir, "
+                       "tasklist, systeminfo, ping, etc. Runs in the workspace "
+                       "folder by default. Max 45 seconds; output truncated to "
+                       "~8 KB. In PLAN mode this tool is disabled.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "description": "The command to run, e.g. 'python tools/screenshot.py'."
+                },
+                "workdir": {
+                    "type": "string",
+                    "description": "Optional folder to run in: absolute path or "
+                                   "relative to the workspace. Default = workspace root."
+                }
+            },
+            "required": ["command"]
+        }
+    }
+}
+
+
+CODE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "run_code",
+        "description": "Run a small snippet of Python or Node.js in a sandboxed "
+                       "environment and return its output. Use it to test functions, "
+                       "verify logic, parse data or prototype before touching real "
+                       "files. The sandbox has no network and a 30s timeout.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "language": {
+                    "type": "string",
+                    "description": "'python' or 'node'."
+                },
+                "code": {
+                    "type": "string",
+                    "description": "The source code to run."
+                }
+            },
+            "required": ["language", "code"]
+        }
+    }
+}
+
 
 def _tools_for(mode):
     if mode == MODE_PLAN:
         return [FILE_TOOLS["list_dir"], FILE_TOOLS["read_file"],
                 FILE_TOOLS["search_files"]] + WEB_SPECS
-    return [TOOL_SPEC] + list(FILE_TOOLS.values()) + WEB_SPECS
+    return [TOOL_SPEC] + list(FILE_TOOLS.values()) + WEB_SPECS + [SHELL_TOOL, CODE_TOOL]
 
 
 def system_prompt(mode):
@@ -1019,6 +1172,10 @@ def execute_tool_call(tc):
         raw_result = _web_search(args.get("query"), 6)
     elif name == "web_fetch":
         raw_result = _web_fetch(args.get("url"))
+    elif name == "run_command":
+        raw_result = _run_command(args.get("command"), args.get("workdir"))
+    elif name == "run_code":
+        raw_result = _run_code(args.get("language"), args.get("code"))
     else:
         raw_result = _exec_file_tool(name, args)
     result = public_result(_clip_result(raw_result))
@@ -1328,6 +1485,13 @@ PAGE = """<!doctype html>
   }
   #send:hover { box-shadow: 0 0 18px rgba(0,240,255,.6); }
   #send:disabled { opacity: .4; cursor: default; box-shadow: none; }
+  #send.stop { background: linear-gradient(135deg, #ff4d6d, #ff0055); color: #fff; box-shadow: 0 0 15px rgba(255,0,85,.5); }
+  #queue {
+    background: transparent; border: 1px solid rgba(0,240,255,.4); color: #22d3ee; border-radius: 12px;
+    padding: 13px 12px; cursor: pointer; font-size: 13px; font-weight: 700; font-family: Consolas, monospace; transition: all .2s; white-space: nowrap;
+  }
+  #queue:hover { background: rgba(0,240,255,.12); box-shadow: 0 0 12px rgba(0,240,255,.4); }
+  #queue.hasq { background: rgba(0,240,255,.2); border-color: #00f0ff; color: #67e8f9; }
 
   #preview { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
   .thumb { position: relative; }
@@ -1452,6 +1616,7 @@ PAGE = """<!doctype html>
             <textarea id="user-input" rows="1" placeholder="Type a command..."></textarea>
             <button type="button" class="iconbtn" id="attach" title="Attach images / files">&#128206;</button>
             <button type="button" class="iconbtn" id="mic-btn" title="Microphone">&#127908;</button>
+            <button type="button" id="queue" title="Queue this message - I will answer it after the current reply">QUEUE</button>
             <button type="submit" id="send">SEND</button>
           </div>
         </form>
@@ -1486,6 +1651,8 @@ let cur = null;
 let busy = false;
 let pendingAtt = [];
 let started = false;
+let abortCtrl = null;
+let msgQueue = [];
 let chatMode = localStorage.getItem('jarvis_mode') === 'plan' ? 'plan' : 'build';
 let workdir = '';
 
@@ -1513,6 +1680,8 @@ function init() {
   if (!chats.length) newChat();
   else cur = chats[chats.length - 1];
   renderAll();
+  setSendUI();
+  setQueueUI();
 }
 function bindModeBtn() {
   const btn = document.getElementById('modebtn');
@@ -1688,16 +1857,40 @@ function buildUserMsg() {
 
 function handleSubmit(e) {
   e.preventDefault();
+  if (busy) { stopRun(); return; }
   go();
 }
 
-async function go() {
+function setSendUI() {
+  const b = document.getElementById('send');
+  if (busy) { b.textContent = 'STOP'; b.disabled = false; b.classList.add('stop'); }
+  else { b.textContent = 'SEND'; b.classList.remove('stop'); }
+}
+function setQueueUI() {
+  const q = document.getElementById('queue');
+  q.textContent = msgQueue.length ? ('QUEUE (' + msgQueue.length + ')') : 'QUEUE';
+  q.classList.toggle('hasq', msgQueue.length > 0);
+}
+function stopRun() {
+  if (abortCtrl) { const a = abortCtrl; abortCtrl = null; try { a.abort(); } catch (e) {} }
+  if (thinkingRow) doneThinking('(stopped by user)');
+  setBonsaiState('idle');
+}
+function drainQueue() {
+  if (busy) return;
+  if (!msgQueue.length) return;
+  const next = msgQueue.shift();
+  setQueueUI();
+  go(next.parts);
+}
+
+async function go(forcedParts) {
   if (busy) return;
   if (!cur) newChat();
-  const parts = buildUserMsg();
+  const parts = forcedParts || buildUserMsg();
   if (!parts) return;
   busy = true;
-  document.getElementById('send').disabled = true;
+  setSendUI();
 
   const textOf = parts.filter(function (p) { return p.type === 'text'; }).map(function (p) { return p.text; }).join(' ');
   const hasFile = parts.some(function (p) { return p.type === 'file_att'; });
@@ -1722,12 +1915,13 @@ async function go() {
   try { await streamRun(cur.messages.slice()); }
   catch (err) { doneThinking('Error: ' + err.message); setBonsaiState('idle'); }
   busy = false;
-  document.getElementById('send').disabled = false;
+  setSendUI();
   document.getElementById('user-input').focus();
   cur.ts = Date.now();
   save();
   renderList();
   suggRow();
+  drainQueue();
 }
 
 let thinkingRow = null;
@@ -1814,32 +2008,45 @@ function doneThinking(errMsg) {
 }
 
 async function streamRun(messages) {
-  const resp = await fetch('/api/stream', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ messages: messages, mode: chatMode }) });
+  abortCtrl = new AbortController();
+  let resp;
+  try {
+    resp = await fetch('/api/stream', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ messages: messages, mode: chatMode }), signal: abortCtrl.signal });
+  } catch (e) { throw new Error('stopped'); }
   if (!resp.ok || !resp.body) { const j = await resp.json().catch(function () { return {}; }); throw new Error(j.error || 'stream unavailable'); }
   const reader = resp.body.getReader();
   const dec = new TextDecoder();
   let buf = '', reply = '', calls = [], reason = '';
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buf += dec.decode(value, { stream: true });
-    let idx;
-    while ((idx = buf.indexOf('\\n\\n')) >= 0) {
-      const block = buf.slice(0, idx); buf = buf.slice(idx + 2);
-      let ev = 'message', data = '';
-      block.split('\\n').forEach(function (line) {
-        if (line.startsWith('event:')) ev = line.slice(6).trim();
-        else if (line.startsWith('data:')) data += line.slice(5).trim();
-      });
-      if (!data) continue;
-      let j; try { j = JSON.parse(data); } catch (e) { continue; }
-      if (ev === 'delta') { reply += j.text; onDelta(j.text); setBonsaiState('speaking'); }
-      else if (ev === 'reason') { reason += j.text; onReason(j.text); setBonsaiState('thinking'); }
-      else if (ev === 'tool') { calls.push(j.call); onTool(j.call); setBonsaiState('tools'); }
-      else if (ev === 'error') { doneThinking('Error: ' + j.text); setBonsaiState('idle'); throw new Error(j.text); }
-      else if (ev === 'done') { doneThinking(); setBonsaiState('idle'); }
+  let aborted = false;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let idx;
+      while ((idx = buf.indexOf('\\n\\n')) >= 0) {
+        const block = buf.slice(0, idx); buf = buf.slice(idx + 2);
+        let ev = 'message', data = '';
+        block.split('\\n').forEach(function (line) {
+          if (line.startsWith('event:')) ev = line.slice(6).trim();
+          else if (line.startsWith('data:')) data += line.slice(5).trim();
+        });
+        if (!data) continue;
+        let j; try { j = JSON.parse(data); } catch (e) { continue; }
+        if (ev === 'delta') { reply += j.text; onDelta(j.text); setBonsaiState('speaking'); }
+        else if (ev === 'reason') { reason += j.text; onReason(j.text); setBonsaiState('thinking'); }
+        else if (ev === 'tool') { calls.push(j.call); onTool(j.call); setBonsaiState('tools'); }
+        else if (ev === 'error') { doneThinking('Error: ' + j.text); setBonsaiState('idle'); throw new Error(j.text); }
+        else if (ev === 'done') { doneThinking(); setBonsaiState('idle'); }
+      }
     }
+  } catch (e) {
+    if (e.name === 'AbortError') aborted = true;
+    else throw e;
+  } finally {
+    abortCtrl = null;
   }
+  if (aborted) throw new Error('stopped');
   const last = cur.messages[cur.messages.length - 1];
   if (last && last.role === 'user') {
     cur.messages.push({ role: 'assistant', content: reply, calls: calls, reason: reason.trim() ? reason : undefined });
@@ -1899,6 +2106,22 @@ document.getElementById('filein').onchange = function () {
 
 document.getElementById('newchat2').onclick = function () { newChat(); setBonsaiState('idle'); };
 document.getElementById('clearbtn').onclick = function () { if (cur) { cur.messages = []; started = false; } renderAll(); setBonsaiState('idle'); };
+document.getElementById('queue').onclick = function () {
+  const parts = buildUserMsg();
+  if (!parts) return;
+  if (busy) {
+    msgQueue.push({ parts: parts });
+    pendingAtt = [];
+    renderPreview();
+    document.getElementById('user-input').value = '';
+    setQueueUI();
+  } else {
+    document.getElementById('user-input').value = '';
+    pendingAtt = [];
+    renderPreview();
+    go(parts);
+  }
+};
 function setWorkdirInUI(wd) {
   workdir = wd;
   const w = document.getElementById('workbtn');
@@ -2262,13 +2485,21 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Content-Type", "text/event-stream; charset=utf-8")
                 self.send_header("Cache-Control", "no-cache")
                 self.end_headers()
-                sse(self, "start", {"ok": True, "workdir": WORKDIR})
+                sse(self, "start", {"ok": True, "workdir": WORKDIR,
+                                    "model_ready": _bonsai_ready()})
+                if not _ensure_bonsai():
+                    sse(self, "error", {"text": "Bonsai 2 model server could not start."})
+                    return
                 handle_chat(messages or [], stream=True, mode=mode,
                             on_reason=lambda t: sse(self, "reason", {"text": t}),
                             on_delta=lambda t: sse(self, "delta", {"text": t}),
                             on_tool=lambda c: sse(self, "tool", {"call": _strip_full(c)}))
                 sse(self, "done", {"ok": True})
             else:
+                if not _ensure_bonsai():
+                    self._send(200, json.dumps({"reply": "Bonsai 2 model server could not start.",
+                                                "calls": []}))
+                    return
                 result = handle_chat(messages or [], mode=mode)
                 self._send(200, json.dumps(result, default=str))
         except Exception as exc:
@@ -2295,8 +2526,7 @@ def main():
         os.makedirs(WORKDIR, exist_ok=True)
     except Exception as exc:
         print(f"WARN: could not create workdir {WORKDIR}: {exc}", flush=True)
-    if not _ensure_bonsai():
-        print("ERROR: Bonsai 2 server could not start. Check bonsai folder / llama-server.", flush=True)
+    threading.Thread(target=_ensure_bonsai, daemon=True).start()
     print("PC Asistent is READY on http://127.0.0.1:8081", flush=True)
     webbrowser.open(f"http://{HOST}:{PORT}")
     ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
