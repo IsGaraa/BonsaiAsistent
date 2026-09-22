@@ -24,6 +24,9 @@ BONSAI_MODEL = os.path.join(BONSAI_DIR, "Ternary-Bonsai-2-27B-PQ2_0.gguf")
 BONSAI_MMPROJ = os.path.join(BONSAI_DIR, "Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf")
 BONSAI_BASE = "http://127.0.0.1:8080"
 BONSAI_MODEL_ID = "bonsai2"
+BONSAI_CTX = 32768
+BONSAI_KEEP_ALIVE = 120
+CHATS_FILE = os.path.join(os.path.expandvars(r"%APPDATA%"), "BonsaiAsistent", "chats.json")
 MAX_TOOL_ROUNDS = 5
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 MAX_TEXT_FILE_BYTES = 200 * 1024
@@ -1054,14 +1057,17 @@ def system_prompt(mode):
 
 def _bonsai_chat(messages, tools):
     payload = {"model": BONSAI_MODEL_ID, "messages": messages,
-               "tools": tools, "stream": False}
+               "tools": tools, "stream": False, "keep_alive": BONSAI_KEEP_ALIVE}
     data = _http_json(BONSAI_BASE + "/v1/chat/completions", payload)
-    return data.get("choices", [{}])[0].get("message", {})
+    msg = data.get("choices", [{}])[0].get("message", {})
+    msg["_usage"] = data.get("usage") or {}
+    msg["_timings"] = data.get("timings") or {}
+    return msg
 
 
 def _bonsai_stream(messages, tools):
     payload = {"model": BONSAI_MODEL_ID, "messages": messages,
-               "tools": tools, "stream": True}
+               "tools": tools, "stream": True, "keep_alive": BONSAI_KEEP_ALIVE}
     req = urllib.request.Request(BONSAI_BASE + "/v1/chat/completions",
                                  data=json.dumps(payload).encode("utf-8"),
                                  headers={"Content-Type": "application/json"},
@@ -1069,6 +1075,10 @@ def _bonsai_stream(messages, tools):
     with urllib.request.urlopen(req, timeout=600) as resp:
         calls = {}
         finish = None
+        usage = {}
+        timings = {}
+        first_content_ts = None
+        t_start = time.monotonic()
         for raw in resp:
             line = raw.decode("utf-8").strip()
             if not line.startswith("data:"):
@@ -1080,12 +1090,19 @@ def _bonsai_stream(messages, tools):
                 chunk = json.loads(payload)
             except Exception:
                 continue
+            if chunk.get("usage"):
+                usage = chunk["usage"]
+            if chunk.get("timings"):
+                timings = chunk["timings"]
             choice = (chunk.get("choices") or [{}])[0]
             delta = choice.get("delta") or {}
             finish = choice.get("finish_reason") or finish
             if delta.get("reasoning_content"):
                 yield {"kind": "reason", "text": delta["reasoning_content"]}
             elif delta.get("content"):
+                if first_content_ts is None:
+                    first_content_ts = time.monotonic()
+                    yield {"kind": "think_end", "t_ms": int((first_content_ts - t_start) * 1000)}
                 yield {"kind": "delta", "text": delta["content"]}
             for tc in delta.get("tool_calls") or []:
                 idx = tc.get("index", 0)
@@ -1101,7 +1118,29 @@ def _bonsai_stream(messages, tools):
             if finish in ("stop", "tool_calls"):
                 break
         ordered = [calls[i] for i in sorted(calls)]
-        yield {"kind": "end", "tool_calls": ordered, "finish": finish}
+        t_end = time.monotonic()
+        think_ms = int((first_content_ts - t_start) * 1000) if first_content_ts else None
+        total_ms = int((t_end - t_start) * 1000)
+        respond_ms = total_ms - think_ms if think_ms is not None else total_ms
+        prompt_tok = (usage.get("prompt_tokens")
+                      or (timings.get("prompt_n") or 0) + (timings.get("cache_n") or 0))
+        comp_tok = (usage.get("completion_tokens")
+                    or timings.get("predicted_n") or 0)
+        cached_tok = ((usage.get("prompt_tokens_details") or {}).get("cached_tokens")
+                      or timings.get("cache_n") or 0)
+        stats = {
+            "think_ms": think_ms,
+            "respond_ms": respond_ms,
+            "total_ms": total_ms,
+            "prompt_tokens": prompt_tok,
+            "completion_tokens": comp_tok,
+            "total_tokens": prompt_tok + comp_tok,
+            "cached_tokens": cached_tok,
+            "tok_s": timings.get("predicted_per_second") or 0,
+            "ctx_used": prompt_tok + comp_tok,
+            "ctx_left": BONSAI_CTX - prompt_tok - comp_tok,
+        }
+        yield {"kind": "end", "tool_calls": ordered, "finish": finish, "stats": stats}
 
 
 def build_messages(raw_messages, mode=MODE_BUILD):
@@ -1210,16 +1249,55 @@ def _confirm_pick_workdir():
     return {"workdir": WORKDIR}
 
 
-def run_agent(messages, on_tool=None, mode=MODE_BUILD):
+def _empty_stats():
+    return {"think_ms": 0, "respond_ms": 0, "total_ms": 0,
+            "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
+            "cached_tokens": 0, "tok_s": 0, "ctx_used": 0, "ctx_left": BONSAI_CTX}
+
+
+def _stats_from(usage, timings):
+    prompt = usage.get("prompt_tokens") or 0
+    comp = usage.get("completion_tokens") or 0
+    cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens") or 0
+    return {"think_ms": int(timings.get("prompt_ms") or 0),
+            "respond_ms": int(timings.get("predicted_ms") or 0),
+            "total_ms": int((timings.get("prompt_ms") or 0) + (timings.get("predicted_ms") or 0)),
+            "prompt_tokens": prompt, "completion_tokens": comp,
+            "total_tokens": usage.get("total_tokens") or 0, "cached_tokens": cached,
+            "tok_s": timings.get("predicted_per_second") or 0,
+            "ctx_used": prompt + comp, "ctx_left": BONSAI_CTX - prompt - comp}
+
+
+def _merge_stats(a, b):
+    out = dict(a)
+    for k in ("think_ms", "respond_ms", "total_ms", "prompt_tokens",
+              "completion_tokens", "total_tokens", "cached_tokens"):
+        out[k] = (a.get(k) or 0) + (b.get(k) or 0)
+    if (b.get("completion_tokens") or 0) > 0:
+        a_tok = a.get("completion_tokens") or 0
+        b_tok = b.get("completion_tokens") or 0
+        out["tok_s"] = round(((a.get("tok_s") or 0) * a_tok + (b.get("tok_s") or 0) * b_tok)
+                             / (a_tok + b_tok), 1)
+    out["ctx_used"] = b.get("ctx_used") or a.get("ctx_used") or 0
+    out["ctx_left"] = BONSAI_CTX - out["ctx_used"]
+    return out
+
+
+def run_agent(messages, on_tool=None, mode=MODE_BUILD, on_stats=None):
     calls = []
     tools = _tools_for(mode)
     msgs = list(messages)
+    total = _empty_stats()
     for _ in range(MAX_TOOL_ROUNDS):
         message = _bonsai_chat(msgs, tools)
+        total = _merge_stats(total, _stats_from(message.get("_usage") or {},
+                                                message.get("_timings") or {}))
         tool_calls = message.get("tool_calls") or []
         content = message.get("content")
         if not tool_calls:
-            return {"reply": (content or "").strip(), "calls": calls}
+            if on_stats:
+                on_stats(total)
+            return {"reply": (content or "").strip(), "calls": calls, "_stats": total}
         msgs.append({"role": "assistant", "content": content,
                      "tool_calls": [{"id": tc.get("id"),
                                      "type": "function",
@@ -1233,14 +1311,17 @@ def run_agent(messages, on_tool=None, mode=MODE_BUILD):
             msgs.append({"role": "tool", "tool_call_id": record["tool_call_id"],
                          "content": json.dumps(record["full_result"],
                                                ensure_ascii=False)})
-    return {"reply": "Am terminat ce am putut executa.", "calls": calls}
+    if on_stats:
+        on_stats(total)
+    return {"reply": "Am terminat ce am putut executa.", "calls": calls, "_stats": total}
 
 
 def stream_agent(messages, on_reason=None, on_delta=None, on_tool=None,
-                 mode=MODE_BUILD):
+                 mode=MODE_BUILD, on_stats=None):
     calls = []
     tools = _tools_for(mode)
     msgs = list(messages)
+    total = _empty_stats()
     for _round in range(MAX_TOOL_ROUNDS):
         tool_calls = None
         for ev in _bonsai_stream(msgs, tools):
@@ -1252,8 +1333,11 @@ def stream_agent(messages, on_reason=None, on_delta=None, on_tool=None,
                     on_delta(ev["text"])
             elif ev["kind"] == "end":
                 tool_calls = ev["tool_calls"]
+                total = _merge_stats(total, ev.get("stats") or {})
+                if on_stats:
+                    on_stats(total)
         if not tool_calls:
-            return {"calls": calls}
+            return {"calls": calls, "_stats": total}
         msgs.append({"role": "assistant", "content": None,
                      "tool_calls": [{"id": tc.get("id"),
                                      "type": "function",
@@ -1271,12 +1355,12 @@ def stream_agent(messages, on_reason=None, on_delta=None, on_tool=None,
 
 
 def handle_chat(messages, on_reason=None, on_delta=None, on_tool=None,
-                stream=False, mode=MODE_BUILD):
+                stream=False, mode=MODE_BUILD, on_stats=None):
     msgs = build_messages(messages, mode=mode)
     if stream:
         return stream_agent(msgs, on_reason=on_reason, on_delta=on_delta,
-                            on_tool=on_tool, mode=mode)
-    return run_agent(msgs, on_tool=on_tool, mode=mode)
+                            on_tool=on_tool, mode=mode, on_stats=on_stats)
+    return run_agent(msgs, on_tool=on_tool, mode=mode, on_stats=on_stats)
 
 
 PAGE = """<!doctype html>
@@ -1447,6 +1531,7 @@ PAGE = """<!doctype html>
   .bubble pre { background: #041018; border: 1px solid #164e63; border-radius: 8px; padding: 12px; overflow-x: auto; font-size: 14px; color: #a5f3fc; }
   .bubble a { color: #22d3ee; }
   .toolchip { display: inline-flex; align-items: center; gap: 6px; background: rgba(0,240,255,.08); border: 1px solid rgba(0,240,255,.4); color: #67e8f9; border-radius: 999px; padding: 4px 12px; margin: 4px 6px 4px 0; font-size: 13px; font-family: Consolas, monospace; }
+  .statschip { display: inline-block; background: rgba(255,215,0,.08); border: 1px solid rgba(255,215,0,.35); color: #fcd34d; border-radius: 6px; padding: 3px 10px; margin: 6px 0 2px; font-size: 11px; font-family: Consolas, monospace; }
   .toolchip.err { background: rgba(255,0,85,.08); border-color: rgba(255,0,85,.5); color: #ff859b; }
   .think { color: #0e7490; font-style: italic; font-size: 14px; display: flex; align-items: center; gap: 8px; font-family: Consolas, monospace; }
   .dots { display: inline-flex; gap: 3px; } .dots i { width: 5px; height: 5px; border-radius: 50%; background: #0e7490; animation: bl 1.2s infinite; } .dots i:nth-child(2){animation-delay:.2s} .dots i:nth-child(3){animation-delay:.4s}
@@ -1542,6 +1627,9 @@ PAGE = """<!doctype html>
   footer { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px; padding: 6px 14px; border-radius: 10px; font-size: 13px; color: #0e7490; font-family: Consolas, monospace; letter-spacing: 1px; }
   footer b { color: #22d3ee; }
   .fine { text-align: center; color: #0e7490; font-size: 12px; margin-top: 6px; font-family: Consolas, monospace; }
+  .statsline { min-height: 16px; padding: 2px 4px 0; font-size: 11px; color: #67e8f9; font-family: Consolas, monospace; letter-spacing: 0; opacity: .85; }
+  .statsline b { color: #00f0ff; font-weight: 600; }
+  .statsline .sdim { color: #0e7490; }
 </style>
 </head>
 <body>
@@ -1620,6 +1708,7 @@ PAGE = """<!doctype html>
             <button type="submit" id="send">SEND</button>
           </div>
         </form>
+        <div class="statsline" id="statsline"></div>
         <div class="fine">Bonsai 2 27B local &middot; opens apps &amp; websites, analyzes images &amp; files, works on your files</div>
       </div>
     </section>
@@ -1633,6 +1722,7 @@ PAGE = """<!doctype html>
 </div>
 <input type="file" id="filein" accept="image/*,.txt,.md,.py,.js,.ts,.json,.csv,.log,.ini,.cfg,.xml,.html,.css,.bat,.ps1,.sh,.yml,.yaml,.sql,.java,.cpp,.c,.h,.cs,.go,.rb,.php,.toml,.env,.gitignore" multiple>
 <script>
+const BONSAI_CTX = 32768;
 const EXAMPLES = [
   'Open Steam', 'open Discord', 'open Notepad and YouTube',
   'tell me a joke', 'who are you?', 'open Google', 'what can you do?'
@@ -1659,7 +1749,26 @@ let workdir = '';
 function load() {
   try { return JSON.parse(localStorage.getItem('jarvis_chats') || '[]'); } catch (e) { return []; }
 }
-function save() { try { const c = chats.slice(-200); localStorage.setItem('jarvis_chats', JSON.stringify(c)); } catch (e) {} }
+function save() {
+  try {
+    const c = chats.slice(-200);
+    localStorage.setItem('jarvis_chats', JSON.stringify(c));
+    fetch('/api/chats', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ chats: c }) }).catch(function () {});
+  } catch (e) {}
+}
+async function serverLoad() {
+  try {
+    const r = await fetch('/api/chats');
+    const j = await r.json();
+    if (j && Array.isArray(j.chats) && j.chats.length) {
+      chats = j.chats;
+      if (!cur || !chats.some(function (c) { return c.id === cur.id; })) cur = chats[chats.length - 1];
+      renderAll();
+      return true;
+    }
+  } catch (e) {}
+  return false;
+}
 function newChat() {
   if (cur && chats.indexOf(cur) !== -1 && cur.messages.length === 0 && cur.title === 'New chat') {
     started = false;
@@ -1682,6 +1791,7 @@ function init() {
   renderAll();
   setSendUI();
   setQueueUI();
+  serverLoad();
 }
 function bindModeBtn() {
   const btn = document.getElementById('modebtn');
@@ -1726,7 +1836,7 @@ function renderConv() {
   if (cur) {
     cur.messages.forEach(function (m) {
       if (m.role === 'user') addUser(m.content);
-      else if (m.role === 'assistant') addAsst(m.content, m.calls || [], m.reason);
+      else if (m.role === 'assistant') addAsst(m.content, m.calls || [], m.reason, m.stats);
     });
   }
   busy = false;
@@ -1770,7 +1880,7 @@ function addUser(content) {
   conv.appendChild(row);
   scrollBottom();
 }
-function addAsst(text, calls, reason) {
+function addAsst(text, calls, reason, stats) {
   const row = document.createElement('div'); row.className = 'msgrow bonsai';
   const av = document.createElement('div'); av.className = 'av bonsai'; av.textContent = 'B';
   const b = document.createElement('div'); b.className = 'bubble';
@@ -1779,10 +1889,23 @@ function addAsst(text, calls, reason) {
   if (calls && calls.length) addToolLog(b, calls);
   const inner = document.createElement('div'); inner.className = 'abody'; inner.innerHTML = fmt(text);
   b.appendChild(inner);
+  if (stats) addStatsChip(b, stats);
   row.appendChild(av); row.appendChild(b);
   convEl().appendChild(row);
   scrollBottom();
   return inner;
+}
+function addStatsChip(container, s) {
+  const c = document.createElement('span');
+  c.className = 'statschip';
+  const think = (s.think_ms || 0) / 1000;
+  const speak = (s.respond_ms || 0) / 1000;
+  let txt = 'THINK ' + think.toFixed(1) + 's &middot; SPEAK ' + speak.toFixed(1) + 's';
+  if (s.tok_s) txt += ' &middot; ' + s.tok_s.toFixed(1) + ' tok/s';
+  if (s.completion_tokens) txt += ' &middot; ' + s.completion_tokens + ' tok';
+  if (s.ctx_used) txt += ' &middot; ctx ' + s.ctx_used + '/' + (s.ctx_used + (s.ctx_left || 0));
+  c.innerHTML = '&#9202; ' + txt;
+  container.appendChild(c);
 }
 function addReasonBox(container, text) {
   const d = document.createElement('details'); d.className = 'reasonbox';
@@ -1926,6 +2049,50 @@ async function go(forcedParts) {
 
 let thinkingRow = null;
 let liveCalls = [];
+let statsTimer = null;
+let statsVals = { think_ms: 0, respond_ms: 0, tok_s: 0, ctx_used: 0, ctx_left: 0, prompt_tokens: 0, completion_tokens: 0 };
+function statLine() { return document.getElementById('statsline'); }
+function fmtMs(ms) {
+  if (!ms && ms !== 0) return '--';
+  return (ms / 1000).toFixed(1) + 's';
+}
+function runningStats() {
+  const el = statLine();
+  if (!el) return;
+  const v = statsVals;
+  const think = fmtMs(v.think_ms || 0);
+  const respond = fmtMs(v.respond_ms || 0);
+  const ts = v.tok_s ? v.tok_s.toFixed(1) : '--';
+  const ctx = v.ctx_left ? (v.ctx_used) + ' / ' + (v.ctx_used + v.ctx_left) : '--';
+  el.innerHTML = 'THINK <b>' + think + '</b> &middot; SPEAK <b>' + respond + '</b> &middot; <b>' + ts + '</b> tok/s &middot; tokens <b>' + (v.completion_tokens || 0) + '</b> &middot; ctx <span class="sdim">' + ctx + '</span>';
+}
+function startStats() {
+  statsVals = { think_ms: 0, respond_ms: 0, tok_s: 0, ctx_used: 0, ctx_left: 0, prompt_tokens: 0, completion_tokens: 0 };
+  const el = statLine();
+  if (el) el.innerHTML = 'THINK <b>--</b> &middot; SPEAK <b>--</b> &middot; <b>--</b> tok/s &middot; tokens <b>0</b> &middot; ctx <span class="sdim">--</span>';
+  if (statsTimer) clearInterval(statsTimer);
+  statsTimer = setInterval(runningStats, 250);
+}
+function stopStats() {
+  if (statsTimer) { clearInterval(statsTimer); statsTimer = null; }
+  runningStats();
+}
+function clearStats() {
+  if (statsTimer) { clearInterval(statsTimer); statsTimer = null; }
+  const el = statLine();
+  if (el) el.innerHTML = '';
+}
+function onStats(j) {
+  if (!j) return;
+  statsVals.think_ms = j.think_ms || 0;
+  statsVals.respond_ms = j.respond_ms || 0;
+  statsVals.tok_s = j.tok_s || 0;
+  statsVals.ctx_used = j.ctx_used || 0;
+  statsVals.ctx_left = j.ctx_left || (BONSAI_CTX - statsVals.ctx_used);
+  statsVals.prompt_tokens = j.prompt_tokens || 0;
+  statsVals.completion_tokens = j.completion_tokens || 0;
+  runningStats();
+}
 function addThinking() {
   liveCalls = [];
   const row = document.createElement('div'); row.className = 'msgrow bonsai';
@@ -2009,15 +2176,17 @@ function doneThinking(errMsg) {
 
 async function streamRun(messages) {
   abortCtrl = new AbortController();
+  startStats();
   let resp;
   try {
     resp = await fetch('/api/stream', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ messages: messages, mode: chatMode }), signal: abortCtrl.signal });
-  } catch (e) { throw new Error('stopped'); }
-  if (!resp.ok || !resp.body) { const j = await resp.json().catch(function () { return {}; }); throw new Error(j.error || 'stream unavailable'); }
+  } catch (e) { stopStats(); throw new Error('stopped'); }
+  if (!resp.ok || !resp.body) { stopStats(); const j = await resp.json().catch(function () { return {}; }); throw new Error(j.error || 'stream unavailable'); }
   const reader = resp.body.getReader();
   const dec = new TextDecoder();
   let buf = '', reply = '', calls = [], reason = '';
   let aborted = false;
+  let startedAt = Date.now();
   try {
     while (true) {
       const { done, value } = await reader.read();
@@ -2033,10 +2202,11 @@ async function streamRun(messages) {
         });
         if (!data) continue;
         let j; try { j = JSON.parse(data); } catch (e) { continue; }
-        if (ev === 'delta') { reply += j.text; onDelta(j.text); setBonsaiState('speaking'); }
-        else if (ev === 'reason') { reason += j.text; onReason(j.text); setBonsaiState('thinking'); }
+        if (ev === 'delta') { reply += j.text; onDelta(j.text); setBonsaiState('speaking'); statsVals.respond_ms = Date.now() - startedAt; }
+        else if (ev === 'reason') { reason += j.text; onReason(j.text); setBonsaiState('thinking'); statsVals.think_ms = Date.now() - startedAt; }
         else if (ev === 'tool') { calls.push(j.call); onTool(j.call); setBonsaiState('tools'); }
-        else if (ev === 'error') { doneThinking('Error: ' + j.text); setBonsaiState('idle'); throw new Error(j.text); }
+        else if (ev === 'stats') { onStats(j); }
+        else if (ev === 'error') { doneThinking('Error: ' + j.text); setBonsaiState('idle'); stopStats(); throw new Error(j.text); }
         else if (ev === 'done') { doneThinking(); setBonsaiState('idle'); }
       }
     }
@@ -2045,14 +2215,18 @@ async function streamRun(messages) {
     else throw e;
   } finally {
     abortCtrl = null;
+    stopStats();
   }
   if (aborted) throw new Error('stopped');
   const last = cur.messages[cur.messages.length - 1];
+  const savedStats = statsVals && (statsVals.think_ms || statsVals.respond_ms || statsVals.completion_tokens)
+      ? JSON.parse(JSON.stringify(statsVals)) : null;
   if (last && last.role === 'user') {
-    cur.messages.push({ role: 'assistant', content: reply, calls: calls, reason: reason.trim() ? reason : undefined });
+    cur.messages.push({ role: 'assistant', content: reply, calls: calls, reason: reason.trim() ? reason : undefined, stats: savedStats });
   } else if (last && last.role === 'assistant' && !last.calls && reply) {
     last.content = reply;
     last.reason = reason.trim() ? reason : undefined;
+    last.stats = savedStats;
   }
   if (reply && sfx.enabled) speakBONSAI(reply);
 }
@@ -2435,6 +2609,26 @@ def sse(handler, event, obj):
     handler.wfile.flush()
 
 
+def _load_chats():
+    try:
+        with open(CHATS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def _save_chats(chats):
+    try:
+        os.makedirs(os.path.dirname(CHATS_FILE), exist_ok=True)
+        with open(CHATS_FILE, "w", encoding="utf-8") as f:
+            json.dump(chats[-200:] if isinstance(chats, list) else [],
+                      f, ensure_ascii=False, default=str)
+        return True
+    except Exception:
+        return False
+
+
 class Handler(BaseHTTPRequestHandler):
     def _send(self, code, body, ctype="application/json; charset=utf-8"):
         data = body if isinstance(body, bytes) else body.encode("utf-8")
@@ -2450,19 +2644,26 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, PAGE, "text/html; charset=utf-8")
         elif path == "/api/workdir":
             self._send(200, json.dumps({"workdir": WORKDIR}))
+        elif path == "/api/chats":
+            self._send(200, json.dumps({"chats": _load_chats()}, default=str))
         else:
             self._send(404, "not found", "text/plain")
 
     def do_POST(self):
         try:
             path = self.path.split("?")[0]
-            if path not in ("/api", "/api/stream", "/api/workdir", "/api/pick_workdir"):
+            if path not in ("/api", "/api/stream", "/api/workdir",
+                            "/api/pick_workdir", "/api/chats"):
                 self._send(404, "not found", "text/plain")
                 return
             length = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(length) or b"{}")
             if path == "/api/pick_workdir":
                 self._send(200, json.dumps(_confirm_pick_workdir()))
+                return
+            if path == "/api/chats":
+                _save_chats(body.get("chats"))
+                self._send(200, json.dumps({"ok": True}))
                 return
             if path == "/api/workdir":
                 global WORKDIR
@@ -2493,7 +2694,8 @@ class Handler(BaseHTTPRequestHandler):
                 handle_chat(messages or [], stream=True, mode=mode,
                             on_reason=lambda t: sse(self, "reason", {"text": t}),
                             on_delta=lambda t: sse(self, "delta", {"text": t}),
-                            on_tool=lambda c: sse(self, "tool", {"call": _strip_full(c)}))
+                            on_tool=lambda c: sse(self, "tool", {"call": _strip_full(c)}),
+                            on_stats=lambda s: sse(self, "stats", s))
                 sse(self, "done", {"ok": True})
             else:
                 if not _ensure_bonsai():
@@ -2501,6 +2703,7 @@ class Handler(BaseHTTPRequestHandler):
                                                 "calls": []}))
                     return
                 result = handle_chat(messages or [], mode=mode)
+                result.pop("_stats", None)
                 self._send(200, json.dumps(result, default=str))
         except Exception as exc:
             if self.wfile.closed:

@@ -23,3 +23,9 @@ DETAILS
      follow-up message that is answered right after the current reply.
    - That is the only launcher: run.cmd / start-server.ps1 are gone.
    - Server profile: 32k context, ~48 tok/s on an RTX 4070.
+   - Live stats bar under the input shows think time / speak time,
+     tokens/s, tokens used and context used/left in real time.
+   - After 2 minutes without a message the model unloads from RAM to free
+     memory; it loads automatically on your next message.
+   - Chat history is saved in the browser AND in
+     %APPDATA%\BonsaiAsistent\chats.json, so conversations survive restarts.

@@ -18,12 +18,14 @@
   - 📁 **Workspace picker** — choose any folder on your PC as the working directory (📁 button in the header), directly from a native folder dialog.
 - 💻 **Shell + sandbox** — the `run_command` tool executes real Windows commands (build, install, debug, inspect); the `run_code` tool runs short Python/Node snippets in a sandboxed, network-less environment with a 30s timeout.
 - ⏹️ **STOP + QUEUE** — the SEND button turns into STOP while I'm replying so you can cut me off; QUEUE holds a follow-up message that gets answered right after the current reply.
+- ⏱️ **Live token stats** — a real-time line under the input shows how long I spend thinking vs. speaking, my tokens/second, tokens used and context used/left (ctx 32768); a final chip is saved with each reply.
+- 🛌 **Auto memory relief** — if you don't message me for 2 minutes, the model unloads from RAM; the moment you text again it loads itself back (first reply after a long pause takes a few seconds longer).
+- 📚 **Chat history** — every conversation is saved both in your browser and on disk (`%APPDATA%\BonsaiAsistent\chats.json`); reopen it any time, even after a server restart.
 - 🔵 **Reactive HUD** — the arc reactor reacts to what it's doing:
   - 🔵 **Blue** – idle (rotating reactor)
   - 🟡 **Yellow** – thinking / processing the command
   - 🟢 **Green** – executing a tool call
   - 🌊 **Blue + waveform** – speaking out loud
-- 📚 **Chat history** — every conversation is saved locally; reopen it any time, even after a restart.
 - 🔊 **Talk-back** — optional text-to-speech that **auto-matches the language** of the reply (Romanian / English) and picks the best natural voice. Off by default.
 - 🔒 **Plan / Build modes** — *Plan* is read-only (just looks at files), *Build* has full tool access.
 - 📴 **Fully offline** — model, inference and UI all run on your PC.
