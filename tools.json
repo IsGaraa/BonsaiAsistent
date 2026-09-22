@@ -1,0 +1,19 @@
+[
+  {
+    "type": "function",
+    "function": {
+      "name": "launch_or_open",
+      "description": "Open a program or a website on this PC by name. Examples: steam, discord, notepad, spotify, epic games, youtube, github, google, wikipedia, youtube.com. The tool decides whether the name is an app or a website.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "The name of the program or website to open, e.g. steam, discord, youtube, github."
+          }
+        },
+        "required": ["name"]
+      }
+    }
+  }
+]

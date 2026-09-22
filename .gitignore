@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.log
+
+# The Bonsai 2 model files, server logs and cache live in this same folder.
+# Keep the repo lean: only the assistant app + server scripts are versioned, not the model.
+.cache/
+*.gguf
+
+# Legacy Needle model package leftovers (kept for reference, not versioned)
+checkpoints/
+python/
+tokenizer/
+assets/
+*.cact
+config.json
+README.needle.md
+.gitattributes
+android-*/
+ios-*
+linux-*/
+macos-*/
+tvos-*/
+watchos-*/
+wasm/
+wasm-component/
+windows-*/
+
+# OS / editor
+Thumbs.db
+Desktop.ini
+.vscode/
+.idea/

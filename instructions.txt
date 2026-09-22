@@ -1,0 +1,21 @@
+HOW TO USE BONSAI 2 (local model)
+
+1) START THE SERVER
+   Double-click:  C:\Users\drago\Desktop\bonsai2\run.cmd
+   -> wait until "Bonsai 2 is READY" appears.
+   If it is already running, run.cmd will not start another one (it checks first).
+
+2) USE IT FROM OPENCODE
+   opencode --model llama.cpp/bonsai2
+   Or: open opencode, type /models and pick "Bonsai 2 27B ternary".
+
+3) STOP THE SERVER (optional)
+   Double-click:  C:\Users\drago\Desktop\bonsai2\stop.cmd
+
+DETAILS
+   - Local API:        http://127.0.0.1:8080/v1
+   - Model id:         bonsai2
+   - opencode config:  ~/.config/opencode/opencode.jsonc  (provider "llama.cpp")
+   - Restart opencode if you change the config (a new provider only loads on restart).
+   - If you see a connection error in opencode -> the server is off, run run.cmd.
+   - Server account: 32k context, ~48 tok/s on an RTX 4070.
