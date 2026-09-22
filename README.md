@@ -99,6 +99,7 @@ bonsai_web.py                     ← the whole assistant (single file: backend 
 run.bat                           ← assistant launcher
 run.cmd / start-server.ps1        ← Bonsai 2 model server launcher
 stop.cmd                          ← stops the model server
+tools/                            ← helper scripts (screenshot, clipboard, scraper, OCR)
 tools.json                        ← tool-call spec reference
 instructions.txt                  ← quick-start guide (English)
 *.gguf                            ← the model weights (local only, not in git)
