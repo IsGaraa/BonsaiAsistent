@@ -40,6 +40,12 @@ echo.
 echo [3/5] Verifying optional tool libraries...
 python -c "import win32gui, psutil, pyautogui, PIL, pyperclip, requests, websocket; print('   screenshots, input, clipboard, windows, api, websockets: OK')" 2>nul
 python -c "import pytesseract; print('   OCR helper: OK')" 2>nul
+python -c "import piper, onnxruntime, sounddevice; print('   local neural TTS - piper + sounddevice: OK')" 2>nul
+if exist "%~dp0piper\*.onnx" (
+    echo   Piper voices: found in "%~dp0piper"
+) else (
+    echo   [!] No Piper voice models found - run: python piper\download_voices.py
+)
 
 echo.
 echo [4/5] Checking required inference files...

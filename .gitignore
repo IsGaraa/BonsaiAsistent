@@ -29,6 +29,11 @@ wasm/
 wasm-component/
 windows-*/
 
+# Piper TTS voice models + audio - fetch them with piper/download_voices.py
+piper/*.onnx
+piper/*.onnx.json
+piper/*.wav
+
 # OS / editor
 Thumbs.db
 Desktop.ini

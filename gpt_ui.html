@@ -41,6 +41,8 @@
   .blrow.mid b { background: var(--warn); }
   .blrow.off b { background: var(--err); }
   .btn-ghost { border: 1px solid var(--bd); background: transparent; color: var(--txt); border-radius: 8px; padding: 7px 10px; cursor: pointer; font-size: 12px; }
+  .btn-ghost.on { background: rgba(74,222,128,.15); border-color: #4ade80; color: #86efac; }
+  .btn-ghost.on:hover { background: rgba(74,222,128,.3); }
   .btn-ghost:hover { border-color: var(--mut); }
   .wd { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%; text-align: left; }
   .foot-row { display: flex; gap: 6px; }
@@ -88,6 +90,9 @@
   .tlitem.err { border-color: var(--err); color: var(--err); }
   .tlitem .rs { color: var(--mut); margin-top: 4px; white-space: pre-wrap; overflow-wrap: anywhere; }
   .tlitem .rs img.tthumb { max-width: 240px; border-radius: 8px; margin-top: 6px; cursor: zoom-in; display: block; }
+  .tlprev { margin-top: 8px; }
+  .tlprev a { font-size: 11px; color: var(--acc); }
+  .tlprev .tlframe { width: 100%; height: 280px; border: 1px dashed var(--bd); border-radius: 8px; background: var(--bg2); margin-top: 6px; }
   .toolsline { margin: 2px 0 8px; display: flex; flex-wrap: wrap; gap: 6px; }
   .chip { font-size: 11.5px; color: var(--mut); background: var(--bg3); border: 1px solid var(--bd); border-radius: 999px; padding: 4px 11px; font-weight: 600; }
   .chip.ok { color: var(--ok); }
@@ -147,6 +152,7 @@
       <button class="btn-ghost wd" id="workbtn"></button>
       <div class="foot-row">
         <a href="/" title="Classic UI">Classic UI</a>
+        <button class="btn-ghost" id="ttsbtn" title="Text-to-speech (Piper) - speak replies aloud. Off by default.">TTS: OFF</button>
         <button class="btn-ghost" id="themebtn" title="Toggle theme"></button>
         <button class="btn-ghost" id="ejectbtn" title="Unload the model from RAM/VRAM">EJECT</button>
       </div>
@@ -343,8 +349,21 @@ function toolResultText(r) {
   if (typeof r === 'string') return r;
   if (!r || typeof r !== 'object') return String(r);
   const copy = {};
-  Object.keys(r).forEach(function (k) { if (k !== 'preview') copy[k] = r[k]; });
+  Object.keys(r).forEach(function (k) { if (k !== 'preview' && k !== 'preview_url') copy[k] = r[k]; });
   return JSON.stringify(copy, null, 2);
+}
+function previewIframeDom(r) {
+  const url = r && typeof r === 'object' ? (r.preview_url || '') : '';
+  if (!url) return null;
+  const w = document.createElement('div');
+  w.className = 'tlprev';
+  const a = document.createElement('a');
+  a.href = url; a.target = '_blank';
+  a.textContent = 'live preview - open in new tab';
+  const ifr = document.createElement('iframe');
+  ifr.className = 'tlframe'; ifr.src = url; ifr.sandbox = 'allow-scripts';
+  w.appendChild(a); w.appendChild(ifr);
+  return w;
 }
 function toolItemDom(call) {
   const it = document.createElement('div');
@@ -352,6 +371,8 @@ function toolItemDom(call) {
   const nm = document.createElement('div'); nm.textContent = '⚙ ' + call.name + ' ' + JSON.stringify(call.arguments || {});
   const rs = document.createElement('div'); rs.className = 'rs'; rs.textContent = toolResultText(call.result);
   it.appendChild(nm); it.appendChild(rs);
+  const pv = previewIframeDom(call.result);
+  if (pv) it.appendChild(pv);
   if (call.preview) {
     const im = document.createElement('img'); im.className = 'tthumb';
     im.src = call.preview; im.title = 'screenshot - click to enlarge';
@@ -833,6 +854,29 @@ document.getElementById('ejectbtn').onclick = function () {
       setTimeout(function () { btn.textContent = 'EJECT'; btn.disabled = false; btn.style.opacity = '1'; }, 2500);
     });
 };
+/* ---------- TTS toggle (Piper) ---------- */
+function renderTtsBtn(j) {
+  const el = document.getElementById('ttsbtn');
+  if (!el) return;
+  el.textContent = j.enabled ? 'TTS: ON' : 'TTS: OFF';
+  el.classList.toggle('on', !!j.enabled);
+  el.title = 'Text-to-speech (Piper) - ' + (j.enabled ? 'speech enabled' : 'off, click to enable');
+}
+function refreshTts() {
+  fetch('/api/tts')
+    .then(function (r) { return r.json(); })
+    .then(renderTtsBtn)
+    .catch(function () { renderTtsBtn({ enabled: false }); });
+}
+document.getElementById('ttsbtn').onclick = function () {
+  const el = document.getElementById('ttsbtn');
+  const next = !el.classList.contains('on');
+  fetch('/api/tts', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled: next }) })
+    .then(function (r) { return r.json(); })
+    .then(renderTtsBtn)
+    .catch(function () { alert('TTS toggle failed'); });
+};
+refreshTts();
 const inp = document.getElementById('user-input');
 inp.addEventListener('input', function () { this.style.height = 'auto'; this.style.height = Math.min(this.scrollHeight, 160) + 'px'; });
 inp.addEventListener('keydown', function (ev) { if (ev.key === 'Enter' && !ev.shiftKey) { ev.preventDefault(); handleSubmit(ev); } });

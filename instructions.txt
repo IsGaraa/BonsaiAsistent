@@ -45,6 +45,18 @@ DETAILS
       endpoints (api_call, ws_test), and schedule shell commands to run later -
       once, every N seconds or on a cron schedule (schedule_task,
       list_schedules, unschedule_task).
+    - TTS: I can speak text aloud with the local neural Piper engine
+      (tts_speak, tts_voices) - English and Romanian voices, saved as WAV files
+      in workspace\out\tts. No cloud, no Windows voices, no media player.
+      OFF by default: click the TTS button in the header to enable speech
+      (resets to OFF on restart). Voice models live in piper\ and are not in
+      git - fetch them once with: python piper\download_voices.py
+    - CODE + PREVIEW: run_code runs snippets in an isolated temp folder in the
+      languages installed on this PC (Python + Node now; Go/Lua/PHP/Ruby/Perl/
+      Bash are auto-detected if you install them) with timeouts up to 600s.
+      When I build an HTML page, a LIVE PREVIEW iframe of it appears right in
+      the chat (workspace .html/.htm files are served at /preview) - or I can
+      call preview_html to re-open it at any time.
    - The model stays loaded (resident) the whole time the app runs - there is
      no idle timeout that unloads it, so replies never stall after a pause.
      To free the memory yourself click the EJECT button in the header (it

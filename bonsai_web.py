@@ -61,6 +61,7 @@ MAX_SEARCH_RESULTS = 200
 MODE_BUILD = "build"
 MODE_PLAN = "plan"
 WORKDIR = os.path.realpath(os.environ.get("PC_WORKDIR", r"C:\Users\drago\Desktop\workspace"))
+PIPER_DIR = os.environ.get("PC_PIPER_DIR", os.path.join(BONSAI_DIR, "piper"))
 
 CREATE_NO_WINDOW = 0x08000000
 
@@ -77,6 +78,21 @@ _EFFORT_LOCK = threading.Lock()
 _SCHED = {}
 _SCHED_LOCK = threading.Lock()
 _SCHED_THREAD_ON = False
+
+_TTS_ENABLED = False
+_TTS_LOCK = threading.Lock()
+
+
+def set_tts_enabled(enabled):
+    global _TTS_ENABLED
+    with _TTS_LOCK:
+        _TTS_ENABLED = bool(enabled)
+        return _TTS_ENABLED
+
+
+def tts_enabled():
+    with _TTS_LOCK:
+        return _TTS_ENABLED
 
 PF = "C:\\Program Files"
 PF86 = "C:\\Program Files (x86)"
@@ -393,6 +409,30 @@ def _resolve_site(name):
     return None
 
 
+_LOCAL_FILE_EXT = (".html", ".htm", ".png", ".jpg", ".jpeg", ".gif", ".bmp",
+                   ".svg", ".webp", ".pdf", ".txt", ".md", ".csv", ".json",
+                   ".xml", ".py", ".js", ".css", ".mp3", ".mp4", ".wav",
+                   ".zip", ".rar", ".docx", ".xlsx", ".pptx")
+
+
+def _local_file_target(name):
+    raw = str(name or "").strip().strip('"')
+    if not raw:
+        return None
+    low = raw.lower()
+    if low.startswith(("http://", "https://", "www.")):
+        return None
+    ext = os.path.splitext(raw)[1].lower()
+    is_path_like = ("/" in raw or "\\" in raw or os.path.splitdrive(raw)[0] != "")
+    if ext not in _LOCAL_FILE_EXT and not is_path_like:
+        return None
+    base = os.path.realpath(WORKDIR)
+    cand = os.path.realpath(os.path.join(base, raw))
+    if cand == base or cand.startswith(base + os.sep):
+        return cand
+    return None
+
+
 def _open_one(name):
     key = _canonical(name)
     if key in _APPS:
@@ -407,6 +447,23 @@ def _open_one(name):
         except Exception as exc:
             return {"error": f"could not open '{name}': {exc}"}
         return {"launched": store.get("Name", key), "result": "ok", "method": "start menu app"}
+    local = _local_file_target(name)
+    if local:
+        if not os.path.isfile(local):
+            return {"error": f"file not found: {local}"}
+        try:
+            os.startfile(local)
+        except Exception as exc:
+            return {"error": f"could not open '{name}': {exc}"}
+        return {"opened": local, "result": "ok", "method": "file"}
+    if key.startswith(("http://", "https://", "www.")):
+        site = _normalize_url(key)
+        webbrowser.open(site)
+        return {"opened": site, "result": "ok", "method": "website"}
+    if "/" in key or "\\" in key or os.path.splitdrive(key)[0]:
+        return {"error": f"could not open '{name}': not a known program, website "
+                         f"or workspace file (paths outside the workspace are "
+                         f"rejected)"}
     site = _resolve_site(key)
     if site:
         webbrowser.open(site)
@@ -431,11 +488,15 @@ TOOL_SPEC = {
     "type": "function",
     "function": {
         "name": "launch_or_open",
-        "description": "Open a program or a website on this PC by name. "
-                       "Examples: steam, discord, notepad, spotify, epic games, "
-                       "youtube, github, google, wikipedia. You may name several, "
-                       "e.g. 'steam and youtube'. The tool decides whether each "
-                       "name is an app or a website.",
+        "description": "Open a program, a website or a FILE on this PC by name. "
+                       "Examples: steam, discord, notepad, spotify, youtube, "
+                       "github, google, wikipedia. You may name several, e.g. "
+                       "'steam and youtube'. Files: give a workspace file like "
+                       "'ad.html', 'out/report.pdf' or 'result.png' (absolute "
+                       "paths also work) - it opens with the default program "
+                       "(HTML/PDF/PNG open in the browser). The tool decides "
+                       "whether each name is an app, a workspace file or a "
+                       "website.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -494,7 +555,12 @@ def _write_file(path, content):
         os.makedirs(parent, exist_ok=True)
     with open(target, "w", encoding="utf-8", newline="\n") as fh:
         fh.write(str(content or ""))
-    return {"result": "ok", "path": target, "bytes": os.path.getsize(target)}
+    rel = os.path.relpath(target, os.path.realpath(WORKDIR))
+    result = {"result": "ok", "path": target, "bytes": os.path.getsize(target)}
+    preview = _preview_url(rel)
+    if preview:
+        result["preview_url"] = preview
+    return result
 
 
 def _edit_file(path, old_text, new_text, replace_all):
@@ -513,6 +579,28 @@ def _edit_file(path, old_text, new_text, replace_all):
     with open(target, "w", encoding="utf-8", newline="\n") as fh:
         fh.write(content)
     return {"result": "ok", "path": target, "replaced": count}
+
+
+def _preview_url(rel):
+    rel = str(rel or "").strip().replace("\\", "/").lstrip("/")
+    if not rel.lower().endswith((".html", ".htm")):
+        return None
+    return "http://127.0.0.1:%d/preview?path=%s" % (PORT, urllib.parse.quote(rel))
+
+
+def _preview_html(path):
+    rel = str(path or "").strip()
+    if not rel.lower().endswith((".html", ".htm")):
+        return {"error": "preview_html only works with .html / .htm files"}
+    try:
+        target = _safe_path(rel)
+    except ValueError as exc:
+        return {"error": str(exc)}
+    if not os.path.isfile(target):
+        return {"error": f"file not found: {target}"}
+    relpath = os.path.relpath(target, os.path.realpath(WORKDIR))
+    return {"result": "ok", "path": target,
+            "preview_url": _preview_url(relpath)}
 
 
 def _search_files(pattern, path):
@@ -876,35 +964,72 @@ def _run_command(command, workdir=None, timeout=45):
 
 
 _CODE_TIMEOUT = 30
+_CODE_TIMEOUT_MAX = 600
 _CODE_CAP = 8000
 _CODE_RUNNERS = {
-    "python": {"cmd": [sys.executable], "ext": ".py"},
-    "py": {"cmd": [sys.executable], "ext": ".py"},
-    "node": {"cmd": None, "ext": ".js"},
-    "js": {"cmd": None, "ext": ".js"},
-    "javascript": {"cmd": None, "ext": ".js"},
+    "python": {"ext": ".py", "exe": sys.executable, "args": ["{script}"]},
+    "py": {"ext": ".py", "exe": sys.executable, "args": ["{script}"]},
+    "node": {"ext": ".js", "exe": "node", "args": ["{script}"]},
+    "js": {"ext": ".js", "exe": "node", "args": ["{script}"]},
+    "javascript": {"ext": ".js", "exe": "node", "args": ["{script}"]},
+    "go": {"ext": ".go", "exe": "go", "args": ["run", "{script}"]},
+    "golang": {"ext": ".go", "exe": "go", "args": ["run", "{script}"]},
+    "lua": {"ext": ".lua", "exe": "lua", "args": ["{script}"]},
+    "php": {"ext": ".php", "exe": "php", "args": ["{script}"]},
+    "ruby": {"ext": ".rb", "exe": "ruby", "args": ["{script}"]},
+    "perl": {"ext": ".pl", "exe": "perl", "args": ["{script}"]},
+    "bash": {"ext": ".sh", "exe": "bash", "args": ["{script}"]},
+    "sh": {"ext": ".sh", "exe": "bash", "args": ["{script}"]},
+    "shell": {"ext": ".sh", "exe": "bash", "args": ["{script}"]},
 }
+
+
+def _resolve_shell():
+    for name in ("bash", "sh"):
+        p = shutil.which(name)
+        if p and "system32" not in p.lower():
+            return p
+    return None
 
 
 def _code_runner(lang):
     key = str(lang or "python").strip().lower()
     spec = _CODE_RUNNERS.get(key)
     if not spec:
-        return None, None
-    cmd = spec["cmd"]
-    if cmd is None:
-        found = shutil.which("node")
-        if not found:
-            return None, None
-        cmd = [found]
-    return list(cmd), spec["ext"]
+        return None, None, None
+    exe = spec["exe"]
+    if exe == sys.executable:
+        resolved = exe
+    elif exe == "bash":
+        resolved = _resolve_shell()
+    else:
+        resolved = shutil.which(exe)
+    if not resolved:
+        return None, None, None
+    return spec["args"], spec["ext"], resolved
+
+
+def _available_languages():
+    langs = []
+    for lang, spec in _CODE_RUNNERS.items():
+        if spec["exe"] == sys.executable:
+            langs.append(lang)
+        elif spec["exe"] == "bash":
+            if _resolve_shell():
+                langs.append(lang)
+        elif shutil.which(spec["exe"]):
+            langs.append(lang)
+    return sorted(set(langs))
 
 
 def _run_code(language, code, timeout=_CODE_TIMEOUT):
-    runner, ext = _code_runner(language)
-    if not runner:
-        return {"error": f"code runner not available for '{language}' "
-                         "(I can run python and node)"}
+    args_tpl, ext, exe = _code_runner(language)
+    if not args_tpl:
+        avail = ", ".join(_available_languages()) or "none"
+        return {"error": f"code runner for '{language}' is not installed on this "
+                         f"PC (available: {avail})"}
+    t = int(timeout or _CODE_TIMEOUT)
+    t = min(max(t, 1), _CODE_TIMEOUT_MAX)
     snippet = str(code or "").strip()
     if not snippet:
         return {"error": "code is required"}
@@ -913,8 +1038,9 @@ def _run_code(language, code, timeout=_CODE_TIMEOUT):
     try:
         with open(script, "w", encoding="utf-8", newline="\n") as fh:
             fh.write(snippet)
-        proc = subprocess.run(runner + [script], capture_output=True,
-                              text=True, timeout=timeout, cwd=sandbox,
+        argv = [exe] + [a.replace("{script}", script) for a in args_tpl]
+        proc = subprocess.run(argv, capture_output=True,
+                              text=True, timeout=t, cwd=sandbox,
                               creationflags=CREATE_NO_WINDOW)
         pieces = [proc.stdout or ""]
         if proc.stderr:
@@ -925,7 +1051,7 @@ def _run_code(language, code, timeout=_CODE_TIMEOUT):
         return {"result": "ok", "language": str(language or "python"),
                 "exit_code": proc.returncode, "output": out}
     except subprocess.TimeoutExpired:
-        return {"error": f"code timed out after {timeout}s"}
+        return {"error": f"code timed out after {t}s (max {_CODE_TIMEOUT_MAX}s)"}
     except Exception as exc:
         return {"error": f"could not run code: {exc}"}
     finally:
@@ -1332,23 +1458,59 @@ CODE_TOOL = {
     "type": "function",
     "function": {
         "name": "run_code",
-        "description": "Run a small snippet of Python or Node.js in a sandboxed "
-                       "environment and return its output. Use it to test functions, "
-                       "verify logic, parse data or prototype before touching real "
-                       "files. The sandbox has no network and a 30s timeout.",
+        "description": "Run a snippet in a sandboxed environment and return its "
+                       "output. Languages available on this PC are auto-detected - "
+                       "typically: python, node (JavaScript). Also supported when "
+                       "installed: go, lua, php, ruby, perl, bash. Use it to test "
+                       "functions, verify logic, parse data or prototype before "
+                       "touching real files. Runs in an isolated temp folder that "
+                       "is deleted afterwards. Default timeout 30s, up to 600s.",
         "parameters": {
             "type": "object",
             "properties": {
                 "language": {
                     "type": "string",
-                    "description": "'python' or 'node'."
+                    "description": "Language to run: 'python', 'node' (or 'js'), "
+                                   "'go', 'lua', 'php', 'ruby', 'perl', 'bash'. "
+                                   "If the runtime is missing this returns the "
+                                   "list actually available."
                 },
                 "code": {
                     "type": "string",
                     "description": "The source code to run."
+                },
+                "timeout": {
+                    "type": "integer",
+                    "description": "Max seconds to run (1-600). Default 30. "
+                                   "Raise it for slow work, e.g. simulations."
                 }
             },
             "required": ["language", "code"]
+        }
+    }
+}
+
+
+PREVIEW_HTML_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "preview_html",
+        "description": "Live-preview an HTML page you created in the workspace. "
+                       "Call it after writing an .html/.htm file (e.g. a chart, "
+                       "a report or a small web app) - the UI will show a live "
+                       "iframe of the page. The page is served from this PC, so "
+                       "JavaScript and local assets work. Returns the preview "
+                       "URL.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Relative workspace path of the .html/.htm "
+                                   "file, e.g. 'out/report.html'."
+                }
+            },
+            "required": ["path"]
         }
     }
 }
@@ -1790,11 +1952,40 @@ UNSCHEDULE_TOOL = _pc_tool(
     ["name"]
 )
 
+TTS_VOICES_TOOL = _pc_tool(
+    "tts_voices",
+    "List the local Piper text-to-speech voices available on this machine "
+    "(each .onnx + .onnx.json pair in the Piper folder). Use tts_speak with "
+    "one of the returned names.",
+    {},
+    []
+)
+
+TTS_SPEAK_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "tts_speak",
+        "description": "Speak text aloud using the local neural Piper TTS "
+                       "engine (no cloud, no Windows voices). Also saves the "
+                       "speech as a WAV file in the workspace. Use this to give "
+                       "the user spoken feedback, alerts or TTS output.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "The text to speak."},
+                "voice": {"type": "string", "description": "Piper voice name, default 'en_US-lessac-medium'. Romanian: 'ro_RO-mihai-medium'. List with tts_voices."}
+            },
+            "required": ["text"]
+        }
+    }
+}
+
 NEW_TOOLS = [WINDOW_LIST_TOOL, WINDOW_ACTION_TOOL,
              DOCKER_PS_TOOL, DOCKER_IMAGES_TOOL, DOCKER_START_TOOL,
              DOCKER_STOP_TOOL, DOCKER_RESTART_TOOL, DOCKER_LOGS_TOOL,
              DOCKER_EXEC_TOOL, API_CALL_TOOL, WS_TEST_TOOL,
-             SCHEDULE_TOOL, LIST_SCHEDULES_TOOL, UNSCHEDULE_TOOL]
+             SCHEDULE_TOOL, LIST_SCHEDULES_TOOL, UNSCHEDULE_TOOL,
+             TTS_VOICES_TOOL, TTS_SPEAK_TOOL, PREVIEW_HTML_TOOL]
 
 PC_TOOLS = [SHOT_TOOL, INPUT_TOOL, CLIPBOARD_TOOL,
             DOWNLOAD_TOOL, ARCHIVE_TOOL, ASK_TOOL, TODO_TOOL] + NEW_TOOLS
@@ -2187,6 +2378,92 @@ def _archive(args):
         return {"result": "ok", "created": dest.replace("\\", "/"),
                 "entries": len(srcs)}
     return {"error": "action must be 'extract' or 'create'"}
+
+
+# ---------------- Local neural TTS (Piper) ----------------
+
+def _piper_voices():
+    if not os.path.isdir(PIPER_DIR):
+        return {"error": f"Piper voices folder not found at {PIPER_DIR} "
+                         "(set PC_PIPER_DIR or run python piper\\download_voices.py)"}
+    voices = []
+    for f in sorted(os.listdir(PIPER_DIR)):
+        if f.endswith(".onnx"):
+            base = f[:-5]
+            if os.path.exists(os.path.join(PIPER_DIR, base + ".onnx.json")):
+                voices.append(base)
+    if not voices:
+        return {"error": f"no Piper voices (.onnx + .onnx.json) found in {PIPER_DIR}"}
+    return {"result": "ok", "folder": PIPER_DIR, "voices": voices}
+
+
+def _play_wav(path):
+    try:
+        import numpy as np
+        import sounddevice as sd
+        import wave as wave_mod
+        with wave_mod.open(path, "rb") as wv:
+            n = wv.getnframes()
+            sr = wv.getframerate()
+            raw = wv.readframes(n)
+        data = np.frombuffer(raw, dtype=np.int16)
+        sd.play(data, sr)  # non-blocking; keeps playing in the background
+        return round(n / sr, 2)
+    except Exception:
+        try:
+            import winsound
+            winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC)
+            return None
+        except Exception:
+            return None
+
+
+def _tts_speak(args):
+    import wave as wave_mod
+    text = str(args.get("text") or "").strip()
+    if not text:
+        return {"error": "text is required"}
+    voice = str(args.get("voice") or "en_US-lessac-medium").strip()
+    voice = voice[:-5] if voice.endswith(".onnx") else voice
+    model = os.path.join(PIPER_DIR, voice + ".onnx")
+    conf = os.path.join(PIPER_DIR, voice + ".onnx.json")
+    if not (os.path.exists(model) and os.path.exists(conf)):
+        return {"error": f"voice '{voice}' not found in {PIPER_DIR} "
+                         "(run tts_voices to list the available voices)"}
+    try:
+        import piper
+    except Exception as exc:
+        return {"error": f"piper-tts is not installed: pip install piper-tts onnxruntime ({exc})"}
+    out_dir = os.path.join(WORKDIR, "out", "tts")
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+    except Exception:
+        out_dir = os.path.join(WORKDIR, "out")
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+        except Exception:
+            out_dir = WORKDIR
+    wav_path = os.path.join(out_dir,
+                            "tts_" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                            + ".wav")
+    try:
+        v = piper.PiperVoice.load(model, conf)
+        with open(wav_path, "wb") as wf:
+            v.synthesize_wav(text, wave_mod.Wave_write(wf))
+    except Exception as exc:
+        return {"error": f"piper synthesis failed: {exc}"}
+    duration = None
+    try:
+        import wave as wave_mod2
+        with wave_mod2.open(wav_path, "rb") as wv:
+            duration = round(wv.getnframes() / max(1, wv.getframerate()), 2)
+    except Exception:
+        pass
+    _play_wav(wav_path)
+    return {"result": "ok", "voice": voice, "text": text[:200],
+            "wav": wav_path.replace("\\", "/"),
+            "bytes": os.path.getsize(wav_path),
+            "duration_seconds": duration}
 
 
 # ---------------- Window management ----------------
@@ -2723,7 +3000,8 @@ def execute_tool_call(tc, hooks=None):
             on_todo(items)
         raw_result = {"result": "ok", "todos": items}
     elif name == "run_code":
-        raw_result = _run_code(args.get("language"), args.get("code"))
+        raw_result = _run_code(args.get("language"), args.get("code"),
+                               timeout=args.get("timeout"))
     elif name == "window_list":
         raw_result = _window_list()
     elif name == "window_action":
@@ -2748,6 +3026,16 @@ def execute_tool_call(tc, hooks=None):
         raw_result = _list_schedules(args)
     elif name == "unschedule_task":
         raw_result = _unschedule_task(args)
+    elif name == "tts_voices":
+        raw_result = _piper_voices()
+    elif name == "tts_speak":
+        if not tts_enabled():
+            raw_result = {"error": "TTS is OFF - click the TTS button in the "
+                                   "header to enable spoken replies, then ask again"}
+        else:
+            raw_result = _tts_speak(args)
+    elif name == "preview_html":
+        raw_result = _preview_html(args.get("path"))
     elif name in _blender_tool_names():
         if not MCP_AVAILABLE:
             raw_result = {"error": "Blender MCP is not installed (pip install mcp-for-blender)"}
@@ -3023,6 +3311,8 @@ PAGE = """<!doctype html>
     padding: 8px 12px; border-radius: 8px; cursor: pointer; font-size: 13px; transition: all .2s;
   }
   .hbtn:hover { background: rgba(0,240,255,.2); border-color: #00f0ff; box-shadow: 0 0 12px rgba(0,240,255,.4); }
+  .hbtn.on { background: rgba(74,222,128,.15); border-color: #4ade80; color: #86efac; }
+  .hbtn.on:hover { background: rgba(74,222,128,.3); box-shadow: 0 0 12px rgba(74,222,128,.4); }
 
   main.grid {
     display: grid; grid-template-columns: 250px 1fr 1.35fr; gap: 10px;
@@ -3239,6 +3529,9 @@ PAGE = """<!doctype html>
 
   /* screenshot thumb in tool log */
   .tlitem .tthumb { max-width: 220px; border-radius: 6px; border: 1px solid #164e63; margin-top: 6px; display: block; }
+  .tlprev { margin-top: 8px; }
+  .tlprev a { font-size: 11px; color: #00f0ff; }
+  .tlprev .tlframe { width: 100%; height: 280px; border: 1px dashed rgba(0,240,255,.35); border-radius: 8px; background: #060b18; margin-top: 6px; }
 
   /* drag & drop attach overlay */
   .chat-wrap { position: relative; }
@@ -3272,6 +3565,7 @@ PAGE = """<!doctype html>
       </div>
       <button class="modebtn" id="modebtn" title="Switch Plan / Build mode">BUILD</button>
       <button class="wbtn" id="workbtn" title="Click to choose the workspace folder">\\WORKSPACE</button>
+      <button class="hbtn" id="ttsbtn" title="Text-to-speech (Piper) - speak replies aloud. Off by default.">TTS: OFF</button>
       <button class="hbtn" id="ejectbtn" title="Unload the model from RAM/VRAM now (it loads back on the next message)">EJECT</button>
       <span class="blstatus off" id="blstatus" title="Blender MCP status">BLENDER: CHECKING</span>
     </div>
@@ -3542,6 +3836,8 @@ function addToolLog(container, calls) {
     const rs = document.createElement('div'); rs.className = 'rs';
     rs.textContent = toolResultText(c.result);
     it.appendChild(nm); it.appendChild(rs);
+    const pv = previewIframeDom(c.result);
+    if (pv) it.appendChild(pv);
     if (c.preview) {
       const im = document.createElement('img'); im.className = 'tthumb';
       im.src = c.preview; im.title = 'screenshot - click to enlarge';
@@ -3552,6 +3848,19 @@ function addToolLog(container, calls) {
   });
   d.appendChild(s); d.appendChild(l);
   container.appendChild(d);
+}
+function previewIframeDom(r) {
+  const url = r && typeof r === 'object' ? (r.preview_url || '') : '';
+  if (!url) return null;
+  const w = document.createElement('div');
+  w.className = 'tlprev';
+  const a = document.createElement('a');
+  a.href = url; a.target = '_blank';
+  a.textContent = 'live preview - open in new tab';
+  const ifr = document.createElement('iframe');
+  ifr.className = 'tlframe'; ifr.src = url; ifr.sandbox = 'allow-scripts';
+  w.appendChild(a); w.appendChild(ifr);
+  return w;
 }
 function toolChip(container, c) {
   const chip = document.createElement('span');
@@ -3754,7 +4063,7 @@ function toolResultText(r) {
   if (typeof r === 'string') return r;
   if (!r || typeof r !== 'object') return String(r);
   const copy = {};
-  Object.keys(r).forEach(function (k) { if (k !== 'preview') copy[k] = r[k]; });
+  Object.keys(r).forEach(function (k) { if (k !== 'preview' && k !== 'preview_url') copy[k] = r[k]; });
   return JSON.stringify(copy, null, 2);
 }
 function toolItemDom(call) {
@@ -3765,6 +4074,8 @@ function toolItemDom(call) {
   const rs = document.createElement('div'); rs.className = 'rs';
   rs.textContent = toolResultText(call.result);
   it.appendChild(nm); it.appendChild(rs);
+  const pv = previewIframeDom(call.result);
+  if (pv) it.appendChild(pv);
   if (call.preview) {
     const im = document.createElement('img'); im.className = 'tthumb';
     im.src = call.preview; im.title = 'screenshot - click to enlarge';
@@ -4100,6 +4411,30 @@ document.getElementById('ejectbtn').onclick = function () {
     });
 };
 
+/* ---------- TTS toggle (Piper) ---------- */
+function renderTtsBtn(j) {
+  const el = document.getElementById('ttsbtn');
+  if (!el) return;
+  el.textContent = j.enabled ? 'TTS: ON' : 'TTS: OFF';
+  el.classList.toggle('on', !!j.enabled);
+  el.title = 'Text-to-speech (Piper) - ' + (j.enabled ? 'speech enabled' : 'off, click to enable');
+}
+function refreshTts() {
+  fetch('/api/tts')
+    .then(function (r) { return r.json(); })
+    .then(renderTtsBtn)
+    .catch(function () { renderTtsBtn({ enabled: false }); });
+}
+document.getElementById('ttsbtn').onclick = function () {
+  const el = document.getElementById('ttsbtn');
+  const next = !el.classList.contains('on');
+  fetch('/api/tts', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled: next }) })
+    .then(function (r) { return r.json(); })
+    .then(renderTtsBtn)
+    .catch(function () { alert('TTS toggle failed'); });
+};
+refreshTts();
+
 const inp = document.getElementById('user-input');
 inp.addEventListener('input', function () { this.style.height = 'auto'; this.style.height = Math.min(this.scrollHeight, 160) + 'px'; });
 inp.addEventListener('keydown', function (ev) { if (ev.key === 'Enter' && !ev.shiftKey) { ev.preventDefault(); handleSubmit(ev); } });
@@ -4219,6 +4554,8 @@ PAGE_GPT = """<!doctype html>
   .blrow.mid b { background: var(--warn); }
   .blrow.off b { background: var(--err); }
   .btn-ghost { border: 1px solid var(--bd); background: transparent; color: var(--txt); border-radius: 8px; padding: 7px 10px; cursor: pointer; font-size: 12px; }
+  .btn-ghost.on { background: rgba(74,222,128,.15); border-color: #4ade80; color: #86efac; }
+  .btn-ghost.on:hover { background: rgba(74,222,128,.3); }
   .btn-ghost:hover { border-color: var(--mut); }
   .wd { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%; text-align: left; }
   .foot-row { display: flex; gap: 6px; }
@@ -4266,6 +4603,9 @@ PAGE_GPT = """<!doctype html>
   .tlitem.err { border-color: var(--err); color: var(--err); }
   .tlitem .rs { color: var(--mut); margin-top: 4px; white-space: pre-wrap; overflow-wrap: anywhere; }
   .tlitem .rs img.tthumb { max-width: 240px; border-radius: 8px; margin-top: 6px; cursor: zoom-in; display: block; }
+  .tlprev { margin-top: 8px; }
+  .tlprev a { font-size: 11px; color: var(--acc); }
+  .tlprev .tlframe { width: 100%; height: 280px; border: 1px dashed var(--bd); border-radius: 8px; background: var(--bg2); margin-top: 6px; }
   .toolsline { margin: 2px 0 8px; display: flex; flex-wrap: wrap; gap: 6px; }
   .chip { font-size: 11.5px; color: var(--mut); background: var(--bg3); border: 1px solid var(--bd); border-radius: 999px; padding: 4px 11px; font-weight: 600; }
   .chip.ok { color: var(--ok); }
@@ -4325,6 +4665,7 @@ PAGE_GPT = """<!doctype html>
       <button class="btn-ghost wd" id="workbtn"></button>
       <div class="foot-row">
         <a href="/" title="Classic UI">Classic UI</a>
+        <button class="btn-ghost" id="ttsbtn" title="Text-to-speech (Piper) - speak replies aloud. Off by default.">TTS: OFF</button>
         <button class="btn-ghost" id="themebtn" title="Toggle theme"></button>
         <button class="btn-ghost" id="ejectbtn" title="Unload the model from RAM/VRAM">EJECT</button>
       </div>
@@ -4521,8 +4862,21 @@ function toolResultText(r) {
   if (typeof r === 'string') return r;
   if (!r || typeof r !== 'object') return String(r);
   const copy = {};
-  Object.keys(r).forEach(function (k) { if (k !== 'preview') copy[k] = r[k]; });
+  Object.keys(r).forEach(function (k) { if (k !== 'preview' && k !== 'preview_url') copy[k] = r[k]; });
   return JSON.stringify(copy, null, 2);
+}
+function previewIframeDom(r) {
+  const url = r && typeof r === 'object' ? (r.preview_url || '') : '';
+  if (!url) return null;
+  const w = document.createElement('div');
+  w.className = 'tlprev';
+  const a = document.createElement('a');
+  a.href = url; a.target = '_blank';
+  a.textContent = 'live preview - open in new tab';
+  const ifr = document.createElement('iframe');
+  ifr.className = 'tlframe'; ifr.src = url; ifr.sandbox = 'allow-scripts';
+  w.appendChild(a); w.appendChild(ifr);
+  return w;
 }
 function toolItemDom(call) {
   const it = document.createElement('div');
@@ -4530,6 +4884,8 @@ function toolItemDom(call) {
   const nm = document.createElement('div'); nm.textContent = '\u2699 ' + call.name + ' ' + JSON.stringify(call.arguments || {});
   const rs = document.createElement('div'); rs.className = 'rs'; rs.textContent = toolResultText(call.result);
   it.appendChild(nm); it.appendChild(rs);
+  const pv = previewIframeDom(call.result);
+  if (pv) it.appendChild(pv);
   if (call.preview) {
     const im = document.createElement('img'); im.className = 'tthumb';
     im.src = call.preview; im.title = 'screenshot - click to enlarge';
@@ -5011,6 +5367,29 @@ document.getElementById('ejectbtn').onclick = function () {
       setTimeout(function () { btn.textContent = 'EJECT'; btn.disabled = false; btn.style.opacity = '1'; }, 2500);
     });
 };
+/* ---------- TTS toggle (Piper) ---------- */
+function renderTtsBtn(j) {
+  const el = document.getElementById('ttsbtn');
+  if (!el) return;
+  el.textContent = j.enabled ? 'TTS: ON' : 'TTS: OFF';
+  el.classList.toggle('on', !!j.enabled);
+  el.title = 'Text-to-speech (Piper) - ' + (j.enabled ? 'speech enabled' : 'off, click to enable');
+}
+function refreshTts() {
+  fetch('/api/tts')
+    .then(function (r) { return r.json(); })
+    .then(renderTtsBtn)
+    .catch(function () { renderTtsBtn({ enabled: false }); });
+}
+document.getElementById('ttsbtn').onclick = function () {
+  const el = document.getElementById('ttsbtn');
+  const next = !el.classList.contains('on');
+  fetch('/api/tts', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled: next }) })
+    .then(function (r) { return r.json(); })
+    .then(renderTtsBtn)
+    .catch(function () { alert('TTS toggle failed'); });
+};
+refreshTts();
 const inp = document.getElementById('user-input');
 inp.addEventListener('input', function () { this.style.height = 'auto'; this.style.height = Math.min(this.scrollHeight, 160) + 'px'; });
 inp.addEventListener('keydown', function (ev) { if (ev.key === 'Enter' && !ev.shiftKey) { ev.preventDefault(); handleSubmit(ev); } });
@@ -5084,6 +5463,33 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _serve_preview(self):
+        qs = self.path.partition("?")[2]
+        params = dict(urllib.parse.parse_qsl(qs))
+        rel = params.get("path", "")
+        if not rel:
+            self._send(400, "preview: missing 'path'", "text/plain")
+            return
+        try:
+            target = _safe_path(rel)
+        except ValueError as exc:
+            self._send(400, str(exc), "text/plain")
+            return
+        if not target.lower().endswith((".html", ".htm")):
+            self._send(400, "preview: only .html / .htm files can be previewed",
+                       "text/plain")
+            return
+        if not os.path.isfile(target):
+            self._send(404, "file not found", "text/plain")
+            return
+        try:
+            with open(target, "rb") as fh:
+                data = fh.read()
+        except Exception as exc:
+            self._send(500, "preview read error: %s" % exc, "text/plain")
+            return
+        self._send(200, data, "text/html; charset=utf-8")
+
     def do_GET(self):
         _touch_activity()
         path = self.path.split("?")[0]
@@ -5100,6 +5506,11 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, json.dumps({"todos": _TODOS}))
         elif path == "/api/blender":
             self._send(200, json.dumps(_blender_status_payload()))
+        elif path == "/api/tts":
+            self._send(200, json.dumps({"enabled": tts_enabled(),
+                                        "folder": PIPER_DIR}))
+        elif path == "/preview":
+            self._serve_preview()
         else:
             self._send(404, "not found", "text/plain")
 
@@ -5109,7 +5520,8 @@ class Handler(BaseHTTPRequestHandler):
             path = self.path.split("?")[0]
             if path not in ("/api", "/api/stream", "/api/workdir",
                             "/api/pick_workdir", "/api/chats",
-                            "/api/answer", "/api/effort", "/api/eject"):
+                            "/api/answer", "/api/effort", "/api/eject",
+                            "/api/tts"):
                 self._send(404, "not found", "text/plain")
                 return
             length = int(self.headers.get("Content-Length", 0))
@@ -5138,6 +5550,10 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/effort":
                 effort = set_bonsai_effort(body.get("effort"))
                 self._send(200, json.dumps({"ok": True, "effort": effort}))
+                return
+            if path == "/api/tts":
+                enabled = set_tts_enabled(body.get("enabled"))
+                self._send(200, json.dumps({"ok": True, "enabled": enabled}))
                 return
             if path == "/api/workdir":
                 global WORKDIR

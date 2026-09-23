@@ -35,8 +35,19 @@ checks the required files and tells you exactly what is still missing.
 | `websocket-client` | WebSocket client | `ws_test` |
 | `beautifulsoup4` | page parsing | `tools/scraper.py` |
 | `pytesseract` | OCR | `tools/ocr.py` *(engine too: Tesseract OCR, see below)* |
+| `piper-tts` + `onnxruntime` | local neural speech synthesis (Piper engine) | `tts_speak`, `tts_voices` |
+| `sounddevice` | plays the synthesized WAV straight to the speakers (bundled PortAudio - no media player involved) | playback half of `tts_speak`; falls back to `winsound` |
 
 Install everything with: `pip install -r requirements.txt -r tools\requirements.txt`
+
+> **Piper voices**: the pack lives in `piper\` (inside the project). The
+> `.onnx` + `.onnx.json` model files are **not** committed (too large) - fetch
+> them once with `python piper\download_voices.py` (English + Romanian). Drop
+> any other `<voice>.onnx` pair in `piper\` and use it via the `voice`
+> parameter. Point elsewhere with the `PC_PIPER_DIR` environment variable.
+>
+> TTS is **off by default**: the model only speaks after you click the
+> **TTS** button in the header (state is per-run, resets on restart).
 
 | Package | Powers |
 |---|---|
@@ -49,6 +60,7 @@ Install everything with: `pip install -r requirements.txt -r tools\requirements.
 | **Docker Desktop + WSL2 + Virtual Machine Platform** | the `docker_ps` / `docker_images` / `docker_start` / `docker_stop` / `docker_restart` / `docker_logs` / `docker_exec` tools | `winget install --id Docker.DockerDesktop`, then `wsl --install --no-distribution` and enable the Virtual Machine Platform feature; **reboot required**. `OPTIONALS.cmd` drives all of it |
 | **"MCP for Blender" addon** (in Blender) | enables the Blender tool family | Blender > Edit > Preferences > Add-ons, enable it after installing `mcp-for-blender` |
 | **Tesseract OCR engine** | powers `tools/ocr.py` | `winget install --id UB-Mannheim.TesseractOCR` |
+| **Node.js / Go / Lua / PHP / Ruby / Perl / bash runtime** | extra languages for the `run_code` sandbox - installed ones are auto-detected (Python always works) | Node: `winget install --id OpenJS.NodeJS` (Go: `winget install GoLang.Go`) |
 
 ## Files that must be present (fresh clone)
 
@@ -61,6 +73,8 @@ OPTIONALS.cmd        installs Docker/WSL2/Blender-MCP system optionals
 requirements.md      this file
 requirements.txt     optional Python packages (see table above)
 tools/               helper scripts (screenshot, clipboard, scraper, ocr)
+piper/               Piper TTS: tts.py + download_voices.py (voice models are
+                     git-ignored - run `python piper\download_voices.py` once)
 tools.json           machine-readable tool reference (auto-generated from code)
 instructions.txt    what BONSAI knows about itself
 README.md            the full manual

@@ -89,6 +89,7 @@ in order).
 | `Pillow` / `pyautogui` / `pyperclip` | power `take_screenshot`, `control_input` and `clipboard` | recommended (tools report a clear error if missing) |
 | `pywin32` / `psutil` | power the `window_list` / `window_action` tools | recommended (installed here; tools report a clear error if missing) |
 | `requests` / `websocket-client` | power the `api_call` / `ws_test` tools | recommended (installed here) |
+| `piper-tts` / `onnxruntime` / `sounddevice` | power the `tts_speak` / `tts_voices` tools (local neural TTS + direct playback) | recommended; voice models in the project's `piper\` (fetch with `python piper\download_voices.py`) |
 | **Blender + MCP addon** | for the Blender tools (§4) | optional; `mcp-for-blender` Python package + the bundled addon enabled in Blender (Edit > Preferences > Add-ons > "MCP for Blender") |
 | Docker / Hyper3D / sketchfab accounts | optional extra Blender *content* tools | not bundled here - only the core Blender tools ship |
 
@@ -103,13 +104,15 @@ in order).
 | **PC control** | `control_input` moves the mouse, clicks, drags, scrolls and types, like a human using the PC |
 | **Clipboard** | reads or writes the system clipboard with `clipboard` (get / set) |
 | **Downloads & archives** | `download_file` saves files from the web into the workspace; `archive` creates/extracts zip & tar |
-| **Shell + sandbox** | `run_command` executes real Windows commands (configurable timeout, up to 600s); `run_code` runs short Python/Node snippets in a sandboxed, network-less environment |
+| **Shell + sandbox** | `run_command` executes real Windows commands (configurable timeout, up to 600s); `run_code` runs snippets in an isolated temp folder (auto-detects what's installed on the PC: Python + Node by default, plus Go/Lua/PHP/Ruby/Perl/Bash when present; timeouts up to 600s) |
 | **Asks you questions** | `ask_user` pauses and asks you a question (with optional clickable options) exactly like a human would - just like opencode |
 | **Todo list** | `todo_write` shows a live, visible checklist on the left panel as it works through longer tasks |
+| **Live HTML preview** | any `.html` page Bonsai writes (or `preview_html` explicitly) is shown as a live iframe right in the conversation - served from this PC, so JavaScript and local assets work |
 | **Window management** | `window_list` lists every open window (title, process, PID) and `window_action` brings one to the front, maximizes, minimizes or restores it - so Bonsai can switch apps before acting |
 | **Docker / containers** | `docker_ps`, `docker_images`, `docker_start`, `docker_stop`, `docker_restart`, `docker_logs` and `docker_exec` drive the Docker CLI (works with Docker Desktop) |
 | **API client** | `api_call` speaks REST/GraphQL (any HTTP method, JSON or raw bodies, custom headers) and `ws_test` connects to WebSocket endpoints, sends and collects replies |
 | **Scheduled tasks** | `schedule_task` (once / every N seconds / 5-field cron), `list_schedules`, `unschedule_task` - run shell commands in the background while the PC is on |
+| **Speaks out loud** | `tts_speak` reads text aloud with the local neural Piper engine (English + Romanian voices) and saves the WAV in the workspace; no cloud, no Windows voices, no media player - streams straight to the speakers with `sounddevice`. **Off by default** - flip the **TTS** header button to let Bonsai speak |
 | **Thinking effort** | **THINK: OFF / LOW / MED / HIGH** selector in the composer controls how deep Bonsai reasons (maps to `enable_thinking` / `reasoning_effort`) |
 | **STOP / QUEUE** | abort a reply mid-stream, or queue a follow-up to be answered immediately after |
 | **Live token stats** | real-time think vs. speak time, tokens/second and context usage under the input (see §6) |
@@ -146,9 +149,11 @@ always produced at the end.
 | `api_call` | Any HTTP method to REST or GraphQL APIs, JSON or raw body, custom headers | needs `requests`; returns status, headers, elapsed ms and body |
 | `ws_test` | Connects to a `ws://`/`wss://` endpoint, optionally sends a message, collects replies | needs `websocket-client` |
 | `schedule_task` / `list_schedules` / `unschedule_task` | Run a shell command later: once, every N seconds, or by 5-field cron | in-process scheduler thread; survives only while the server runs |
+| `tts_voices` / `tts_speak` | Lists local Piper voices; speaks text aloud and saves the WAV (`out\tts\`) | needs `piper-tts` + `onnxruntime` + `sounddevice`; voice models live in the project's `piper\` - run `python piper\download_voices.py` once; `tts_speak` only works after the **TTS** header button is turned on |
 | `web_search` / `web_fetch` | Look up current information online when it's not sure | documents itself before answering |
 | `run_command` | Runs a real Windows command | timeout default 45s, configurable up to 600s, output capped to ~8 KB |
-| `run_code` | Runs short Python/Node snippets | sandboxed, **no network**, 30s timeout, ~8 KB output cap |
+| `run_code` | Runs snippets in many languages (auto-detected: Python + Node by default; Go/Lua/PHP/Ruby/Perl/Bash when installed) | isolated temp folder, deleted afterwards; timeout default 30s, up to 600s; ~8 KB output cap |
+| `preview_html` | Live-preview an `.html` page from the workspace in an iframe inside the chat | also auto-suggested when `write_file` targets an `.html`/`.htm` file (returns a `preview_url`) |
 | `get_scene_info` | Lists the open Blender scene: objects, types, locations (Mesh, Camera, Light, ...) | requires Blender running with the *MCP for Blender* addon enabled |
 | `get_object_info` | Details on one object (location, rotation, scale, ...) | |
 | `execute_blender_code` | Runs real Python inside Blender's `bpy` context | add cubes, move them, re-parent, set materials - always step by step |
@@ -176,6 +181,7 @@ from the UI (📁 button in the header) with a native folder dialog, or set
 | **Workspace (folder icon)** | Choose/open the working folder for the file tools |
 | **Blender status light** | Shows the Blender MCP connection: green *CONNECTED*, yellow *ADDON OFF*, red *OFF*, grey *NO MCP* |
 | **EJECT** | Unloads the model from RAM/VRAM **now** to free memory; it simply loads back on the next message |
+| **TTS** | Toggles Piper text-to-speech. **Off by default** - click to let Bonsai speak replies aloud (state resets on server restart) |
 | **Plan / Build** | Toggle mode - *Plan* read-only, *Build* full tool access |
 | **Mic (🎙)** | microphone voice input (speech-to-text) for your messages |
 | **NEW CHAT** | Start a fresh conversation |
@@ -261,7 +267,13 @@ Useful links:
 
 - Everything runs locally - the browser only talks to `127.0.0.1`.
 - File tools are confined to the configured workspace folder.
-- `run_code` runs in a sandbox with **no network access** and a 30s timeout.
+- `run_code` runs in an isolated temp folder that is deleted afterwards (30s
+  timeout by default, up to 600s). Note: it runs as your user on this PC, so
+  snippets do have network access - prefer Python's sandbox tools where strict
+  isolation matters.
+- HTML previews are served only from the workspace and only for `.html`/`.htm`
+  files; the preview `<iframe>` runs with `sandbox="allow-scripts"` so a page
+  cannot touch the rest of the UI.
 - Chat history lives on your PC only (`%APPDATA%\BonsaiAsistent\chats.json`).
 - Don't expose the server to the internet; it's an assistant, not a web service.
 
@@ -294,12 +306,14 @@ tools/                 # optional helper scripts (screenshot, clipboard, scraper
 tools.json             # tool-call spec reference (auto-generated from code)
 gpt_ui.html            # standalone copy of the /chat UI (extracted for reference)
 instructions.txt       # quick-start guide (English)
+piper/                 # Piper TTS: tts.py + download_voices.py; voice .onnx models are git-ignored (fetch with `python piper\download_voices.py`)
 *.gguf                 # the model weights (local only, not in git)
 README.md              # this file
 ```
 
-The repo intentionally does **not** contain the model weights - they are
-git-ignored; download them from the links in §9 if missing.
+The repo intentionally does **not** contain the model weights (git-ignored;
+download from §9) nor the Piper voice models (fetch with
+`python piper\download_voices.py`).
 
 ## 13. License
 

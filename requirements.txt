@@ -22,3 +22,8 @@ pytesseract
 
 # Blender control (optional addon)   -> Blender MCP tools
 mcp-for-blender
+
+# Local neural TTS                   -> tts_speak, tts_voices (Piper + playback)
+piper-tts
+onnxruntime
+sounddevice
