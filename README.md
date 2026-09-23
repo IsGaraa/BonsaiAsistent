@@ -74,6 +74,9 @@ in order).
 | Python 3.10+ | runs `bonsai_web.py` | required |
 | GPU with ~7-8 GB VRAM | fast inference (tested on an RTX 4070, ~48 tok/s); CPU-only works, just slower | recommended |
 | `prism-llama` `llama-server.exe` | the PrismML llama.cpp fork with ternary kernels - stock llama.cpp **can't** run Bonsai 2 files | required |
+| `Pillow` / `pyautogui` / `pyperclip` | power `take_screenshot`, `control_input` and `clipboard` | recommended (tools report a clear error if missing) |
+| **Blender + MCP addon** | for the Blender tools (§4) | optional; `mcp-for-blender` Python package + the bundled addon enabled in Blender (Edit > Preferences > Add-ons > "MCP for Blender") |
+| Docker / Hyper3D / sketchfab accounts | optional extra Blender *content* tools | not bundled here - only the core Blender tools ship |
 
 ## 3. Capabilities
 
@@ -82,14 +85,21 @@ in order).
 | **Multi-turn chat** | conversational assistant powered by a local 27B model (Bonsai 2, ternary 2-bit quantization) |
 | **Live reasoning** | shows its chain of thought in real time, streaming as it is produced |
 | **Tool calls** | decides autonomously when to use a tool and surfaces every call (see §4) |
-| **Vision** | understands attached images - photos, screenshots, scanned documents |
-| **Shell + sandbox** | `run_command` executes real Windows commands; `run_code` runs short Python/Node snippets in a sandboxed, network-less environment with a 30s timeout |
+| **Vision + screen capture** | understands attached images *and* can `take_screenshot` the live screen - it actually sees what's displayed (apps, error dialogs, terminal output) |
+| **PC control** | `control_input` moves the mouse, clicks, drags, scrolls and types, like a human using the PC |
+| **Clipboard** | reads or writes the system clipboard with `clipboard` (get / set) |
+| **Downloads & archives** | `download_file` saves files from the web into the workspace; `archive` creates/extracts zip & tar |
+| **Shell + sandbox** | `run_command` executes real Windows commands (configurable timeout, up to 600s); `run_code` runs short Python/Node snippets in a sandboxed, network-less environment |
+| **Asks you questions** | `ask_user` pauses and asks you a question (with optional clickable options) exactly like a human would - just like opencode |
+| **Todo list** | `todo_write` shows a live, visible checklist on the left panel as it works through longer tasks |
+| **Thinking effort** | **THINK: OFF / LOW / MED / HIGH** selector in the composer controls how deep Bonsai reasons (maps to `enable_thinking` / `reasoning_effort`) |
 | **STOP / QUEUE** | abort a reply mid-stream, or queue a follow-up to be answered immediately after |
 | **Live token stats** | real-time think vs. speak time, tokens/second and context usage under the input (see §6) |
-| **Auto memory relief** | model unloads from RAM after 2 idle minutes and reloads on the next message (see §6) |
+| **Always-in-memory** | the model stays loaded (resident) for the whole session - no idle timer ever unloads it, so a reply never stalls because of a pause (see §6) |
 | **Persistent history** | conversations saved in the browser and on disk; survive server restarts (see §7) |
 | **Talk-back** | optional text-to-speech that auto-matches the language of the reply and picks the most natural installed voice; off by default |
 | **Plan / Build modes** | *Plan* is read-only (inspection only), *Build* grants full tool access |
+| **Blender control** | when Blender is open, Bonsai can create, move and edit 3D scenes inside it and screenshot the viewport - you keep the mouse (no exodus) |
 | **Fully offline** | model, inference and UI all run locally, with no cloud dependency |
 
 ## 4. Tool execution (how it works)
@@ -103,11 +113,28 @@ full log.
 | Tool | What it does | Notes |
 |---|---|---|
 | `launch_or_open` | Opens apps, websites, files and Windows settings by name | Notepad, Steam, Chrome, Spotify, YouTube, system settings... |
-| `list_dir` / `read_file` / `search_files` / `write_file` | Work on your files | strictly confined to the **workspace folder** |
-| `screenshot` / `clipboard` / `ocr` / `scraper` | Capture screen, read clipboard, OCR text from images, grab web page text | helper scripts in `tools/` |
+| `list_dir` / `read_file` / `search_files` / `write_file` / `edit_file` | Work on your files | strictly confined to the **workspace folder** |
+| `take_screenshot` | Captures the screen (or a region) and **feeds the image to Bonsai's eyes** | also saves a PNG in the workspace; shown as a thumbnail in the tool log |
+| `control_input` | Moves the mouse, clicks, double/right-clicks, drags, scrolls, types text, presses keys/hotkeys | screen-pixel coordinates; pair with `take_screenshot` to see the result |
+| `clipboard` | Reads (`get`) or writes (`set`) the system clipboard | |
+| `download_file` | Downloads a file from a URL into the workspace | returns path, size and a text preview when possible |
+| `archive` | Creates / extracts zip, tar, tar.gz, tgz archives | unpack or pack inside the workspace |
+| `ask_user` | Asks you a question and **waits for your answer** (options or free text) | pauses its work like opencode's question skill |
+| `todo_write` | Replaces the visible TODO checklist (pending / in_progress / completed) | shown live on the left panel |
 | `web_search` / `web_fetch` | Look up current information online when it's not sure | documents itself before answering |
-| `run_command` | Runs a real Windows command | timeout-capped, output capped to ~8 KB |
+| `run_command` | Runs a real Windows command | timeout default 45s, configurable up to 600s, output capped to ~8 KB |
 | `run_code` | Runs short Python/Node snippets | sandboxed, **no network**, 30s timeout, ~8 KB output cap |
+| `get_scene_info` | Lists the open Blender scene: objects, types, locations (Mesh, Camera, Light, ...) | requires Blender running with the *MCP for Blender* addon enabled |
+| `get_object_info` | Details on one object (location, rotation, scale, ...) | |
+| `execute_blender_code` | Runs real Python inside Blender's `bpy` context | add cubes, move them, re-parent, set materials - always step by step |
+| `get_viewport_screenshot` | Captures the Blender viewport and **feeds it to Bonsai's eyes** | shown as a thumbnail; the model confirms its work visually |
+| `bpy_api_lookup` / `describe_node_type` / `export_scene` | look up the exact `bpy` API, inspect one shader-node type, export the scene | Bonsai reads real API docs so its code actually runs |
+
+The **Blender** tools run through `mcp-for-blender` (a stdio MCP server that talks to
+the addon on `localhost:9876`). Bonsai keeps full control of the tool loop and
+reasoning - only the actual Blender commands are delegated. A status light in the
+header shows the connection: green **BLENDER: CONNECTED**, yellow *ADDON OFF*
+(Blender open but addon not enabled), red *OFF*.
 
 The **workspace** is the only area the file tools touch. You can pick any folder
 from the UI (📁 button in the header) with a native folder dialog, or set
@@ -119,7 +146,11 @@ from the UI (📁 button in the header) with a native folder dialog, or set
 |---|---|
 | **SEND / STOP** | Submits your message; while Bonsai is replying it becomes **STOP** to abort the run |
 | **QUEUE** | Holds your typed message so it's answered right after the current reply (ordered backlog) |
+| **THINK: OFF / LOW / MED / HIGH** | Selects how deeply Bonsai reasons (`enable_thinking` / `reasoning_effort`); higher = deeper reasoning, slower replies. Default MED |
+| **TODO panel** | Live checklist on the left panel, updated by `todo_write` as longer tasks progress |
 | **Workspace (folder icon)** | Choose/open the working folder for the file tools |
+| **Blender status light** | Shows the Blender MCP connection: green *CONNECTED*, yellow *ADDON OFF*, red *OFF*, grey *NO MCP* |
+| **EJECT** | Unloads the model from RAM/VRAM **now** to free memory; it simply loads back on the next message |
 | **Plan / Build** | Toggle mode - *Plan* read-only, *Build* full tool access |
 | **Voice (🔊) / Mic (🎙)** | Talk-back (TTS) toggle and microphone input |
 | **NEW CHAT / CLEAR** | Start a fresh conversation / reset the current one |
@@ -147,10 +178,12 @@ THINK 2.8s · SPEAK 0.4s · 45.3 tok/s · tokens 138 · ctx 1638/32768
 A compact gold chip with the same numbers is saved onto each reply so the
 stats survive reloads.
 
-**Auto memory relief** - every request tells the model server
-`keep_alive: 120`, so if you don't message Bonsai for 2 minutes the model
-unloads from RAM to free memory. The moment you text again it loads itself
-back automatically - only the first reply after a long pause is slower.
+**Always resident, eject when you want** - the model stays fully loaded for as
+long as the app (and `llama-server`) are running, so there is no idle timer
+that could unload it mid-conversation or right before your next message. When
+you *want* the memory back (e.g. before running a big game), click **EJECT** in
+the header and the model unloads immediately - it simply loads again on the
+next message, no restart needed.
 
 ## 7. Chat history
 
@@ -212,12 +245,16 @@ Useful links:
 
 | Symptom | Fix |
 |---|---|
-| First reply after a pause is slow | normal - the model unloaded from RAM after 2 min idle and is reloading (auto) |
+| First reply after a pause is slow | normal only if `llama-server` was stopped/restarted meanwhile - otherwise the model stays resident for the whole session |
 | Model won't start / blank UI | make sure `prism-llama`'s `llama-server.exe` is installed and `BONSAI_DIR` points at the `.gguf` files |
 | Vision doesn't work | the `*.mmproj-Q8_0.gguf` file must be next to the language model |
 | "Bonsai 2 model server could not start" | run `run.bat` again; check port 8080 isn't taken and the GPU/driver support CUDA |
 | Model answers but sees no files | pick the workspace folder (📁 button) - file tools are confined to it |
+| `take_screenshot` / `control_input` / `clipboard` error ("not installed") | install Pillow, pyautogui and pyperclip (`pip install pillow pyautogui pyperclip`) |
 | Tool output looks truncated | results are intentionally capped (~8 KB) to protect the 32k context |
+| Blender light stuck yellow (**ADDON OFF**) | open Blender and enable the addon (Edit > Preferences > Add-ons > search "MCP for Blender") - the server auto-starts on port 9876 |
+| Blender tools error "not reachable" | Blender must be running with the addon enabled; the reconnect is automatic on the next command |
+| Blender tools missing from the chat | close any other app serving MCP on `localhost:9876` and make sure `mcp-for-blender` is pip-installed (`pip install mcp-for-blender`) |
 
 ## 12. Repository layout
 
@@ -225,7 +262,7 @@ Useful links:
 bonsai_web.py          # the whole assistant (single file: backend + UI)
 run.bat                # the ONE launcher: starts UI + model server
 stop.cmd               # stops the model server
-tools/                 # helper scripts (screenshot, clipboard, scraper, OCR)
+tools/                 # optional helper scripts (screenshot, clipboard, scraper, OCR) - the same capabilities are also built into bonsai_web.py
 tools.json             # tool-call spec reference
 instructions.txt       # quick-start guide (English)
 *.gguf                 # the model weights (local only, not in git)

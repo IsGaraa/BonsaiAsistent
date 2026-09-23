@@ -1,5 +1,8 @@
+import asyncio
+import base64
 import glob
 import html
+import io
 import json
 import os
 import re
@@ -11,8 +14,16 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+import uuid
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+try:
+    from mcp import ClientSession, StdioServerParameters
+    from mcp.client.stdio import stdio_client
+    MCP_AVAILABLE = True
+except Exception:
+    MCP_AVAILABLE = False
 
 HOST, PORT = "127.0.0.1", 8081
 
@@ -39,6 +50,14 @@ WORKDIR = os.path.realpath(os.environ.get("PC_WORKDIR", r"C:\Users\drago\Desktop
 CREATE_NO_WINDOW = 0x08000000
 
 _BONSAI_LOCK = threading.Lock()
+_ASKS = {}
+_ASKS_LOCK = threading.Lock()
+_TODOS = []
+_TODOS_LOCK = threading.Lock()
+_LAST_ACTIVITY = time.time()
+_ACTIVITY_LOCK = threading.Lock()
+_BONSAI_EFFORT = "xhigh"
+_EFFORT_LOCK = threading.Lock()
 
 PF = "C:\\Program Files"
 PF86 = "C:\\Program Files (x86)"
@@ -913,18 +932,239 @@ def _exec_file_tool(name, args):
     return {"error": f"unknown tool {name}"}
 
 
+# ---- Blender MCP bridge (mcp-for-blender: stdio server -> Blender addon) ----
+BLENDER_MCP_ALLOW = (
+    "get_addon_status", "get_scene_info", "get_object_info",
+    "get_viewport_screenshot", "execute_blender_code",
+    "bpy_api_lookup", "describe_node_type", "export_scene",
+)
+BLENDER_OFFLINE_MSG = ("Blender tools are not reachable. Open Blender and make sure the "
+                       "'MCP for Blender' addon is enabled (Edit > Preferences > "
+                       "Add-ons > MCP for Blender), then the blender tools reconnect.")
+_BLENDER_MCP = None
+_BLENDER_GUARD = threading.Lock()
+_BLENDER_PROBE = {"at": 0.0, "state": "unknown"}
+
+
+class _BlenderMcp:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._loop = None
+        self._session = None
+        self._tools = {}
+        self._error = None
+        self._settled = threading.Event()
+        self._restart_at = 0.0
+
+    def ensure(self, timeout=40):
+        with self._lock:
+            if self._session is not None:
+                return True
+            if self._error is not None and time.time() < self._restart_at:
+                return False
+            if self._loop is None or not self._loop.is_running():
+                self._error = None
+                self._tools = {}
+                loop = asyncio.new_event_loop()
+                self._loop = loop
+                self._settled.clear()
+                threading.Thread(target=self._run, args=(loop,), daemon=True).start()
+        self._settled.wait(timeout)
+        with self._lock:
+            return self._session is not None
+
+    def _run(self, loop):
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(self._supervise())
+        except Exception as exc:
+            self._fail(f"bridge crashed: {exc}")
+        finally:
+            try:
+                loop.close()
+            except Exception:
+                pass
+            self._settled.set()
+
+    async def _supervise(self):
+        env = dict(os.environ)
+        env["BLENDER_MCP_DISABLE_TELEMETRY"] = "1"
+        env["DISABLE_TELEMETRY"] = "1"
+        params = StdioServerParameters(command=sys.executable,
+                                       args=["-m", "blender_mcp.server"], env=env)
+        async with stdio_client(params) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                tools = await session.list_tools()
+                with self._lock:
+                    self._session = session
+                    self._tools = {t.name: t for t in tools.tools
+                                   if t.name in BLENDER_MCP_ALLOW}
+                self._settled.set()
+                while True:
+                    await asyncio.sleep(0.5)
+
+    def _fail(self, msg):
+        self._restart_at = time.time() + 5
+        with self._lock:
+            self._error = msg
+            self._session = None
+
+    def call(self, name, args):
+        with self._lock:
+            session, loop = self._session, self._loop
+            tools = set(self._tools)
+        if session is None or loop is None:
+            return {"error": "Blender MCP bridge is not connected"}
+        if name not in tools:
+            return {"error": f"unknown blender tool '{name}'"}
+        try:
+            fut = asyncio.run_coroutine_threadsafe(
+                session.call_tool(name, args or {}), loop)
+            res = fut.result(timeout=600)
+        except Exception as exc:
+            return {"error": f"blender tool '{name}' failed: {exc}"}
+        if getattr(res, "isError", False):
+            text = "".join(getattr(p, "text", "") or "" for p in res.content)
+            return {"error": text.strip() or f"blender tool '{name}' returned an error"}
+        text, image = [], None
+        for p in res.content:
+            typ = getattr(p, "type", "")
+            if typ == "text":
+                text.append(getattr(p, "text", "") or "")
+            elif typ == "image":
+                data = getattr(p, "data", None) or ""
+                mime = getattr(p, "mimeType", "") or "image/png"
+                if isinstance(data, (bytes, bytearray)):
+                    data = base64.b64encode(bytes(data)).decode("ascii")
+                elif isinstance(data, str):
+                    data = data.strip()
+                    if data.startswith("data:") and "," in data:
+                        data = data.split(",", 1)[1]
+                if data and image is None:
+                    image = "data:" + mime + ";base64," + "".join(data.split())
+            elif getattr(p, "text", None):
+                text.append(str(p.text))
+        out = {}
+        body = "\n".join(t for t in text if t.strip()).strip()
+        if body:
+            out["result"] = body
+        if image:
+            out["image_data"] = image
+        if not body and not image:
+            out["result"] = "ok"
+        return out
+
+
+def _blender_mcp_bridge():
+    global _BLENDER_MCP
+    with _BLENDER_GUARD:
+        if _BLENDER_MCP is None:
+            _BLENDER_MCP = _BlenderMcp()
+        return _BLENDER_MCP
+
+
+def _blender_tool_schemas():
+    if not MCP_AVAILABLE:
+        return []
+    bridge = _blender_mcp_bridge()
+    with bridge._lock:
+        items = list(bridge._tools.values())
+    out = []
+    for tool in items:
+        out.append({"type": "function",
+                    "function": {"name": tool.name,
+                                 "description": getattr(tool, "description", "") or "",
+                                 "parameters": getattr(tool, "inputSchema", None)
+                                               or {"type": "object", "properties": {}}}})
+    return out
+
+
+def _blender_tool_names():
+    if not MCP_AVAILABLE:
+        return set()
+    return set(_blender_mcp_bridge()._tools)
+
+
+def _blender_tool_call(name, args):
+    try:
+        bridge = _blender_mcp_bridge()
+        if not bridge.ensure(timeout=45):
+            return None
+        return bridge.call(name, args)
+    except Exception as exc:
+        return {"error": f"blender tool '{name}' failed: {exc}"}
+
+
+def _blender_kickoff():
+    try:
+        _blender_mcp_bridge().ensure(timeout=60)
+    except Exception as exc:
+        print(f"WARN: blender bridge start failed: {exc}", flush=True)
+
+
+def _blender_status_payload():
+    if not MCP_AVAILABLE:
+        return {"ok": False, "state": "missing", "tool_count": 0,
+                "detail": "Python package 'mcp-for-blender' is not installed"}
+    bridge = _blender_mcp_bridge()
+    try:
+        started = bridge.ensure(timeout=25)
+    except Exception:
+        started = False
+    names = sorted(bridge._tools)
+    if started:
+        now = time.time()
+        if now - _BLENDER_PROBE["at"] >= 8:
+            try:
+                r = bridge.call("get_addon_status", {})
+                if r.get("error") or "error" in str(r.get("result", ""))[:120].lower():
+                    state = "bridge"
+                    detail = "Blender addon not reachable on port 9876"
+                else:
+                    state = "ok"
+                    detail = ""
+            except Exception:
+                state = "bridge"
+                detail = ""
+            _BLENDER_PROBE.update(at=time.time(), state=state)
+        else:
+            state = _BLENDER_PROBE["state"]
+            detail = ""
+    else:
+        state = "down"
+        detail = bridge._error or "bridge not started"
+    return {"ok": started, "state": state, "tool_count": len(names),
+            "tools": names, "detail": detail}
+
+
 SYSTEM = ("You are the friendly assistant living on the user's Windows PC. Reply "
-          "concisely and naturally, in the same language the user writes in "
-          "(Romanian if they write Romanian). If the user attaches one or more "
-          "images or text files, look at the images carefully and read the file "
-          "contents to answer their question about them. You can also work on "
-          "files inside the workspace folder. When you are not sure about "
-          "something, are asked for recent/current information, or want to "
-          "double-check a fact, you may search the web (web_search) and read "
-          "pages (web_fetch) to document yourself before answering. When the "
-          "user asks you to build, test, install or inspect something on the "
-          "PC, you can run shell commands (run_command) and read their output "
-          "to actually do it instead of only describing it.")
+          "concisely and naturally, in the same language the user writes in. "
+          "You have vision: if the user "
+          "attaches one or more images or text files - or asks you to inspect "
+          "the screen - look at the images carefully and read the file "
+          "contents to answer their question about them. You can capture the "
+          "screen (take_screenshot) and actually see what is displayed: error "
+          "dialogs, app windows, web pages, terminal output. You can control "
+          "the PC like a human: move the mouse, click, drag and type "
+          "(control_input), read or write the system clipboard (clipboard) and "
+          "download files from the web (download_file). You can also work on "
+          "files inside the workspace folder and on archives (archive). When "
+          "you are not sure about something, are asked for recent/current "
+          "information, or want to double-check a fact, you may search the web "
+          "(web_search) and read pages (web_fetch) to document yourself. When "
+          "the user asks you to build, test, install or inspect something on "
+          "the PC, you can run shell commands (run_command) and read their "
+          "output to actually do it instead of only describing it. If you need "
+          "a choice, a password or a confirmation from the user, ask them "
+          "politely with ask_user instead of assuming. For longer tasks use "
+          "todo_write to keep a visible list of the steps you are working on. "
+          "When the user asks you to create or edit 3D content and Blender is "
+          "running (check the Blender indicator in the header), use the blender "
+          "tools (get_scene_info, get_object_info, execute_blender_code, "
+          "get_viewport_screenshot) to work inside Blender: build and move "
+          "objects with code, inspect the scene, and confirm your results with "
+          "a viewport screenshot.")
 
 PLAN_MODE_SYSTEM = ("\nMODE: PLAN. The user only wants a PLAN right now - do NOT "
                     "write, edit, create or delete any files, and do NOT launch "
@@ -976,6 +1216,40 @@ def _ensure_bonsai():
         return _start_bonsai()
 
 
+def _touch_activity():
+    global _LAST_ACTIVITY
+    with _ACTIVITY_LOCK:
+        _LAST_ACTIVITY = time.time()
+
+
+def _unload_bonsai():
+    try:
+        _http_json(BONSAI_BASE + "/v1/chat/completions",
+                   {"model": BONSAI_MODEL_ID,
+                    "messages": [{"role": "user", "content": "unload"}],
+                    "max_tokens": 1, "keep_alive": 0}, timeout=60)
+        return {"ok": True}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def set_bonsai_effort(effort):
+    global _BONSAI_EFFORT
+    val = str(effort or "high").strip().lower()
+    _BONSAI_EFFORT = {"off": "off", "low": "low", "med": "medium",
+                      "medium": "medium", "high": "xhigh"}.get(val, "xhigh")
+    return _BONSAI_EFFORT
+
+
+def _effort_params():
+    with _EFFORT_LOCK:
+        eff = _BONSAI_EFFORT
+    if eff == "off":
+        return {"chat_template_kwargs": {"enable_thinking": False}}
+    return {"chat_template_kwargs": {"enable_thinking": True,
+                                     "reasoning_effort": eff}}
+
+
 def _http_json(url, payload, timeout=300):
     req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"),
                                  headers={"Content-Type": "application/json"},
@@ -994,8 +1268,10 @@ SHELL_TOOL = {
                        "output. Use it to build, test, install, debug or check "
                        "system info: python, pip, git, npm, node, dir, "
                        "tasklist, systeminfo, ping, etc. Runs in the workspace "
-                       "folder by default. Max 45 seconds; output truncated to "
-                       "~8 KB. In PLAN mode this tool is disabled.",
+                       "folder by default. Max 45 seconds by default - raise "
+                       "'timeout' for long-running commands (up to 600s). "
+                       "Output truncated to ~8 KB. In PLAN mode this tool is "
+                       "disabled.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -1007,6 +1283,12 @@ SHELL_TOOL = {
                     "type": "string",
                     "description": "Optional folder to run in: absolute path or "
                                    "relative to the workspace. Default = workspace root."
+                },
+                "timeout": {
+                    "type": "integer",
+                    "description": "Optional timeout in seconds (1-600). Use a "
+                                   "higher value for long downloads, builds or "
+                                   "tests. Default 45."
                 }
             },
             "required": ["command"]
@@ -1041,11 +1323,237 @@ CODE_TOOL = {
 }
 
 
+SHOT_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "take_screenshot",
+        "description": "Capture the screen (or a region of it) and SEE it - you "
+                       "have vision, so the image is fed directly to your eyes. "
+                       "Use this whenever you need to inspect what is displayed "
+                       "on the PC: error dialogs, app windows, web pages, "
+                       "terminal output, a GUI, or to check the result of your "
+                       "own mouse/keyboard actions. Also saves the PNG inside "
+                       "the workspace so the user has a copy.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "region": {
+                    "type": "object",
+                    "description": "Optional region to capture: {x, y, width, "
+                                   "height} in screen pixels. Omit for the full "
+                                   "screen (all monitors)."
+                }
+            },
+            "required": []
+        }
+    }
+}
+
+
+INPUT_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "control_input",
+        "description": "Control the mouse and keyboard like a human: move the "
+                       "cursor, click, double-click, right-click, drag, scroll, "
+                       "type text or send key combinations. Pair it with "
+                       "take_screenshot to see the result. Coordinates are "
+                       "screen pixels (0,0 = top-left of the primary monitor).",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["move", "click", "double_click", "right_click",
+                             "drag", "scroll", "type", "keys", "hotkey"],
+                    "description": "What to do. 'move' only moves the cursor. "
+                                   "'click'/'double_click'/'right_click' move "
+                                   "then click. 'drag' moves then drags the "
+                                   "mouse button. 'scroll' scrolls. 'type' "
+                                   "writes text. 'keys' presses each key. "
+                                   "'hotkey' presses keys together."
+                },
+                "x": {"type": "number", "description": "Cursor X (screen pixel). Not needed for 'type'/'keys'/'hotkey'."},
+                "y": {"type": "number", "description": "Cursor Y (screen pixel). Not needed for 'type'/'keys'/'hotkey'."},
+                "to_x": {"type": "number", "description": "For 'drag': end X position."},
+                "to_y": {"type": "number", "description": "For 'drag': end Y position."},
+                "clicks": {"type": "integer", "description": "For 'click': number of clicks."},
+                "button": {"type": "string", "enum": ["left", "right", "middle"], "description": "Mouse button for 'click'/'drag'."},
+                "amount": {"type": "integer", "description": "For 'scroll': number of scroll steps (negative = down)."},
+                "text": {"type": "string", "description": "For 'type': the text to type."},
+                "keys": {"type": "array", "items": {"type": "string"}, "description": "Key names, e.g. ['enter'], ['ctrl','s']. Use for 'keys'/'hotkey'."}
+            },
+            "required": ["action"]
+        }
+    }
+}
+
+
+CLIPBOARD_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "clipboard",
+        "description": "Read or write the system clipboard. Use 'get' to read "
+                       "what the user copied, and 'set' to put text on the "
+                       "clipboard so the user can paste it anywhere.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["get", "set"],
+                    "description": "'get' reads the current clipboard text; "
+                                   "'set' writes 'text' to the clipboard."
+                },
+                "text": {
+                    "type": "string",
+                    "description": "Required for 'set': the text to copy."
+                }
+            },
+            "required": ["action"]
+        }
+    }
+}
+
+
+DOWNLOAD_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "download_file",
+        "description": "Download a file from a web URL and save it inside the "
+                       "workspace folder. Returns the saved path, the byte size "
+                       "and (for text files) the beginning of the content so "
+                       "you can see what you got.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "Full http(s) URL to download."
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Relative destination inside the workspace, "
+                                   "e.g. 'Downloads/installer.exe'. Defaults to "
+                                   "the file name from the URL."
+                }
+            },
+            "required": ["url"]
+        }
+    }
+}
+
+
+ARCHIVE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "archive",
+        "description": "Create or extract archives (zip / tar / tar.gz / tgz) "
+                       "inside the workspace folder. Use 'extract' to unpack a "
+                       "file into a folder, or 'create' to pack files/folders "
+                       "into a new zip.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["extract", "create"],
+                    "description": "'extract' unpacks 'archive' into 'dest'. "
+                                   "'create' packs 'files' into a new archive."
+                },
+                "archive": {
+                    "type": "string",
+                    "description": "Relative path of the archive (for extract: "
+                                   "the file to unpack; for create: the file to "
+                                   "produce)."
+                },
+                "dest": {
+                    "type": "string",
+                    "description": "For 'extract': relative folder to unpack into. "
+                                   "For 'create': optional destination file."
+                },
+                "files": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "For 'create': relative files/folders to include."
+                }
+            },
+            "required": ["action", "archive"]
+        }
+    }
+}
+
+
+ASK_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "ask_user",
+        "description": "Ask the user a question and wait for their answer, like "
+                       "a human would. Use it when you need a choice, extra "
+                       "information, a password, or confirmation before doing "
+                       "something important. The user can pick one of the given "
+                       "options or type a free answer. The rest of your work is "
+                       "paused until they reply.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "question": {
+                    "type": "string",
+                    "description": "The question to ask, phrased clearly."
+                },
+                "options": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional short answer options the user can "
+                                   "pick with one click."
+                }
+            },
+            "required": ["question"]
+        }
+    }
+}
+
+
+TODO_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "todo_write",
+        "description": "Replace the visible TODO list with the given items and "
+                       "statuses. Use it at the start of a longer task to show "
+                       "the user the plan, and update it as you make progress. "
+                       "Status can be 'pending', 'in_progress' or 'completed'.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "todos": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "description": {"type": "string"},
+                            "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}
+                        },
+                        "required": ["description"]
+                    },
+                    "description": "The full new list of todo items."
+                }
+            },
+            "required": ["todos"]
+        }
+    }
+}
+
+
+PC_TOOLS = [SHOT_TOOL, INPUT_TOOL, CLIPBOARD_TOOL,
+            DOWNLOAD_TOOL, ARCHIVE_TOOL, ASK_TOOL, TODO_TOOL]
+
+
 def _tools_for(mode):
     if mode == MODE_PLAN:
         return [FILE_TOOLS["list_dir"], FILE_TOOLS["read_file"],
                 FILE_TOOLS["search_files"]] + WEB_SPECS
-    return [TOOL_SPEC] + list(FILE_TOOLS.values()) + WEB_SPECS + [SHELL_TOOL, CODE_TOOL]
+    return ([TOOL_SPEC] + list(FILE_TOOLS.values()) + WEB_SPECS +
+            [SHELL_TOOL, CODE_TOOL] + PC_TOOLS + _blender_tool_schemas())
 
 
 def system_prompt(mode):
@@ -1057,7 +1565,8 @@ def system_prompt(mode):
 
 def _bonsai_chat(messages, tools):
     payload = {"model": BONSAI_MODEL_ID, "messages": messages,
-               "tools": tools, "stream": False, "keep_alive": BONSAI_KEEP_ALIVE}
+               "tools": tools, "stream": False, "keep_alive": -1}
+    payload.update(_effort_params())
     data = _http_json(BONSAI_BASE + "/v1/chat/completions", payload)
     msg = data.get("choices", [{}])[0].get("message", {})
     msg["_usage"] = data.get("usage") or {}
@@ -1067,7 +1576,8 @@ def _bonsai_chat(messages, tools):
 
 def _bonsai_stream(messages, tools):
     payload = {"model": BONSAI_MODEL_ID, "messages": messages,
-               "tools": tools, "stream": True, "keep_alive": BONSAI_KEEP_ALIVE}
+               "tools": tools, "stream": True, "keep_alive": -1}
+    payload.update(_effort_params())
     req = urllib.request.Request(BONSAI_BASE + "/v1/chat/completions",
                                  data=json.dumps(payload).encode("utf-8"),
                                  headers={"Content-Type": "application/json"},
@@ -1201,10 +1711,238 @@ def public_result(result):
     return result
 
 
-def execute_tool_call(tc):
+def _take_screenshot(args):
+    try:
+        from PIL import Image, ImageGrab
+    except Exception as exc:
+        return {"error": f"PIL is not installed: {exc}"}
+    bbox = None
+    reg = args.get("region")
+    if isinstance(reg, dict):
+        try:
+            bx = int(reg.get("x") or 0)
+            by = int(reg.get("y") or 0)
+            bw = int(reg.get("width") or reg.get("w") or 0)
+            bh = int(reg.get("height") or reg.get("h") or 0)
+            if bw > 0 and bh > 0:
+                bbox = (bx, by, bx + bw, by + bh)
+        except Exception:
+            bbox = None
+    try:
+        img = ImageGrab.grab(bbox=bbox, all_screens=True)
+    except Exception as exc:
+        return {"error": f"screenshot capture failed: {exc}"}
+    out_dir = os.path.join(WORKDIR, "screenshots")
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+        png = os.path.join(out_dir, "screen_" +
+                           time.strftime("%Y%m%d_%H%M%S") + ".png")
+        img.save(png, "PNG")
+    except Exception:
+        png = None
+    w, h = img.size
+    view = img
+    if max(w, h) > 1280:
+        r = 1280.0 / max(w, h)
+        try:
+            view = img.resize((int(w * r), int(h * r)), Image.Resampling.LANCZOS)
+        except Exception:
+            view = img.resize((int(w * r), int(h * r)))
+    if view.mode != "RGB":
+        view = view.convert("RGB")
+    buf = io.BytesIO()
+    view.save(buf, "JPEG", quality=82)
+    data_uri = "data:image/jpeg;base64," + \
+        base64.b64encode(buf.getvalue()).decode("ascii")
+    info = {"result": "ok", "width": w, "height": h}
+    if png:
+        info["saved"] = png.replace("\\", "/")
+    info["image"] = data_uri
+    return info
+
+
+def _control_input(args):
+    try:
+        import pyautogui
+    except Exception as exc:
+        return {"error": f"pyautogui is not installed: {exc}"}
+    action = str(args.get("action") or "click").strip()
+    try:
+        if action == "move":
+            pyautogui.moveTo(int(args.get("x") or 0),
+                             int(args.get("y") or 0), duration=0.15)
+        elif action == "click":
+            pyautogui.moveTo(int(args.get("x") or 0),
+                             int(args.get("y") or 0), duration=0.15)
+            pyautogui.click(clicks=int(args.get("clicks") or 1),
+                            button=str(args.get("button") or "left"))
+        elif action == "double_click":
+            pyautogui.moveTo(int(args.get("x") or 0),
+                             int(args.get("y") or 0), duration=0.15)
+            pyautogui.doubleClick()
+        elif action == "right_click":
+            pyautogui.moveTo(int(args.get("x") or 0),
+                             int(args.get("y") or 0), duration=0.15)
+            pyautogui.rightClick()
+        elif action == "drag":
+            sx = int(args.get("x") or 0)
+            sy = int(args.get("y") or 0)
+            tx = int(args.get("to_x") or sx)
+            ty = int(args.get("to_y") or sy)
+            pyautogui.moveTo(sx, sy, duration=0.2)
+            pyautogui.dragRel(tx - sx, ty - sy, duration=0.4,
+                              button=str(args.get("button") or "left"))
+        elif action == "scroll":
+            pyautogui.scroll(int(args.get("amount") or -400))
+        elif action == "type":
+            pyautogui.write(str(args.get("text") or ""), interval=0.02)
+        elif action == "keys":
+            for key in (args.get("keys") or []):
+                pyautogui.press(str(key))
+        elif action == "hotkey":
+            keys = [str(k) for k in (args.get("keys") or []) if k]
+            if keys:
+                pyautogui.hotkey(*keys)
+        else:
+            return {"error": f"unknown action '{action}'"}
+    except Exception as exc:
+        return {"error": f"input action '{action}' failed: {exc}"}
+    result = {"result": "ok", "action": action}
+    try:
+        result["mouse"] = list(pyautogui.position())
+    except Exception:
+        pass
+    return result
+
+
+def _clipboard(args):
+    action = str(args.get("action") or "get").strip().lower()
+    try:
+        import pyperclip
+    except Exception as exc:
+        return {"error": f"pyperclip is not installed: {exc}"}
+    try:
+        if action == "set":
+            pyperclip.copy(str(args.get("text") or ""))
+            return {"result": "ok", "action": "set"}
+        if action in ("get", "read"):
+            return {"result": "ok", "action": "get",
+                    "text": str(pyperclip.paste() or "")}
+    except Exception as exc:
+        return {"error": f"clipboard {action} failed: {exc}"}
+    return {"error": "action must be 'get' or 'set'"}
+
+
+def _download_file(args):
+    url = str(args.get("url") or "").strip()
+    if not url.startswith(("http://", "https://")):
+        return {"error": "url must start with http:// or https://"}
+    raw_path = str(args.get("path") or "").strip()
+    if not raw_path:
+        raw_path = url.split("/")[-1].split("?")[0] or "download.bin"
+    try:
+        dest = _safe_path(raw_path)
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+    except Exception as exc:
+        return {"error": f"bad destination path: {exc}"}
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=180) as resp:
+            data = resp.read()
+        with open(dest, "wb") as fh:
+            fh.write(data)
+    except Exception as exc:
+        return {"error": f"download failed: {exc}"}
+    info = {"result": "ok", "url": url,
+            "saved": dest.replace("\\", "/"), "bytes": len(data)}
+    if len(data) <= MAX_TEXT_FILE_BYTES and _looks_text(data):
+        try:
+            text = data.decode("utf-8", errors="replace")
+            if len(text) > 2000:
+                text = text[:2000] + "\n[... preview truncated ...]"
+            info["preview"] = text
+        except Exception:
+            pass
+    return info
+
+
+def _looks_text(data):
+    try:
+        data.decode("utf-8")
+        return True
+    except Exception:
+        return False
+
+
+def _archive(args):
+    import zipfile
+    import tarfile
+    action = str(args.get("action") or "extract").strip().lower()
+    try:
+        arc = _safe_path(str(args.get("archive") or ""))
+    except Exception as exc:
+        return {"error": f"bad archive path: {exc}"}
+    if action == "extract":
+        try:
+            dest = _safe_path(str(args.get("dest") or os.path.basename(arc) + "_extracted"))
+            os.makedirs(dest, exist_ok=True)
+        except Exception as exc:
+            return {"error": f"bad destination path: {exc}"}
+        lower = arc.lower()
+        try:
+            if lower.endswith(".zip"):
+                with zipfile.ZipFile(arc) as z:
+                    names = z.namelist()
+                    z.extractall(dest)
+            elif lower.endswith((".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tar.xz")):
+                with tarfile.open(arc) as t:
+                    names = t.getnames()
+                    t.extractall(dest)
+            else:
+                return {"error": "only zip / tar / tar.gz / tgz are supported "
+                                 "directly - for other formats unpack with a "
+                                 "run_command (e.g. 7z)"}
+        except Exception as exc:
+            return {"error": f"extract failed: {exc}"}
+        return {"result": "ok", "extracted_to": dest.replace("\\", "/"),
+                "entries": len(names),
+                "first_files": [n.replace("\\", "/") for n in names[:15]]}
+    if action == "create":
+        dest = _safe_path(str(args.get("dest") or args.get("archive") or "archive.zip"))
+        try:
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+        except Exception:
+            pass
+        srcs = [str(f) for f in (args.get("files") or []) if f]
+        if not srcs:
+            return {"error": "files is required for 'create'"}
+        try:
+            with zipfile.ZipFile(dest, "w", zipfile.ZIP_DEFLATED) as z:
+                count = [0]
+                for src in srcs:
+                    p = os.path.abspath(_safe_path(src))
+                    if os.path.isdir(p):
+                        for root, _, files in os.walk(p):
+                            for f in files:
+                                fp = os.path.join(root, f)
+                                z.write(fp, os.path.relpath(fp, os.path.dirname(p)))
+                                count[0] += 1
+                    elif os.path.isfile(p):
+                        z.write(p, os.path.basename(p))
+                        count[0] += 1
+        except Exception as exc:
+            return {"error": f"create failed: {exc}"}
+        return {"result": "ok", "created": dest.replace("\\", "/"),
+                "entries": len(srcs)}
+    return {"error": "action must be 'extract' or 'create'"}
+
+
+def execute_tool_call(tc, hooks=None):
+    global _TODOS
     fn = tc.get("function") or {}
     name = fn.get("name") or "launch_or_open"
     args = parse_arguments(fn.get("arguments"))
+    image_uri = None
     if name == "launch_or_open":
         raw_result = launch_or_open(args.get("name", ""))
     elif name == "web_search":
@@ -1212,16 +1950,78 @@ def execute_tool_call(tc):
     elif name == "web_fetch":
         raw_result = _web_fetch(args.get("url"))
     elif name == "run_command":
-        raw_result = _run_command(args.get("command"), args.get("workdir"))
+        timeout = min(max(int(args.get("timeout") or 45), 1), 600)
+        raw_result = _run_command(args.get("command"), args.get("workdir"),
+                                  timeout=timeout)
+    elif name == "take_screenshot":
+        shot = _take_screenshot(args)
+        if shot.get("error"):
+            raw_result = {"error": shot["error"]}
+        else:
+            image_uri = shot.pop("image", None)
+            raw_result = shot
+    elif name == "control_input":
+        raw_result = _control_input(args)
+    elif name == "clipboard":
+        raw_result = _clipboard(args)
+    elif name == "download_file":
+        raw_result = _download_file(args)
+    elif name == "archive":
+        raw_result = _archive(args)
+    elif name == "ask_user":
+        on_ask = (hooks or {}).get("on_ask")
+        if on_ask:
+            raw_result = {"result": "ok",
+                          "answer": on_ask(args) or "(no answer)"}
+        else:
+            raw_result = {"error": "ask_user is only available in the live UI"}
+    elif name == "todo_write":
+        items = []
+        for it in (args.get("todos") or []):
+            if isinstance(it, dict):
+                status = str(it.get("status") or "pending").strip().lower()
+                if status not in ("pending", "in_progress", "completed"):
+                    status = "pending"
+                items.append({"description": str(it.get("description") or "").strip(),
+                              "status": status})
+            elif isinstance(it, str):
+                items.append({"description": it.strip(), "status": "pending"})
+        with _TODOS_LOCK:
+            _TODOS = items
+        on_todo = (hooks or {}).get("on_todo")
+        if on_todo:
+            on_todo(items)
+        raw_result = {"result": "ok", "todos": items}
     elif name == "run_code":
         raw_result = _run_code(args.get("language"), args.get("code"))
+    elif name in _blender_tool_names():
+        if not MCP_AVAILABLE:
+            raw_result = {"error": "Blender MCP is not installed (pip install mcp-for-blender)"}
+        else:
+            res = _blender_tool_call(name, args)
+            if res is None:
+                raw_result = {"error": BLENDER_OFFLINE_MSG}
+            else:
+                if res.get("image_data"):
+                    image_uri = res["image_data"]
+                body = res.get("result")
+                err = res.get("error")
+                if err:
+                    raw_result = {"error": err}
+                elif body:
+                    raw_result = {"result": body}
+                else:
+                    raw_result = {"result": "done (see capture)"}
     else:
         raw_result = _exec_file_tool(name, args)
     result = public_result(_clip_result(raw_result))
     full = _clip_result(raw_result)
-    return {"name": name, "arguments": args, "result": result,
-            "full_result": full,
-            "tool_call_id": tc.get("id") or "call_" + str(len(name))}
+    record = {"name": name, "arguments": args, "result": result,
+              "full_result": full,
+              "tool_call_id": tc.get("id") or "call_" + str(len(name))}
+    if image_uri:
+        record["image_data"] = image_uri
+    return record
 
 
 def _pick_folder():
@@ -1283,7 +2083,7 @@ def _merge_stats(a, b):
     return out
 
 
-def run_agent(messages, on_tool=None, mode=MODE_BUILD, on_stats=None):
+def run_agent(messages, on_tool=None, mode=MODE_BUILD, on_stats=None, hooks=None):
     calls = []
     tools = _tools_for(mode)
     msgs = list(messages)
@@ -1304,20 +2104,37 @@ def run_agent(messages, on_tool=None, mode=MODE_BUILD, on_stats=None):
                                      "function": tc.get("function")}
                                     for tc in tool_calls]})
         for tc in tool_calls:
-            record = execute_tool_call(tc)
+            record = execute_tool_call(tc, hooks=hooks)
+            image_uri = record.pop("image_data", None)
             calls.append(record)
             if on_tool:
                 on_tool(record)
             msgs.append({"role": "tool", "tool_call_id": record["tool_call_id"],
                          "content": json.dumps(record["full_result"],
                                                ensure_ascii=False)})
+            if image_uri:
+                msgs.append({"role": "user",
+                             "content": [{"type": "text",
+                                          "text": "[I just captured this screenshot - inspect it carefully.]"},
+                                         {"type": "image_url",
+                                          "image_url": {"url": image_uri}}]})
     if on_stats:
         on_stats(total)
-    return {"reply": "Am terminat ce am putut executa.", "calls": calls, "_stats": total}
+    return {"reply": "Done - completed the steps that could be executed.", "calls": calls, "_stats": total}
+
+
+def _append_shot_image(msgs, record):
+    image_uri = record.get("preview")
+    if image_uri:
+        msgs.append({"role": "user",
+                     "content": [{"type": "text",
+                                  "text": "[I just captured this screenshot - inspect it carefully.]"},
+                                 {"type": "image_url",
+                                  "image_url": {"url": image_uri}}]})
 
 
 def stream_agent(messages, on_reason=None, on_delta=None, on_tool=None,
-                 mode=MODE_BUILD, on_stats=None):
+                 mode=MODE_BUILD, on_stats=None, hooks=None):
     calls = []
     tools = _tools_for(mode)
     msgs = list(messages)
@@ -1344,23 +2161,28 @@ def stream_agent(messages, on_reason=None, on_delta=None, on_tool=None,
                                      "function": tc.get("function")}
                                     for tc in tool_calls]})
         for tc in tool_calls:
-            record = execute_tool_call(tc)
+            record = execute_tool_call(tc, hooks=hooks)
+            if record.get("image_data"):
+                record["preview"] = record.pop("image_data")
             calls.append(record)
             if on_tool:
                 on_tool(record)
             msgs.append({"role": "tool", "tool_call_id": record["tool_call_id"],
                          "content": json.dumps(record["full_result"],
                                                ensure_ascii=False)})
+            _append_shot_image(msgs, record)
     return {"calls": calls}
 
 
 def handle_chat(messages, on_reason=None, on_delta=None, on_tool=None,
-                stream=False, mode=MODE_BUILD, on_stats=None):
+                stream=False, mode=MODE_BUILD, on_stats=None, hooks=None):
     msgs = build_messages(messages, mode=mode)
     if stream:
         return stream_agent(msgs, on_reason=on_reason, on_delta=on_delta,
-                            on_tool=on_tool, mode=mode, on_stats=on_stats)
-    return run_agent(msgs, on_tool=on_tool, mode=mode, on_stats=on_stats)
+                            on_tool=on_tool, mode=mode, on_stats=on_stats,
+                            hooks=hooks)
+    return run_agent(msgs, on_tool=on_tool, mode=mode, on_stats=on_stats,
+                     hooks=hooks)
 
 
 PAGE = """<!doctype html>
@@ -1614,6 +2436,10 @@ PAGE = """<!doctype html>
   .modebtn.plan { border-color: rgba(103,232,249,.5); background: rgba(0,240,255,.1); color: #67e8f9; }
   .wbtn { background: rgba(0,240,255,.05); border: 1px solid rgba(0,240,255,.3); color: #67e8f9; padding: 7px 10px; border-radius: 8px; cursor: pointer; font-size: 12px; font-family: Consolas, monospace; max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .wbtn:hover { background: rgba(0,240,255,.18); }
+  .blstatus { color: #9ca3af; font-size: 12px; font-family: Consolas, monospace; padding: 7px 6px; letter-spacing: .5px; white-space: nowrap; }
+  .blstatus.on { color: #34d399; text-shadow: 0 0 8px rgba(52,211,153,.5); }
+  .blstatus.mid { color: #fbbf24; }
+  .blstatus.off { color: #f87171; }
 
   #voice-sel {
     background: rgba(0,240,255,.05); border: 1px solid rgba(0,240,255,.3); color: #67e8f9;
@@ -1630,6 +2456,49 @@ PAGE = """<!doctype html>
   .statsline { min-height: 16px; padding: 2px 4px 0; font-size: 11px; color: #67e8f9; font-family: Consolas, monospace; letter-spacing: 0; opacity: .85; }
   .statsline b { color: #00f0ff; font-weight: 600; }
   .statsline .sdim { color: #0e7490; }
+
+  /* thinking effort selector */
+  #effort-sel {
+    background: rgba(0,240,255,.05); border: 1px solid rgba(0,240,255,.3); color: #67e8f9;
+    border-radius: 12px; padding: 13px 8px; cursor: pointer; font-size: 12px; font-family: Consolas, monospace;
+    font-weight: 700; outline: none; transition: all .2s;
+  }
+  #effort-sel option { background: #031018; color: #99f6e4; }
+  #effort-sel:hover { border-color: #00f0ff; box-shadow: 0 0 12px rgba(0,240,255,.3); }
+
+  /* todo panel */
+  #todopanel { display: none; padding: 4px 8px; }
+  #todopanel.on { display: block; }
+  #todopanel .todo { display: flex; align-items: flex-start; gap: 8px; padding: 5px 6px; border-radius: 6px; font-size: 13px; font-family: Consolas, monospace; }
+  #todopanel .todo .st { width: 14px; flex: 0 0 14px; }
+  #todopanel .todo.pending { color: #94a3b8; }
+  #todopanel .todo.in_progress { color: #fde047; }
+  #todopanel .todo.completed { color: #4ade80; text-decoration: line-through; opacity: .75; }
+
+  /* ask_user dialog */
+  .askov { position: fixed; inset: 0; background: rgba(2,6,16,.72); backdrop-filter: blur(3px); display: flex; align-items: center; justify-content: center; z-index: 60; }
+  .askbox { width: min(540px, 92vw); background: #031018; border: 1px solid rgba(0,240,255,.5); border-radius: 14px; padding: 18px; box-shadow: 0 0 30px rgba(0,240,255,.35); font-family: Consolas, monospace; }
+  .askbox h4 { margin: 0 0 10px; color: #00f0ff; font-size: 14px; letter-spacing: 1px; }
+  .askbox .aq { color: #d1f5f7; font-size: 15px; line-height: 1.5; white-space: pre-wrap; }
+  .askbox .opts { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+  .askbox .opt { background: rgba(0,240,255,.08); border: 1px solid rgba(0,240,255,.45); color: #67e8f9; border-radius: 10px; padding: 8px 14px; cursor: pointer; font-size: 13px; font-family: Consolas, monospace; }
+  .askbox .opt:hover { background: rgba(0,240,255,.2); box-shadow: 0 0 12px rgba(0,240,255,.4); }
+  .askbox .afree { display: flex; gap: 8px; margin-top: 14px; }
+  .askbox .afree input { flex: 1; min-width: 0; background: rgba(2,10,20,.8); border: 1px solid rgba(0,240,255,.35); border-radius: 10px; padding: 10px; color: #d1f5f7; font-size: 14px; font-family: Consolas, monospace; outline: none; }
+  .askbox .afree input:focus { border-color: #00f0ff; }
+  .askbox .afree button { background: linear-gradient(135deg, #00f0ff, #0072ff); color: #02060d; border: none; border-radius: 10px; padding: 10px 16px; font-weight: 700; cursor: pointer; font-size: 14px; font-family: Consolas, monospace; }
+
+  /* screenshot thumb in tool log */
+  .tlitem .tthumb { max-width: 220px; border-radius: 6px; border: 1px solid #164e63; margin-top: 6px; display: block; }
+
+  /* drag & drop attach overlay */
+  .chat-wrap { position: relative; }
+  .dropov { position: absolute; inset: 0; z-index: 70; display: none; align-items: center; justify-content: center;
+    background: rgba(0,240,255,.07); border: 2px dashed #00f0ff; border-radius: 14px;
+    font-family: Consolas, monospace; color: #67e8f9; font-size: 15px; letter-spacing: 1px;
+    text-shadow: 0 0 10px rgba(0,240,255,.8); pointer-events: none; }
+  .dropov.on { display: flex; }
+  .dropov b { color: #00f0ff; }
 </style>
 </head>
 <body>
@@ -1659,6 +2528,8 @@ PAGE = """<!doctype html>
       </select>
       <button class="modebtn" id="modebtn" title="Switch Plan / Build mode">BUILD</button>
       <button class="wbtn" id="workbtn" title="Click to choose the workspace folder">\\WORKSPACE</button>
+      <button class="hbtn" id="ejectbtn" title="Unload the model from RAM/VRAM now (it loads back on the next message)">EJECT</button>
+      <span class="blstatus off" id="blstatus" title="Blender MCP status">BLENDER: CHECKING</span>
     </div>
   </header>
 
@@ -1667,6 +2538,8 @@ PAGE = """<!doctype html>
       <div class="ptitle"><span>CHAT HISTORY</span><span>LOCAL</span></div>
       <button class="hbtn new" id="newchat2">+ NEW CHAT</button>
       <div id="chatlist"></div>
+      <div class="ptitle" style="margin-top:8px; border-top:1px solid #164e63; padding-top:8px;"><span>TODO</span><span id="todocount"></span></div>
+      <div id="todopanel"></div>
       <div class="fine" style="padding:8px; border-top:1px solid #164e63;">data stays on your PC only</div>
     </section>
 
@@ -1705,11 +2578,17 @@ PAGE = """<!doctype html>
             <button type="button" class="iconbtn" id="attach" title="Attach images / files">&#128206;</button>
             <button type="button" class="iconbtn" id="mic-btn" title="Microphone">&#127908;</button>
             <button type="button" id="queue" title="Queue this message - I will answer it after the current reply">QUEUE</button>
+            <select id="effort-sel" title="Thinking effort - how deeply BONSAI reasons (this can change the response quality)">
+              <option value="off">THINK: OFF</option>
+              <option value="low">THINK: LOW</option>
+              <option value="med" selected>THINK: MED</option>
+              <option value="high">THINK: HIGH</option>
+            </select>
             <button type="submit" id="send">SEND</button>
           </div>
         </form>
         <div class="statsline" id="statsline"></div>
-        <div class="fine">Bonsai 2 27B local &middot; opens apps &amp; websites, analyzes images &amp; files, works on your files</div>
+        <div class="fine">Bonsai 2 27B local &middot; sees your screen &middot; clicks &amp; types &middot; clipboard &middot; downloads &middot; asks you questions &middot; todo list</div>
       </div>
     </section>
   </main>
@@ -1751,7 +2630,13 @@ function load() {
 }
 function save() {
   try {
-    const c = chats.slice(-200);
+    const c = chats.slice(-200).map(function (ch) {
+      const copy = JSON.parse(JSON.stringify(ch));
+      (copy.messages || []).forEach(function (m) {
+        if (m.calls) (m.calls).forEach(function (cl) { if (cl.preview) delete cl.preview; });
+      });
+      return copy;
+    });
     localStorage.setItem('jarvis_chats', JSON.stringify(c));
     fetch('/api/chats', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ chats: c }) }).catch(function () {});
   } catch (e) {}
@@ -1792,6 +2677,9 @@ function init() {
   setSendUI();
   setQueueUI();
   serverLoad();
+  fetch('/api/todos').then(function (r) { return r.json(); }).then(function (j) {
+    if (j && j.todos) renderTodo(j.todos);
+  }).catch(function () {});
 }
 function bindModeBtn() {
   const btn = document.getElementById('modebtn');
@@ -1909,7 +2797,7 @@ function addStatsChip(container, s) {
 }
 function addReasonBox(container, text) {
   const d = document.createElement('details'); d.className = 'reasonbox';
-  const s = document.createElement('summary'); s.textContent = 'Thinking (BONSAI)';
+  const s = document.createElement('summary'); s.textContent = 'Thinking';
   const c = document.createElement('div'); c.className = 'rc'; c.textContent = text;
   d.appendChild(s); d.appendChild(c);
   container.appendChild(d);
@@ -1925,8 +2813,14 @@ function addToolLog(container, calls) {
     const nm = document.createElement('div'); nm.className = 'nm';
     nm.textContent = '\u2699 ' + c.name + ' ' + JSON.stringify(c.arguments || {});
     const rs = document.createElement('div'); rs.className = 'rs';
-    rs.textContent = typeof c.result === 'string' ? c.result : JSON.stringify(c.result, null, 2);
+    rs.textContent = toolResultText(c.result);
     it.appendChild(nm); it.appendChild(rs);
+    if (c.preview) {
+      const im = document.createElement('img'); im.className = 'tthumb';
+      im.src = c.preview; im.title = 'screenshot - click to enlarge';
+      im.onclick = function () { window.open(c.preview); };
+      it.appendChild(im);
+    }
     l.appendChild(it);
   });
   d.appendChild(s); d.appendChild(l);
@@ -1942,7 +2836,9 @@ function toolChip(container, c) {
   else label = '\u2699\ufe0f ' + c.name;
   chip.className = 'toolchip' + (res && res.error ? ' err' : '');
   chip.textContent = label;
-  chip.title = JSON.stringify(c, null, 2);
+  const chipData = JSON.parse(JSON.stringify(c));
+  if (chipData.preview) delete chipData.preview;
+  chip.title = JSON.stringify(chipData, null, 2);
   container.appendChild(chip);
 }
 function suggRow() {
@@ -2122,7 +3018,7 @@ function onReason(txt) {
   if (!thinkingRow.reasonD) {
     thinkingRow.reasonD = document.createElement('details');
     thinkingRow.reasonD.className = 'reasonbox live';
-    const s = document.createElement('summary'); s.textContent = 'Thinking (BONSAI)...';
+    const s = document.createElement('summary'); s.textContent = 'Thinking...';
     thinkingRow.reasonC = document.createElement('div'); thinkingRow.reasonC.className = 'rc';
     thinkingRow.reasonD.appendChild(s); thinkingRow.reasonD.appendChild(thinkingRow.reasonC);
     thinkingRow.b.appendChild(thinkingRow.reasonD);
@@ -2131,14 +3027,27 @@ function onReason(txt) {
   thinkingRow.reasonC.scrollTop = thinkingRow.reasonC.scrollHeight;
   scrollBottom();
 }
+function toolResultText(r) {
+  if (typeof r === 'string') return r;
+  if (!r || typeof r !== 'object') return String(r);
+  const copy = {};
+  Object.keys(r).forEach(function (k) { if (k !== 'preview') copy[k] = r[k]; });
+  return JSON.stringify(copy, null, 2);
+}
 function toolItemDom(call) {
   const it = document.createElement('div');
   it.className = 'tlitem' + (call.result && call.result.error ? ' err' : '');
   const nm = document.createElement('div'); nm.className = 'nm';
   nm.textContent = '\u2699 ' + call.name + ' ' + JSON.stringify(call.arguments || {});
   const rs = document.createElement('div'); rs.className = 'rs';
-  rs.textContent = typeof call.result === 'string' ? call.result : JSON.stringify(call.result, null, 2);
+  rs.textContent = toolResultText(call.result);
   it.appendChild(nm); it.appendChild(rs);
+  if (call.preview) {
+    const im = document.createElement('img'); im.className = 'tthumb';
+    im.src = call.preview; im.title = 'screenshot - click to enlarge';
+    im.onclick = function () { window.open(call.preview); };
+    it.appendChild(im);
+  }
   return it;
 }
 function onTool(call) {
@@ -2174,12 +3083,76 @@ function doneThinking(errMsg) {
   thinkingRow = null;
 }
 
+function effortValue() {
+  const el = document.getElementById('effort-sel');
+  return el ? el.value : 'med';
+}
+
+function onAsk(j) {
+  const old = document.getElementById('askov');
+  if (old) old.remove();
+  const ov = document.createElement('div'); ov.className = 'askov'; ov.id = 'askov';
+  const box = document.createElement('div'); box.className = 'askbox';
+  const h = document.createElement('h4'); h.textContent = 'BONSAI is asking you';
+  const q = document.createElement('div'); q.className = 'aq';
+  q.textContent = j.question || 'What should I do?';
+  box.appendChild(h); box.appendChild(q);
+  const say = function (ans) {
+    ov.remove();
+    fetch('/api/answer', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: j.id, answer: ans }) }).catch(function () {});
+  };
+  if (j.options && j.options.length) {
+    const opts = document.createElement('div'); opts.className = 'opts';
+    (j.options).forEach(function (o) {
+      const b = document.createElement('button'); b.className = 'opt'; b.textContent = o;
+      b.onclick = function () { say(o); };
+      opts.appendChild(b);
+    });
+    box.appendChild(opts);
+  }
+  const free = document.createElement('div'); free.className = 'afree';
+  const inp = document.createElement('input'); inp.placeholder = 'Type your answer...';
+  const btn = document.createElement('button'); btn.textContent = 'SEND';
+  const go = function () { const v = inp.value.trim(); if (v) say(v); };
+  btn.onclick = go;
+  inp.onkeydown = function (e) { if (e.key === 'Enter') { e.preventDefault(); go(); } };
+  free.appendChild(inp); free.appendChild(btn);
+  box.appendChild(free);
+  ov.appendChild(box);
+  document.body.appendChild(ov);
+  inp.focus();
+}
+
+function renderTodo(items) {
+  const el = document.getElementById('todopanel');
+  const cnt = document.getElementById('todocount');
+  if (!el) return;
+  if (!items || !items.length) {
+    el.classList.remove('on'); el.innerHTML = '';
+    if (cnt) cnt.textContent = '';
+    return;
+  }
+  el.classList.add('on'); el.innerHTML = '';
+  const done = items.filter(function (t) { return t.status === 'completed'; }).length;
+  if (cnt) cnt.textContent = done + '/' + items.length;
+  items.forEach(function (t) {
+    const d = document.createElement('div');
+    d.className = 'todo ' + (t.status || 'pending');
+    const st = document.createElement('span'); st.className = 'st';
+    st.textContent = t.status === 'completed' ? '\u2713' : (t.status === 'in_progress' ? '\u25CF' : '\u25CB');
+    const tx = document.createElement('span'); tx.textContent = t.description || '';
+    d.appendChild(st); d.appendChild(tx);
+    el.appendChild(d);
+  });
+}
+
 async function streamRun(messages) {
   abortCtrl = new AbortController();
   startStats();
   let resp;
   try {
-    resp = await fetch('/api/stream', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ messages: messages, mode: chatMode }), signal: abortCtrl.signal });
+    resp = await fetch('/api/stream', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ messages: messages, mode: chatMode, effort: effortValue() }), signal: abortCtrl.signal });
   } catch (e) { stopStats(); throw new Error('stopped'); }
   if (!resp.ok || !resp.body) { stopStats(); const j = await resp.json().catch(function () { return {}; }); throw new Error(j.error || 'stream unavailable'); }
   const reader = resp.body.getReader();
@@ -2206,6 +3179,8 @@ async function streamRun(messages) {
         else if (ev === 'reason') { reason += j.text; onReason(j.text); setBonsaiState('thinking'); statsVals.think_ms = Date.now() - startedAt; }
         else if (ev === 'tool') { calls.push(j.call); onTool(j.call); setBonsaiState('tools'); }
         else if (ev === 'stats') { onStats(j); }
+        else if (ev === 'ask') { onAsk(j); setBonsaiState('thinking'); }
+        else if (ev === 'todo') { renderTodo(j.todos); }
         else if (ev === 'error') { doneThinking('Error: ' + j.text); setBonsaiState('idle'); stopStats(); throw new Error(j.text); }
         else if (ev === 'done') { doneThinking(); setBonsaiState('idle'); }
       }
@@ -2252,11 +3227,12 @@ function renderPreview() {
   });
 }
 
-document.getElementById('attach').onclick = function () { document.getElementById('filein').click(); };
-document.getElementById('filein').onchange = function () {
-  const files = Array.from(this.files);
+function addFiles(files) {
+  const arr = Array.from(files || []);
+  if (!arr.length) return;
   const slots = 4 - pendingAtt.length;
-  files.slice(0, slots).forEach(function (f) {
+  if (slots <= 0) { alert('Too many attachments (max 4) - remove one first'); return; }
+  arr.slice(0, slots).forEach(function (f) {
     const isImg = (f.type || '').indexOf('image/') === 0;
     if (isImg) {
       if (f.size > 10 * 1024 * 1024) return;
@@ -2275,8 +3251,31 @@ document.getElementById('filein').onchange = function () {
       r.readAsText(f, 'utf-8');
     }
   });
-  this.value = '';
-};
+}
+
+document.getElementById('attach').onclick = function () { document.getElementById('filein').click(); };
+document.getElementById('filein').onchange = function () { addFiles(this.files); this.value = ''; };
+
+(function () {
+  const wrap = document.querySelector('.chat-wrap');
+  const ov = document.createElement('div');
+  ov.className = 'dropov';
+  ov.innerHTML = 'DROP FILES <b>&#128206;</b> TO ATTACH (images / text)';
+  wrap.appendChild(ov);
+  let depth = 0;
+  window.addEventListener('dragover', function (e) { e.preventDefault(); });
+  window.addEventListener('drop', function (e) { e.preventDefault(); });
+  wrap.addEventListener('dragenter', function (e) { e.preventDefault(); depth++; ov.classList.add('on'); });
+  wrap.addEventListener('dragleave', function (e) { e.preventDefault(); depth = Math.max(0, depth - 1); if (!depth) ov.classList.remove('on'); });
+  wrap.addEventListener('drop', function (e) {
+    e.preventDefault(); e.stopPropagation();
+    depth = 0; ov.classList.remove('on');
+    const files = e.dataTransfer ? e.dataTransfer.files : null;
+    if (files && files.length) { addFiles(files); return; }
+    const txt = e.dataTransfer ? e.dataTransfer.getData('text/plain') : '';
+    if (txt) { const inp = document.getElementById('user-input'); if (inp) inp.value += txt; }
+  });
+})();
 
 document.getElementById('newchat2').onclick = function () { newChat(); setBonsaiState('idle'); };
 document.getElementById('clearbtn').onclick = function () { if (cur) { cur.messages = []; started = false; } renderAll(); setBonsaiState('idle'); };
@@ -2316,6 +3315,56 @@ document.getElementById('workbtn').onclick = async function () {
     const j = await r.json();
     if (j.workdir) setWorkdirInUI(j.workdir);
   } catch (e) { alert('Could not change folder: ' + e.message); }
+};
+
+/* ---------- Blender MCP status ---------- */
+function renderBlenderStatus(j) {
+  const el = document.getElementById('blstatus');
+  if (!el) return;
+  const map = {
+    ok: ['on', 'BLENDER: CONNECTED'],
+    bridge: ['mid', 'BLENDER: ADDON OFF'],
+    down: ['off', 'BLENDER: OFF'],
+    missing: ['off', 'BLENDER: NO MCP']
+  };
+  const m = map[j.state || 'down'] || map.down;
+  el.className = 'blstatus ' + m[0];
+  el.textContent = m[1];
+  el.title = j.detail ? ('Blender MCP: ' + (j.state || 'down') + ' - ' + j.detail)
+                      : ('Blender MCP: ' + (j.state || 'down'));
+}
+function refreshBlender() {
+  fetch('/api/blender').then(function (r) { return r.json(); })
+    .then(renderBlenderStatus)
+    .catch(function () { renderBlenderStatus({ state: 'down' }); });
+}
+refreshBlender();
+setInterval(refreshBlender, 8000);
+
+/* ---------- EJECT: unload the model from RAM/VRAM ---------- */
+document.getElementById('ejectbtn').onclick = function () {
+  const btn = document.getElementById('ejectbtn');
+  if (btn.disabled) return;
+  btn.disabled = true;
+  btn.style.opacity = '0.5';
+  fetch('/api/eject', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
+    .then(function (r) { return r.json(); })
+    .then(function (j) {
+      btn.textContent = j.ok ? 'EJECTED' : 'FAILED';
+      setTimeout(function () {
+        btn.textContent = 'EJECT';
+        btn.disabled = false;
+        btn.style.opacity = '1';
+      }, 2500);
+    })
+    .catch(function () {
+      btn.textContent = 'FAILED';
+      setTimeout(function () {
+        btn.textContent = 'EJECT';
+        btn.disabled = false;
+        btn.style.opacity = '1';
+      }, 2500);
+    });
 };
 
 const inp = document.getElementById('user-input');
@@ -2639,6 +3688,7 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_GET(self):
+        _touch_activity()
         path = self.path.split("?")[0]
         if path == "/":
             self._send(200, PAGE, "text/html; charset=utf-8")
@@ -2646,24 +3696,49 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, json.dumps({"workdir": WORKDIR}))
         elif path == "/api/chats":
             self._send(200, json.dumps({"chats": _load_chats()}, default=str))
+        elif path == "/api/todos":
+            with _TODOS_LOCK:
+                self._send(200, json.dumps({"todos": _TODOS}))
+        elif path == "/api/blender":
+            self._send(200, json.dumps(_blender_status_payload()))
         else:
             self._send(404, "not found", "text/plain")
 
     def do_POST(self):
+        _touch_activity()
         try:
             path = self.path.split("?")[0]
             if path not in ("/api", "/api/stream", "/api/workdir",
-                            "/api/pick_workdir", "/api/chats"):
+                            "/api/pick_workdir", "/api/chats",
+                            "/api/answer", "/api/effort", "/api/eject"):
                 self._send(404, "not found", "text/plain")
                 return
             length = int(self.headers.get("Content-Length", 0))
             body = json.loads(self.rfile.read(length) or b"{}")
+            if path == "/api/eject":
+                self._send(200, json.dumps(_unload_bonsai()))
+                return
             if path == "/api/pick_workdir":
                 self._send(200, json.dumps(_confirm_pick_workdir()))
                 return
             if path == "/api/chats":
                 _save_chats(body.get("chats"))
                 self._send(200, json.dumps({"ok": True}))
+                return
+            if path == "/api/answer":
+                ask_id = str(body.get("id") or "")
+                answer = str(body.get("answer") or "")
+                with _ASKS_LOCK:
+                    pending = _ASKS.get(ask_id)
+                    if pending:
+                        pending["answer"] = answer
+                        pending["event"].set()
+                _touch_activity()
+                self._send(200, json.dumps({"ok": True}))
+                return
+            if path == "/api/effort":
+                effort = set_bonsai_effort(body.get("effort"))
+                self._send(200, json.dumps({"ok": True, "effort": effort}))
                 return
             if path == "/api/workdir":
                 global WORKDIR
@@ -2681,7 +3756,32 @@ class Handler(BaseHTTPRequestHandler):
             if not messages and body.get("input"):
                 messages = [{"role": "user", "content": body["input"]}]
             mode = MODE_PLAN if str(body.get("mode", "")).lower() == MODE_PLAN else MODE_BUILD
+            if body.get("effort"):
+                set_bonsai_effort(body["effort"])
             if path == "/api/stream":
+
+                def do_ask(q):
+                    ask_id = uuid.uuid4().hex[:12]
+                    event = threading.Event()
+                    entry = {"event": event, "answer": None}
+                    with _ASKS_LOCK:
+                        _ASKS[ask_id] = entry
+                    sse(self, "ask", {"id": ask_id,
+                                      "question": q.get("question", ""),
+                                      "options": q.get("options") or []})
+                    _touch_activity()
+                    try:
+                        event.wait(BONSAI_KEEP_ALIVE)
+                    except Exception:
+                        pass
+                    with _ASKS_LOCK:
+                        answer = (entry.get("answer") or "").strip() or "(no answer)"
+                        _ASKS.pop(ask_id, None)
+                    return answer
+
+                def do_todo(items):
+                    sse(self, "todo", {"todos": items})
+
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream; charset=utf-8")
                 self.send_header("Cache-Control", "no-cache")
@@ -2695,7 +3795,8 @@ class Handler(BaseHTTPRequestHandler):
                             on_reason=lambda t: sse(self, "reason", {"text": t}),
                             on_delta=lambda t: sse(self, "delta", {"text": t}),
                             on_tool=lambda c: sse(self, "tool", {"call": _strip_full(c)}),
-                            on_stats=lambda s: sse(self, "stats", s))
+                            on_stats=lambda s: sse(self, "stats", s),
+                            hooks={"on_ask": do_ask, "on_todo": do_todo})
                 sse(self, "done", {"ok": True})
             else:
                 if not _ensure_bonsai():
@@ -2729,8 +3830,10 @@ def main():
         os.makedirs(WORKDIR, exist_ok=True)
     except Exception as exc:
         print(f"WARN: could not create workdir {WORKDIR}: {exc}", flush=True)
+
     threading.Thread(target=_ensure_bonsai, daemon=True).start()
-    print("PC Asistent is READY on http://127.0.0.1:8081", flush=True)
+    threading.Thread(target=_blender_kickoff, daemon=True).start()
+    print("BONSAI is READY on http://127.0.0.1:8081", flush=True)
     webbrowser.open(f"http://{HOST}:{PORT}")
     ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
 

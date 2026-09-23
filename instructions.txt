@@ -25,7 +25,22 @@ DETAILS
    - Server profile: 32k context, ~48 tok/s on an RTX 4070.
    - Live stats bar under the input shows think time / speak time,
      tokens/s, tokens used and context used/left in real time.
-   - After 2 minutes without a message the model unloads from RAM to free
-     memory; it loads automatically on your next message.
+   - THINK: OFF/LOW/MED/HIGH selector next to SEND controls how deeply I reason
+     (maps to enable_thinking / reasoning_effort on the model).
+   - NEW PC CONTROLS: I can take a screenshot and really SEE your screen
+     (take_screenshot), move the mouse / click / drag / type (control_input),
+     read and write the clipboard (clipboard), download files into the
+     workspace (download_file) and pack/unpack zip+tar archives (archive).
+   - BLENDER: when Blender is open (with the "MCP for Blender" addon enabled)
+     I can create/edit 3D scenes inside it, inspect the scene and screenshot
+     the viewport to show you - a status light in the header shows the
+     connection (CONNECTED / ADDON OFF / OFF).
+   - I can ASK YOU a question with options and wait for your answer (ask_user)
+     exactly like a human, and I keep a live TODO checklist on the left panel
+     (todo_write).
+   - The model stays loaded (resident) the whole time the app runs - there is
+     no idle timeout that unloads it, so replies never stall after a pause.
+     To free the memory yourself click the EJECT button in the header (it
+     loads back automatically on the next message).
    - Chat history is saved in the browser AND in
      %APPDATA%\BonsaiAsistent\chats.json, so conversations survive restarts.
