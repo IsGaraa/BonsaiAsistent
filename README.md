@@ -1,10 +1,10 @@
 # Bonsai PC Assistant
 
-Self-contained, 100% offline **JARVIS-style PC assistant** built around the local
-**Bonsai 2 27B** ternary model. Multi-turn voice & text chat, live "thinking"
-display, real tool calls (open apps, open websites, work on your files), vision,
-optional web lookup, a shell runner and a code sandbox - all in one Python file,
-no cloud, no API keys, nothing leaves your machine.
+Self-contained, 100% offline **local AI assistant** built around the **Bonsai 2
+27B** ternary model. Multi-turn voice & text chat, live "thinking" display, real
+tool calls (open apps, open websites, work on your files), vision, optional web
+lookup, a shell runner and a code sandbox - all in one Python file, no cloud, no
+API keys, nothing leaves your machine.
 
 ![Windows](https://img.shields.io/badge/Platform-Windows-0078D6?logo=windows&logoColor=white)
 ![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)
@@ -51,12 +51,14 @@ It starts the assistant UI at **http://localhost:8081**, auto-starts the
 Bonsai 2 model server on port 8080 if it isn't running yet, and opens your
 browser. To stop the model server, double-click `stop.cmd`.
 
-You're in. Type a command:
+Once the UI is open, try a few commands:
 
 ```
-Open Notepad and start YouTube
-What is the CPU doing?
-Tell me a joke
+Create a Python script in the workspace that renames files with regex
+Open the README in the workspace and summarize it
+Screenshot the current window and describe what you see
+Check the latest news about Nvidia and pick three highlights
+List the .py files in this folder with their sizes
 ```
 
 The SEND button becomes **STOP** while Bonsai is replying, so you can cut it
@@ -75,18 +77,20 @@ in order).
 
 ## 3. Capabilities
 
-- 🗣️ **Multi-turn chat** with a locally running 27B model (Bonsai 2, ternary 2-bit quantization).
-- 🧠 **Live thinking** - the assistant shows its reasoning as it flows, like OpenAI's "reasoning" mode.
-- 🛠️ **Tool calls** - Bonsai decides by itself when to use a tool and shows every call it makes (see §4).
-- 👁️ **Vision** - attach an image (photo, screenshot, document) and it understands it.
-- 💻 **Shell + sandbox** - `run_command` executes real Windows commands (build, install, debug, inspect); `run_code` runs short Python/Node snippets in a sandboxed, network-less environment with a 30s timeout.
-- ⏹️ **STOP + QUEUE** - cut off a reply mid-stream, or queue a follow-up to be answered right after.
-- ⏱️ **Live token stats** - real-time line under the input showing think vs. speak time, tokens/second, tokens used and context used/left (see §6).
-- 🛌 **Auto memory relief** - idle for 2 minutes and the model unloads from RAM; the moment you text again it loads itself back (see §6).
-- 📚 **Chat history** - every conversation is saved both in the browser and on disk; survives server restarts (see §7).
-- 🔊 **Talk-back** - optional text-to-speech that **auto-matches the language** of the reply (Romanian / English) and picks the best natural voice. Off by default.
-- 🔒 **Plan / Build modes** - *Plan* is read-only (just looks at files), *Build* has full tool access.
-- 📴 **Fully offline** - model, inference and UI all run on your PC.
+| Capability | Details |
+|---|---|
+| **Multi-turn chat** | conversational assistant powered by a local 27B model (Bonsai 2, ternary 2-bit quantization) |
+| **Live reasoning** | shows its chain of thought in real time, streaming as it is produced |
+| **Tool calls** | decides autonomously when to use a tool and surfaces every call (see §4) |
+| **Vision** | understands attached images - photos, screenshots, scanned documents |
+| **Shell + sandbox** | `run_command` executes real Windows commands; `run_code` runs short Python/Node snippets in a sandboxed, network-less environment with a 30s timeout |
+| **STOP / QUEUE** | abort a reply mid-stream, or queue a follow-up to be answered immediately after |
+| **Live token stats** | real-time think vs. speak time, tokens/second and context usage under the input (see §6) |
+| **Auto memory relief** | model unloads from RAM after 2 idle minutes and reloads on the next message (see §6) |
+| **Persistent history** | conversations saved in the browser and on disk; survive server restarts (see §7) |
+| **Talk-back** | optional text-to-speech that auto-matches the language of the reply and picks the most natural installed voice; off by default |
+| **Plan / Build modes** | *Plan* is read-only (inspection only), *Build* grants full tool access |
+| **Fully offline** | model, inference and UI all run locally, with no cloud dependency |
 
 ## 4. Tool execution (how it works)
 
@@ -115,17 +119,17 @@ from the UI (📁 button in the header) with a native folder dialog, or set
 |---|---|
 | **SEND / STOP** | Submits your message; while Bonsai is replying it becomes **STOP** to abort the run |
 | **QUEUE** | Holds your typed message so it's answered right after the current reply (ordered backlog) |
-| **📁 workspace** | Choose/open the working folder for the file tools |
+| **Workspace (folder icon)** | Choose/open the working folder for the file tools |
 | **Plan / Build** | Toggle mode - *Plan* read-only, *Build* full tool access |
-| **🔊 / 🎙 voice** | Talk-back (TTS) toggle and microphone input |
-| **+ NEW CHAT / CLEAR** | Start a fresh conversation / reset the current one |
+| **Voice (🔊) / Mic (🎙)** | Talk-back (TTS) toggle and microphone input |
+| **NEW CHAT / CLEAR** | Start a fresh conversation / reset the current one |
 
-The **arc reactor** reacts to what Bonsai is doing:
+The **arc reactor** indicator reflects what Bonsai is doing:
 
-- 🔵 **Blue** - idle (rotating reactor)
-- 🟡 **Yellow** - thinking / processing the command
-- 🟢 **Green** - executing a tool call
-- 🌊 **Blue + waveform** - speaking out loud
+- **Blue** - idle (rotating reactor)
+- **Yellow** - thinking / processing the command
+- **Green** - executing a tool call
+- **Blue + waveform** - speaking out loud
 
 ## 6. Live token stats & memory relief
 
@@ -163,15 +167,17 @@ time.
 
 ## 8. Configuration
 
-Environment variables, all optional:
+All settings are optional. Unless an environment variable is set, Bonsai uses
+the defaults defined at the top of `bonsai_web.py` (which resolve to the
+project's local folders).
 
-| Variable | Default | Purpose |
+| Variable | Purpose | When to set it |
 |---|---|---|
-| `BONSAI_DIR` | `C:\Users\drago\Desktop\bonsai2` | folder containing the `.gguf` files |
-| `PC_WORKDIR` | `C:\Users\drago\Desktop\workspace` | the workspace folder the file tools use |
+| `BONSAI_DIR` | Folder containing the `.gguf` model files | only if the model files live somewhere other than the project folder |
+| `PC_WORKDIR` | The workspace folder the file tools use | to point file access at a specific folder by default |
 
 The workspace can also be changed at runtime from the UI (📁 button in the
-header).
+header) - this is the recommended way.
 
 ## 9. The AI model
 

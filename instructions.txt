@@ -1,7 +1,7 @@
 HOW TO USE BONSAI 2 (local model + assistant)
 
 1) START EVERYTHING (ONE CLICK)
-   Double-click:  C:\Users\drago\Desktop\bonsai2\run.bat
+   Double-click:  run.bat   (in the project folder)
    -> starts the assistant UI at http://localhost:8081
    -> also starts the Bonsai 2 model server on port 8080 automatically
       (the model loads into RAM on your first message, ~1 min on first start).
@@ -13,7 +13,7 @@ HOW TO USE BONSAI 2 (local model + assistant)
     provider "llama.cpp" - restart opencode after changing it.)
 
 3) STOP THE MODEL SERVER (optional)
-   Double-click:  C:\Users\drago\Desktop\bonsai2\stop.cmd
+   Double-click:  stop.cmd   (in the project folder)
    (The UI panel can keep running; the model just loads again on next message.)
 
 DETAILS
