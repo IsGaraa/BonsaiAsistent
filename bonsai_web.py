@@ -1,5 +1,7 @@
 import asyncio
 import base64
+import ctypes
+import datetime
 import glob
 import html
 import io
@@ -12,6 +14,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 import urllib.parse
 import urllib.request
 import uuid
@@ -24,6 +27,14 @@ try:
     MCP_AVAILABLE = True
 except Exception:
     MCP_AVAILABLE = False
+
+try:
+    import win32gui
+    import win32process
+    import psutil
+    _WIN_UI = True
+except Exception:
+    _WIN_UI = False
 
 HOST, PORT = "127.0.0.1", 8081
 
@@ -38,7 +49,11 @@ BONSAI_MODEL_ID = "bonsai2"
 BONSAI_CTX = 32768
 BONSAI_KEEP_ALIVE = 120
 CHATS_FILE = os.path.join(os.path.expandvars(r"%APPDATA%"), "BonsaiAsistent", "chats.json")
-MAX_TOOL_ROUNDS = 5
+# Tool calls are effectively unlimited - the model calls tools for as long as it
+# needs and the conversation context is the natural stop. The guard counter only
+# exists to catch a pathological infinite loop; tune it with BONSAI_MAX_TOOL_ROUNDS
+# (e.g. 1000, or 0 for no guard at all).
+MAX_TOOL_ROUNDS = int(os.environ.get("BONSAI_MAX_TOOL_ROUNDS", "1000")) or 10 ** 9
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 MAX_TEXT_FILE_BYTES = 200 * 1024
 MAX_FILE_BYTES = 1024 * 1024
@@ -58,6 +73,10 @@ _LAST_ACTIVITY = time.time()
 _ACTIVITY_LOCK = threading.Lock()
 _BONSAI_EFFORT = "xhigh"
 _EFFORT_LOCK = threading.Lock()
+
+_SCHED = {}
+_SCHED_LOCK = threading.Lock()
+_SCHED_THREAD_ON = False
 
 PF = "C:\\Program Files"
 PF86 = "C:\\Program Files (x86)"
@@ -585,12 +604,24 @@ def _parse_wikipedia_search(query, limit):
     return results
 
 
+def _trim_results(results, limit=5, snippet=240):
+    out = []
+    for r in (results or [])[:limit]:
+        snip = (r.get("snippet") or "").strip()
+        if len(snip) > snippet:
+            snip = snip[:snippet].rstrip() + "..."
+        out.append({"title": (r.get("title") or "").strip()[:180],
+                    "url": r.get("url") or "",
+                    "snippet": snip})
+    return out
+
+
 def _web_search(query, max_results=6):
     if not str(query or "").strip():
         return {"error": "query is required"}
     results = _parse_wikipedia_search(query, max_results)
     if results:
-        return {"result": "ok", "query": str(query), "results": results,
+        return {"result": "ok", "query": str(query), "results": _trim_results(results),
                 "note": "from Wikipedia"}
     urls = [
         "https://html.duckduckgo.com/html/?q=" + urllib.parse.quote(str(query)),
@@ -616,7 +647,7 @@ def _web_search(query, max_results=6):
         else:
             results = _parse_bing(markup, max_results)
         if results:
-            return {"result": "ok", "query": str(query), "results": results}
+            return {"result": "ok", "query": str(query), "results": _trim_results(results)}
     return {"result": "ok", "query": str(query), "results": [],
             "note": "no results found"}
 
@@ -1544,8 +1575,229 @@ TODO_TOOL = {
 }
 
 
+WINDOW_LIST_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "window_list",
+        "description": "List the open desktop windows: window title, process name "
+                       "and PID for every visible top-level window. Use this "
+                       "first to discover what is running, then bring one to the "
+                       "front with window_action.",
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "required": []
+        }
+    }
+}
+
+WINDOW_ACTION_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "window_action",
+        "description": "Control an existing desktop window: bring a window to the "
+                       "front and give it keyboard focus, maximize it, minimize it "
+                       "or restore it. Find a matching window first with "
+                       "window_list. The window can be matched by a substring of "
+                       "its title ('title') or by its process name/PID "
+                       "('process'/'pid'). 'focus' makes the window visible, "
+                       "restores it if minimized and steals focus so that "
+                       "take_screenshot/control_input act on it.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["focus", "maximize", "minimize", "restore"],
+                    "description": "What to do with the window. Default: focus."
+                },
+                "title": {
+                    "type": "string",
+                    "description": "Substring of the window title to match."
+                },
+                "process": {
+                    "type": "string",
+                    "description": "Process name (e.g. 'notepad.exe') to match."
+                },
+                "pid": {
+                    "type": "integer",
+                    "description": "Exact process ID to match."
+                }
+            },
+            "required": ["action"]
+        }
+    }
+}
+
+
+def _pc_tool(name, description, properties, required):
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": description,
+            "parameters": {
+                "type": "object",
+                "properties": properties,
+                "required": required
+            }
+        }
+    }
+
+
+DOCKER_PS_TOOL = _pc_tool(
+    "docker_ps",
+    "List Docker containers. Include stopped ones with 'all'. Returns id, name, "
+    "image and status per container. Use docker_logs/docker_exec/docker_start/"
+    "docker_stop with the returned names.",
+    {"all": {"type": "boolean", "description": "Include stopped containers."}},
+    []
+)
+
+DOCKER_IMAGES_TOOL = _pc_tool(
+    "docker_images",
+    "List Docker images available locally (repository, tag, id, size).",
+    {"filter": {"type": "string", "description": "Optional name filter (repository substring)."}},
+    []
+)
+
+DOCKER_START_TOOL = _pc_tool(
+    "docker_start",
+    "Start a Docker container by name or id.",
+    {"name": {"type": "string", "description": "Container name or id."}},
+    ["name"]
+)
+
+DOCKER_STOP_TOOL = _pc_tool(
+    "docker_stop",
+    "Stop a running Docker container by name or id.",
+    {"name": {"type": "string", "description": "Container name or id."},
+     "timeout": {"type": "integer", "description": "Seconds to wait before killing (default 10)."}},
+    ["name"]
+)
+
+DOCKER_RESTART_TOOL = _pc_tool(
+    "docker_restart",
+    "Restart a Docker container by name or id.",
+    {"name": {"type": "string", "description": "Container name or id."}},
+    ["name"]
+)
+
+DOCKER_LOGS_TOOL = _pc_tool(
+    "docker_logs",
+    "Read the logs of a Docker container by name or id.",
+    {"name": {"type": "string", "description": "Container name or id."},
+     "tail": {"type": "integer", "description": "Number of lines from the end (default 100)."}},
+    ["name"]
+)
+
+DOCKER_EXEC_TOOL = _pc_tool(
+    "docker_exec",
+    "Run a command inside a running Docker container (docker exec with sh -c). "
+    "Returns the command output.",
+    {"name": {"type": "string", "description": "Container name or id."},
+     "command": {"type": "string", "description": "The shell command to run inside the container, e.g. 'ls -la /app'."}},
+    ["name", "command"]
+)
+
+API_CALL_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "api_call",
+        "description": "Make an HTTP request to any REST or GraphQL API and read "
+                       "the response: status code, headers and body. Works for "
+                       "GET/POST/PUT/PATCH/DELETE/HEAD/OPTIONS. For GraphQL send "
+                       "a JSON body like {\"query\": \"...\"} - the response JSON "
+                       "is returned automatically. Handles JSON bodies from dict "
+                       "input, or raw text bodies.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "method": {"type": "string", "enum": ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"], "description": "HTTP method. Default GET."},
+                "url": {"type": "string", "description": "Full URL, e.g. https://api.example.com/v1/users"},
+                "headers": {"type": "object", "description": "Extra request headers, e.g. {\"Authorization\": \"Bearer ...\"}"},
+                "body": {"description": "Request body. Use a dict/list for JSON or a string for raw text."},
+                "content_type": {"type": "string", "description": "Content-Type header for string bodies (default 'application/json')."},
+                "timeout": {"type": "integer", "description": "Request timeout in seconds (default 20, max 120)."},
+                "insecure": {"type": "boolean", "description": "Skip TLS certificate verification (default false)."},
+                "follow_redirects": {"type": "boolean", "description": "Follow HTTP redirects (default true)."}
+            },
+            "required": ["url"]
+        }
+    }
+}
+
+WS_TEST_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "ws_test",
+        "description": "Connect to a WebSocket server, optionally send a message, "
+                       "and collect the replies that arrive before the timeout. "
+                       "Useful to test APIs, push feeds, or debug local sockets.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "WebSocket URL, e.g. ws://127.0.0.1:8000/ws or wss://..."},
+                "send": {"description": "Optional message to send after connecting. Dicts/lists are JSON-encoded."},
+                "timeout": {"type": "integer", "description": "How long to listen for replies, seconds (default 5, max 60)."}
+            },
+            "required": ["url"]
+        }
+    }
+}
+
+SCHEDULE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "schedule_task",
+        "description": "Schedule a shell command to run later (and while this PC "
+                       "is on): once after a delay, on an interval, or on a cron "
+                       "schedule. Intervals are 'every N seconds'. Cron is a "
+                       "5-field expression: minute hour day-of-month month "
+                       "day-of-week (0 or 7 = Sunday). Examples: '15 3 * * *' "
+                       "daily at 03:15; '*/5 * * * *' every 5 minutes; "
+                       "'0 9 * * 1-5' weekdays at 09:00. The command runs via the "
+                       "system shell (cmd). Check runs with list_schedules; "
+                       "cancel with unschedule_task.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Unique name for this task."},
+                "command": {"type": "string", "description": "The shell command to run."},
+                "when": {"type": "string", "enum": ["once", "interval", "cron"], "description": "Schedule kind. Default 'once'."},
+                "delay_seconds": {"type": "integer", "description": "For 'once': seconds to wait before running (default 1)."},
+                "interval_seconds": {"type": "integer", "description": "For 'interval': seconds between runs (min 5)."},
+                "cron": {"type": "string", "description": "For 'cron': 5-field cron expression."},
+                "timeout": {"type": "integer", "description": "Max seconds the command may run (default 180, max 600)."}
+            },
+            "required": ["name", "command"]
+        }
+    }
+}
+
+LIST_SCHEDULES_TOOL = _pc_tool(
+    "list_schedules",
+    "List all scheduled tasks: name, schedule kind, next run time, last run, "
+    "how many times it ran and the tail of its last output.",
+    {},
+    []
+)
+
+UNSCHEDULE_TOOL = _pc_tool(
+    "unschedule_task",
+    "Cancel a scheduled task by name. Already-started runs are not interrupted.",
+    {"name": {"type": "string", "description": "Task name to cancel."}},
+    ["name"]
+)
+
+NEW_TOOLS = [WINDOW_LIST_TOOL, WINDOW_ACTION_TOOL,
+             DOCKER_PS_TOOL, DOCKER_IMAGES_TOOL, DOCKER_START_TOOL,
+             DOCKER_STOP_TOOL, DOCKER_RESTART_TOOL, DOCKER_LOGS_TOOL,
+             DOCKER_EXEC_TOOL, API_CALL_TOOL, WS_TEST_TOOL,
+             SCHEDULE_TOOL, LIST_SCHEDULES_TOOL, UNSCHEDULE_TOOL]
+
 PC_TOOLS = [SHOT_TOOL, INPUT_TOOL, CLIPBOARD_TOOL,
-            DOWNLOAD_TOOL, ARCHIVE_TOOL, ASK_TOOL, TODO_TOOL]
+            DOWNLOAD_TOOL, ARCHIVE_TOOL, ASK_TOOL, TODO_TOOL] + NEW_TOOLS
 
 
 def _tools_for(mode):
@@ -1937,6 +2189,484 @@ def _archive(args):
     return {"error": "action must be 'extract' or 'create'"}
 
 
+# ---------------- Window management ----------------
+
+def _window_list():
+    if not _WIN_UI:
+        return {"error": "window tools need pywin32 + psutil on Windows"}
+    out = []
+    try:
+        def _cb(hwnd, _):
+            if not win32gui.IsWindowVisible(hwnd):
+                return
+            title = win32gui.GetWindowText(hwnd)
+            if not title:
+                return
+            pid = None
+            pname = None
+            try:
+                _, pid = win32process.GetWindowThreadProcessId(hwnd)
+            except Exception:
+                pass
+            if pid:
+                try:
+                    pname = psutil.Process(pid).name()
+                except Exception:
+                    pass
+            out.append({"title": title[:160], "process": pname, "pid": pid})
+        win32gui.EnumWindows(_cb, None)
+    except Exception as exc:
+        return {"error": f"window enumeration failed: {exc}"}
+    out = [w for w in out if w.get("pid")]
+    out.sort(key=lambda w: (w.get("process") or "").lower())
+    return {"result": "ok", "windows": out[:80], "count": len(out)}
+
+
+def _window_find(title=None, process=None, pid=None):
+    if not _WIN_UI:
+        return None
+    if pid is not None:
+        pid = int(pid)
+    t = str(title or "").strip().lower() if title else None
+    p = str(process or "").strip().lower() if process else None
+    handles = []
+    try:
+        win32gui.EnumWindows(lambda h, _: handles.append(h), None)
+    except Exception:
+        return None
+    fallback = None
+    for h in handles:
+        try:
+            if not win32gui.IsWindowVisible(h):
+                continue
+            wtitle = win32gui.GetWindowText(h)
+            wpid = None
+            try:
+                _, wpid = win32process.GetWindowThreadProcessId(h)
+            except Exception:
+                wpid = None
+            if pid is not None and wpid == pid:
+                return h
+            if t and t in wtitle.lower():
+                return h
+            if p:
+                pname = None
+                if wpid:
+                    try:
+                        pname = psutil.Process(wpid).name().lower()
+                    except Exception:
+                        pname = None
+                if pname and p in pname:
+                    if fallback is None:
+                        fallback = h
+        except Exception:
+            continue
+    return fallback
+
+
+def _window_action(args):
+    if not _WIN_UI:
+        return {"error": "window tools need pywin32 + psutil on Windows"}
+    action = str(args.get("action") or "focus")
+    hwnd = _window_find(args.get("title"), args.get("process"), args.get("pid"))
+    if not hwnd:
+        return {"error": "no matching window found (list windows first with window_list)"}
+    try:
+        if action == "minimize":
+            win32gui.ShowWindow(hwnd, 6)  # SW_MINIMIZE
+        elif action == "maximize":
+            win32gui.ShowWindow(hwnd, 3)  # SW_MAXIMIZE
+        else:  # focus / restore
+            win32gui.ShowWindow(hwnd, 9)  # SW_RESTORE
+            win32gui.ShowWindow(hwnd, 5)  # SW_SHOW
+            try:
+                ctypes.windll.user32.keybd_event(0x12, 0, 0, 0)
+                ctypes.windll.user32.keybd_event(0x12, 0, 0x2, 0)
+            except Exception:
+                pass
+            win32gui.BringWindowToTop(hwnd)
+            try:
+                win32gui.SetForegroundWindow(hwnd)
+            except Exception:
+                pass
+    except Exception as exc:
+        return {"error": f"window action failed: {exc}"}
+    title = win32gui.GetWindowText(hwnd)
+    return {"result": "ok", "action": action, "window": title[:160]}
+
+
+# ---------------- Docker tools ----------------
+
+def _docker_run(args_list, timeout=120):
+    cmd = ["docker"] + list(args_list)
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=timeout, creationflags=CREATE_NO_WINDOW)
+    except FileNotFoundError:
+        return {"error": "docker CLI not found - is Docker Desktop installed, running and on PATH?"}
+    except subprocess.TimeoutExpired:
+        return {"error": f"docker command timed out after {timeout}s"}
+    out = (proc.stdout or "").strip()
+    err = (proc.stderr or "").strip()
+    if proc.returncode != 0:
+        return {"error": (err or out)[:1500]}
+    return {"result": "ok", "output": out[:12000]}
+
+
+def _docker_ps(args):
+    fmt = r"{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Status}}"
+    cmd = ["ps", "--format", fmt]
+    if args.get("all"):
+        cmd.append("-a")
+    res = _docker_run(cmd)
+    if res.get("error"):
+        return res
+    rows = []
+    for line in res["output"].splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 4:
+            rows.append({"id": parts[0], "name": parts[1],
+                         "image": parts[2], "status": parts[3]})
+    return {"result": "ok", "containers": rows, "count": len(rows)}
+
+
+def _docker_images(args):
+    fmt = r"{{.Repository}}\t{{.Tag}}\t{{.ID}}\t{{.Size}}"
+    res = _docker_run(["images", "--format", fmt])
+    if res.get("error"):
+        return res
+    filt = str(args.get("filter") or "").strip().lower()
+    rows = []
+    for line in res["output"].splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 4:
+            repo, tag, iid, size = parts[0], parts[1], parts[2], parts[3]
+            if filt and filt not in repo.lower():
+                continue
+            rows.append({"repository": repo, "tag": tag, "id": iid, "size": size})
+    return {"result": "ok", "images": rows, "count": len(rows)}
+
+
+def _docker_action(action, args):
+    name = str(args.get("name") or "").strip()
+    if not name:
+        return {"error": "container name is required"}
+    if action == "stop" and args.get("timeout"):
+        secs = max(1, min(int(args.get("timeout")), 120))
+        res = _docker_run(["stop", "-t", str(secs), name])
+    else:
+        res = _docker_run([action, name])
+    if res.get("error"):
+        return res
+    return {"result": "ok", "action": action, "container": res["output"] or name}
+
+
+def _docker_logs(args):
+    name = str(args.get("name") or "").strip()
+    if not name:
+        return {"error": "container name is required"}
+    tail = max(1, min(int(args.get("tail") or 100), 5000))
+    res = _docker_run(["logs", "--tail", str(tail), name], timeout=120)
+    if res.get("error"):
+        return res
+    return {"result": "ok", "container": name, "logs": res["output"]}
+
+
+def _docker_exec(args):
+    name = str(args.get("name") or "").strip()
+    command = str(args.get("command") or "").strip()
+    if not name:
+        return {"error": "container name is required"}
+    if not command:
+        return {"error": "command is required"}
+    res = _docker_run(["exec", name, "sh", "-c", command], timeout=180)
+    if res.get("error"):
+        return res
+    return {"result": "ok", "container": name, "output": res["output"]}
+
+
+# ---------------- API client ----------------
+
+def _api_call(args):
+    try:
+        import requests
+    except Exception as exc:
+        return {"error": "api_call needs the 'requests' package: " + str(exc)}
+    method = str(args.get("method") or "GET").upper()
+    url = str(args.get("url") or "").strip()
+    if not url:
+        return {"error": "url is required"}
+    try:
+        timeout = min(max(int(args.get("timeout") or 20), 1), 120)
+    except Exception:
+        timeout = 20
+    headers = {str(k): str(v) for k, v in (args.get("headers") or {}).items()}
+    body = args.get("body")
+    data = None
+    if body is not None:
+        if isinstance(body, (dict, list)):
+            data = json.dumps(body)
+            headers.setdefault("Content-Type", "application/json")
+        else:
+            data = str(body)
+            ct = str(args.get("content_type") or "application/json")
+            headers.setdefault("Content-Type", ct)
+    verify = not bool(args.get("insecure"))
+    follow = bool(args.get("follow_redirects", True))
+    try:
+        t0 = time.monotonic()
+        resp = requests.request(method, url, headers=headers, data=data,
+                                timeout=timeout, verify=verify,
+                                allow_redirects=follow)
+        elapsed = round((time.monotonic() - t0) * 1000)
+    except Exception as exc:
+        return {"error": f"request failed: {exc}"}
+    text = ""
+    try:
+        text = resp.content.decode("utf-8", "replace")
+    except Exception:
+        text = ""
+    parsed = None
+    ctype = (resp.headers.get("Content-Type") or "").lower()
+    if "json" in ctype:
+        try:
+            parsed = resp.json()
+            text = json.dumps(parsed, ensure_ascii=False, indent=2)
+        except Exception:
+            parsed = None
+    capped = text if len(text) <= 8000 else text[:8000] + "\n[... response body truncated ...]"
+    return {"result": "ok", "method": method, "url": url,
+            "status": resp.status_code,
+            "elapsed_ms": elapsed,
+            "content_type": ctype,
+            "headers": dict(list(resp.headers.items())[:20]),
+            "response": capped}
+
+
+def _ws_test(args):
+    try:
+        import websocket
+    except Exception as exc:
+        return {"error": "ws_test needs the 'websocket-client' package: " + str(exc)}
+    url = str(args.get("url") or "").strip()
+    if not url:
+        return {"error": "url is required (ws:// or wss://)"}
+    try:
+        timeout = min(max(int(args.get("timeout") or 5), 1), 60)
+    except Exception:
+        timeout = 5
+    try:
+        ws = websocket.create_connection(url, timeout=timeout)
+    except Exception as exc:
+        return {"error": f"connection failed: {exc}"}
+    received = []
+    try:
+        send = args.get("send")
+        if send is not None:
+            payload = json.dumps(send) if isinstance(send, (dict, list)) else str(send)
+            ws.send(payload)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                ws.settimeout(max(0.1, deadline - time.monotonic()))
+                msg = ws.recv()
+                received.append(str(msg))
+            except Exception as exc:
+                if isinstance(exc, websocket.WebSocketTimeoutException):
+                    break
+                break
+    finally:
+        try:
+            ws.close()
+        except Exception:
+            pass
+    capped = [m if len(m) <= 4000 else m[:4000] + "[... truncated ...]" for m in received]
+    return {"result": "ok", "messages_received": capped[:20], "count": len(received)}
+
+
+# ---------------- Scheduled tasks ----------------
+
+def _cron_field(field, lo, hi):
+    field = str(field).strip()
+    if field == "*":
+        return set(range(lo, hi + 1))
+    out = set()
+    for part in field.split(","):
+        part = part.strip()
+        step = 1
+        if "/" in part:
+            part, _, step_s = part.partition("/")
+            step = max(1, int(step_s or 1))
+        if part in ("*", ""):
+            out.update(range(lo, hi + 1, step))
+        elif "-" in part:
+            a, _, b = part.partition("-")
+            out.update(range(int(a), int(b) + 1, step))
+        else:
+            v = int(part)
+            if lo <= v <= hi:
+                out.add(v)
+    return out
+
+
+_CRON_DOW = {0: 6, 1: 0, 2: 1, 3: 2, 4: 3, 5: 4, 6: 5, 7: 6}  # cron -> Python weekday
+
+
+def _cron_next(expr, after):
+    parts = expr.split()
+    if len(parts) != 5:
+        return None
+    try:
+        minutes = _cron_field(parts[0], 0, 59)
+        hours = _cron_field(parts[1], 0, 23)
+        doms = _cron_field(parts[2], 1, 31)
+        months = _cron_field(parts[3], 1, 12)
+        dows = {_CRON_DOW[d] for d in _cron_field(parts[4], 0, 7)}
+    except Exception:
+        return None
+    probe = after.replace(second=0, microsecond=0) + datetime.timedelta(minutes=1)
+    for _ in range(2 * 366 * 24 * 60):
+        if (probe.minute in minutes and probe.hour in hours
+                and probe.day in doms and probe.month in months
+                and probe.weekday() in dows):
+            return probe
+        probe += datetime.timedelta(minutes=1)
+    return None
+
+
+def _sched_public(job):
+    nxt = job.get("next_fire")
+    return {"name": job["name"], "when": job.get("when"),
+            "command": job.get("command"),
+            "next_run": datetime.datetime.fromtimestamp(nxt).isoformat(timespec="seconds") if nxt else None,
+            "last_run": job.get("last_fire"),
+            "count": job.get("count", 0),
+            "interval_seconds": job.get("interval"),
+            "cron": job.get("cron"),
+            "last_output": job.get("last_output")}
+
+
+def _schedule_task(args):
+    name = str(args.get("name") or "").strip()
+    command = str(args.get("command") or "").strip()
+    if not name:
+        return {"error": "task name is required"}
+    if not command:
+        return {"error": "shell command is required"}
+    when = str(args.get("when") or "once").lower()
+    try:
+        timeout = min(max(int(args.get("timeout") or 180), 1), 600)
+    except Exception:
+        timeout = 180
+    job = {"name": name, "command": command, "when": when,
+           "timeout": timeout, "count": 0, "_running": False, "_cancel": False}
+    if when == "once":
+        delay = max(1, int(args.get("delay_seconds") or 1))
+        job["delay"] = delay
+        job["next_fire"] = time.time() + delay
+    elif when == "interval":
+        interval = max(5, int(args.get("interval_seconds") or 60))
+        job["interval"] = interval
+        job["next_fire"] = time.time() + interval
+    elif when == "cron":
+        expr = str(args.get("cron") or "").strip()
+        if len(expr.split()) != 5:
+            return {"error": "cron must be a 5-field expression: 'min hour day-of-month month day-of-week'"}
+        nxt = _cron_next(expr, datetime.datetime.now())
+        if not nxt:
+            return {"error": "cron expression does not match a time within the next 2 years - check the fields"}
+        job["cron"] = expr
+        job["next_fire"] = nxt.timestamp()
+    else:
+        return {"error": "when must be one of: once, interval, cron"}
+    with _SCHED_LOCK:
+        _SCHED[name] = job
+    _ensure_sched_thread()
+    return {"result": "ok", "scheduled": True, "task": _sched_public(job)}
+
+
+def _list_schedules(args):
+    with _SCHED_LOCK:
+        items = [_sched_public(j) for j in _SCHED.values() if not j.get("_cancel")]
+    return {"result": "ok", "scheduled_tasks": items, "count": len(items)}
+
+
+def _unschedule_task(args):
+    name = str(args.get("name") or "").strip()
+    if not name:
+        return {"error": "task name is required"}
+    with _SCHED_LOCK:
+        job = _SCHED.pop(name, None)
+        if job:
+            job["_cancel"] = True
+    return {"result": "ok", "removed": bool(job), "name": name}
+
+
+def _ensure_sched_thread():
+    global _SCHED_THREAD_ON
+    with _SCHED_LOCK:
+        if _SCHED_THREAD_ON:
+            return
+        _SCHED_THREAD_ON = True
+    threading.Thread(target=_sched_loop, daemon=True, name="bonsai-scheduler").start()
+
+
+def _sched_loop():
+    while True:
+        time.sleep(0.5)
+        if not _SCHED:
+            continue
+        now = time.time()
+        to_fire = []
+        with _SCHED_LOCK:
+            for name, job in list(_SCHED.items()):
+                if job.get("_cancel") or job.get("_running"):
+                    continue
+                n = job.get("next_fire")
+                if n and n <= now:
+                    to_fire.append(job)
+        for job in to_fire:
+            with _SCHED_LOCK:
+                if job.get("_cancel") or job.get("_running"):
+                    continue
+                job["_running"] = True
+            threading.Thread(target=_sched_run, args=(job,), daemon=True).start()
+
+
+def _sched_run(job):
+    try:
+        proc = subprocess.Popen(job["command"], shell=True,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                text=True, creationflags=CREATE_NO_WINDOW)
+        try:
+            out, _ = proc.communicate(timeout=job.get("timeout") or 180)
+        except subprocess.TimeoutExpired:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            out = "[command timed out]"
+    except Exception as exc:
+        out = "error: " + str(exc)
+    with _SCHED_LOCK:
+        job["last_fire"] = datetime.datetime.now().isoformat(timespec="seconds")
+        job["last_output"] = (out or "")[:2000]
+        job["count"] = job.get("count", 0) + 1
+        job["_running"] = False
+        if job["when"] == "once":
+            job["_cancel"] = True
+        elif job["when"] == "interval":
+            job["next_fire"] = time.time() + max(5, int(job.get("interval") or 60))
+        elif job["when"] == "cron":
+            nxt = _cron_next(job["cron"], datetime.datetime.now())
+            job["next_fire"] = nxt.timestamp() if nxt else 0
+            if not nxt:
+                job["_cancel"] = True
+    with _SCHED_LOCK:
+        for name in [n for n, j in _SCHED.items() if j.get("_cancel") and j.get("count")]:
+            _SCHED.pop(name, None)
+
+
 def execute_tool_call(tc, hooks=None):
     global _TODOS
     fn = tc.get("function") or {}
@@ -1994,6 +2724,30 @@ def execute_tool_call(tc, hooks=None):
         raw_result = {"result": "ok", "todos": items}
     elif name == "run_code":
         raw_result = _run_code(args.get("language"), args.get("code"))
+    elif name == "window_list":
+        raw_result = _window_list()
+    elif name == "window_action":
+        raw_result = _window_action(args)
+    elif name == "docker_ps":
+        raw_result = _docker_ps(args)
+    elif name == "docker_images":
+        raw_result = _docker_images(args)
+    elif name in ("docker_start", "docker_stop", "docker_restart"):
+        raw_result = _docker_action(name[len("docker_"):], args)
+    elif name == "docker_logs":
+        raw_result = _docker_logs(args)
+    elif name == "docker_exec":
+        raw_result = _docker_exec(args)
+    elif name == "api_call":
+        raw_result = _api_call(args)
+    elif name == "ws_test":
+        raw_result = _ws_test(args)
+    elif name == "schedule_task":
+        raw_result = _schedule_task(args)
+    elif name == "list_schedules":
+        raw_result = _list_schedules(args)
+    elif name == "unschedule_task":
+        raw_result = _unschedule_task(args)
     elif name in _blender_tool_names():
         if not MCP_AVAILABLE:
             raw_result = {"error": "Blender MCP is not installed (pip install mcp-for-blender)"}
@@ -2120,6 +2874,13 @@ def run_agent(messages, on_tool=None, mode=MODE_BUILD, on_stats=None, hooks=None
                                           "image_url": {"url": image_uri}}]})
     if on_stats:
         on_stats(total)
+    try:
+        final = _bonsai_chat(msgs, [])
+        content = (final.get("content") or "").strip()
+        if content:
+            return {"reply": content, "calls": calls, "_stats": total}
+    except Exception:
+        pass
     return {"reply": "Done - completed the steps that could be executed.", "calls": calls, "_stats": total}
 
 
@@ -2139,20 +2900,33 @@ def stream_agent(messages, on_reason=None, on_delta=None, on_tool=None,
     tools = _tools_for(mode)
     msgs = list(messages)
     total = _empty_stats()
-    for _round in range(MAX_TOOL_ROUNDS):
+
+    def emit(ev):
+        nonlocal total
+        kind = ev["kind"]
+        if kind == "reason":
+            if on_reason:
+                on_reason(ev["text"])
+        elif kind == "delta":
+            if on_delta:
+                on_delta(ev["text"])
+        elif kind == "end":
+            total = _merge_stats(total, ev.get("stats") or {})
+            if on_stats:
+                on_stats(total)
+
+    def one_round(tools_for_round):
         tool_calls = None
-        for ev in _bonsai_stream(msgs, tools):
-            if ev["kind"] == "reason":
-                if on_reason:
-                    on_reason(ev["text"])
-            elif ev["kind"] == "delta":
-                if on_delta:
-                    on_delta(ev["text"])
-            elif ev["kind"] == "end":
+        for ev in _bonsai_stream(msgs, tools_for_round):
+            if ev["kind"] == "end":
                 tool_calls = ev["tool_calls"]
-                total = _merge_stats(total, ev.get("stats") or {})
-                if on_stats:
-                    on_stats(total)
+                emit(ev)
+            else:
+                emit(ev)
+        return tool_calls or []
+
+    for _round in range(MAX_TOOL_ROUNDS):
+        tool_calls = one_round(tools)
         if not tool_calls:
             return {"calls": calls, "_stats": total}
         msgs.append({"role": "assistant", "content": None,
@@ -2171,7 +2945,10 @@ def stream_agent(messages, on_reason=None, on_delta=None, on_tool=None,
                          "content": json.dumps(record["full_result"],
                                                ensure_ascii=False)})
             _append_shot_image(msgs, record)
-    return {"calls": calls}
+    # Tool budget exhausted but the model still wants tools - force a plain,
+    # tool-free closing answer so the run never ends in silence.
+    one_round([])
+    return {"calls": calls, "_stats": total}
 
 
 def handle_chat(messages, on_reason=None, on_delta=None, on_tool=None,
@@ -2723,7 +3500,7 @@ function addAsst(text, calls, reason, stats) {
   const av = document.createElement('div'); av.className = 'av bonsai'; av.textContent = 'B';
   const b = document.createElement('div'); b.className = 'bubble';
   if (reason) addReasonBox(b, reason);
-  (calls || []).forEach(function (c) { toolChip(b, c); });
+  addToolChips(b, calls);
   if (calls && calls.length) addToolLog(b, calls);
   const inner = document.createElement('div'); inner.className = 'abody'; inner.innerHTML = fmt(text);
   b.appendChild(inner);
@@ -2790,6 +3567,20 @@ function toolChip(container, c) {
   if (chipData.preview) delete chipData.preview;
   chip.title = JSON.stringify(chipData, null, 2);
   container.appendChild(chip);
+  return chip;
+}
+function addToolChips(container, calls) {
+  let prevName = null, count = 0, chipEl = null;
+  (calls || []).forEach(function (c) {
+    if (c.name === prevName) {
+      count += 1;
+      chipEl.textContent = '\u2699\ufe0f ' + prevName + ' \u00d7' + count;
+    } else {
+      chipEl = toolChip(container, c);
+      prevName = c.name;
+      count = 1;
+    }
+  });
 }
 
 function buildUserMsg() {
@@ -2984,7 +3775,16 @@ function toolItemDom(call) {
 }
 function onTool(call) {
   if (thinkingRow && thinkingRow.body) thinkingRow.body.classList.remove('caret');
-  toolChip(thinkingRow.b, call);
+  const prev = thinkingRow.lastChip;
+  if (prev && prev.__name === call.name) {
+    prev.__count += 1;
+    prev.textContent = '\u2699\ufe0f ' + call.name + ' \u00d7' + prev.__count;
+  } else {
+    const chip = toolChip(thinkingRow.b, call);
+    chip.__name = call.name;
+    chip.__count = 1;
+    thinkingRow.lastChip = chip;
+  }
   liveCalls.push(call);
   if (!thinkingRow.toolEl) {
     thinkingRow.toolEl = document.createElement('details');
@@ -3092,6 +3892,7 @@ async function streamRun(messages, chat) {
   const dec = new TextDecoder();
   let buf = '', reply = '', calls = [], reason = '';
   let aborted = false;
+  let gotEnd = false;
   let startedAt = Date.now();
   try {
     while (true) {
@@ -3115,7 +3916,7 @@ async function streamRun(messages, chat) {
         else if (ev === 'ask') { onAsk(j); setBonsaiState('thinking'); }
         else if (ev === 'todo') { renderTodo(j.todos); }
         else if (ev === 'error') { doneThinking('Error: ' + j.text); setBonsaiState('idle'); stopStats(); throw new Error(j.text); }
-        else if (ev === 'done') { doneThinking(); setBonsaiState('idle'); }
+        else if (ev === 'done') { gotEnd = true; doneThinking(); setBonsaiState('idle'); }
       }
     }
   } catch (e) {
@@ -3126,6 +3927,7 @@ async function streamRun(messages, chat) {
     stopStats();
   }
   if (aborted) throw new Error('stopped');
+  if (!gotEnd) throw new Error('The reply was cut off unexpectedly - please try again.');
   const last = chat.messages[chat.messages.length - 1];
   const savedStats = statsVals && (statsVals.think_ms || statsVals.respond_ms || statsVals.completion_tokens)
       ? JSON.parse(JSON.stringify(statsVals)) : null;
@@ -3372,6 +4174,872 @@ init();
 </body>
 </html>"""
 
+# ---------------------------------------------------------------------------
+# GPT-style clean UI, served at /chat. Same backend, same features, fresh look.
+# ---------------------------------------------------------------------------
+PAGE_GPT = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BONSAI - Chat</title>
+<style>
+  :root {
+    color-scheme: light;
+    --bg: #ffffff; --bg2: #f7f7f9; --bg3: #ededf0; --bd: #e3e3e7;
+    --txt: #111214; --mut: #71717a; --acc: #19191c; --acc-txt: #fafafa;
+    --ok: #16a34a; --warn: #d97706; --err: #dc2626;
+  }
+  html.dark {
+    color-scheme: dark;
+    --bg: #212121; --bg2: #171717; --bg3: #2f2f2f; --bd: #303030;
+    --txt: #ececec; --mut: #9b9ba3; --acc: #e4e4e7; --acc-txt: #18181b;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body { font-family: "Segoe UI", system-ui, sans-serif; background: var(--bg); color: var(--txt); }
+  .app { display: flex; height: 100vh; min-height: 0; }
+  .side { width: 264px; flex: none; background: var(--bg2); border-right: 1px solid var(--bd); display: flex; flex-direction: column; min-height: 0; }
+  .side-head { padding: 12px 14px; border-bottom: 1px solid var(--bd); }
+  .brand { display: flex; align-items: center; gap: 9px; font-weight: 600; letter-spacing: .3px; }
+  .logo { width: 26px; height: 26px; border-radius: 7px; background: var(--acc); color: var(--acc-txt); display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 14px; }
+  .btn-new { width: 100%; margin-top: 12px; border: 1px solid var(--bd); background: transparent; color: var(--txt); border-radius: 10px; padding: 9px 12px; cursor: pointer; font-weight: 600; text-align: left; }
+  .btn-new:hover { border-color: var(--mut); }
+  .chatlist { flex: 1; overflow-y: auto; padding: 10px; display: flex; flex-direction: column; gap: 2px; min-height: 0; }
+  .chat-item { display: flex; align-items: center; gap: 6px; padding: 8px 10px; border-radius: 8px; cursor: pointer; color: var(--txt); font-size: 13px; }
+  .chat-item:hover { background: var(--bg3); }
+  .chat-item.active { background: var(--bg3); font-weight: 600; }
+  .chat-item .tit { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .chat-item .del { background: none; border: none; color: var(--mut); cursor: pointer; font-size: 14px; opacity: 0; padding: 0 4px; }
+  .chat-item:hover .del { opacity: 1; }
+  .side-foot { padding: 10px 12px; border-top: 1px solid var(--bd); display: flex; flex-direction: column; gap: 8px; }
+  .blrow { display: flex; align-items: center; gap: 7px; font-size: 11.5px; color: var(--mut); }
+  .blrow b { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #8b8b8b; }
+  .blrow.ok b { background: var(--ok); }
+  .blrow.mid b { background: var(--warn); }
+  .blrow.off b { background: var(--err); }
+  .btn-ghost { border: 1px solid var(--bd); background: transparent; color: var(--txt); border-radius: 8px; padding: 7px 10px; cursor: pointer; font-size: 12px; }
+  .btn-ghost:hover { border-color: var(--mut); }
+  .wd { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%; text-align: left; }
+  .foot-row { display: flex; gap: 6px; }
+  .foot-row a { text-decoration: none; color: var(--mut); flex: 1; text-align: center; }
+  .main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  .topbar { height: 54px; flex: none; border-bottom: 1px solid var(--bd); display: flex; align-items: center; justify-content: flex-end; gap: 10px; padding: 0 18px; }
+  .pill { border: 1px solid var(--bd); background: transparent; color: var(--txt); border-radius: 999px; padding: 6px 14px; font-size: 12px; cursor: pointer; font-weight: 600; }
+  .pill:hover { border-color: var(--mut); }
+  .pill.plan { color: var(--acc); border-color: var(--acc); }
+  select.pill { cursor: pointer; background: var(--bg2); }
+  select.pill option { background: var(--bg); color: var(--txt); }
+  .state { font-size: 11px; letter-spacing: 1px; color: var(--mut); font-weight: 600; }
+  .messages { flex: 1; overflow-y: auto; min-height: 0; }
+  .inner { max-width: 780px; margin: 0 auto; padding: 20px 24px 4px; display: flex; flex-direction: column; gap: 20px; min-height: 100%; }
+  .empty { display: flex; flex-direction: column; align-items: center; justify-content: center; flex: 1; text-align: center; color: var(--mut); min-height: 55vh; }
+  .empty .logo { width: 52px; height: 52px; border-radius: 16px; font-size: 26px; margin-bottom: 16px; }
+  .empty h1 { margin: 0 0 8px; color: var(--txt); font-size: 22px; letter-spacing: .5px; }
+  .empty p { font-size: 13px; line-height: 1.6; max-width: 390px; margin: 0; }
+  .msgrow { display: flex; flex-direction: column; }
+  .msgrow.user { align-items: flex-end; }
+  .ubub { background: var(--bg3); border-radius: 16px 16px 4px 16px; padding: 10px 14px; max-width: 80%; font-size: 14px; white-space: pre-wrap; word-break: break-word; line-height: 1.5; }
+  .ubub .thumbs { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 6px; }
+  .ubub .thumb { width: 60px; height: 60px; border-radius: 10px; overflow: hidden; border: 1px solid var(--bd); }
+  .ubub .thumb img { width: 100%; height: 100%; object-fit: cover; }
+  .ubub .pf { display: inline-block; background: var(--bg2); border: 1px solid var(--bd); border-radius: 999px; padding: 4px 10px; font-size: 12px; }
+  .abody { font-size: 14px; line-height: 1.65; word-break: break-word; }
+  .abody pre { background: var(--bg2); border: 1px solid var(--bd); border-radius: 10px; padding: 10px 12px; overflow-x: auto; font-size: 12.5px; line-height: 1.5; }
+  .abody code { background: var(--bg3); border-radius: 5px; padding: 1px 5px; font-size: 12.5px; }
+  .abody pre code { background: none; padding: 0; }
+  .abody a { color: var(--acc); }
+  .abody.caret::after { content: ''; display: inline-block; width: 7px; height: 14px; background: var(--acc); margin-left: 3px; vertical-align: text-bottom; animation: blk .8s steps(1) infinite; }
+  @keyframes blk { 50% { opacity: 0; } }
+  .thinkstub { display: flex; align-items: center; gap: 8px; color: var(--mut); font-size: 13px; }
+  .dots i { display: inline-block; width: 5px; height: 5px; border-radius: 50%; background: var(--mut); margin-right: 3px; animation: puls 1s infinite; }
+  .dots i:nth-child(2) { animation-delay: .15s; }
+  .dots i:nth-child(3) { animation-delay: .3s; }
+  @keyframes puls { 0%, 100% { opacity: .25; } 50% { opacity: 1; } }
+  .reasonbox, .tlog { margin: 2px 0 6px; }
+  .reasonbox > summary, .tlog > summary { cursor: pointer; list-style: none; user-select: none; display: inline-flex; align-items: center; gap: 6px; font-size: 11.5px; color: var(--mut); font-weight: 600; padding: 5px 11px; border-radius: 999px; background: var(--bg2); border: 1px solid var(--bd); }
+  .reasonbox > summary::-webkit-details-marker, .tlog > summary::-webkit-details-marker { display: none; }
+  .reasonbox > summary::before { content: ''; }
+  .rc { margin-top: 6px; font-size: 12.5px; line-height: 1.55; color: var(--mut); background: var(--bg2); border: 1px solid var(--bd); border-radius: 10px; padding: 10px; white-space: pre-wrap; max-height: 220px; overflow-y: auto; }
+  .tl { margin-top: 6px; display: flex; flex-direction: column; gap: 6px; max-height: 260px; overflow-y: auto; }
+  .tlitem { font-family: Consolas, monospace; font-size: 11.5px; background: var(--bg2); border: 1px solid var(--bd); border-radius: 8px; padding: 8px 10px; white-space: pre-wrap; word-break: break-word; }
+  .tlitem.err { border-color: var(--err); color: var(--err); }
+  .tlitem .rs { color: var(--mut); margin-top: 4px; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .tlitem .rs img.tthumb { max-width: 240px; border-radius: 8px; margin-top: 6px; cursor: zoom-in; display: block; }
+  .toolsline { margin: 2px 0 8px; display: flex; flex-wrap: wrap; gap: 6px; }
+  .chip { font-size: 11.5px; color: var(--mut); background: var(--bg3); border: 1px solid var(--bd); border-radius: 999px; padding: 4px 11px; font-weight: 600; }
+  .chip.ok { color: var(--ok); }
+  .chip.err { color: var(--err); border-color: var(--err); }
+  .statschip { display: block; margin-top: 8px; font-size: 11px; color: var(--mut); }
+  .inputzone { flex: none; padding: 0 0 16px; }
+  .innerc { max-width: 780px; margin: 0 auto; padding: 0 24px; }
+  .preview { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 8px; }
+  .preview:empty { display: none; }
+  .thumb { position: relative; width: 62px; height: 62px; border-radius: 10px; overflow: hidden; border: 1px solid var(--bd); }
+  .thumb img { width: 100%; height: 100%; object-fit: cover; }
+  .pf { display: inline-flex; align-items: center; gap: 8px; background: var(--bg2); border: 1px solid var(--bd); border-radius: 999px; padding: 6px 12px; font-size: 12px; }
+  .x { width: 18px; height: 18px; border-radius: 50%; border: none; background: rgba(0,0,0,.55); color: #fff; font-size: 12px; line-height: 1; cursor: pointer; }
+  .pf .x { background: var(--bg3); color: var(--txt); }
+  .composer { display: flex; align-items: flex-end; gap: 8px; border: 1px solid var(--bd); border-radius: 18px; padding: 10px 12px; background: var(--bg2); }
+  .composer:focus-within { border-color: var(--mut); }
+  #user-input { flex: 1; border: none; outline: none; background: transparent; color: var(--txt); font: inherit; font-size: 14px; resize: none; max-height: 160px; padding: 6px 2px; line-height: 1.5; }
+  .ic { border: none; background: transparent; color: var(--mut); cursor: pointer; font-size: 15px; width: 32px; height: 32px; border-radius: 8px; display: flex; align-items: center; justify-content: center; }
+  .ic:hover { background: var(--bg3); color: var(--txt); }
+  .ic.err { color: var(--err); }
+  .send { width: 34px; height: 34px; border: none; border-radius: 50%; background: var(--acc); color: var(--acc-txt); cursor: pointer; display: flex; align-items: center; justify-content: center; flex: none; }
+  .send:hover { opacity: .85; }
+  .send.busy { background: var(--err); }
+  .stats { margin: 8px auto 0; font-size: 11px; color: var(--mut); text-align: center; }
+  .todo-panel { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+  .todo-panel:empty { display: none; }
+  .todochip { font-size: 11.5px; padding: 4px 10px; border-radius: 999px; background: var(--bg2); border: 1px solid var(--bd); color: var(--mut); }
+  .todochip .st.ok { color: var(--ok); }
+  .todochip .st.run { color: var(--warn); }
+  .fine { margin: 10px auto 0; font-size: 11px; color: var(--mut); text-align: center; }
+  #filein { display: none; }
+  .askov { position: fixed; inset: 0; background: rgba(0,0,0,.45); display: flex; align-items: center; justify-content: center; z-index: 90; backdrop-filter: blur(3px); }
+  .askbox { background: var(--bg); border: 1px solid var(--bd); border-radius: 16px; padding: 22px; width: min(460px, 90vw); box-shadow: 0 12px 40px rgba(0,0,0,.25); }
+  .askbox h4 { margin: 0 0 12px; font-size: 12px; color: var(--mut); letter-spacing: 1px; }
+  .aq { margin-bottom: 14px; font-size: 15px; line-height: 1.5; }
+  .opts { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
+  .opt, .afree button { border: 1px solid var(--bd); background: var(--bg2); color: var(--txt); border-radius: 999px; padding: 8px 14px; font-size: 13px; cursor: pointer; }
+  .opt:hover { border-color: var(--mut); }
+  .afree { display: flex; gap: 8px; }
+  .afree input { flex: 1; border: 1px solid var(--bd); border-radius: 10px; padding: 9px 12px; background: var(--bg2); color: var(--txt); font: inherit; outline: none; }
+  .afree button { padding: 8px 18px; }
+  .dropov { position: fixed; inset: 0; z-index: 95; display: none; align-items: center; justify-content: center; pointer-events: none; }
+  .dropov.on { display: flex; }
+  .dropov .bx { border: 2px dashed var(--mut); border-radius: 20px; padding: 40px 60px; background: var(--bg); font-size: 15px; color: var(--mut); }
+</style>
+</head>
+<body>
+<div class="app">
+  <nav class="side">
+    <div class="side-head">
+      <div class="brand"><div class="logo">B</div><div>BONSAI</div></div>
+      <button class="btn-new" id="newchat">+ New chat</button>
+    </div>
+    <div class="chatlist" id="chatlist"></div>
+    <div class="side-foot">
+      <div class="blrow" id="blstatus">BLENDER <b></b> CHECKING...</div>
+      <button class="btn-ghost wd" id="workbtn"></button>
+      <div class="foot-row">
+        <a href="/" title="Classic UI">Classic UI</a>
+        <button class="btn-ghost" id="themebtn" title="Toggle theme"></button>
+        <button class="btn-ghost" id="ejectbtn" title="Unload the model from RAM/VRAM">EJECT</button>
+      </div>
+    </div>
+  </nav>
+  <main class="main">
+    <header class="topbar">
+      <div class="tb-r" style="display:flex;align-items:center;gap:10px">
+        <button class="pill" id="modebtn" title="Plan = pure reasoning without tools">BUILD</button>
+        <select class="pill" id="effort-sel" title="Thinking effort - how deeply BONSAI reasons">
+          <option value="off">Effort: off</option>
+          <option value="low">Effort: low</option>
+          <option value="med" selected>Effort: med</option>
+          <option value="high">Effort: high</option>
+        </select>
+        <span class="state" id="state-label">READY</span>
+      </div>
+    </header>
+    <div class="messages" id="messages">
+      <div class="inner">
+        <div class="empty" id="empty">
+          <div class="logo">B</div>
+          <h1>BONSAI</h1>
+          <p>Your local PC assistant. Ask anything - I can search, read files, run commands and see your screen. Everything runs on this PC.</p>
+        </div>
+      </div>
+    </div>
+    <div class="inputzone">
+      <div class="innerc">
+        <div class="preview" id="preview"></div>
+        <div class="todo-panel" id="todopanel"></div>
+        <div class="composer">
+          <textarea id="user-input" rows="1" placeholder="Message BONSAI..."></textarea>
+          <div style="display:flex;align-items:center;gap:2px">
+            <button class="ic" id="attach" title="Attach images / files">&#128206;</button>
+            <button class="ic" id="mic-btn" title="Microphone">&#127908;</button>
+            <button class="ic" id="queue" title="Queue this message - I will answer after the current reply">&#9201;</button>
+            <button class="send" id="send" title="Send"></button>
+          </div>
+        </div>
+        <div class="stats" id="statsline"></div>
+        <div class="fine">BONSAI 2 27B local &middot; tools + vision &middot; your data stays on this PC</div>
+      </div>
+    </div>
+  </main>
+</div>
+<input type="file" id="filein" accept="image/*,.txt,.md,.py,.js,.ts,.json,.csv,.log,.ini,.cfg,.xml,.html,.css,.bat,.ps1,.sh,.yml,.yaml,.sql,.java,.cpp,.c,.h,.cs,.go,.rb,.php,.toml,.env,.gitignore" multiple>
+<script>
+const BONSAI_CTX = 32768;
+let chats = load();
+let cur = null, busy = false, pendingAtt = [], started = false, abortCtrl = null, msgQueue = [];
+let chatMode = localStorage.getItem('bonsai_gpt_mode') === 'plan' ? 'plan' : 'build';
+let workdir = '';
+let thinkingRow = null, liveCalls = [], statsTimer = null;
+let statsVals = { think_ms: 0, respond_ms: 0, tok_s: 0, ctx_used: 0, ctx_left: 0, prompt_tokens: 0, completion_tokens: 0 };
+
+const SEND_SVG = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path d="M12 19V5M5 12l7-7 7 7"/></svg>';
+const STOP_SVG = '<svg width="13" height="13" viewBox="0 0 24 24"><rect x="5" y="5" width="14" height="14" rx="2" fill="currentColor"/></svg>';
+
+function load() { try { return JSON.parse(localStorage.getItem('bonsai_gpt_chats') || '[]'); } catch (e) { return []; } }
+function save() {
+  try {
+    const c = chats.slice(-200).map(function (ch) {
+      const copy = JSON.parse(JSON.stringify(ch));
+      (copy.messages || []).forEach(function (m) {
+        if (m.calls) (m.calls).forEach(function (cl) { if (cl.preview) delete cl.preview; });
+      });
+      return copy;
+    });
+    localStorage.setItem('bonsai_gpt_chats', JSON.stringify(c));
+  } catch (e) {}
+}
+function newChat() {
+  if (cur && chats.indexOf(cur) !== -1 && cur.messages.length === 0 && cur.title === 'New chat') { started = false; renderAll(); return; }
+  if (cur && cur.messages.length > 0 && chats.indexOf(cur) === -1) chats.push(cur);
+  cur = { id: 'c' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6), title: 'New chat', ts: Date.now(), messages: [] };
+  chats.push(cur); started = false; save(); renderAll();
+}
+function init() {
+  bindModeBtn(); bindTheme(); loadWorkdir();
+  if (!chats.length) newChat(); else cur = chats[chats.length - 1];
+  renderAll(); setSendUI(); setQueueUI();
+  fetch('/api/todos').then(function (r) { return r.json(); }).then(function (j) {
+    if (j && j.todos) renderTodo(j.todos);
+  }).catch(function () {});
+  refreshBlender();
+  setInterval(refreshBlender, 8000);
+}
+function bindModeBtn() {
+  const btn = document.getElementById('modebtn');
+  const update = function () { btn.textContent = chatMode === 'plan' ? 'PLAN' : 'BUILD'; btn.classList.toggle('plan', chatMode === 'plan'); };
+  update();
+  btn.onclick = function () { chatMode = chatMode === 'plan' ? 'build' : 'plan'; localStorage.setItem('bonsai_gpt_mode', chatMode); update(); };
+}
+function bindTheme() {
+  const b = document.getElementById('themebtn');
+  const apply = function (d) { document.documentElement.classList.toggle('dark', d); b.textContent = d ? '\u2600\ufe0f' : '\u263e'; };
+  const saved = localStorage.getItem('bonsai_gpt_theme');
+  apply(saved ? saved === 'dark' : true);
+  b.onclick = function () {
+    const d = !document.documentElement.classList.contains('dark');
+    localStorage.setItem('bonsai_gpt_theme', d ? 'dark' : 'light');
+    apply(d);
+  };
+}
+async function loadWorkdir() {
+  try {
+    const r = await fetch('/api/workdir');
+    const j = await r.json();
+    if (j.workdir) setWorkdirInUI(j.workdir);
+  } catch (e) {}
+}
+function setWorkdirInUI(wd) {
+  workdir = wd;
+  const w = document.getElementById('workbtn');
+  w.textContent = '\\ud83d\\udcc1 ' + workdir;
+  w.title = 'Working folder: ' + workdir;
+}
+function renderAll() { renderList(); renderConv(); }
+function renderList() {
+  const el = document.getElementById('chatlist');
+  el.innerHTML = '';
+  chats.slice().sort(function (a, b) { return (b.ts || 0) - (a.ts || 0); }).forEach(function (c) {
+    const row = document.createElement('div');
+    row.className = 'chat-item' + (cur && c.id === cur.id ? ' active' : '');
+    const t = document.createElement('span'); t.className = 'tit'; t.textContent = c.title; t.title = c.title;
+    const d = document.createElement('button'); d.className = 'del'; d.textContent = '\u00d7';
+    d.onclick = function (e) {
+      e.stopPropagation();
+      chats = chats.filter(function (x) { return x.id !== c.id; });
+      if (!chats.length) { cur = null; newChat(); }
+      else { if (cur && cur.id === c.id) cur = chats[chats.length - 1]; save(); renderAll(); }
+    };
+    row.onclick = function () { cur = c; started = cur.messages.length > 0; renderAll(); setState('idle'); };
+    row.appendChild(t); row.appendChild(d);
+    el.appendChild(row);
+  });
+}
+function convInner() { return document.querySelector('#messages .inner'); }
+function scrollBottom() { const c = document.getElementById('messages'); c.scrollTop = c.scrollHeight; }
+function renderConv() {
+  const conv = convInner();
+  const empty = document.getElementById('empty');
+  conv.innerHTML = '';
+  if (!cur || !cur.messages.length) {
+    if (empty) { if (!empty.parentNode) conv.appendChild(empty); empty.style.display = 'flex'; }
+  } else {
+    if (empty) empty.remove();
+    cur.messages.forEach(function (m) {
+      if (m.role === 'user') addUser(m.content);
+      else if (m.role === 'assistant') addAsst(m.content, m.calls || [], m.reason, m.stats);
+    });
+  }
+}
+function esc(s) { return (s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+function fmt(s) {
+  let t = esc(s);
+  t = t.replace(/```([\\s\\S]*?)```/g, '<pre>$1</pre>');
+  t = t.replace(/`([^`]+)`/g, '<code>$1</code>');
+  t = t.replace(/\\*\\*([^*]+)\\*\\*/g, '<b>$1</b>');
+  t = t.replace(/\\*([^*]+)\\*/g, '<i>$1</i>');
+  t = t.replace(/(https?:\\/\\/[^\\s<]+)/g, '<a href="$1" target="_blank" rel="noreferrer">$1</a>');
+  t = t.replace(/\\n/g, '<br>');
+  return t;
+}
+function addUser(content) {
+  const row = document.createElement('div'); row.className = 'msgrow user';
+  const b = document.createElement('div'); b.className = 'ubub';
+  const parts = typeof content === 'string' ? [{ type: 'text', text: content }] : content;
+  const arr = parts || [];
+  const imgs = arr.filter(function (p) { return p.type === 'image_url'; });
+  const files = arr.filter(function (p) { return p.type === 'file_att'; });
+  const text = arr.filter(function (p) { return p.type === 'text'; }).map(function (p) { return p.text; }).join(' ');
+  if (imgs.length || files.length) {
+    const g = document.createElement('div'); g.className = 'thumbs';
+    imgs.forEach(function (p) {
+      const th = document.createElement('div'); th.className = 'thumb';
+      const im = document.createElement('img'); im.src = p.image_url.url; th.appendChild(im); g.appendChild(th);
+    });
+    files.forEach(function (p) {
+      const pf = document.createElement('span'); pf.className = 'pf'; pf.textContent = '\\ud83d\\udcc4 ' + p.name; g.appendChild(pf);
+    });
+    const sp = document.createElement('div');
+    if (text) sp.textContent = text;
+    else if (imgs.length && !files.length) sp.textContent = '[Image attached]';
+    b.appendChild(g);
+    if (sp.textContent) { sp.style.marginTop = '6px'; b.appendChild(sp); }
+  } else {
+    b.textContent = text;
+  }
+  row.appendChild(b); convInner().appendChild(row); scrollBottom();
+}
+function toolResultText(r) {
+  if (typeof r === 'string') return r;
+  if (!r || typeof r !== 'object') return String(r);
+  const copy = {};
+  Object.keys(r).forEach(function (k) { if (k !== 'preview') copy[k] = r[k]; });
+  return JSON.stringify(copy, null, 2);
+}
+function toolItemDom(call) {
+  const it = document.createElement('div');
+  it.className = 'tlitem' + (call.result && call.result.error ? ' err' : '');
+  const nm = document.createElement('div'); nm.textContent = '\u2699 ' + call.name + ' ' + JSON.stringify(call.arguments || {});
+  const rs = document.createElement('div'); rs.className = 'rs'; rs.textContent = toolResultText(call.result);
+  it.appendChild(nm); it.appendChild(rs);
+  if (call.preview) {
+    const im = document.createElement('img'); im.className = 'tthumb';
+    im.src = call.preview; im.title = 'screenshot - click to enlarge';
+    im.onclick = function () { window.open(call.preview); };
+    it.appendChild(im);
+  }
+  return it;
+}
+function toolGroups(calls) {
+  const g = [];
+  (calls || []).forEach(function (c) {
+    const last = g[g.length - 1];
+    if (last && last.name === c.name) last.count += 1;
+    else g.push({ name: c.name, count: 1, call: c });
+  });
+  return g;
+}
+function renderLivePills(container, calls) {
+  container.innerHTML = '';
+  toolGroups(calls).forEach(function (g) {
+    const chip = document.createElement('span'); chip.className = 'chip gear';
+    const ok = g.call.result && g.call.result.result === 'ok';
+    const bad = g.call.result && g.call.result.error;
+    let label = '\u2699\ufe0f ' + g.name + (g.count > 1 ? ' \u00d7' + g.count : '');
+    if (ok) { chip.classList.add('ok'); label = '\u2713 ' + g.name + (g.count > 1 ? ' \u00d7' + g.count : ''); }
+    else if (bad) { chip.classList.add('err'); label = '\u26a0 ' + g.call.result.error.slice(0, 90); }
+    chip.textContent = label;
+    container.appendChild(chip);
+  });
+}
+function addToolLog(container, calls) {
+  if (!calls || !calls.length) return;
+  const d = document.createElement('details'); d.className = 'tlog';
+  const s = document.createElement('summary'); s.textContent = 'Tool log \u00b7 ' + calls.length + ' call' + (calls.length === 1 ? '' : 's');
+  const l = document.createElement('div'); l.className = 'tl';
+  (calls).forEach(function (c) { l.appendChild(toolItemDom(c)); });
+  d.appendChild(s); d.appendChild(l); container.appendChild(d);
+}
+function addReasonBox(container, text, live) {
+  const d = document.createElement('details'); d.className = 'reasonbox';
+  const s = document.createElement('summary'); s.textContent = live ? 'Thinking...' : ('Thinking \u00b7 ' + (text.trim() ? text.trim().length + ' chars' : 'empty'));
+  const c = document.createElement('div'); c.className = 'rc'; c.textContent = text;
+  d.appendChild(s); d.appendChild(c); container.appendChild(d);
+  return { d: d, s: s, c: c };
+}
+function addStatsChip(container, s) {
+  const c = document.createElement('span'); c.className = 'statschip';
+  const think = (s.think_ms || 0) / 1000;
+  const speak = (s.respond_ms || 0) / 1000;
+  let txt = 'THINK ' + think.toFixed(1) + 's \u00b7 SPEAK ' + speak.toFixed(1) + 's';
+  if (s.tok_s) txt += ' \u00b7 ' + s.tok_s.toFixed(1) + ' tok/s';
+  if (s.completion_tokens) txt += ' \u00b7 ' + s.completion_tokens + ' tok';
+  if (s.ctx_used) txt += ' \u00b7 ctx ' + s.ctx_used + '/' + (s.ctx_used + (s.ctx_left || 0));
+  c.textContent = txt;
+  container.appendChild(c);
+}
+function addAsst(text, calls, reason, stats) {
+  const row = document.createElement('div'); row.className = 'msgrow';
+  const b = document.createElement('div');
+  if (reason) addReasonBox(b, reason, false);
+  if (calls && calls.length) {
+    const pills = document.createElement('div'); pills.className = 'toolsline';
+    renderLivePills(pills, calls); b.appendChild(pills);
+    addToolLog(b, calls);
+  }
+  const inner = document.createElement('div'); inner.className = 'abody'; inner.innerHTML = fmt(text) || '';
+  b.appendChild(inner);
+  if (stats) addStatsChip(b, stats);
+  row.appendChild(b); convInner().appendChild(row); scrollBottom();
+  return inner;
+}
+function addThinking() {
+  liveCalls = [];
+  const row = document.createElement('div'); row.className = 'msgrow';
+  const b = document.createElement('div');
+  const t = document.createElement('div'); t.className = 'thinkstub';
+  t.innerHTML = '<span class="dots"><i></i><i></i><i></i></span> thinking...';
+  b.appendChild(t);
+  row.appendChild(b); convInner().appendChild(row); scrollBottom();
+  thinkingRow = { row: row, b: b, body: null, pills: null, tlog: null, reasonD: null };
+}
+function onDelta(txt) {
+  if (!thinkingRow) return;
+  if (!thinkingRow.body) {
+    const t = thinkingRow.row.querySelector('.thinkstub');
+    if (t) t.remove();
+    thinkingRow.body = document.createElement('div'); thinkingRow.body.className = 'abody caret';
+    thinkingRow.b.appendChild(thinkingRow.body);
+  }
+  thinkingRow.body.textContent += txt;
+  scrollBottom();
+}
+function onReason(txt) {
+  if (!thinkingRow) return;
+  if (!thinkingRow.reasonD) thinkingRow.reasonD = addReasonBox(thinkingRow.b, '', true);
+  thinkingRow.reasonD.c.textContent += txt;
+  thinkingRow.reasonD.c.scrollTop = thinkingRow.reasonD.c.scrollHeight;
+  scrollBottom();
+}
+function onTool(call) {
+  if (thinkingRow && thinkingRow.body) thinkingRow.body.classList.remove('caret');
+  if (!thinkingRow.pills) { thinkingRow.pills = document.createElement('div'); thinkingRow.pills.className = 'toolsline'; thinkingRow.b.appendChild(thinkingRow.pills); }
+  liveCalls.push(call);
+  renderLivePills(thinkingRow.pills, liveCalls);
+  if (!thinkingRow.tlog) {
+    const d = document.createElement('details'); d.className = 'tlog';
+    const s = document.createElement('summary'); s.textContent = 'Tool log \u00b7 running...';
+    const l = document.createElement('div'); l.className = 'tl';
+    d.appendChild(s); d.appendChild(l);
+    thinkingRow.tlog = { d: d, s: s, l: l };
+    thinkingRow.b.appendChild(d);
+  }
+  thinkingRow.tlog.s.textContent = 'Tool log \u00b7 ' + liveCalls.length + ' running...';
+  thinkingRow.tlog.l.appendChild(toolItemDom(call));
+  scrollBottom();
+}
+function doneThinking(errMsg) {
+  if (!thinkingRow) return;
+  if (thinkingRow.reasonD) {
+    const txt = (thinkingRow.reasonD.c.textContent || '').trim();
+    thinkingRow.reasonD.s.textContent = 'Thinking \u00b7 ' + (txt ? txt.length + ' chars' : 'empty');
+  }
+  if (thinkingRow.tlog) thinkingRow.tlog.s.textContent = 'Tool log \u00b7 ' + liveCalls.length + ' call' + (liveCalls.length === 1 ? '' : 's');
+  if (thinkingRow.body) { thinkingRow.body.classList.remove('caret'); }
+  if (errMsg) { const e = document.createElement('div'); e.style.color = 'var(--err)'; e.style.fontSize = '13px'; e.textContent = errMsg; thinkingRow.b.appendChild(e); }
+  thinkingRow = null;
+}
+function effortValue() { return document.getElementById('effort-sel').value; }
+function statLine() { return document.getElementById('statsline'); }
+function fmtMs(ms) { if (!ms && ms !== 0) return '--'; return (ms / 1000).toFixed(1) + 's'; }
+function runningStats() {
+  const el = statLine(); if (!el) return;
+  const v = statsVals;
+  const ctx = v.ctx_left ? (v.ctx_used) + ' / ' + (v.ctx_used + v.ctx_left) : '--';
+  el.textContent = 'THINK ' + fmtMs(v.think_ms || 0) + ' \u00b7 SPEAK ' + fmtMs(v.respond_ms || 0) + ' \u00b7 ' + (v.tok_s ? v.tok_s.toFixed(1) : '--') + ' tok/s \u00b7 ' + (v.completion_tokens || 0) + ' tok \u00b7 ctx ' + ctx;
+}
+function startStats() {
+  statsVals = { think_ms: 0, respond_ms: 0, tok_s: 0, ctx_used: 0, ctx_left: 0, prompt_tokens: 0, completion_tokens: 0 };
+  if (statsTimer) clearInterval(statsTimer);
+  statsTimer = setInterval(runningStats, 250);
+}
+function stopStats() { if (statsTimer) { clearInterval(statsTimer); statsTimer = null; } runningStats(); }
+function clearStats() { if (statsTimer) { clearInterval(statsTimer); statsTimer = null; } const el = statLine(); if (el) el.textContent = ''; }
+function onStats(j) {
+  if (!j) return;
+  statsVals.think_ms = j.think_ms || 0;
+  statsVals.respond_ms = j.respond_ms || 0;
+  statsVals.tok_s = j.tok_s || 0;
+  statsVals.ctx_used = j.ctx_used || 0;
+  statsVals.ctx_left = j.ctx_left || (BONSAI_CTX - statsVals.ctx_used);
+  statsVals.prompt_tokens = j.prompt_tokens || 0;
+  statsVals.completion_tokens = j.completion_tokens || 0;
+  runningStats();
+}
+function onAsk(j) {
+  const old = document.getElementById('askov');
+  if (old) old.remove();
+  const ov = document.createElement('div'); ov.className = 'askov'; ov.id = 'askov';
+  const box = document.createElement('div'); box.className = 'askbox';
+  const h = document.createElement('h4'); h.textContent = 'BONSAI IS ASKING YOU';
+  const q = document.createElement('div'); q.className = 'aq'; q.textContent = j.question || 'What should I do?';
+  box.appendChild(h); box.appendChild(q);
+  const say = function (ans) {
+    ov.remove();
+    fetch('/api/answer', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: j.id, answer: ans }) }).catch(function () {});
+  };
+  if (j.options && j.options.length) {
+    const opts = document.createElement('div'); opts.className = 'opts';
+    (j.options).forEach(function (o) {
+      const b = document.createElement('button'); b.className = 'opt'; b.textContent = o;
+      b.onclick = function () { say(o); };
+      opts.appendChild(b);
+    });
+    box.appendChild(opts);
+  }
+  const free = document.createElement('div'); free.className = 'afree';
+  const inp = document.createElement('input'); inp.placeholder = 'Type your answer...';
+  const btn = document.createElement('button'); btn.textContent = 'SEND';
+  const submit = function () { const v = inp.value.trim(); if (v) say(v); };
+  btn.onclick = submit;
+  inp.onkeydown = function (e) { if (e.key === 'Enter') { e.preventDefault(); submit(); } };
+  free.appendChild(inp); free.appendChild(btn);
+  box.appendChild(free);
+  ov.appendChild(box);
+  document.body.appendChild(ov);
+  inp.focus();
+}
+function renderTodo(items) {
+  const el = document.getElementById('todopanel');
+  if (!el) return;
+  el.innerHTML = '';
+  if (!items || !items.length) return;
+  items.forEach(function (t) {
+    const d = document.createElement('span'); d.className = 'todochip';
+    const st = document.createElement('span'); st.className = 'st ' + (t.status === 'completed' ? 'ok' : (t.status === 'in_progress' ? 'run' : ''));
+    st.textContent = t.status === 'completed' ? '\u2713' : (t.status === 'in_progress' ? '\u25cf' : '\u25cb');
+    const tx = document.createElement('span'); tx.textContent = ' ' + (t.description || '');
+    d.appendChild(st); d.appendChild(tx); el.appendChild(d);
+  });
+}
+async function streamRun(messages, chat) {
+  chat = chat || cur;
+  abortCtrl = new AbortController();
+  startStats();
+  let resp;
+  try {
+    resp = await fetch('/api/stream', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ messages: messages, mode: chatMode, effort: effortValue() }), signal: abortCtrl.signal });
+  } catch (e) { stopStats(); throw new Error('stopped'); }
+  if (!resp.ok || !resp.body) {
+    stopStats();
+    const j = await resp.json().catch(function () { return {}; });
+    throw new Error(j.error || 'stream unavailable');
+  }
+  const reader = resp.body.getReader();
+  const dec = new TextDecoder();
+  let buf = '', reply = '', calls = [], reason = '';
+  let aborted = false, gotEnd = false, startedAt = Date.now();
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let idx;
+      while ((idx = buf.indexOf('\\n\\n')) >= 0) {
+        const block = buf.slice(0, idx); buf = buf.slice(idx + 2);
+        let ev = 'message', data = '';
+        block.split('\\n').forEach(function (line) {
+          if (line.startsWith('event:')) ev = line.slice(6).trim();
+          else if (line.startsWith('data:')) data += line.slice(5).trim();
+        });
+        if (!data) continue;
+        let j; try { j = JSON.parse(data); } catch (e) { continue; }
+        if (ev === 'start') { if (j.workdir) setWorkdirInUI(j.workdir); setState('idle'); }
+        else if (ev === 'delta') { reply += j.text; onDelta(j.text); statsVals.respond_ms = Date.now() - startedAt; }
+        else if (ev === 'reason') { reason += j.text; onReason(j.text); setState('thinking'); statsVals.think_ms = Date.now() - startedAt; }
+        else if (ev === 'tool') { calls.push(j.call); onTool(j.call); setState('tools'); }
+        else if (ev === 'stats') { onStats(j); }
+        else if (ev === 'ask') { onAsk(j); setState('thinking'); }
+        else if (ev === 'todo') { renderTodo(j.todos); }
+        else if (ev === 'error') { doneThinking('Error: ' + j.text); setState('idle'); stopStats(); throw new Error(j.text); }
+        else if (ev === 'done') { gotEnd = true; }
+      }
+    }
+  } catch (e) {
+    if (e.name === 'AbortError') aborted = true;
+    else throw e;
+  } finally {
+    abortCtrl = null;
+    stopStats();
+  }
+  if (aborted) throw new Error('stopped');
+  if (!gotEnd) throw new Error('The reply was cut off unexpectedly - please try again.');
+  if (thinkingRow && thinkingRow.body) thinkingRow.body.innerHTML = fmt(reply);
+  doneThinking();
+  setState('idle');
+  const last = chat.messages[chat.messages.length - 1];
+  const savedStats = statsVals && (statsVals.think_ms || statsVals.respond_ms || statsVals.completion_tokens)
+      ? JSON.parse(JSON.stringify(statsVals)) : null;
+  if (last && last.role === 'user') {
+    chat.messages.push({ role: 'assistant', content: reply, calls: calls, reason: reason.trim() ? reason : undefined, stats: savedStats });
+  } else if (last && last.role === 'assistant' && !last.calls && reply) {
+    last.content = reply;
+    last.reason = reason.trim() ? reason : undefined;
+    last.stats = savedStats;
+  }
+}
+function setState(s) {
+  const el = document.getElementById('state-label');
+  if (s === 'thinking' || s === 'tools') el.textContent = s === 'thinking' ? 'THINKING' : 'EXECUTING TOOLS';
+  else el.textContent = 'READY';
+}
+function buildUserMsg() {
+  const text = document.getElementById('user-input').value.trim();
+  if (!text && !pendingAtt.length) return null;
+  const parts = [];
+  if (text) parts.push({ type: 'text', text: text });
+  pendingAtt.forEach(function (a) {
+    if (a.type === 'img') parts.push({ type: 'image_url', image_url: { url: a.src } });
+    else parts.push({ type: 'file_att', name: a.name, text: a.text });
+  });
+  return parts;
+}
+function handleSubmit(e) {
+  e.preventDefault();
+  if (busy) { stopRun(); return; }
+  go();
+}
+function setSendUI() {
+  const b = document.getElementById('send');
+  if (busy) { b.innerHTML = STOP_SVG; b.className = 'send busy'; b.title = 'Stop'; }
+  else { b.innerHTML = SEND_SVG; b.className = 'send'; b.title = 'Send'; }
+}
+function setQueueUI() {
+  const q = document.getElementById('queue');
+  q.textContent = msgQueue.length ? '\u9201' + msgQueue.length : '\u9201';
+  q.title = msgQueue.length ? 'Queued: ' + msgQueue.length + ' message(s)' : 'Queue this message';
+}
+function stopRun() {
+  if (abortCtrl) { const a = abortCtrl; abortCtrl = null; try { a.abort(); } catch (e) {} }
+  if (thinkingRow) doneThinking('(stopped by user)');
+  setState('idle');
+}
+function drainQueue() {
+  if (busy) return;
+  if (!msgQueue.length) return;
+  const next = msgQueue.shift();
+  setQueueUI();
+  go(next.parts, next.chat);
+}
+async function go(forcedParts, chat) {
+  if (busy) return;
+  if (!cur) newChat();
+  if (chat && chat !== cur && chats.indexOf(chat) !== -1) { cur = chat; renderAll(); }
+  const parts = forcedParts || buildUserMsg();
+  if (!parts) return;
+  busy = true;
+  setSendUI();
+
+  const target = cur;
+  const textOf = parts.filter(function (p) { return p.type === 'text'; }).map(function (p) { return p.text; }).join(' ');
+  const hasFile = parts.some(function (p) { return p.type === 'file_att'; });
+  const hasImg = parts.some(function (p) { return p.type === 'image_url'; });
+  const label = [textOf, hasFile ? 'files' : '', hasImg ? 'images' : ''].filter(Boolean).join(' + ').slice(0, 34);
+  if (!started) {
+    started = true;
+    cur.title = label || 'Conversation';
+    cur.title = cur.title.replace(/&#\\d+;/g, '');
+    if (chats.indexOf(cur) === -1) chats.push(cur);
+  }
+
+  const raw = parts.length === 1 && parts[0].type === 'text' ? parts[0].text : parts;
+  target.messages.push({ role: 'user', content: raw });
+  addUser(parts);
+
+  addThinking();
+  setState('thinking');
+  pendingAtt = [];
+  renderPreview();
+  document.getElementById('user-input').value = '';
+  try { await streamRun(target.messages.slice(), target); }
+  catch (err) { doneThinking('Error: ' + err.message); setState('idle'); }
+  busy = false;
+  setSendUI();
+  document.getElementById('user-input').focus();
+  target.ts = Date.now();
+  save();
+  if (cur === target) renderConv(); else renderList();
+  drainQueue();
+}
+function renderPreview() {
+  const el = document.getElementById('preview'); el.innerHTML = '';
+  pendingAtt.forEach(function (a, i) {
+    if (a.type === 'img') {
+      const th = document.createElement('div'); th.className = 'thumb';
+      const img = document.createElement('img'); img.src = a.src;
+      const x = document.createElement('button'); x.className = 'x'; x.textContent = '\u00d7';
+      x.onclick = function () { pendingAtt.splice(i, 1); renderPreview(); };
+      th.appendChild(img); th.appendChild(x);
+      el.appendChild(th);
+    } else {
+      const pf = document.createElement('span'); pf.className = 'pf';
+      pf.textContent = '\\ud83d\\udcc4 ' + a.name + ' (' + Math.round(a.text.length / 1024) + 'k)';
+      const x = document.createElement('button'); x.className = 'x'; x.textContent = '\u00d7';
+      x.onclick = function () { pendingAtt.splice(i, 1); renderPreview(); };
+      pf.appendChild(x);
+      el.appendChild(pf);
+    }
+  });
+}
+function addFiles(files) {
+  const arr = Array.from(files || []);
+  if (!arr.length) return;
+  const slots = 4 - pendingAtt.length;
+  if (slots <= 0) { alert('Too many attachments (max 4) - remove one first'); return; }
+  arr.slice(0, slots).forEach(function (f) {
+    const isImg = (f.type || '').indexOf('image/') === 0;
+    if (isImg) {
+      if (f.size > 10 * 1024 * 1024) return;
+      const r = new FileReader();
+      r.onload = function () { pendingAtt.push({ type: 'img', src: r.result }); renderPreview(); };
+      r.readAsDataURL(f);
+    } else {
+      if (f.size > 200 * 1024) { pendingAtt.push({ type: 'file', name: f.name, text: '[file too large for direct read]' }); renderPreview(); return; }
+      const r = new FileReader();
+      r.onload = function () {
+        let text = String(r.result || '');
+        if (text.length > 60000) text = text.slice(0, 60000) + '\\n[... file truncated ...]';
+        pendingAtt.push({ type: 'file', name: f.name, text: text });
+        renderPreview();
+      };
+      r.readAsText(f, 'utf-8');
+    }
+  });
+}
+document.getElementById('attach').onclick = function () { document.getElementById('filein').click(); };
+document.getElementById('filein').onchange = function () { addFiles(this.files); this.value = ''; };
+(function () {
+  const wrap = document.getElementById('messages');
+  const ov = document.createElement('div');
+  ov.className = 'dropov';
+  ov.innerHTML = '<div class="bx">DROP FILES &#128206; TO ATTACH (images / text)</div>';
+  document.body.appendChild(ov);
+  let depth = 0;
+  window.addEventListener('dragover', function (e) { e.preventDefault(); });
+  window.addEventListener('drop', function (e) { e.preventDefault(); });
+  wrap.addEventListener('dragenter', function (e) { e.preventDefault(); depth++; ov.classList.add('on'); });
+  wrap.addEventListener('dragleave', function (e) { e.preventDefault(); depth = Math.max(0, depth - 1); if (!depth) ov.classList.remove('on'); });
+  wrap.addEventListener('drop', function (e) {
+    e.preventDefault(); e.stopPropagation();
+    depth = 0; ov.classList.remove('on');
+    const files = e.dataTransfer ? e.dataTransfer.files : null;
+    if (files && files.length) { addFiles(files); return; }
+    const txt = e.dataTransfer ? e.dataTransfer.getData('text/plain') : '';
+    if (txt) { const inp = document.getElementById('user-input'); if (inp) inp.value += txt; }
+  });
+})();
+document.getElementById('newchat').onclick = function () { newChat(); setState('idle'); };
+document.getElementById('queue').onclick = function () {
+  const parts = buildUserMsg();
+  if (!parts) return;
+  if (busy) {
+    msgQueue.push({ parts: parts, chat: cur });
+    pendingAtt = []; renderPreview();
+    document.getElementById('user-input').value = '';
+    setQueueUI();
+  } else {
+    document.getElementById('user-input').value = '';
+    pendingAtt = []; renderPreview();
+    go(parts);
+  }
+};
+document.getElementById('workbtn').onclick = async function () {
+  try {
+    const r = await fetch('/api/pick_workdir', { method: 'POST' });
+    const j = await r.json();
+    if (j && j.workdir) { setWorkdirInUI(j.workdir); return; }
+    if (j && j.cancelled) return;
+  } catch (e) {}
+  const v = prompt('Working folder (workspace for files):', workdir || '');
+  if (!v) return;
+  try {
+    const r = await fetch('/api/workdir', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ workdir: v }) });
+    const j = await r.json();
+    if (j.workdir) setWorkdirInUI(j.workdir);
+  } catch (e) { alert('Could not change folder: ' + e.message); }
+};
+function renderBlenderStatus(j) {
+  const el = document.getElementById('blstatus');
+  if (!el) return;
+  const map = {
+    ok: ['ok', 'BLENDER CONNECTED'],
+    bridge: ['mid', 'BLENDER ADDON OFF'],
+    down: ['off', 'BLENDER OFF'],
+    missing: ['off', 'BLENDER NO MCP']
+  };
+  const m = map[j.state || 'down'] || map.down;
+  el.className = 'blrow ' + m[0];
+  el.innerHTML = 'BLENDER <b></b> ' + m[1];
+  el.title = j.detail ? ('Blender MCP: ' + (j.state || 'down') + ' - ' + j.detail) : ('Blender MCP: ' + (j.state || 'down'));
+}
+function refreshBlender() {
+  fetch('/api/blender').then(function (r) { return r.json(); })
+    .then(renderBlenderStatus)
+    .catch(function () { renderBlenderStatus({ state: 'down' }); });
+}
+document.getElementById('ejectbtn').onclick = function () {
+  const btn = document.getElementById('ejectbtn');
+  if (btn.disabled) return;
+  btn.disabled = true;
+  btn.style.opacity = '0.5';
+  fetch('/api/eject', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
+    .then(function (r) { return r.json(); })
+    .then(function (j) {
+      btn.textContent = j.ok ? 'EJECTED' : 'FAILED';
+      setTimeout(function () { btn.textContent = 'EJECT'; btn.disabled = false; btn.style.opacity = '1'; }, 2500);
+    })
+    .catch(function () {
+      btn.textContent = 'FAILED';
+      setTimeout(function () { btn.textContent = 'EJECT'; btn.disabled = false; btn.style.opacity = '1'; }, 2500);
+    });
+};
+const inp = document.getElementById('user-input');
+inp.addEventListener('input', function () { this.style.height = 'auto'; this.style.height = Math.min(this.scrollHeight, 160) + 'px'; });
+inp.addEventListener('keydown', function (ev) { if (ev.key === 'Enter' && !ev.shiftKey) { ev.preventDefault(); handleSubmit(ev); } });
+const micBtn = document.getElementById('mic-btn');
+micBtn.onclick = function () {
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SR) {
+    addAsst('Voice recognition is not supported by this browser.', []);
+    return;
+  }
+  const rec = new SR();
+  rec.lang = 'ro-RO';
+  rec.interimResults = false;
+  rec.onstart = function () { micBtn.classList.add('err'); };
+  rec.onresult = function (ev) {
+    const tx = ev.results[0][0].transcript;
+    document.getElementById('user-input').value = tx;
+    micBtn.classList.remove('err');
+    handleSubmit(ev);
+  };
+  rec.onerror = function () { micBtn.classList.remove('err'); };
+  rec.onend = function () { micBtn.classList.remove('err'); };
+  rec.start();
+};
+init();
+</script>
+</body>
+</html>"""
+
 
 def _strip_full(record):
     if isinstance(record, dict):
@@ -3421,6 +5089,8 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?")[0]
         if path == "/":
             self._send(200, PAGE, "text/html; charset=utf-8")
+        elif path == "/chat":
+            self._send(200, PAGE_GPT, "text/html; charset=utf-8")
         elif path == "/api/workdir":
             self._send(200, json.dumps({"workdir": WORKDIR}))
         elif path == "/api/chats":
@@ -3520,12 +5190,19 @@ class Handler(BaseHTTPRequestHandler):
                 if not _ensure_bonsai():
                     sse(self, "error", {"text": "Bonsai 2 model server could not start."})
                     return
-                handle_chat(messages or [], stream=True, mode=mode,
-                            on_reason=lambda t: sse(self, "reason", {"text": t}),
-                            on_delta=lambda t: sse(self, "delta", {"text": t}),
-                            on_tool=lambda c: sse(self, "tool", {"call": _strip_full(c)}),
-                            on_stats=lambda s: sse(self, "stats", s),
-                            hooks={"on_ask": do_ask, "on_todo": do_todo})
+                try:
+                    handle_chat(messages or [], stream=True, mode=mode,
+                                on_reason=lambda t: sse(self, "reason", {"text": t}),
+                                on_delta=lambda t: sse(self, "delta", {"text": t}),
+                                on_tool=lambda c: sse(self, "tool", {"call": _strip_full(c)}),
+                                on_stats=lambda s: sse(self, "stats", s),
+                                hooks={"on_ask": do_ask, "on_todo": do_todo})
+                except Exception as exc:
+                    traceback.print_exc()
+                    try:
+                        sse(self, "error", {"text": "The model run failed: " + str(exc)})
+                    except Exception:
+                        pass
                 sse(self, "done", {"ok": True})
             else:
                 if not _ensure_bonsai():

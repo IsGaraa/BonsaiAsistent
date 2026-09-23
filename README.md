@@ -48,9 +48,20 @@ assistant app. **One click**:
 run.bat
 ```
 
+Fresh machine? Run **`AUTO-SETUP.cmd`** first - it installs every Python
+package (required + optional), verifies the model server and model files, and
+tells you what is missing. `OPTIONALS.cmd` installs the system-level extras
+(Docker Desktop + WSL2, Tesseract OCR, Blender MCP). See `requirements.md`
+for the full dependency list.
+
 It starts the assistant UI at **http://localhost:8081**, auto-starts the
 Bonsai 2 model server on port 8080 if it isn't running yet, and opens your
 browser. To stop the model server, double-click `stop.cmd`.
+
+A second, cleaner chat UI is available at **http://localhost:8081/chat**
+(GPT-style look, same backend and features: tools, thinking, streaming, plan/build
+mode, effort, attachments, mic, workdir, EJECT and Blender status). The two UIs
+keep separate chat histories (the GPT UI stores its history in the browser).
 
 Once the UI is open, try a few commands:
 
@@ -76,6 +87,8 @@ in order).
 | GPU with ~7-8 GB VRAM | fast inference (tested on an RTX 4070, ~48 tok/s); CPU-only works, just slower | recommended |
 | `prism-llama` `llama-server.exe` | the PrismML llama.cpp fork with ternary kernels - stock llama.cpp **can't** run Bonsai 2 files | required |
 | `Pillow` / `pyautogui` / `pyperclip` | power `take_screenshot`, `control_input` and `clipboard` | recommended (tools report a clear error if missing) |
+| `pywin32` / `psutil` | power the `window_list` / `window_action` tools | recommended (installed here; tools report a clear error if missing) |
+| `requests` / `websocket-client` | power the `api_call` / `ws_test` tools | recommended (installed here) |
 | **Blender + MCP addon** | for the Blender tools (§4) | optional; `mcp-for-blender` Python package + the bundled addon enabled in Blender (Edit > Preferences > Add-ons > "MCP for Blender") |
 | Docker / Hyper3D / sketchfab accounts | optional extra Blender *content* tools | not bundled here - only the core Blender tools ship |
 
@@ -93,6 +106,10 @@ in order).
 | **Shell + sandbox** | `run_command` executes real Windows commands (configurable timeout, up to 600s); `run_code` runs short Python/Node snippets in a sandboxed, network-less environment |
 | **Asks you questions** | `ask_user` pauses and asks you a question (with optional clickable options) exactly like a human would - just like opencode |
 | **Todo list** | `todo_write` shows a live, visible checklist on the left panel as it works through longer tasks |
+| **Window management** | `window_list` lists every open window (title, process, PID) and `window_action` brings one to the front, maximizes, minimizes or restores it - so Bonsai can switch apps before acting |
+| **Docker / containers** | `docker_ps`, `docker_images`, `docker_start`, `docker_stop`, `docker_restart`, `docker_logs` and `docker_exec` drive the Docker CLI (works with Docker Desktop) |
+| **API client** | `api_call` speaks REST/GraphQL (any HTTP method, JSON or raw bodies, custom headers) and `ws_test` connects to WebSocket endpoints, sends and collects replies |
+| **Scheduled tasks** | `schedule_task` (once / every N seconds / 5-field cron), `list_schedules`, `unschedule_task` - run shell commands in the background while the PC is on |
 | **Thinking effort** | **THINK: OFF / LOW / MED / HIGH** selector in the composer controls how deep Bonsai reasons (maps to `enable_thinking` / `reasoning_effort`) |
 | **STOP / QUEUE** | abort a reply mid-stream, or queue a follow-up to be answered immediately after |
 | **Live token stats** | real-time think vs. speak time, tokens/second and context usage under the input (see §6) |
@@ -104,11 +121,14 @@ in order).
 
 ## 4. Tool execution (how it works)
 
-Bonsai is a **tool-calling agent**. Each reply runs up to 5 model rounds
-(`MAX_TOOL_ROUNDS`): the model decides whether it needs a tool, the tool runs,
-its result is folded back into the conversation, and the model continues. Every
+Bonsai is a **tool-calling agent**. Tool calls are effectively **unlimited** -
+the model calls tools for as long as it needs and the conversation context is
+the natural stop (no artificial per-reply cap). Each tool runs, its result is
+folded back into the conversation, and the model continues. Every
 call shows up live in the chat as a chip (green = ok, red = error) with a
-full log.
+full log; repeated back-to-back calls of the same tool collapse into one chip
+(e.g. `⚙️ web_search ×8`) so the console stays clean. A closing answer is
+always produced at the end.
 
 | Tool | What it does | Notes |
 |---|---|---|
@@ -121,6 +141,11 @@ full log.
 | `archive` | Creates / extracts zip, tar, tar.gz, tgz archives | unpack or pack inside the workspace |
 | `ask_user` | Asks you a question and **waits for your answer** (options or free text) | pauses its work like opencode's question skill |
 | `todo_write` | Replaces the visible TODO checklist (pending / in_progress / completed) | shown live on the left panel |
+| `window_list` / `window_action` | Lists open windows (title, process, PID); brings one to front / maximizes / minimizes / restores | needs `pywin32` + `psutil` (both installed here) |
+| `docker_ps` / `docker_images` / `docker_start` / `docker_stop` / `docker_restart` / `docker_logs` / `docker_exec` | Manage Docker containers and images | shells out to the `docker` CLI (Docker Desktop); clean error if not installed |
+| `api_call` | Any HTTP method to REST or GraphQL APIs, JSON or raw body, custom headers | needs `requests`; returns status, headers, elapsed ms and body |
+| `ws_test` | Connects to a `ws://`/`wss://` endpoint, optionally sends a message, collects replies | needs `websocket-client` |
+| `schedule_task` / `list_schedules` / `unschedule_task` | Run a shell command later: once, every N seconds, or by 5-field cron | in-process scheduler thread; survives only while the server runs |
 | `web_search` / `web_fetch` | Look up current information online when it's not sure | documents itself before answering |
 | `run_command` | Runs a real Windows command | timeout default 45s, configurable up to 600s, output capped to ~8 KB |
 | `run_code` | Runs short Python/Node snippets | sandboxed, **no network**, 30s timeout, ~8 KB output cap |
@@ -261,8 +286,13 @@ Useful links:
 bonsai_web.py          # the whole assistant (single file: backend + UI)
 run.bat                # the ONE launcher: starts UI + model server
 stop.cmd               # stops the model server
+AUTO-SETUP.cmd         # one-shot installer: Python deps + required-file check
+OPTIONALS.cmd          # system-level optionals: Docker/WSL2, Tesseract, Blender MCP
+requirements.md        # full dependency list (required vs optional)
+requirements.txt       # pip installs for the extended tools
 tools/                 # optional helper scripts (screenshot, clipboard, scraper, OCR) - the same capabilities are also built into bonsai_web.py
-tools.json             # tool-call spec reference
+tools.json             # tool-call spec reference (auto-generated from code)
+gpt_ui.html            # standalone copy of the /chat UI (extracted for reference)
 instructions.txt       # quick-start guide (English)
 *.gguf                 # the model weights (local only, not in git)
 README.md              # this file

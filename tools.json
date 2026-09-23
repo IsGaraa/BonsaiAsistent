@@ -3,7 +3,7 @@
     "type": "function",
     "function": {
       "name": "launch_or_open",
-      "description": "Open a program or a website on this PC by name. Examples: steam, discord, notepad, spotify, epic games, youtube, github, google, wikipedia. You may name several (e.g. 'steam and youtube'). The tool decides whether each name is an app or a website.",
+      "description": "Open a program or a website on this PC by name. Examples: steam, discord, notepad, spotify, epic games, youtube, github, google, wikipedia. You may name several, e.g. 'steam and youtube'. The tool decides whether each name is an app or a website.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -12,7 +12,159 @@
             "description": "Name of the program or website to open."
           }
         },
-        "required": ["name"]
+        "required": [
+          "name"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "list_dir",
+      "description": "List files and folders inside the workspace folder (paths are relative to it). Use before reading files so you know what exists.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Relative path inside the workspace, e.g. 'src', '' (default = workspace root)."
+          }
+        },
+        "required": []
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "read_file",
+      "description": "Read a text file inside the workspace folder (relative path). Returns its full content.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Relative path of the file, e.g. 'notes.txt'."
+          }
+        },
+        "required": [
+          "path"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "search_files",
+      "description": "Regex search across files in the workspace folder and returns file + line matches.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "pattern": {
+            "type": "string",
+            "description": "Regular expression, e.g. 'def main'."
+          },
+          "path": {
+            "type": "string",
+            "description": "Optional relative folder to search inside (default = whole workspace)."
+          }
+        },
+        "required": [
+          "pattern"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "write_file",
+      "description": "Create or overwrite a text file inside the workspace folder (relative path). Creates parent folders if missing. Use only when the user asks you to write or create a file.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Relative path, e.g. 'tasklist.txt'."
+          },
+          "content": {
+            "type": "string",
+            "description": "Full text content to write."
+          }
+        },
+        "required": [
+          "path",
+          "content"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "edit_file",
+      "description": "Replace text inside an existing file in the workspace folder (relative path). Replaces ALL occurrences of old_text with new_text.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Relative path of the file."
+          },
+          "old_text": {
+            "type": "string",
+            "description": "Exact text to find."
+          },
+          "new_text": {
+            "type": "string",
+            "description": "Replacement text."
+          }
+        },
+        "required": [
+          "path",
+          "old_text",
+          "new_text"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "web_search",
+      "description": "Search the internet when you need up-to-date information, facts, news, documentation or anything you are not sure about. Returns a short list of titles, links and snippets. Then read details with web_fetch on the most relevant link.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "Search query, e.g. 'latest node.js LTS version'."
+          }
+        },
+        "required": [
+          "query"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "web_fetch",
+      "description": "Fetch and read the full text of a webpage by URL. Use after web_search to read an article, docs page or answer in detail.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "url": {
+            "type": "string",
+            "description": "Full URL, e.g. 'https://en.wikipedia.org/wiki/Rocket'."
+          }
+        },
+        "required": [
+          "url"
+        ]
       }
     }
   },
@@ -20,7 +172,7 @@
     "type": "function",
     "function": {
       "name": "run_command",
-      "description": "Run a shell command on this Windows PC and return its output. Use it to build, test, install, debug or check system info: python, pip, git, npm, node, dir, tasklist, systeminfo, ping, etc. Runs in the workspace folder by default. Max 45 seconds; output truncated to ~8 KB. Disabled in PLAN mode.",
+      "description": "Run a shell command on this Windows PC and return its output. Use it to build, test, install, debug or check system info: python, pip, git, npm, node, dir, tasklist, systeminfo, ping, etc. Runs in the workspace folder by default. Max 45 seconds by default - raise 'timeout' for long-running commands (up to 600s). Output truncated to ~8 KB. In PLAN mode this tool is disabled.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -30,10 +182,16 @@
           },
           "workdir": {
             "type": "string",
-            "description": "Optional folder to run in: absolute path or relative to the workspace."
+            "description": "Optional folder to run in: absolute path or relative to the workspace. Default = workspace root."
+          },
+          "timeout": {
+            "type": "integer",
+            "description": "Optional timeout in seconds (1-600). Use a higher value for long downloads, builds or tests. Default 45."
           }
         },
-        "required": ["command"]
+        "required": [
+          "command"
+        ]
       }
     }
   },
@@ -54,55 +212,24 @@
             "description": "The source code to run."
           }
         },
-        "required": ["language", "code"]
+        "required": [
+          "language",
+          "code"
+        ]
       }
     }
   },
   {
     "type": "function",
     "function": {
-      "name": "web_search",
-      "description": "Search the internet when you need up-to-date information, facts, news, documentation or anything you are not sure about.",
+      "name": "take_screenshot",
+      "description": "Capture the screen (or a region of it) and SEE it - you have vision, so the image is fed directly to your eyes. Use this whenever you need to inspect what is displayed on the PC: error dialogs, app windows, web pages, terminal output, a GUI, or to check the result of your own mouse/keyboard actions. Also saves the PNG inside the workspace so the user has a copy.",
       "parameters": {
         "type": "object",
         "properties": {
-          "query": {
-            "type": "string",
-            "description": "Search query."
-          }
-        },
-        "required": ["query"]
-      }
-    }
-  },
-  {
-    "type": "function",
-    "function": {
-      "name": "web_fetch",
-      "description": "Fetch and read the full text of a webpage by URL (use after web_search).",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "url": {
-            "type": "string",
-            "description": "Full URL."
-          }
-        },
-        "required": ["url"]
-      }
-    }
-  },
-  {
-    "type": "function",
-    "function": {
-      "name": "list_dir",
-      "description": "List files and folders inside the workspace folder (paths are relative to it).",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "path": {
-            "type": "string",
-            "description": "Relative path inside the workspace, e.g. '' (root)."
+          "region": {
+            "type": "object",
+            "description": "Optional region to capture: {x, y, width, height} in screen pixels. Omit for the full screen (all monitors)."
           }
         },
         "required": []
@@ -112,84 +239,579 @@
   {
     "type": "function",
     "function": {
-      "name": "read_file",
-      "description": "Read a text file inside the workspace folder (relative path).",
+      "name": "control_input",
+      "description": "Control the mouse and keyboard like a human: move the cursor, click, double-click, right-click, drag, scroll, type text or send key combinations. Pair it with take_screenshot to see the result. Coordinates are screen pixels (0,0 = top-left of the primary monitor).",
       "parameters": {
         "type": "object",
         "properties": {
-          "path": {
+          "action": {
             "type": "string",
-            "description": "Relative path of the file."
+            "enum": [
+              "move",
+              "click",
+              "double_click",
+              "right_click",
+              "drag",
+              "scroll",
+              "type",
+              "keys",
+              "hotkey"
+            ],
+            "description": "What to do. 'move' only moves the cursor. 'click'/'double_click'/'right_click' move then click. 'drag' moves then drags the mouse button. 'scroll' scrolls. 'type' writes text. 'keys' presses each key. 'hotkey' presses keys together."
+          },
+          "x": {
+            "type": "number",
+            "description": "Cursor X (screen pixel). Not needed for 'type'/'keys'/'hotkey'."
+          },
+          "y": {
+            "type": "number",
+            "description": "Cursor Y (screen pixel). Not needed for 'type'/'keys'/'hotkey'."
+          },
+          "to_x": {
+            "type": "number",
+            "description": "For 'drag': end X position."
+          },
+          "to_y": {
+            "type": "number",
+            "description": "For 'drag': end Y position."
+          },
+          "clicks": {
+            "type": "integer",
+            "description": "For 'click': number of clicks."
+          },
+          "button": {
+            "type": "string",
+            "enum": [
+              "left",
+              "right",
+              "middle"
+            ],
+            "description": "Mouse button for 'click'/'drag'."
+          },
+          "amount": {
+            "type": "integer",
+            "description": "For 'scroll': number of scroll steps (negative = down)."
+          },
+          "text": {
+            "type": "string",
+            "description": "For 'type': the text to type."
+          },
+          "keys": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Key names, e.g. ['enter'], ['ctrl','s']. Use for 'keys'/'hotkey'."
           }
         },
-        "required": ["path"]
+        "required": [
+          "action"
+        ]
       }
     }
   },
   {
     "type": "function",
     "function": {
-      "name": "search_files",
-      "description": "Regex search across files in the workspace folder; returns file + line matches.",
+      "name": "clipboard",
+      "description": "Read or write the system clipboard. Use 'get' to read what the user copied, and 'set' to put text on the clipboard so the user can paste it anywhere.",
       "parameters": {
         "type": "object",
         "properties": {
-          "pattern": {
+          "action": {
             "type": "string",
-            "description": "Regular expression."
+            "enum": [
+              "get",
+              "set"
+            ],
+            "description": "'get' reads the current clipboard text; 'set' writes 'text' to the clipboard."
           },
-          "path": {
+          "text": {
             "type": "string",
-            "description": "Optional relative folder to search inside."
+            "description": "Required for 'set': the text to copy."
           }
         },
-        "required": ["pattern"]
+        "required": [
+          "action"
+        ]
       }
     }
   },
   {
     "type": "function",
     "function": {
-      "name": "write_file",
-      "description": "Create or overwrite a text file inside the workspace folder (relative path). Use only when the user asks to write or create a file.",
+      "name": "download_file",
+      "description": "Download a file from a web URL and save it inside the workspace folder. Returns the saved path, the byte size and (for text files) the beginning of the content so you can see what you got.",
       "parameters": {
         "type": "object",
         "properties": {
+          "url": {
+            "type": "string",
+            "description": "Full http(s) URL to download."
+          },
           "path": {
             "type": "string",
-            "description": "Relative path."
-          },
-          "content": {
-            "type": "string",
-            "description": "Full text content to write."
+            "description": "Relative destination inside the workspace, e.g. 'Downloads/installer.exe'. Defaults to the file name from the URL."
           }
         },
-        "required": ["path", "content"]
+        "required": [
+          "url"
+        ]
       }
     }
   },
   {
     "type": "function",
     "function": {
-      "name": "edit_file",
-      "description": "Replace text inside an existing workspace file (replaces ALL occurrences of old_text with new_text).",
+      "name": "archive",
+      "description": "Create or extract archives (zip / tar / tar.gz / tgz) inside the workspace folder. Use 'extract' to unpack a file into a folder, or 'create' to pack files/folders into a new zip.",
       "parameters": {
         "type": "object",
         "properties": {
-          "path": {
+          "action": {
             "type": "string",
-            "description": "Relative path of the file."
+            "enum": [
+              "extract",
+              "create"
+            ],
+            "description": "'extract' unpacks 'archive' into 'dest'. 'create' packs 'files' into a new archive."
           },
-          "old_text": {
+          "archive": {
             "type": "string",
-            "description": "Exact text to find."
+            "description": "Relative path of the archive (for extract: the file to unpack; for create: the file to produce)."
           },
-          "new_text": {
+          "dest": {
             "type": "string",
-            "description": "Replacement text."
+            "description": "For 'extract': relative folder to unpack into. For 'create': optional destination file."
+          },
+          "files": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "For 'create': relative files/folders to include."
           }
         },
-        "required": ["path", "old_text", "new_text"]
+        "required": [
+          "action",
+          "archive"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "ask_user",
+      "description": "Ask the user a question and wait for their answer, like a human would. Use it when you need a choice, extra information, a password, or confirmation before doing something important. The user can pick one of the given options or type a free answer. The rest of your work is paused until they reply.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "question": {
+            "type": "string",
+            "description": "The question to ask, phrased clearly."
+          },
+          "options": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Optional short answer options the user can pick with one click."
+          }
+        },
+        "required": [
+          "question"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "todo_write",
+      "description": "Replace the visible TODO list with the given items and statuses. Use it at the start of a longer task to show the user the plan, and update it as you make progress. Status can be 'pending', 'in_progress' or 'completed'.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "todos": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "description": {
+                  "type": "string"
+                },
+                "status": {
+                  "type": "string",
+                  "enum": [
+                    "pending",
+                    "in_progress",
+                    "completed"
+                  ]
+                }
+              },
+              "required": [
+                "description"
+              ]
+            },
+            "description": "The full new list of todo items."
+          }
+        },
+        "required": [
+          "todos"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "window_list",
+      "description": "List the open desktop windows: window title, process name and PID for every visible top-level window. Use this first to discover what is running, then bring one to the front with window_action.",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "window_action",
+      "description": "Control an existing desktop window: bring a window to the front and give it keyboard focus, maximize it, minimize it or restore it. Find a matching window first with window_list. The window can be matched by a substring of its title ('title') or by its process name/PID ('process'/'pid'). 'focus' makes the window visible, restores it if minimized and steals focus so that take_screenshot/control_input act on it.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "action": {
+            "type": "string",
+            "enum": [
+              "focus",
+              "maximize",
+              "minimize",
+              "restore"
+            ],
+            "description": "What to do with the window. Default: focus."
+          },
+          "title": {
+            "type": "string",
+            "description": "Substring of the window title to match."
+          },
+          "process": {
+            "type": "string",
+            "description": "Process name (e.g. 'notepad.exe') to match."
+          },
+          "pid": {
+            "type": "integer",
+            "description": "Exact process ID to match."
+          }
+        },
+        "required": [
+          "action"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "docker_ps",
+      "description": "List Docker containers. Include stopped ones with 'all'. Returns id, name, image and status per container. Use docker_logs/docker_exec/docker_start/docker_stop with the returned names.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "all": {
+            "type": "boolean",
+            "description": "Include stopped containers."
+          }
+        },
+        "required": []
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "docker_images",
+      "description": "List Docker images available locally (repository, tag, id, size).",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "filter": {
+            "type": "string",
+            "description": "Optional name filter (repository substring)."
+          }
+        },
+        "required": []
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "docker_start",
+      "description": "Start a Docker container by name or id.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Container name or id."
+          }
+        },
+        "required": [
+          "name"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "docker_stop",
+      "description": "Stop a running Docker container by name or id.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Container name or id."
+          },
+          "timeout": {
+            "type": "integer",
+            "description": "Seconds to wait before killing (default 10)."
+          }
+        },
+        "required": [
+          "name"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "docker_restart",
+      "description": "Restart a Docker container by name or id.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Container name or id."
+          }
+        },
+        "required": [
+          "name"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "docker_logs",
+      "description": "Read the logs of a Docker container by name or id.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Container name or id."
+          },
+          "tail": {
+            "type": "integer",
+            "description": "Number of lines from the end (default 100)."
+          }
+        },
+        "required": [
+          "name"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "docker_exec",
+      "description": "Run a command inside a running Docker container (docker exec with sh -c). Returns the command output.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Container name or id."
+          },
+          "command": {
+            "type": "string",
+            "description": "The shell command to run inside the container, e.g. 'ls -la /app'."
+          }
+        },
+        "required": [
+          "name",
+          "command"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "api_call",
+      "description": "Make an HTTP request to any REST or GraphQL API and read the response: status code, headers and body. Works for GET/POST/PUT/PATCH/DELETE/HEAD/OPTIONS. For GraphQL send a JSON body like {\"query\": \"...\"} - the response JSON is returned automatically. Handles JSON bodies from dict input, or raw text bodies.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "method": {
+            "type": "string",
+            "enum": [
+              "GET",
+              "POST",
+              "PUT",
+              "PATCH",
+              "DELETE",
+              "HEAD",
+              "OPTIONS"
+            ],
+            "description": "HTTP method. Default GET."
+          },
+          "url": {
+            "type": "string",
+            "description": "Full URL, e.g. https://api.example.com/v1/users"
+          },
+          "headers": {
+            "type": "object",
+            "description": "Extra request headers, e.g. {\"Authorization\": \"Bearer ...\"}"
+          },
+          "body": {
+            "description": "Request body. Use a dict/list for JSON or a string for raw text."
+          },
+          "content_type": {
+            "type": "string",
+            "description": "Content-Type header for string bodies (default 'application/json')."
+          },
+          "timeout": {
+            "type": "integer",
+            "description": "Request timeout in seconds (default 20, max 120)."
+          },
+          "insecure": {
+            "type": "boolean",
+            "description": "Skip TLS certificate verification (default false)."
+          },
+          "follow_redirects": {
+            "type": "boolean",
+            "description": "Follow HTTP redirects (default true)."
+          }
+        },
+        "required": [
+          "url"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "ws_test",
+      "description": "Connect to a WebSocket server, optionally send a message, and collect the replies that arrive before the timeout. Useful to test APIs, push feeds, or debug local sockets.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "url": {
+            "type": "string",
+            "description": "WebSocket URL, e.g. ws://127.0.0.1:8000/ws or wss://..."
+          },
+          "send": {
+            "description": "Optional message to send after connecting. Dicts/lists are JSON-encoded."
+          },
+          "timeout": {
+            "type": "integer",
+            "description": "How long to listen for replies, seconds (default 5, max 60)."
+          }
+        },
+        "required": [
+          "url"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "schedule_task",
+      "description": "Schedule a shell command to run later (and while this PC is on): once after a delay, on an interval, or on a cron schedule. Intervals are 'every N seconds'. Cron is a 5-field expression: minute hour day-of-month month day-of-week (0 or 7 = Sunday). Examples: '15 3 * * *' daily at 03:15; '*/5 * * * *' every 5 minutes; '0 9 * * 1-5' weekdays at 09:00. The command runs via the system shell (cmd). Check runs with list_schedules; cancel with unschedule_task.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Unique name for this task."
+          },
+          "command": {
+            "type": "string",
+            "description": "The shell command to run."
+          },
+          "when": {
+            "type": "string",
+            "enum": [
+              "once",
+              "interval",
+              "cron"
+            ],
+            "description": "Schedule kind. Default 'once'."
+          },
+          "delay_seconds": {
+            "type": "integer",
+            "description": "For 'once': seconds to wait before running (default 1)."
+          },
+          "interval_seconds": {
+            "type": "integer",
+            "description": "For 'interval': seconds between runs (min 5)."
+          },
+          "cron": {
+            "type": "string",
+            "description": "For 'cron': 5-field cron expression."
+          },
+          "timeout": {
+            "type": "integer",
+            "description": "Max seconds the command may run (default 180, max 600)."
+          }
+        },
+        "required": [
+          "name",
+          "command"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "list_schedules",
+      "description": "List all scheduled tasks: name, schedule kind, next run time, last run, how many times it ran and the tail of its last output.",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "unschedule_task",
+      "description": "Cancel a scheduled task by name. Already-started runs are not interrupted.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Task name to cancel."
+          }
+        },
+        "required": [
+          "name"
+        ]
       }
     }
   }

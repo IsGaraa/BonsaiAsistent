@@ -1,0 +1,24 @@
+# BONSAI - recommended Python packages.
+# EVERY line below is optional: the app runs on the standard library alone and
+# each tool reports a clear error if its package is missing. This file installs
+# them all so every tool family is live (see requirements.md for the mapping).
+#
+# Screen capture / input / clipboard  -> take_screenshot, control_input, clipboard
+pyautogui
+pillow
+pyperclip
+
+# Window management                 -> window_list, window_action
+pywin32
+psutil
+
+# API client + WebSocket            -> api_call, ws_test
+requests
+websocket-client
+
+# Helper scripts                     -> tools/scraper.py, tools/ocr.py
+beautifulsoup4
+pytesseract
+
+# Blender control (optional addon)   -> Blender MCP tools
+mcp-for-blender

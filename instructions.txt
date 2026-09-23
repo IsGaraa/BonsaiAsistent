@@ -36,8 +36,15 @@ DETAILS
      the viewport to show you - a status light in the header shows the
      connection (CONNECTED / ADDON OFF / OFF).
    - I can ASK YOU a question with options and wait for your answer (ask_user)
-     exactly like a human, and I keep a live TODO checklist on the left panel
-     (todo_write).
+      exactly like a human, and I keep a live TODO checklist on the left panel
+      (todo_write).
+    - NEW TOOLS: I can list your open windows and switch / bring them to the
+      front (window_list, window_action), manage Docker containers
+      (docker_ps / docker_images / docker_start / docker_stop / docker_restart /
+      docker_logs / docker_exec), call REST or GraphQL APIs and WebSocket
+      endpoints (api_call, ws_test), and schedule shell commands to run later -
+      once, every N seconds or on a cron schedule (schedule_task,
+      list_schedules, unschedule_task).
    - The model stays loaded (resident) the whole time the app runs - there is
      no idle timeout that unloads it, so replies never stall after a pause.
      To free the memory yourself click the EJECT button in the header (it
