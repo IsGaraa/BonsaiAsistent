@@ -2292,24 +2292,19 @@ PAGE = """<!doctype html>
 
   .arc-container.thinking { --ring: rgba(255,215,0,.55); --core1: #ffd700; --core2: rgba(255,136,0,.8); --glow1: #ffd700; --glow2: #ff8800; }
   .arc-container.tools { --ring: rgba(57,255,20,.55); --core1: #39ff14; --core2: rgba(0,255,136,.8); --glow1: #39ff14; --glow2: #00e676; }
-  .arc-container.speaking { --ring: rgba(0,240,255,.55); --core1: #00f0ff; --core2: rgba(0,114,255,.8); --glow1: #00f0ff; --glow2: #0072ff; }
 
   .arc-container.thinking .arc-core { animation: pulseFast .3s infinite alternate; }
   .arc-container.tools .arc-core { animation: pulseGreen .4s infinite alternate; }
-  .arc-container.speaking .arc-core { animation: pulseGlow .6s infinite alternate; }
   .arc-container.thinking .arc-ring-outer { animation-duration: 6s; }
   .arc-container.tools .arc-ring-outer { animation-duration: 4s; }
-  .arc-container.speaking .arc-ring-outer { animation-duration: 9s; }
   .arc-container.thinking .arc-ring-inner { animation-duration: 5s; }
   .arc-container.tools .arc-ring-inner { animation-duration: 3.5s; }
-  @keyframes pulseGlow { 0% { transform: scale(.9); box-shadow: 0 0 25px var(--glow1); } 100% { transform: scale(1.15); box-shadow: 0 0 55px var(--glow1), 0 0 85px var(--glow2); } }
   @keyframes pulseFast { 0% { transform: scale(.95); opacity: .8; } 100% { transform: scale(1.1); opacity: 1; } }
   @keyframes pulseGreen { 0% { transform: scale(.92); box-shadow: 0 0 20px var(--glow1); } 100% { transform: scale(1.18); box-shadow: 0 0 55px var(--glow1), 0 0 85px var(--glow2); } }
   #waveform { display: flex; align-items: center; justify-content: center; gap: 6px; height: 40px; margin: 16px 0; }
   .wave-bar { width: 3px; height: 14px; border-radius: 2px; background-color: #00f0ff; transition: background-color .3s; }
   body.thinking .wave-bar { background-color: #ffd700; }
   body.tools .wave-bar { background-color: #39ff14; }
-  body.speaking .wave-bar { background-color: #00f0ff; }
   .active-wave .wave-bar { animation: waveAnim .8s infinite ease-in-out alternate; }
   .wave-bar:nth-child(2) { animation-delay: .1s; } .wave-bar:nth-child(3) { animation-delay: .2s; }
   .wave-bar:nth-child(4) { animation-delay: .3s; } .wave-bar:nth-child(5) { animation-delay: .4s; }
@@ -2319,13 +2314,6 @@ PAGE = """<!doctype html>
   @keyframes waveAnim { 0% { height: 6px; } 100% { height: 35px; } }
   #bonsai-state-label { font-size: 13px; letter-spacing: 3px; color: #22d3ee; text-align: center; font-family: Consolas, monospace; text-transform: uppercase; margin: 0; }
   .sub { font-size: 11px; color: #0e7490; margin: 6px 0 0; text-align: center; font-family: Consolas, monospace; }
-  #qty { display: flex; flex-direction: column; gap: 8px; margin-top: 18px; width: 100%; }
-  .qbtn {
-    background: rgba(0,240,255,.05); border: 1px solid rgba(0,240,255,.25); color: #67e8f9;
-    border-radius: 8px; padding: 9px 12px; cursor: pointer; font: inherit; font-size: 13px; text-align: left;
-    transition: all .2s;
-  }
-  .qbtn:hover { background: rgba(0,240,255,.2); border-color: #00f0ff; box-shadow: 0 0 12px rgba(0,240,255,.4); }
 
   /* meters for metrics */
   .meterrow { padding: 10px 12px; }
@@ -2364,13 +2352,6 @@ PAGE = """<!doctype html>
   .imggrid img { width: 90px; height: 90px; object-fit: cover; border-radius: 10px; border: 1px solid #164e63; }
   .filechip { display: inline-flex; align-items: center; gap: 6px; background: rgba(0,240,255,.06); border: 1px solid rgba(0,240,255,.35); color: #67e8f9; border-radius: 8px; padding: 5px 10px; margin: 2px 6px 2px 0; font-size: 13px; font-family: Consolas, monospace; }
   .filechip .fname { font-weight: 700; }
-
-  .sugg { display: flex; gap: 8px; padding: 8px 0; overflow-x: auto; }
-  .sg {
-    background: rgba(0,240,255,.04); border: 1px solid rgba(0,240,255,.22); color: #67e8f9;
-    border-radius: 999px; padding: 6px 14px; white-space: nowrap; cursor: pointer; font-size: 13px; font-family: Consolas, monospace; transition: all .2s;
-  }
-  .sg:hover { background: rgba(0,240,255,.18); border-color: #00f0ff; }
 
   .composer { display: flex; align-items: flex-end; gap: 8px; padding: 8px 0 2px; }
   .field {
@@ -2441,15 +2422,6 @@ PAGE = """<!doctype html>
   .blstatus.mid { color: #fbbf24; }
   .blstatus.off { color: #f87171; }
 
-  #voice-sel {
-    background: rgba(0,240,255,.05); border: 1px solid rgba(0,240,255,.3); color: #67e8f9;
-    border-radius: 8px; padding: 7px 8px; font-size: 11px; font-family: Consolas, monospace; cursor: pointer;
-    max-width: 200px; outline: none;
-  }
-  #voice-sel option { background: #031018; color: #99f6e4; }
-  #voice-sel:hover { border-color: #00f0ff; }
-  #voice-toggle-btn.onv { background: rgba(0,240,255,.25); border-color: #00f0ff; box-shadow: 0 0 12px rgba(0,240,255,.5); }
-
   footer { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px; padding: 6px 14px; border-radius: 10px; font-size: 13px; color: #0e7490; font-family: Consolas, monospace; letter-spacing: 1px; }
   footer b { color: #22d3ee; }
   .fine { text-align: center; color: #0e7490; font-size: 12px; margin-top: 6px; font-family: Consolas, monospace; }
@@ -2508,7 +2480,7 @@ PAGE = """<!doctype html>
       <div class="chip-ic">&#9679;</div>
       <div>
         <h1>BONSAI</h1>
-        <p>BONSAI 2 &middot; PC ASSISTANT &middot; 100% LOCAL</p>
+        <p>BONSAI 2 &middot; PC ASSISTANT</p>
       </div>
     </div>
     <div class="hstatus">
@@ -2521,11 +2493,6 @@ PAGE = """<!doctype html>
         <div class="t" id="clock-time">00:00:00</div>
         <div class="d" id="clock-date"></div>
       </div>
-      <button class="hbtn" id="voice-toggle-btn" title="Talk back (voice replies)">&#128483;&#65039;</button>
-      <button class="hbtn" id="audio-toggle-btn" title="Sound effects">&#128266;</button>
-      <select id="voice-sel" title="TTS voice (Natural = most realistic)">
-        <option value="">Voice: Auto</option>
-      </select>
       <button class="modebtn" id="modebtn" title="Switch Plan / Build mode">BUILD</button>
       <button class="wbtn" id="workbtn" title="Click to choose the workspace folder">\\WORKSPACE</button>
       <button class="hbtn" id="ejectbtn" title="Unload the model from RAM/VRAM now (it loads back on the next message)">EJECT</button>
@@ -2540,7 +2507,6 @@ PAGE = """<!doctype html>
       <div id="chatlist"></div>
       <div class="ptitle" style="margin-top:8px; border-top:1px solid #164e63; padding-top:8px;"><span>TODO</span><span id="todocount"></span></div>
       <div id="todopanel"></div>
-      <div class="fine" style="padding:8px; border-top:1px solid #164e63;">data stays on your PC only</div>
     </section>
 
     <section class="center panel hud-border">
@@ -2558,7 +2524,6 @@ PAGE = """<!doctype html>
       </div>
       <p id="bonsai-state-label">BONSAI READY</p>
       <p class="sub">Awaiting your command</p>
-      <div id="qty"></div>
       <div class="meterrow" style="width:100%; margin-top:8px;">
         <div class="meter"><div class="lab"><span>CPU</span><b id="cpu-val">0%</b></div><div class="bar"><div class="fill" id="cpu-bar"></div></div></div>
         <div class="meter"><div class="lab"><span>RAM</span><b id="ram-val">0%</b></div><div class="bar"><div class="fill" id="ram-bar"></div></div></div>
@@ -2567,10 +2532,9 @@ PAGE = """<!doctype html>
     </section>
 
     <section class="right panel hud-border">
-      <div class="ptitle"><span>CONVERSATION CONSOLE</span><span><button class="hbtn" style="padding:4px 10px; font-size:11px;" id="clearbtn">CLEAR</button></span></div>
+      <div class="ptitle"><span>CONVERSATION CONSOLE</span></div>
       <div class="chat-wrap">
         <div id="chat-container"></div>
-        <div class="sugg" id="sugg"></div>
         <div id="preview"></div>
         <form id="chat-form" class="composer" onsubmit="handleSubmit(event)">
           <div class="field">
@@ -2588,7 +2552,6 @@ PAGE = """<!doctype html>
           </div>
         </form>
         <div class="statsline" id="statsline"></div>
-        <div class="fine">Bonsai 2 27B local &middot; sees your screen &middot; clicks &amp; types &middot; clipboard &middot; downloads &middot; asks you questions &middot; todo list</div>
       </div>
     </section>
   </main>
@@ -2602,19 +2565,6 @@ PAGE = """<!doctype html>
 <input type="file" id="filein" accept="image/*,.txt,.md,.py,.js,.ts,.json,.csv,.log,.ini,.cfg,.xml,.html,.css,.bat,.ps1,.sh,.yml,.yaml,.sql,.java,.cpp,.c,.h,.cs,.go,.rb,.php,.toml,.env,.gitignore" multiple>
 <script>
 const BONSAI_CTX = 32768;
-const EXAMPLES = [
-  'Open Steam', 'open Discord', 'open Notepad and YouTube',
-  'tell me a joke', 'who are you?', 'open Google', 'what can you do?'
-];
-const QUICK = [
-  ['&#129302; System Status', 'what is the system status and what is the CPU doing?'],
-  ['&#128421; Open Notepad', 'open notepad'],
-  ['&#127918; Start Steam', 'open steam'],
-  ['&#128250; YouTube', 'open youtube'],
-  ['&#127925; Spotify', 'open spotify'],
-  ['&#128214; Wikipedia', 'open wikipedia']
-];
-
 let chats = load();
 let cur = null;
 let busy = false;
@@ -2710,7 +2660,7 @@ function renderList() {
     row.className = 'chat-item' + (cur && c.id === cur.id ? ' active' : '');
     const t = document.createElement('span'); t.className = 'tit'; t.textContent = c.title; t.title = c.title;
     const d = document.createElement('button'); d.className = 'del'; d.textContent = '\u00d7';
-    d.onclick = function (e) { e.stopPropagation(); chats = chats.filter(function (x) { return x.id !== c.id; }); if (cur && cur.id === c.id) { cur = chats.length ? chats[chats.length - 1] : null; } save(); renderAll(); };
+    d.onclick = function (e) { e.stopPropagation(); chats = chats.filter(function (x) { return x.id !== c.id; }); if (!chats.length) { cur = null; newChat(); } else { if (cur && cur.id === c.id) cur = chats[chats.length - 1]; save(); renderAll(); } };
     row.onclick = function () { cur = c; started = cur.messages.length > 0; renderAll(); setBonsaiState('idle'); };
     row.appendChild(t); row.appendChild(d);
     el.appendChild(row);
@@ -2761,9 +2711,9 @@ function addUser(content) {
     b.appendChild(fileChipDom(p.name));
   });
   const text = arr.filter(function (p) { return p.type === 'text'; }).map(function (p) { return p.text; }).join(' ');
-  const imgs = arr.filter(function (p) { return p.type === 'image_url'; }).map(function (p) { return '- imagine ata&#537;at&#259;'; }).join(' ');
+  const hasImgs = arr.some(function (p) { return p.type === 'image_url'; });
   if (text) { const sp = document.createElement('div'); sp.innerHTML = fmt(text); b.appendChild(sp); }
-  else if (imgs && !arr.some(function (p) { return p.type === 'file_att'; })) { const sp = document.createElement('div'); sp.textContent = 'imagine ata&#537;at&#259;'; b.appendChild(sp); }
+  else if (hasImgs && !arr.some(function (p) { return p.type === 'file_att'; })) { const sp = document.createElement('div'); sp.textContent = '[Image attached]'; b.appendChild(sp); }
   row.appendChild(b); row.appendChild(av);
   conv.appendChild(row);
   scrollBottom();
@@ -2841,26 +2791,6 @@ function toolChip(container, c) {
   chip.title = JSON.stringify(chipData, null, 2);
   container.appendChild(chip);
 }
-function suggRow() {
-  const el = document.getElementById('sugg');
-  el.innerHTML = '';
-  if (cur && cur.messages.length) { el.innerHTML = ''; return; }
-  EXAMPLES.forEach(function (ex) {
-    const c = document.createElement('button'); c.className = 'sg'; c.textContent = ex;
-    c.onclick = function () { document.getElementById('user-input').value = ex; handleSubmit(new Event('submit')); };
-    el.appendChild(c);
-  });
-}
-function qtyRow() {
-  const el = document.getElementById('qty');
-  el.innerHTML = '';
-  QUICK.forEach(function (q) {
-    const b = document.createElement('button'); b.className = 'qbtn';
-    b.innerHTML = q[0];
-    b.onclick = function () { document.getElementById('user-input').value = q[1]; handleSubmit(new Event('submit')); };
-    el.appendChild(b);
-  });
-}
 
 function buildUserMsg() {
   const text = document.getElementById('user-input').value.trim();
@@ -2900,16 +2830,19 @@ function drainQueue() {
   if (!msgQueue.length) return;
   const next = msgQueue.shift();
   setQueueUI();
-  go(next.parts);
+  go(next.parts, next.chat);
 }
 
-async function go(forcedParts) {
+async function go(forcedParts, chat) {
   if (busy) return;
   if (!cur) newChat();
+  if (chat && chat !== cur && chats.indexOf(chat) !== -1) { cur = chat; renderAll(); }
   const parts = forcedParts || buildUserMsg();
   if (!parts) return;
   busy = true;
   setSendUI();
+
+  const target = cur;
 
   const textOf = parts.filter(function (p) { return p.type === 'text'; }).map(function (p) { return p.text; }).join(' ');
   const hasFile = parts.some(function (p) { return p.type === 'file_att'; });
@@ -2923,7 +2856,7 @@ async function go(forcedParts) {
   }
 
   const raw = parts.length === 1 && parts[0].type === 'text' ? parts[0].text : parts;
-  cur.messages.push({ role: 'user', content: raw });
+  target.messages.push({ role: 'user', content: raw });
   addUser(parts);
 
   addThinking();
@@ -2931,15 +2864,14 @@ async function go(forcedParts) {
   pendingAtt = [];
   renderPreview();
   document.getElementById('user-input').value = '';
-  try { await streamRun(cur.messages.slice()); }
+  try { await streamRun(target.messages.slice(), target); }
   catch (err) { doneThinking('Error: ' + err.message); setBonsaiState('idle'); }
   busy = false;
   setSendUI();
   document.getElementById('user-input').focus();
-  cur.ts = Date.now();
+  target.ts = Date.now();
   save();
   renderList();
-  suggRow();
   drainQueue();
 }
 
@@ -3147,7 +3079,8 @@ function renderTodo(items) {
   });
 }
 
-async function streamRun(messages) {
+async function streamRun(messages, chat) {
+  chat = chat || cur;
   abortCtrl = new AbortController();
   startStats();
   let resp;
@@ -3175,7 +3108,7 @@ async function streamRun(messages) {
         });
         if (!data) continue;
         let j; try { j = JSON.parse(data); } catch (e) { continue; }
-        if (ev === 'delta') { reply += j.text; onDelta(j.text); setBonsaiState('speaking'); statsVals.respond_ms = Date.now() - startedAt; }
+        if (ev === 'delta') { reply += j.text; onDelta(j.text); statsVals.respond_ms = Date.now() - startedAt; }
         else if (ev === 'reason') { reason += j.text; onReason(j.text); setBonsaiState('thinking'); statsVals.think_ms = Date.now() - startedAt; }
         else if (ev === 'tool') { calls.push(j.call); onTool(j.call); setBonsaiState('tools'); }
         else if (ev === 'stats') { onStats(j); }
@@ -3193,17 +3126,16 @@ async function streamRun(messages) {
     stopStats();
   }
   if (aborted) throw new Error('stopped');
-  const last = cur.messages[cur.messages.length - 1];
+  const last = chat.messages[chat.messages.length - 1];
   const savedStats = statsVals && (statsVals.think_ms || statsVals.respond_ms || statsVals.completion_tokens)
       ? JSON.parse(JSON.stringify(statsVals)) : null;
   if (last && last.role === 'user') {
-    cur.messages.push({ role: 'assistant', content: reply, calls: calls, reason: reason.trim() ? reason : undefined, stats: savedStats });
+    chat.messages.push({ role: 'assistant', content: reply, calls: calls, reason: reason.trim() ? reason : undefined, stats: savedStats });
   } else if (last && last.role === 'assistant' && !last.calls && reply) {
     last.content = reply;
     last.reason = reason.trim() ? reason : undefined;
     last.stats = savedStats;
   }
-  if (reply && sfx.enabled) speakBONSAI(reply);
 }
 
 function renderPreview() {
@@ -3278,12 +3210,11 @@ document.getElementById('filein').onchange = function () { addFiles(this.files);
 })();
 
 document.getElementById('newchat2').onclick = function () { newChat(); setBonsaiState('idle'); };
-document.getElementById('clearbtn').onclick = function () { if (cur) { cur.messages = []; started = false; } renderAll(); setBonsaiState('idle'); };
 document.getElementById('queue').onclick = function () {
   const parts = buildUserMsg();
   if (!parts) return;
   if (busy) {
-    msgQueue.push({ parts: parts });
+    msgQueue.push({ parts: parts, chat: cur });
     pendingAtt = [];
     renderPreview();
     document.getElementById('user-input').value = '';
@@ -3371,7 +3302,7 @@ const inp = document.getElementById('user-input');
 inp.addEventListener('input', function () { this.style.height = 'auto'; this.style.height = Math.min(this.scrollHeight, 160) + 'px'; });
 inp.addEventListener('keydown', function (ev) { if (ev.key === 'Enter' && !ev.shiftKey) { ev.preventDefault(); handleSubmit(ev); } });
 
-/* ---------- BONSAI FX: clock, metrics, sound, voice, TTS ---------- */
+/* ---------- BONSAI FX: clock & metrics ---------- */
 function updateClock() {
   const now = new Date();
   document.getElementById('clock-time').textContent = now.toLocaleTimeString('ro-RO');
@@ -3390,214 +3321,14 @@ function startMetrics() {
     document.getElementById('gpu-bar').style.width = gpu + '%';
   }, 2500);
 }
-class SoundFX {
-  constructor() { this.ctx = null; this.enabled = true; }
-  init() {
-    if (!this.ctx) {
-      const C = window.AudioContext || window.webkitAudioContext;
-      this.ctx = new C();
-    }
-  }
-  beep(freq, dur) {
-    if (!this.enabled) return;
-    try {
-      this.init();
-      const o = this.ctx.createOscillator(), g = this.ctx.createGain();
-      o.type = 'sine'; o.frequency.setValueAtTime(freq, this.ctx.currentTime);
-      g.gain.setValueAtTime(0.04, this.ctx.currentTime);
-      g.gain.exponentialRampToValueAtTime(0.001, this.ctx.currentTime + dur);
-      o.connect(g); g.connect(this.ctx.destination);
-      o.start(); o.stop(this.ctx.currentTime + dur);
-    } catch (e) {}
-  }
-  resp() { this.beep(600, .05); setTimeout(() => this.beep(900, .08), 60); }
-}
-const sfx = new SoundFX();
-
-let talkOn = localStorage.getItem('jarvis_talk') === '1';
-const talkBtn = document.getElementById('voice-toggle-btn');
-function updateTalkBtn() {
-  talkBtn.textContent = talkOn ? '\\ud83d\\udd50' : '\\ud83d\\udd07';
-  talkBtn.classList.toggle('onv', talkOn);
-  talkBtn.title = talkOn ? 'Talk back ON - I reply out loud' : 'Talk back OFF - click to enable voice replies';
-}
-updateTalkBtn();
-talkBtn.onclick = function () {
-  talkOn = !talkOn;
-  localStorage.setItem('jarvis_talk', talkOn ? '1' : '0');
-  updateTalkBtn();
-  if (talkOn && sfx.enabled) sfx.beep(1000, .1);
-};
-
-const audioToggleBtn = document.getElementById('audio-toggle-btn');
-audioToggleBtn.onclick = function () {
-  sfx.enabled = !sfx.enabled;
-  this.textContent = sfx.enabled ? '\\ud83d\\udd0a' : '\\ud83d\\udd07';
-  if (sfx.enabled) sfx.beep(1000, .1);
-};
-
-/* ---- TTS: pick best voice, chunk text, watchdog fallback ---- */
-let ttsVoices = [];
-let ttsBest = null;
-let ttsFallback = null;
-function voiceScore(v) {
-  const n = (v.name || '');
-  const lang = (v.lang || '').toLowerCase();
-  let s = 0;
-  if (lang.indexOf('ro') === 0) s += 400;
-  if (/natural|online|neural/i.test(n)) s += 500;
-  else if (/google/i.test(n)) s += 250;
-  if (v.localService) s -= 100;
-  if (/mobile|tablet/i.test(n)) s -= 50;
-  return s;
-}
-function pickTTSVoices() {
-  if (!('speechSynthesis' in window)) return;
-  ttsVoices = window.speechSynthesis.getVoices() || [];
-  const sorted = ttsVoices.slice().sort(function (a, b) { return voiceScore(b) - voiceScore(a); });
-  ttsBest = sorted[0] || null;
-  ttsFallback = sorted.find(function (v) { return v.localService && v !== ttsBest; }) || null;
-  fillVoiceSel();
-}
-function fillVoiceSel() {
-  const sel = document.getElementById('voice-sel');
-  if (!sel) return;
-  const current = sel.value;
-  sel.innerHTML = '';
-  const def = document.createElement('option');
-  def.value = '';
-  def.textContent = 'Voice: Auto';
-  sel.appendChild(def);
-  const picked = localStorage.getItem('jarvis_voice');
-  ttsVoices.slice().sort(function (a, b) { return voiceScore(b) - voiceScore(a); }).forEach(function (v) {
-    const o = document.createElement('option');
-    o.value = v.name;
-    o.textContent = ((voiceScore(v) >= 300 && !v.localService) ? '[NATURAL] ' : '') + v.name + ' (' + v.lang + ')';
-    sel.appendChild(o);
-  });
-  if (picked && Array.prototype.some.call(sel.options, function (o) { return o.value === picked; })) {
-    sel.value = picked;
-  } else if (current && Array.prototype.some.call(sel.options, function (o) { return o.value === current; })) {
-    sel.value = current;
-  }
-}
-function detectLang(text) {
-  const t = (text || '').toLowerCase();
-  let ro = 0, en = 0;
-  if (/[ăâîșţ]/u.test(t)) ro += 4;
-  const roWords = ['si ', 'și ', 'este ', 'sunt ', 'pentru', 'despre', ' dar ', 'mai ', 'asta ', 'acum ', 'vreau', 'mulțumesc', 'poti', 'poți', 'facut', 'făcut'];
-  const enWords = [' the ', ' and ', ' is ', ' are ', ' for ', ' about ', ' you ', ' i ', ' me ', ' we ', ' want', 'please'];
-  roWords.forEach(function (w) { if (t.indexOf(w) >= 0) ro += 1; });
-  enWords.forEach(function (w) { if (t.indexOf(w) >= 0) en += 1; });
-  if (ro > en) return 'ro';
-  return 'en';
-}
-function voiceForLang(lang) {
-  const pref = lang === 'ro' ? 'ro' : 'en';
-  const ranked = ttsVoices.slice().sort(function (a, b) {
-    const sameA = (a.lang || '').toLowerCase().indexOf(pref) === 0 ? 1 : 0;
-    const sameB = (b.lang || '').toLowerCase().indexOf(pref) === 0 ? 1 : 0;
-    if (sameA !== sameB) return sameB - sameA;
-    return voiceScore(b) - voiceScore(a);
-  });
-  return ranked[0] || null;
-}
-function chosenVoice(text) {
-  const picked = localStorage.getItem('jarvis_voice');
-  if (picked) {
-    const v = ttsVoices.find(function (x) { return (x.name || '') === picked; });
-    if (v) return v;
-  }
-  return voiceForLang(detectLang(text)) || ttsBest;
-}
-function initVoices() {
-  pickTTSVoices();
-  const langs = ttsVoices.map(function (v) { return (v.lang || '') + ' / ' + (v.name || ''); });
-  console.log('[TTS] voices:', JSON.stringify(langs));
-}
-if ('speechSynthesis' in window) {
-  window.speechSynthesis.onvoiceschanged = initVoices;
-  initVoices();
-  setTimeout(pickTTSVoices, 300);
-  setTimeout(pickTTSVoices, 1200);
-}
-(function () {
-  const sel = document.getElementById('voice-sel');
-  if (!sel) return;
-  sel.addEventListener('change', function () {
-    if (sel.value) localStorage.setItem('jarvis_voice', sel.value);
-    else localStorage.removeItem('jarvis_voice');
-    sfx.beep(720, .08);
-    const v = chosenVoice('Astept comenzi, Dominic. Sunt BONSAI. Awaiting command, Dominic. I am BONSAI.');
-    if (!v) return;
-    const u = new SpeechSynthesisUtterance('Astept comenzi, Dominic. Sunt BONSAI. Awaiting command, Dominic. I am BONSAI.');
-    u.voice = v; u.lang = v.lang || 'ro-RO'; u.rate = 1.0; u.pitch = 1.0;
-    try { window.speechSynthesis.speak(u); } catch (e) {}
-  });
-})();
-function splitTTS(text, max) {
-  const parts = [];
-  const sentences = text.replace(/\\s*\\n+\\s*/g, ' ').split(/(?<=[.!?…])\\s+/);
-  let cur = '';
-  sentences.forEach(function (s) {
-    const piece = (cur ? cur + ' ' : '') + s;
-    if (piece.length > max && cur) { parts.push(cur); cur = s; }
-    else cur = piece;
-  });
-  if (cur) parts.push(cur);
-  return parts.length ? parts : [''];
-}
-function speakBONSAI(text) {
-  if (!talkOn || !('speechSynthesis' in window)) return;
-  if (!ttsVoices.length) pickTTSVoices();
-  const clean = String(text).replace(/```[\\s\\S]*?```/g, ' ').replace(/`([^`]+)`/g, '$1')
-                .replace(/\\*\\*([^*]+)\\*\\*/g, '$1').replace(/\\*([^*]+)\\*/g, '$1')
-                .replace(/[#_~]/g, '').replace(/\\s+/g, ' ').trim();
-  if (!clean) return;
-  const parts = splitTTS(clean, 220);
-  const useVoice = chosenVoice(clean) || ttsFallback || null;
-  const detected = detectLang(clean);
-  const natural = useVoice && !useVoice.localService;
-  let useLang = (useVoice && useVoice.lang) || (detected === 'ro' ? 'ro-RO' : 'en-US');
-  let started = false;
-  let watchdog = null;
-  let ti = 0;
-  function speakNext() {
-    if (ti >= parts.length) { clearTimeout(watchdog); return; }
-    const u = new SpeechSynthesisUtterance(parts[ti++]);
-    if (useVoice) u.voice = useVoice;
-    u.lang = useLang;
-    if (natural) { u.rate = 1.02; u.pitch = 1.0; }
-    else { u.rate = 0.98; u.pitch = 1.1; }
-    u.onstart = function () { started = true; clearTimeout(watchdog); };
-    u.onend = function () { speakNext(); };
-    u.onerror = function () { speakNext(); };
-    try { window.speechSynthesis.speak(u); } catch (e) { speakNext(); }
-  }
-  watchdog = setTimeout(function () {
-    if (!started && window.speechSynthesis) {
-      try { window.speechSynthesis.cancel(); } catch (e) {}
-      if (ttsFallback) {
-        const u2 = new SpeechSynthesisUtterance(clean);
-        u2.voice = ttsFallback; u2.lang = ttsFallback.lang || 'ro-RO'; u2.rate = 1.0; u2.pitch = 1.1;
-        try { window.speechSynthesis.speak(u2); } catch (e) {}
-      }
-    }
-  }, 1400);
-  speakNext();
-}
 
 const reactor = document.getElementById('arc-reactor');
 const waveform = document.getElementById('waveform');
 const stateLabel = document.getElementById('bonsai-state-label');
 function setBonsaiState(state) {
-  ['speaking', 'thinking', 'tools'].forEach(function (s) { reactor.classList.remove(s); document.body.classList.remove(s); });
+  ['thinking', 'tools'].forEach(function (s) { reactor.classList.remove(s); document.body.classList.remove(s); });
   waveform.classList.remove('active-wave');
-  if (state === 'speaking') {
-    reactor.classList.add('speaking'); document.body.classList.add('speaking');
-    waveform.classList.add('active-wave');
-    stateLabel.textContent = 'BONSAI SPEAKING...';
-  } else if (state === 'thinking') {
+  if (state === 'thinking') {
     reactor.classList.add('thinking'); document.body.classList.add('thinking');
     stateLabel.textContent = 'PROCESSING COMMAND...';
   } else if (state === 'tools') {
@@ -3620,7 +3351,7 @@ micBtn.onclick = function () {
   const rec = new SR();
   rec.lang = 'ro-RO';
   rec.interimResults = false;
-  rec.onstart = function () { micBtn.classList.add('err'); sfx.beep(900, .1); };
+  rec.onstart = function () { micBtn.classList.add('err'); };
   rec.onresult = function (ev) {
     const tx = ev.results[0][0].transcript;
     document.getElementById('user-input').value = tx;
@@ -3636,8 +3367,6 @@ document.querySelectorAll('.err, .micerr').forEach(function () {});
 updateClock();
 setInterval(updateClock, 1000);
 startMetrics();
-qtyRow();
-suggRow();
 init();
 </script>
 </body>

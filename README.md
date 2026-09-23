@@ -1,7 +1,8 @@
 # Bonsai PC Assistant
 
 Self-contained, 100% offline **local AI assistant** built around the **Bonsai 2
-27B** ternary model. Multi-turn voice & text chat, live "thinking" display, real
+27B** ternary model. Multi-turn text chat (with optional microphone input), live
+"thinking" display, real
 tool calls (open apps, open websites, work on your files), vision, optional web
 lookup, a shell runner and a code sandbox - all in one Python file, no cloud, no
 API keys, nothing leaves your machine.
@@ -97,7 +98,6 @@ in order).
 | **Live token stats** | real-time think vs. speak time, tokens/second and context usage under the input (see §6) |
 | **Always-in-memory** | the model stays loaded (resident) for the whole session - no idle timer ever unloads it, so a reply never stalls because of a pause (see §6) |
 | **Persistent history** | conversations saved in the browser and on disk; survive server restarts (see §7) |
-| **Talk-back** | optional text-to-speech that auto-matches the language of the reply and picks the most natural installed voice; off by default |
 | **Plan / Build modes** | *Plan* is read-only (inspection only), *Build* grants full tool access |
 | **Blender control** | when Blender is open, Bonsai can create, move and edit 3D scenes inside it and screenshot the viewport - you keep the mouse (no exodus) |
 | **Fully offline** | model, inference and UI all run locally, with no cloud dependency |
@@ -152,15 +152,14 @@ from the UI (📁 button in the header) with a native folder dialog, or set
 | **Blender status light** | Shows the Blender MCP connection: green *CONNECTED*, yellow *ADDON OFF*, red *OFF*, grey *NO MCP* |
 | **EJECT** | Unloads the model from RAM/VRAM **now** to free memory; it simply loads back on the next message |
 | **Plan / Build** | Toggle mode - *Plan* read-only, *Build* full tool access |
-| **Voice (🔊) / Mic (🎙)** | Talk-back (TTS) toggle and microphone input |
-| **NEW CHAT / CLEAR** | Start a fresh conversation / reset the current one |
+| **Mic (🎙)** | microphone voice input (speech-to-text) for your messages |
+| **NEW CHAT** | Start a fresh conversation |
 
 The **arc reactor** indicator reflects what Bonsai is doing:
 
 - **Blue** - idle (rotating reactor)
 - **Yellow** - thinking / processing the command
 - **Green** - executing a tool call
-- **Blue + waveform** - speaking out loud
 
 ## 6. Live token stats & memory relief
 
