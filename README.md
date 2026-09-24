@@ -203,7 +203,9 @@ from the UI (📁 button in the header) with a native folder dialog, or set
 | **THINK: OFF / LOW / MED / HIGH** | Selects how deeply Bonsai reasons (`enable_thinking` / `reasoning_effort`); higher = deeper reasoning, slower replies. Default MED |
 | **TODO panel** | Live checklist on the left panel, updated by `todo_write` as longer tasks progress |
 | **Workspace (folder icon)** | Choose/open the working folder for the file tools |
-| **Blender status light** | Shows the Blender MCP connection: green *CONNECTED*, yellow *ADDON OFF*, red *OFF*, grey *NO MCP* |
+| **Model dropdown (+ ⚙)** | Pick the active model, add one, and - via the gear - set its runtime options (see §8) |
+| **Model status ball** | **Red** = no model loaded · **orange→green** cycling = loading into RAM/VRAM · **green** = loaded and resident |
+| **Blender icon + dot** | The Blender logo with a dot beside it: **green** = connected, **yellow** = addon off, **red** = not connected. Hover for the full reason |
 | **EJECT** | Stops the model server **now** and frees its RAM/VRAM; it restarts automatically on the next message |
 | **TTS** | Toggles Piper text-to-speech. **Off by default** - click to let Bonsai speak replies aloud (state resets on server restart) |
 | **Plan / Build** | Toggle mode - *Plan* read-only, *Build* full tool access |
@@ -353,8 +355,24 @@ must switch away from a model before it can be removed from the list. The
 `+` dialog also re-scans the project and `models/` folders, so a newly dropped
 model shows up without touching `models.json`.
 
-**Context size:** a model entry uses a 32k context by default. If a model needs
-a different value, edit its `ctx` in `models.json` and restart the app.
+**Context size and sampling** - the gear (⚙) next to the model dropdown opens
+**MODEL SETTINGS** for the currently selected local model:
+
+| Setting | Default | Notes |
+|---|---|---|
+| **Context size (ctx)** | **32768** | tokens the model can see. Bigger = longer conversations/files, but more VRAM and slower prompt processing |
+| **Temperature** | 1.0 | lower = more focused/deterministic, higher = more varied |
+| **Top-p** | 0.95 | nucleus sampling cut-off |
+| **Top-k** | 20 | candidate limit; 0 disables it |
+| **GPU layers (-ngl)** | 99 | how many layers to offload to the GPU. Lower it (e.g. 20) if the model doesn't fit in VRAM |
+
+These are stored **per model** in `models.json`, so each model keeps its own
+settings, and they are read when the model server is launched - so a saved
+change takes effect the **next time that model loads** (after a switch, an
+EJECT or a restart), never in the middle of a reply. **Defaults** restores
+32768 / 1.0 / 0.95 / 20 / 99, and values are clamped to sane ranges server-side.
+They apply to locally-served models; an external API endpoint is configured by
+its own server.
 
 ## 9. The AI model
 

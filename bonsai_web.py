@@ -93,6 +93,7 @@ except Exception:
 
 _BONSAI_LOCK = threading.Lock()
 _BONSAI_PROC = None
+_LOADING_MODEL = False
 _MODELS = []
 _ACTIVE_MODEL = None
 _MODELS_LOCK = threading.RLock()
@@ -1469,13 +1470,14 @@ def _bonsai_ready():
 
 
 def _start_bonsai():
-    global _BONSAI_PROC
+    global _BONSAI_PROC, _LOADING_MODEL
     entry = _active_model()
     if not entry or entry.get("type") == "api":
         return _bonsai_ready()
     model = entry.get("path") or ""
     mmproj = entry.get("mmproj") or ""
     port = int(entry.get("port") or 8080)
+    cfg = _entry_cfg(entry)
     log_out = os.path.join(BONSAI_DIR, "bonsai-server.out.log")
     log_err = os.path.join(BONSAI_DIR, "bonsai-server.err.log")
     if not os.path.exists(LLAMA_EXE):
@@ -1488,16 +1490,27 @@ def _start_bonsai():
     if mmproj and os.path.exists(mmproj):
         args += ["--mmproj", mmproj]
     args += ["--alias", entry["id"], "--port", str(port),
-             "--ctx-size", str(int(entry.get("ctx") or 32768)),
-             "-ngl", "99", "--flash-attn", "on", "--temp", "1.0",
-             "--top-p", "0.95", "--top-k", "20"]
-    with open(log_out, "ab") as o, open(log_err, "ab") as e:
-        _BONSAI_PROC = subprocess.Popen(args, stdout=o, stderr=e,
-                                        creationflags=CREATE_NO_WINDOW)
-    for _ in range(100):
+             "--ctx-size", str(int(cfg["ctx"])),
+             "-ngl", str(int(cfg["ngl"])),
+             "--flash-attn", "on",
+             "--temp", str(float(cfg["temp"])),
+             "--top-p", str(float(cfg["top_p"])),
+             "--top-k", str(int(cfg["top_k"]))]
+    _LOADING_MODEL = True
+    try:
+        with open(log_out, "ab") as o, open(log_err, "ab") as e:
+            _BONSAI_PROC = subprocess.Popen(args, stdout=o, stderr=e,
+                                            creationflags=CREATE_NO_WINDOW)
+    except Exception as exc:
+        _LOADING_MODEL = False
+        print(f"could not start the model server: {exc}", flush=True)
+        return False
+    for _ in range(150):
         if _bonsai_ready():
+            _LOADING_MODEL = False
             return True
         time.sleep(2)
+    _LOADING_MODEL = False
     return False
 
 
@@ -1563,6 +1576,48 @@ def _stop_local_server(port=8080):
 
 
 # ---------------- Model registry (selector) ----------------
+
+_MODEL_DEFAULTS = {"ctx": 32768, "temp": 1.0, "top_p": 0.95,
+                   "top_k": 20, "ngl": 99}
+
+
+def _model_sanitise_cfg(raw):
+    raw = raw if isinstance(raw, dict) else {}
+
+    def num(key, lo, hi, cast, default):
+        try:
+            val = cast(raw.get(key, default))
+        except Exception:
+            return default
+        return max(lo, min(hi, val))
+
+    return {"ctx": num("ctx", 512, 1048576, int, _MODEL_DEFAULTS["ctx"]),
+            "temp": num("temp", 0.0, 2.0, float, _MODEL_DEFAULTS["temp"]),
+            "top_p": num("top_p", 0.01, 1.0, float, _MODEL_DEFAULTS["top_p"]),
+            "top_k": num("top_k", 0, 1000, int, _MODEL_DEFAULTS["top_k"]),
+            "ngl": num("ngl", -1, 999, int, _MODEL_DEFAULTS["ngl"])}
+
+
+def _entry_cfg(entry):
+    cfg = dict(_MODEL_DEFAULTS)
+    cfg.update({k: v for k, v in ((entry or {}).get("cfg") or {}).items()
+                if k in _MODEL_DEFAULTS})
+    return cfg
+
+
+def _set_model_config(mid, raw):
+    cfg = _model_sanitise_cfg(raw)
+    with _MODELS_LOCK:
+        entry = next((m for m in _MODELS if m["id"] == mid), None)
+        if not entry:
+            return {"ok": False, "error": "unknown model '%s'" % mid}
+        if entry.get("type", "local") != "local":
+            return {"ok": False,
+                    "error": "sampling settings only apply to local models"}
+        entry["cfg"] = cfg
+    _save_models()
+    return {"ok": True, "id": mid, "cfg": cfg, **_public_models()}
+
 
 def _default_model_entry():
     return {"id": "bonsai2", "label": "Bonsai 2 27B", "type": "local",
@@ -1717,7 +1772,8 @@ def _public_models():
         if mtype == "local":
             item["path"] = m.get("path")
             item["available"] = bool(m.get("path") and os.path.exists(m["path"]))
-            item["ctx"] = m.get("ctx")
+            item["ctx"] = _entry_cfg(m)["ctx"]
+            item["cfg"] = _entry_cfg(m)
             item["mmproj"] = m.get("mmproj") or ""
             item["vision"] = bool(item["mmproj"]
                                   and os.path.isfile(item["mmproj"]))
@@ -1725,10 +1781,13 @@ def _public_models():
             item["base_url"] = m.get("base_url")
             item["model"] = m.get("model")
         out.append(item)
+    ready = _bonsai_ready()
     return {"active": entry["id"] if entry else None,
             "active_label": (entry or {}).get("label"),
             "managed": (entry or {}).get("type") == "local",
-            "ready": _bonsai_ready(),
+            "ready": ready,
+            "loading": bool(_LOADING_MODEL and not ready),
+            "defaults": dict(_MODEL_DEFAULTS),
             "vision": (entry or {}).get("type") == "local"
                       and bool((entry or {}).get("mmproj")
                                and os.path.isfile((entry or {}).get("mmproj"))),
@@ -4087,8 +4146,12 @@ PAGE = """<!doctype html>
   .hstatus { display: flex; gap: 16px; font-size: 12.5px; color: var(--mut); font-family: Consolas, monospace; }
   .hstatus b { color: var(--txt2); font-weight: 600; }
   .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--ok); margin-right: 4px; }
-  .dot.idle { background: var(--mut); }
-  .dot.busy { background: var(--warn); }
+  .dot.idle { background: var(--err); }
+  .dot.busy { animation: dotLoad 1.2s ease-in-out infinite; }
+  @keyframes dotLoad {
+    0%, 100% { background: var(--warn); box-shadow: 0 0 0 0 rgba(251,191,36,.5); }
+    50% { background: var(--ok); box-shadow: 0 0 0 5px rgba(52,211,153,0); }
+  }
   .hclock { text-align: right; font-family: Consolas, monospace; }
   .hclock .t { font-size: 17px; font-weight: 700; color: var(--txt); }
   .hclock .d { font-size: 11px; color: var(--mut); }
@@ -4119,6 +4182,11 @@ PAGE = """<!doctype html>
   .mdlbox select { flex: 1; min-width: 0; background: var(--bg3); border: 1px solid var(--bd2); border-radius: 10px; padding: 10px; color: var(--txt); font: inherit; font-size: 12.5px; outline: none; }
   .mdlbox select option { background: #16161b; color: var(--txt2); }
   .mdlbox .hint { color: var(--mut); font-size: 11.5px; margin-top: 8px; }
+  .cfgrid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin-bottom: 4px; }
+  .cfgrid label { display: flex; flex-direction: column; gap: 4px; font-size: 11.5px; color: var(--mut); }
+  .cfgrid input { width: 100%; box-sizing: border-box; background: var(--bg3); border: 1px solid var(--bd2); border-radius: 8px; padding: 8px 10px; color: var(--txt); font: inherit; font-size: 13px; outline: none; }
+  .cfgrid input:focus { border-color: var(--acc); }
+  .mdlbox h4 span { color: var(--mut); font-weight: 400; text-transform: none; letter-spacing: 0; }
   .mdlbox .close { margin-top: 14px; text-align: center; color: var(--mut); cursor: pointer; font-size: 12.5px; }
   .mdlbox .close:hover { color: var(--err); }
 
@@ -4298,10 +4366,18 @@ PAGE = """<!doctype html>
   .modebtn.plan { border-color: var(--acc); color: var(--acc); }
   .wbtn { background: var(--bg3); border: 1px solid var(--bd2); color: var(--txt2); padding: 7px 10px; border-radius: 8px; cursor: pointer; font-size: 12px; font-family: Consolas, monospace; max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .wbtn:hover { background: var(--bg4); color: var(--txt); }
-  .blstatus { color: var(--mut); font-size: 12px; font-family: Consolas, monospace; padding: 7px 6px; letter-spacing: .5px; white-space: nowrap; }
-  .blstatus.on { color: var(--ok); }
+  .blstatus { display: inline-flex; align-items: center; gap: 6px; color: var(--mut); font-size: 12px; font-family: Consolas, monospace; padding: 7px 6px; letter-spacing: .5px; white-space: nowrap; }
+  .blicon { width: 15px; height: 15px; flex: none; }
+  .blstatus.on .blicon { color: #ea7600; }
+  .blstatus.mid .blicon { color: var(--warn); }
+  .blstatus.off .blicon { color: var(--mut); }
+  .bldot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--mut); }
+  .bldot.on { background: var(--ok); }
+  .bldot.mid { background: var(--warn); }
+  .bldot.off { background: var(--err); }
+  .blstatus.on { color: var(--txt2); }
   .blstatus.mid { color: var(--warn); }
-  .blstatus.off { color: var(--err); }
+  .blstatus.off { color: var(--mut); }
 
   footer { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px; padding: 6px 14px; border-radius: 12px; font-size: 12.5px; color: var(--mut); font-family: Consolas, monospace; letter-spacing: 1px; }
   footer b { color: var(--txt2); }
@@ -4380,9 +4456,10 @@ PAGE = """<!doctype html>
       <button class="wbtn" id="workbtn" title="Click to choose the workspace folder">\\WORKSPACE</button>
       <select class="hbtn modelsel" id="modelsel" title="Active AI model - pick a local .gguf or an external OpenAI-compatible endpoint"></select>
       <button class="hbtn add" id="addmodelbtn" title="Add a model (local .gguf file or an external API endpoint)">+</button>
+      <button class="hbtn add" id="cfgbtn" title="Model settings - context size, temperature, GPU layers">&#9881;</button>
       <button class="hbtn" id="ttsbtn" title="Text-to-speech (Piper) - speak replies aloud. Off by default.">TTS: OFF</button>
       <button class="hbtn" id="ejectbtn" title="Stop the model server now and free its RAM/VRAM (it restarts automatically on the next message)">EJECT</button>
-      <span class="blstatus off" id="blstatus" title="Blender MCP status">BLENDER: CHECKING</span>
+      <span class="blstatus off" id="blstatus" title="Blender MCP status" aria-label="Blender MCP status"><svg class="blicon" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 1.6C7.4 1.6 3.7 3.9 3.7 6.9c0 1.6 1.1 3 2.8 3.9-2.1.9-3.5 2.4-3.5 4.2 0 3.2 4 5.8 9 5.8 2.4 0 4.6-.7 6.2-1.8l3.4 2.8 1.7-2-3.3-2.7c.6-.9.9-1.9.9-3 0-1.9-1-3.6-2.6-4.9.3-.5.4-1.1.4-1.7 0-3-3.7-5.3-8.3-5.3Z"/><ellipse cx="12" cy="6.9" rx="4.2" ry="2.5" fill="#0a0a0c"/></svg><span class="bldot off" id="bldot"></span></span>
     </div>
   </header>
 
@@ -4405,6 +4482,25 @@ PAGE = """<!doctype html>
       </div>
       <div class="hint" id="mmprojhint"></div>
       <div class="close" id="addmdl-close">Cancel</div>
+    </div>
+  </div>
+
+  <div class="mdl" id="cfgmdl">
+    <div class="mdlbox">
+      <h4>MODEL SETTINGS <span id="cfgwho"></span></h4>
+      <div class="cfgrid">
+        <label>Context size (ctx)<input id="cfg_ctx" type="number" min="512" max="1048576" step="512"></label>
+        <label>Temperature<input id="cfg_temp" type="number" min="0" max="2" step="0.05"></label>
+        <label>Top-p<input id="cfg_top_p" type="number" min="0.01" max="1" step="0.01"></label>
+        <label>Top-k<input id="cfg_top_k" type="number" min="0" max="1000" step="1"></label>
+        <label>GPU layers (-ngl)<input id="cfg_ngl" type="number" min="-1" max="999" step="1"></label>
+      </div>
+      <div class="hint" id="cfghint"></div>
+      <div class="row">
+        <button class="act inline" id="cfg-save">Save</button>
+        <button class="act inline" id="cfg-defaults">Defaults</button>
+        <button class="act inline" id="cfg-close">Close</button>
+      </div>
     </div>
   </div>
 
@@ -5100,6 +5196,7 @@ async function streamRun(messages, chat) {
   let buf = '', reply = '', calls = [], reason = '';
   let aborted = false;
   let gotEnd = false;
+  let modelUp = false;
   let startedAt = Date.now();
   try {
     while (true) {
@@ -5117,13 +5214,13 @@ async function streamRun(messages, chat) {
         if (!data) continue;
         let j; try { j = JSON.parse(data); } catch (e) { continue; }
         if (ev === 'start') { setModelStatus(!!j.model_ready, !j.model_ready); }
-        else if (ev === 'delta') { reply += j.text; onDelta(j.text); statsVals.respond_ms = Date.now() - startedAt; }
-        else if (ev === 'reason') { reason += j.text; onReason(j.text); setBonsaiState('thinking'); statsVals.think_ms = Date.now() - startedAt; }
-        else if (ev === 'tool') { calls.push(j.call); onTool(j.call); setBonsaiState('tools'); }
+        else if (ev === 'delta') { if (!modelUp) { modelUp = true; setModelStatus(true, false); } reply += j.text; onDelta(j.text); statsVals.respond_ms = Date.now() - startedAt; }
+        else if (ev === 'reason') { if (!modelUp) { modelUp = true; setModelStatus(true, false); } reason += j.text; onReason(j.text); setBonsaiState('thinking'); statsVals.think_ms = Date.now() - startedAt; }
+        else if (ev === 'tool') { if (!modelUp) { modelUp = true; setModelStatus(true, false); } calls.push(j.call); onTool(j.call); setBonsaiState('tools'); }
         else if (ev === 'stats') { onStats(j); }
         else if (ev === 'ask') { onAsk(j); setBonsaiState('thinking'); }
         else if (ev === 'todo') { renderTodo(j.todos); }
-        else if (ev === 'error') { doneThinking('Error: ' + j.text); setBonsaiState('idle'); stopStats(); throw new Error(j.text); }
+        else if (ev === 'error') { doneThinking('Error: ' + j.text); setBonsaiState('idle'); if (!modelUp) setModelStatus(false, false); stopStats(); throw new Error(j.text); }
         else if (ev === 'done') { gotEnd = true; doneThinking(); setBonsaiState('idle'); }
       }
     }
@@ -5263,16 +5360,16 @@ function renderBlenderStatus(j) {
   const el = document.getElementById('blstatus');
   if (!el) return;
   const map = {
-    ok: ['on', 'BLENDER: CONNECTED'],
-    bridge: ['mid', 'BLENDER: ADDON OFF'],
-    down: ['off', 'BLENDER: OFF'],
-    missing: ['off', 'BLENDER: NO MCP']
+    ok: ['on', 'Blender MCP: connected - the Blender tools are available.'],
+    bridge: ['mid', 'Blender MCP: bridge is up, but the addon is not enabled.'],
+    down: ['off', 'Blender MCP: not connected. Open Blender with the addon enabled.'],
+    missing: ['off', 'Blender MCP: not installed (pip install mcp-for-blender).']
   };
   const m = map[j.state || 'down'] || map.down;
-  el.className = 'blstatus ' + m[0];
-  el.textContent = m[1];
-  el.title = j.detail ? ('Blender MCP: ' + (j.state || 'down') + ' - ' + j.detail)
-                      : ('Blender MCP: ' + (j.state || 'down'));
+  el.className = el.classList.contains('blrow') ? 'blrow ' + m[0] : 'blstatus ' + m[0];
+  const dot = document.getElementById('bldot');
+  if (dot) dot.className = 'bldot ' + m[0];
+  el.title = j.detail ? (m[1] + ' (' + j.state + ': ' + j.detail + ')') : m[1];
 }
 function refreshBlender() {
   fetch('/api/blender').then(function (r) { return r.json(); })
@@ -5345,7 +5442,7 @@ function setModelStatus(ready, loading) {
   const dot = document.getElementById('sdot');
   if (dot) dot.className = 'dot' + (loading ? ' busy' : (ready ? '' : ' idle'));
   if (!t) return;
-  t.textContent = loading ? 'LOADING MODEL...' : (ready ? 'ONLINE / LOADED' : 'ONLINE / IDLE');
+  t.textContent = loading ? 'LOADING MODEL...' : (ready ? 'ONLINE / LOADED' : 'ONLINE / NOT LOADED');
   t.title = loading ? 'The model is being loaded into RAM/VRAM - this only happens on your first message.'
     : (ready ? 'The model is resident in RAM/VRAM.' : 'The model is not loaded. It loads the first time you send a message.');
 }
@@ -5371,7 +5468,7 @@ function renderModels(j) {
   if (fm && j.active_label) fm.textContent = j.active_label;
   const fc = document.getElementById('footer-caps');
   if (fc) fc.textContent = (j.vision ? 'VISION' : 'TEXT-ONLY') + '+TOOLS';
-  if (typeof setModelStatus === 'function') setModelStatus(!!j.ready, false);
+  if (typeof setModelStatus === 'function') setModelStatus(!!j.ready, !!j.loading);
   window.__lastModels = j;
   renderMmprojList(j);
 }
@@ -5500,6 +5597,69 @@ const _mdlClose = document.getElementById('addmdl-close');
 if (_mdlClose) _mdlClose.onclick = closeAddMdl;
 const _mdl = document.getElementById('addmdl');
 if (_mdl) _mdl.onclick = function (ev) { if (ev.target === _mdl) closeAddMdl(); };
+/* ---------- MODEL SETTINGS modal ---------- */
+function cfgFill(j) {
+  const models = (j && j.models) || [];
+  const act = models.filter(function (m) { return m.id === (j && j.active); })[0];
+  const cfg = (act && act.cfg) || (j && j.defaults) || { ctx: 32768, temp: 1, top_p: 0.95, top_k: 20, ngl: 99 };
+  const set = function (id, v) { const e = document.getElementById(id); if (e) e.value = v; };
+  set('cfg_ctx', cfg.ctx); set('cfg_temp', cfg.temp);
+  set('cfg_top_p', cfg.top_p); set('cfg_top_k', cfg.top_k); set('cfg_ngl', cfg.ngl);
+  const who = document.getElementById('cfgwho');
+  if (who) who.textContent = act ? ('- ' + (act.label || act.id)) : '';
+  const hint = document.getElementById('cfghint');
+  if (hint) {
+    hint.textContent = !act ? 'No local model selected.'
+      : (act.type === 'api' ? 'External endpoints are configured by their own server.'
+      : 'Saved settings are used the next time this model is loaded (after a switch or EJECT).');
+  }
+}
+function openCfgMdl() {
+  const m = document.getElementById('cfgmdl');
+  if (!m) return;
+  cfgFill(window.__lastModels);
+  m.classList.add('on');
+}
+function closeCfgMdl() { const m = document.getElementById('cfgmdl'); if (m) m.classList.remove('on'); }
+const _cfgBtn = document.getElementById('cfgbtn');
+if (_cfgBtn) _cfgBtn.onclick = openCfgMdl;
+const _cfgClose = document.getElementById('cfg-close');
+if (_cfgClose) _cfgClose.onclick = closeCfgMdl;
+const _cfgMdl = document.getElementById('cfgmdl');
+if (_cfgMdl) _cfgMdl.onclick = function (ev) { if (ev.target === _cfgMdl) closeCfgMdl(); };
+const _cfgDefaults = document.getElementById('cfg-defaults');
+if (_cfgDefaults) _cfgDefaults.onclick = function () {
+  const j = window.__lastModels || {};
+  const d = j.defaults || { ctx: 32768, temp: 1, top_p: 0.95, top_k: 20, ngl: 99 };
+  const set = function (id, v) { const e = document.getElementById(id); if (e) e.value = v; };
+  set('cfg_ctx', d.ctx); set('cfg_temp', d.temp);
+  set('cfg_top_p', d.top_p); set('cfg_top_k', d.top_k); set('cfg_ngl', d.ngl);
+};
+const _cfgSave = document.getElementById('cfg-save');
+if (_cfgSave) _cfgSave.onclick = function () {
+  const j = window.__lastModels || {};
+  const act = (j.models || []).filter(function (m) { return m.id === j.active; })[0];
+  if (!act) { alert('No model selected.'); return; }
+  const num = function (id) {
+    const e = document.getElementById(id);
+    return e && e.value !== '' ? Number(e.value) : undefined;
+  };
+  const cfg = { ctx: num('cfg_ctx'), temp: num('cfg_temp'), top_p: num('cfg_top_p'),
+                top_k: num('cfg_top_k'), ngl: num('cfg_ngl') };
+  _cfgSave.disabled = true;
+  fetch('/api/models', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action: 'config', id: act.id, cfg: cfg }) })
+    .then(function (r) { return r.json(); })
+    .then(function (res) {
+      if (!res.ok) { alert('Could not save the settings:\\n' + (res.error || 'unknown error')); return; }
+      renderModels(res);
+      cfgFill(res);
+      const hint = document.getElementById('cfghint');
+      if (hint) hint.textContent = 'Saved. These values apply the next time this model is loaded.';
+    })
+    .catch(function () { alert('Could not save the settings'); })
+    .then(function () { _cfgSave.disabled = false; });
+};
 document.addEventListener('keydown', function (ev) {
   if (ev.key === 'Escape') closeAddMdl();
 });
@@ -5636,6 +5796,11 @@ PAGE_GPT = """<!doctype html>
   .blrow.ok b { background: var(--ok); }
   .blrow.mid b { background: var(--warn); }
   .blrow.off b { background: var(--err); }
+  .blrow .blicon { width: 14px; height: 14px; flex: none; }
+  .blrow .bldot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--mut); }
+  .blrow .bldot.on { background: var(--ok); }
+  .blrow .bldot.mid { background: var(--warn); }
+  .blrow .bldot.off { background: var(--err); }
   .btn-ghost { border: 1px solid var(--bd); background: transparent; color: var(--txt); border-radius: 8px; padding: 7px 10px; cursor: pointer; font-size: 12px; }
   .btn-ghost.on { background: rgba(74,222,128,.15); border-color: #4ade80; color: #86efac; }
   .btn-ghost.on:hover { background: rgba(74,222,128,.3); }
@@ -5655,6 +5820,11 @@ PAGE_GPT = """<!doctype html>
   .mdlbox select { flex: 1; min-width: 0; background: transparent; border: 1px solid var(--bd); border-radius: 10px; padding: 10px; color: var(--txt); font-size: 13px; outline: none; }
   .mdlbox select option { background: #17171a; color: var(--txt); }
   .mdlbox .hint { color: var(--mut); font-size: 11.5px; margin-top: 8px; }
+  .cfgrid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin-bottom: 4px; }
+  .cfgrid label { display: flex; flex-direction: column; gap: 4px; font-size: 11.5px; color: var(--mut); }
+  .cfgrid input { width: 100%; box-sizing: border-box; background: transparent; border: 1px solid var(--bd); border-radius: 8px; padding: 8px 10px; color: var(--txt); font-size: 13px; outline: none; }
+  .cfgrid input:focus { border-color: var(--mut); }
+  .mdlbox h4 span { color: var(--mut); font-weight: 400; text-transform: none; letter-spacing: 0; }
   .mdlbox .close { margin-top: 14px; text-align: center; color: var(--mut); cursor: pointer; font-size: 12.5px; }
   .mdlbox .close:hover { color: var(--err); }
   .wd { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%; text-align: left; }
@@ -5761,7 +5931,7 @@ PAGE_GPT = """<!doctype html>
     </div>
     <div class="chatlist" id="chatlist"></div>
     <div class="side-foot">
-      <div class="blrow" id="blstatus">BLENDER <b></b> CHECKING...</div>
+      <div class="blrow" id="blstatus" title="Blender MCP status"><svg class="blicon" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 1.6C7.4 1.6 3.7 3.9 3.7 6.9c0 1.6 1.1 3 2.8 3.9-2.1.9-3.5 2.4-3.5 4.2 0 3.2 4 5.8 9 5.8 2.4 0 4.6-.7 6.2-1.8l3.4 2.8 1.7-2-3.3-2.7c.6-.9.9-1.9.9-3 0-1.9-1-3.6-2.6-4.9.3-.5.4-1.1.4-1.7 0-3-3.7-5.3-8.3-5.3Z"/><ellipse cx="12" cy="6.9" rx="4.2" ry="2.5" fill="#18181b"/></svg><span class="bldot off" id="bldot"></span></div>
       <button class="btn-ghost wd" id="workbtn"></button>
       <div class="foot-row">
         <a href="/" title="Classic UI">Classic UI</a>
@@ -5777,6 +5947,7 @@ PAGE_GPT = """<!doctype html>
         <button class="pill" id="modebtn" title="Plan = pure reasoning without tools">BUILD</button>
         <select class="pill" id="modelsel" title="Active AI model - pick a local .gguf or an external OpenAI-compatible endpoint" style="max-width:190px"></select>
         <button class="pill" id="addmodelbtn" title="Add a model (local .gguf file or an external API endpoint)">+</button>
+        <button class="pill" id="cfgbtn" title="Model settings - context size, temperature, GPU layers">&#9881;</button>
         <select class="pill" id="effort-sel" title="Thinking effort - how deeply BONSAI reasons">
           <option value="off">Effort: off</option>
           <option value="low">Effort: low</option>
@@ -5806,6 +5977,25 @@ PAGE_GPT = """<!doctype html>
         </div>
         <div class="hint" id="mmprojhint"></div>
         <div class="close" id="addmdl-close">Cancel</div>
+      </div>
+    </div>
+
+    <div class="mdl" id="cfgmdl">
+      <div class="mdlbox">
+        <h4>MODEL SETTINGS <span id="cfgwho"></span></h4>
+        <div class="cfgrid">
+          <label>Context size (ctx)<input id="cfg_ctx" type="number" min="512" max="1048576" step="512"></label>
+          <label>Temperature<input id="cfg_temp" type="number" min="0" max="2" step="0.05"></label>
+          <label>Top-p<input id="cfg_top_p" type="number" min="0.01" max="1" step="0.01"></label>
+          <label>Top-k<input id="cfg_top_k" type="number" min="0" max="1000" step="1"></label>
+          <label>GPU layers (-ngl)<input id="cfg_ngl" type="number" min="-1" max="999" step="1"></label>
+        </div>
+        <div class="hint" id="cfghint"></div>
+        <div class="row">
+          <button class="act inline" id="cfg-save">Save</button>
+          <button class="act inline" id="cfg-defaults">Defaults</button>
+          <button class="act inline" id="cfg-close">Close</button>
+        </div>
       </div>
     </div>
 
@@ -6496,15 +6686,16 @@ function renderBlenderStatus(j) {
   const el = document.getElementById('blstatus');
   if (!el) return;
   const map = {
-    ok: ['ok', 'BLENDER CONNECTED'],
-    bridge: ['mid', 'BLENDER ADDON OFF'],
-    down: ['off', 'BLENDER OFF'],
-    missing: ['off', 'BLENDER NO MCP']
+    ok: ['ok', 'Blender MCP: connected - the Blender tools are available.'],
+    bridge: ['mid', 'Blender MCP: bridge is up, but the addon is not enabled.'],
+    down: ['off', 'Blender MCP: not connected. Open Blender with the addon enabled.'],
+    missing: ['off', 'Blender MCP: not installed (pip install mcp-for-blender).']
   };
   const m = map[j.state || 'down'] || map.down;
   el.className = 'blrow ' + m[0];
-  el.innerHTML = 'BLENDER <b></b> ' + m[1];
-  el.title = j.detail ? ('Blender MCP: ' + (j.state || 'down') + ' - ' + j.detail) : ('Blender MCP: ' + (j.state || 'down'));
+  const dot = document.getElementById('bldot');
+  if (dot) dot.className = 'bldot ' + (j.state === 'ok' ? 'on' : m[0]);
+  el.title = j.detail ? (m[1] + ' (' + j.state + ': ' + j.detail + ')') : m[1];
 }
 function refreshBlender() {
   fetch('/api/blender').then(function (r) { return r.json(); })
@@ -6564,7 +6755,7 @@ function setModelStatus(ready, loading) {
   const dot = document.getElementById('sdot');
   if (dot) dot.className = 'dot' + (loading ? ' busy' : (ready ? '' : ' idle'));
   if (!t) return;
-  t.textContent = loading ? 'LOADING MODEL...' : (ready ? 'ONLINE / LOADED' : 'ONLINE / IDLE');
+  t.textContent = loading ? 'LOADING MODEL...' : (ready ? 'ONLINE / LOADED' : 'ONLINE / NOT LOADED');
   t.title = loading ? 'The model is being loaded into RAM/VRAM - this only happens on your first message.'
     : (ready ? 'The model is resident in RAM/VRAM.' : 'The model is not loaded. It loads the first time you send a message.');
 }
@@ -6590,7 +6781,7 @@ function renderModels(j) {
   if (fm && j.active_label) fm.textContent = j.active_label;
   const fc = document.getElementById('footer-caps');
   if (fc) fc.textContent = (j.vision ? 'VISION' : 'TEXT-ONLY') + '+TOOLS';
-  if (typeof setModelStatus === 'function') setModelStatus(!!j.ready, false);
+  if (typeof setModelStatus === 'function') setModelStatus(!!j.ready, !!j.loading);
   window.__lastModels = j;
   renderMmprojList(j);
 }
@@ -6719,6 +6910,69 @@ const _mdlClose = document.getElementById('addmdl-close');
 if (_mdlClose) _mdlClose.onclick = closeAddMdl;
 const _mdl = document.getElementById('addmdl');
 if (_mdl) _mdl.onclick = function (ev) { if (ev.target === _mdl) closeAddMdl(); };
+/* ---------- MODEL SETTINGS modal ---------- */
+function cfgFill(j) {
+  const models = (j && j.models) || [];
+  const act = models.filter(function (m) { return m.id === (j && j.active); })[0];
+  const cfg = (act && act.cfg) || (j && j.defaults) || { ctx: 32768, temp: 1, top_p: 0.95, top_k: 20, ngl: 99 };
+  const set = function (id, v) { const e = document.getElementById(id); if (e) e.value = v; };
+  set('cfg_ctx', cfg.ctx); set('cfg_temp', cfg.temp);
+  set('cfg_top_p', cfg.top_p); set('cfg_top_k', cfg.top_k); set('cfg_ngl', cfg.ngl);
+  const who = document.getElementById('cfgwho');
+  if (who) who.textContent = act ? ('- ' + (act.label || act.id)) : '';
+  const hint = document.getElementById('cfghint');
+  if (hint) {
+    hint.textContent = !act ? 'No local model selected.'
+      : (act.type === 'api' ? 'External endpoints are configured by their own server.'
+      : 'Saved settings are used the next time this model is loaded (after a switch or EJECT).');
+  }
+}
+function openCfgMdl() {
+  const m = document.getElementById('cfgmdl');
+  if (!m) return;
+  cfgFill(window.__lastModels);
+  m.classList.add('on');
+}
+function closeCfgMdl() { const m = document.getElementById('cfgmdl'); if (m) m.classList.remove('on'); }
+const _cfgBtn = document.getElementById('cfgbtn');
+if (_cfgBtn) _cfgBtn.onclick = openCfgMdl;
+const _cfgClose = document.getElementById('cfg-close');
+if (_cfgClose) _cfgClose.onclick = closeCfgMdl;
+const _cfgMdl = document.getElementById('cfgmdl');
+if (_cfgMdl) _cfgMdl.onclick = function (ev) { if (ev.target === _cfgMdl) closeCfgMdl(); };
+const _cfgDefaults = document.getElementById('cfg-defaults');
+if (_cfgDefaults) _cfgDefaults.onclick = function () {
+  const j = window.__lastModels || {};
+  const d = j.defaults || { ctx: 32768, temp: 1, top_p: 0.95, top_k: 20, ngl: 99 };
+  const set = function (id, v) { const e = document.getElementById(id); if (e) e.value = v; };
+  set('cfg_ctx', d.ctx); set('cfg_temp', d.temp);
+  set('cfg_top_p', d.top_p); set('cfg_top_k', d.top_k); set('cfg_ngl', d.ngl);
+};
+const _cfgSave = document.getElementById('cfg-save');
+if (_cfgSave) _cfgSave.onclick = function () {
+  const j = window.__lastModels || {};
+  const act = (j.models || []).filter(function (m) { return m.id === j.active; })[0];
+  if (!act) { alert('No model selected.'); return; }
+  const num = function (id) {
+    const e = document.getElementById(id);
+    return e && e.value !== '' ? Number(e.value) : undefined;
+  };
+  const cfg = { ctx: num('cfg_ctx'), temp: num('cfg_temp'), top_p: num('cfg_top_p'),
+                top_k: num('cfg_top_k'), ngl: num('cfg_ngl') };
+  _cfgSave.disabled = true;
+  fetch('/api/models', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action: 'config', id: act.id, cfg: cfg }) })
+    .then(function (r) { return r.json(); })
+    .then(function (res) {
+      if (!res.ok) { alert('Could not save the settings:\\n' + (res.error || 'unknown error')); return; }
+      renderModels(res);
+      cfgFill(res);
+      const hint = document.getElementById('cfghint');
+      if (hint) hint.textContent = 'Saved. These values apply the next time this model is loaded.';
+    })
+    .catch(function () { alert('Could not save the settings'); })
+    .then(function () { _cfgSave.disabled = false; });
+};
 document.addEventListener('keydown', function (ev) {
   if (ev.key === 'Escape') closeAddMdl();
 });
@@ -7041,6 +7295,9 @@ class Handler(BaseHTTPRequestHandler):
                 elif action == "mmproj":
                     res = _set_model_mmproj(str(body.get("id") or ""),
                                             body.get("mmproj"))
+                elif action == "config":
+                    res = _set_model_config(str(body.get("id") or ""),
+                                            body.get("cfg") or {})
                 elif action == "scan":
                     res = _scan_models()
                 else:
