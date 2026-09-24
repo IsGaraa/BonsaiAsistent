@@ -34,6 +34,9 @@ piper/*.onnx
 piper/*.onnx.json
 piper/*.wav
 
+# Model selector config (per-machine model list + active choice)
+models.json
+
 # OS / editor
 Thumbs.db
 Desktop.ini

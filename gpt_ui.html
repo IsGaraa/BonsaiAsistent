@@ -44,6 +44,23 @@
   .btn-ghost.on { background: rgba(74,222,128,.15); border-color: #4ade80; color: #86efac; }
   .btn-ghost.on:hover { background: rgba(74,222,128,.3); }
   .btn-ghost:hover { border-color: var(--mut); }
+  .mdl { position: fixed; inset: 0; z-index: 90; display: none; align-items: center; justify-content: center; background: rgba(0,0,0,.55); }
+  .mdl.on { display: flex; }
+  .mdlbox { width: min(560px, 92vw); background: var(--bg2); border: 1px solid var(--bd); border-radius: 14px; padding: 18px; }
+  .mdlbox h4 { margin: 0 0 12px; font-size: 12px; letter-spacing: 1.5px; color: var(--mut); text-transform: uppercase; }
+  .mdlbox .act { display: block; width: 100%; text-align: left; background: transparent; border: 1px solid var(--bd); color: var(--txt); border-radius: 10px; padding: 11px 12px; margin-bottom: 8px; cursor: pointer; font-size: 13px; font-weight: 500; }
+  .mdlbox .act:hover { background: var(--bg3); border-color: var(--mut); }
+  .mdlbox .act small { display: block; color: var(--mut); font-size: 11.5px; margin-top: 3px; font-weight: 400; }
+  .mdlbox .act.inline { width: auto; margin: 0; padding: 10px 16px; }
+  .mdlbox .mdlsep { color: var(--mut); font-size: 11px; letter-spacing: 1px; text-transform: uppercase; margin: 14px 0 8px; }
+  .mdlbox .row { display: flex; gap: 8px; }
+  .mdlbox input { flex: 1; min-width: 0; background: transparent; border: 1px solid var(--bd); border-radius: 10px; padding: 10px; color: var(--txt); font-size: 13px; outline: none; }
+  .mdlbox input:focus { border-color: var(--mut); }
+  .mdlbox select { flex: 1; min-width: 0; background: transparent; border: 1px solid var(--bd); border-radius: 10px; padding: 10px; color: var(--txt); font-size: 13px; outline: none; }
+  .mdlbox select option { background: #17171a; color: var(--txt); }
+  .mdlbox .hint { color: var(--mut); font-size: 11.5px; margin-top: 8px; }
+  .mdlbox .close { margin-top: 14px; text-align: center; color: var(--mut); cursor: pointer; font-size: 12.5px; }
+  .mdlbox .close:hover { color: var(--err); }
   .wd { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%; text-align: left; }
   .foot-row { display: flex; gap: 6px; }
   .foot-row a { text-decoration: none; color: var(--mut); flex: 1; text-align: center; }
@@ -154,7 +171,7 @@
         <a href="/" title="Classic UI">Classic UI</a>
         <button class="btn-ghost" id="ttsbtn" title="Text-to-speech (Piper) - speak replies aloud. Off by default.">TTS: OFF</button>
         <button class="btn-ghost" id="themebtn" title="Toggle theme"></button>
-        <button class="btn-ghost" id="ejectbtn" title="Unload the model from RAM/VRAM">EJECT</button>
+        <button class="btn-ghost" id="ejectbtn" title="Stop the model server now and free its RAM/VRAM (it restarts automatically on the next message)">EJECT</button>
       </div>
     </div>
   </nav>
@@ -162,6 +179,8 @@
     <header class="topbar">
       <div class="tb-r" style="display:flex;align-items:center;gap:10px">
         <button class="pill" id="modebtn" title="Plan = pure reasoning without tools">BUILD</button>
+        <select class="pill" id="modelsel" title="Active AI model - pick a local .gguf or an external OpenAI-compatible endpoint" style="max-width:190px"></select>
+        <button class="pill" id="addmodelbtn" title="Add a model (local .gguf file or an external API endpoint)">+</button>
         <select class="pill" id="effort-sel" title="Thinking effort - how deeply BONSAI reasons">
           <option value="off">Effort: off</option>
           <option value="low">Effort: low</option>
@@ -171,6 +190,29 @@
         <span class="state" id="state-label">READY</span>
       </div>
     </header>
+
+    <div class="mdl" id="addmdl">
+      <div class="mdlbox">
+        <h4>ADD A MODEL</h4>
+        <button class="act" id="mdl-file">Model file (.gguf) &mdash; browse&hellip;<small>Pick a single GGUF model from anywhere on this PC.</small></button>
+        <button class="act" id="mdl-folder">Model folder &mdash; browse&hellip;<small>Scan a folder (and its subfolders) and add every .gguf it finds.</small></button>
+        <div class="mdlsep">or connect to an API server</div>
+        <div class="row">
+          <input id="apibase" placeholder="base URL, e.g. http://127.0.0.1:1234/v1">
+          <input id="apimodel" placeholder="model id, e.g. qwen3-8b">
+          <button class="act inline" id="mdl-api">Add</button>
+        </div>
+        <div class="mdlsep">vision projector (optional - enables screenshots &amp; images)</div>
+        <div class="row">
+          <select id="mmprojfor"></select>
+          <button class="act inline" id="mdl-mmproj">Browse&hellip;</button>
+          <button class="act inline" id="mdl-mmproj-clear">Clear</button>
+        </div>
+        <div class="hint" id="mmprojhint"></div>
+        <div class="close" id="addmdl-close">Cancel</div>
+      </div>
+    </div>
+
     <div class="messages" id="messages">
       <div class="inner">
         <div class="empty" id="empty">
@@ -212,13 +254,28 @@ let statsVals = { think_ms: 0, respond_ms: 0, tok_s: 0, ctx_used: 0, ctx_left: 0
 const SEND_SVG = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path d="M12 19V5M5 12l7-7 7 7"/></svg>';
 const STOP_SVG = '<svg width="13" height="13" viewBox="0 0 24 24"><rect x="5" y="5" width="14" height="14" rx="2" fill="currentColor"/></svg>';
 
-function load() { try { return JSON.parse(localStorage.getItem('bonsai_gpt_chats') || '[]'); } catch (e) { return []; } }
+function load() { try { const v = JSON.parse(localStorage.getItem('bonsai_gpt_chats') || '[]'); return Array.isArray(v) ? v : []; } catch (e) { return []; } }
+const IMG_KEEP = 200 * 1024;
+function stripHeavyImages(m) {
+  if (!Array.isArray(m.content)) return;
+  const keep = [];
+  let dropped = 0;
+  m.content.forEach(function (p) {
+    if (p.type === 'image_url' && p.image_url && (p.image_url.url || '').length > IMG_KEEP) { dropped++; return; }
+    keep.push(p);
+  });
+  if (dropped) m.content = keep.length ? keep : '[large image removed from history]';
+}
 function save() {
   try {
+    const recent = {};
+    chats.slice().sort(function (a, b) { return (b.ts || 0) - (a.ts || 0); })
+      .slice(0, 5).forEach(function (c) { recent[c.id] = 1; });
     const c = chats.slice(-200).map(function (ch) {
       const copy = JSON.parse(JSON.stringify(ch));
       (copy.messages || []).forEach(function (m) {
         if (m.calls) (m.calls).forEach(function (cl) { if (cl.preview) delete cl.preview; });
+        if (!recent[ch.id]) stripHeavyImages(m);
       });
       return copy;
     });
@@ -233,6 +290,7 @@ function newChat() {
 }
 function init() {
   bindModeBtn(); bindTheme(); loadWorkdir();
+  dedupeChats();
   if (!chats.length) newChat(); else cur = chats[chats.length - 1];
   renderAll(); setSendUI(); setQueueUI();
   fetch('/api/todos').then(function (r) { return r.json(); }).then(function (j) {
@@ -272,12 +330,31 @@ function setWorkdirInUI(wd) {
   w.title = 'Working folder: ' + workdir;
 }
 function renderAll() { renderList(); renderConv(); }
+function dedupeChats() {
+  const byId = {};
+  const out = [];
+  (chats || []).forEach(function (c) {
+    if (!c || !c.id) return;
+    const prev = byId[c.id];
+    if (!prev) { byId[c.id] = c; out.push(c); return; }
+    const a = (c.messages || []).length, b = (prev.messages || []).length;
+    if (a > b || (a === b && (c.ts || 0) > (prev.ts || 0))) {
+      const i = out.indexOf(prev);
+      if (i !== -1) out[i] = c;
+      byId[c.id] = c;
+    }
+  });
+  chats = out;
+}
 function renderList() {
   const el = document.getElementById('chatlist');
   el.innerHTML = '';
+  let marked = false;
   chats.slice().sort(function (a, b) { return (b.ts || 0) - (a.ts || 0); }).forEach(function (c) {
     const row = document.createElement('div');
-    row.className = 'chat-item' + (cur && c.id === cur.id ? ' active' : '');
+    const isActive = !marked && cur && c.id === cur.id;
+    if (isActive) marked = true;
+    row.className = 'chat-item' + (isActive ? ' active' : '');
     const t = document.createElement('span'); t.className = 'tit'; t.textContent = c.title; t.title = c.title;
     const d = document.createElement('button'); d.className = 'del'; d.textContent = '×';
     d.onclick = function (e) {
@@ -842,15 +919,18 @@ document.getElementById('ejectbtn').onclick = function () {
   const btn = document.getElementById('ejectbtn');
   if (btn.disabled) return;
   btn.disabled = true;
+  btn.textContent = 'EJECTING...';
   btn.style.opacity = '0.5';
   fetch('/api/eject', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
     .then(function (r) { return r.json(); })
     .then(function (j) {
       btn.textContent = j.ok ? 'EJECTED' : 'FAILED';
+      btn.title = j.detail || j.error || (j.ok ? 'Model unloaded - it reloads on the next message' : 'Eject failed');
       setTimeout(function () { btn.textContent = 'EJECT'; btn.disabled = false; btn.style.opacity = '1'; }, 2500);
     })
     .catch(function () {
       btn.textContent = 'FAILED';
+      btn.title = 'The eject request failed.';
       setTimeout(function () { btn.textContent = 'EJECT'; btn.disabled = false; btn.style.opacity = '1'; }, 2500);
     });
 };
@@ -877,6 +957,165 @@ document.getElementById('ttsbtn').onclick = function () {
     .catch(function () { alert('TTS toggle failed'); });
 };
 refreshTts();
+
+/* ---------- MODEL selector ---------- */
+function modelLabel(m) {
+  return (m.type === 'api' ? '☁ ' : '◉ ') + (m.label || m.id);
+}
+function renderModels(j) {
+  const sel = document.getElementById('modelsel');
+  if (!sel) return;
+  sel.innerHTML = '';
+  (j.models || []).forEach(function (m) {
+    const o = document.createElement('option');
+    o.value = m.id;
+    o.textContent = modelLabel(m) + (m.type === 'local' && m.vision ? ' · vision' : '') +
+      (m.type === 'local' && m.available === false ? ' (missing)' : '');
+    if (m.id === j.active) o.selected = true;
+    sel.appendChild(o);
+  });
+  sel.classList.toggle('off', !j.managed);
+  sel.setAttribute('data-prev', j.active || '');
+  const badge = document.getElementById('modelbadge');
+  if (badge && j.active_label) badge.textContent = j.active_label;
+  const vs = document.getElementById('visionbadge');
+  if (vs) vs.textContent = j.vision ? 'mmproj ON' : 'mmproj OFF';
+  const fm = document.getElementById('footer-model');
+  if (fm && j.active_label) fm.textContent = j.active_label;
+  const fc = document.getElementById('footer-caps');
+  if (fc) fc.textContent = (j.vision ? 'VISION' : 'TEXT-ONLY') + '+TOOLS';
+  window.__lastModels = j;
+  renderMmprojList(j);
+}
+function renderMmprojList(j) {
+  const sel = document.getElementById('mmprojfor');
+  const hint = document.getElementById('mmprojhint');
+  if (!sel) return;
+  const keep = sel.value;
+  sel.innerHTML = '';
+  (j.models || []).filter(function (m) { return m.type === 'local'; })
+    .forEach(function (m) {
+      const o = document.createElement('option');
+      o.value = m.id;
+      o.textContent = (m.label || m.id) + (m.vision ? '  (vision on)' : '');
+      sel.appendChild(o);
+    });
+  if (keep) sel.value = keep;
+  const cur = (j.models || []).filter(function (m) { return m.id === sel.value; })[0];
+  if (hint) {
+    hint.textContent = !cur ? 'No local models yet.'
+      : (cur.vision ? 'Projector: ' + String(cur.mmproj).split(/[\/]/).pop()
+                    : 'No projector attached - this model is text-only.');
+  }
+}
+function setMmproj(mmproj) {
+  const sel = document.getElementById('mmprojfor');
+  if (!sel || !sel.value) { alert('Add a local model first.'); return; }
+  fetch('/api/models', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action: 'mmproj', id: sel.value, mmproj: mmproj }) })
+    .then(function (r) { return r.json(); })
+    .then(function (j) {
+      if (!j.ok) { alert('Could not set the projector:\n' + (j.error || 'unknown error')); return; }
+      renderModels(j);
+    })
+    .catch(function () { alert('Could not set the projector'); });
+}
+function refreshModels() {
+  fetch('/api/models')
+    .then(function (r) { return r.json(); })
+    .then(renderModels)
+    .catch(function () {});
+}
+document.getElementById('modelsel').onchange = function () {
+  const sel = document.getElementById('modelsel');
+  const id = sel.value;
+  const prev = sel.getAttribute('data-prev') || '';
+  sel.disabled = true;
+  sel.title = 'Switching model - a local model restarts the model server, this can take up to a minute...';
+  fetch('/api/models', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'select', id: id }) })
+    .then(function (r) { return r.json(); })
+    .then(function (j) {
+      sel.disabled = false;
+      renderModels(j);
+      if (!j.ok) { alert('Could not switch model: ' + (j.error || 'unknown error')); sel.value = prev; }
+    })
+    .catch(function () { sel.disabled = false; sel.value = prev; alert('Model switch failed'); });
+};
+/* ---------- ADD MODEL modal (native file / folder browser) ---------- */
+function openAddMdl() { const m = document.getElementById('addmdl'); if (m) m.classList.add('on'); }
+function closeAddMdl() { const m = document.getElementById('addmdl'); if (m) m.classList.remove('on'); }
+function afterAdd(j, what) {
+  if (j.cancelled) return;
+  if (!j.ok) { alert('Could not add the model:\n' + (j.error || 'unknown error')); return; }
+  renderModels(j);
+  if (what === 'folder') {
+    alert('Added ' + ((j.added && j.added.length) || 0) + ' model(s) from that folder' +
+          (j.skipped ? ' (' + j.skipped + ' already in the list)' : '') +
+          '.\n\nPick the one you want from the dropdown.');
+  } else if (what === 'file') {
+    alert('Model added. Pick it from the dropdown to use it.');
+  }
+  closeAddMdl();
+}
+function addModelPick(what) {
+  const btn = document.getElementById('addmodelbtn');
+  if (btn) { btn.disabled = true; btn.textContent = '...'; }
+  fetch('/api/pick_model', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ what: what }) })
+    .then(function (r) { return r.json(); })
+    .then(function (j) { afterAdd(j, what); })
+    .catch(function () { alert('Could not open the file browser'); })
+    .then(function () { if (btn) { btn.disabled = false; btn.textContent = '+'; } });
+}
+function addModelApi() {
+  const base = (document.getElementById('apibase').value || '').trim();
+  const model = (document.getElementById('apimodel').value || '').trim();
+  if (!base || !model) { alert('Fill in both the base URL and the model id.'); return; }
+  fetch('/api/models', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action: 'add', type: 'api', label: model, base_url: base, model: model }) })
+    .then(function (r) { return r.json(); })
+    .then(function (j) {
+      if (!j.ok) { alert('Could not add the model:\n' + (j.error || 'unknown error')); return; }
+      renderModels(j); closeAddMdl();
+      document.getElementById('apibase').value = '';
+      document.getElementById('apimodel').value = '';
+    })
+    .catch(function () { alert('Add failed'); });
+}
+document.getElementById('addmodelbtn').onclick = openAddMdl;
+const _mdlFile = document.getElementById('mdl-file');
+if (_mdlFile) _mdlFile.onclick = function () { addModelPick('file'); };
+const _mdlFolder = document.getElementById('mdl-folder');
+if (_mdlFolder) _mdlFolder.onclick = function () { addModelPick('folder'); };
+const _mdlApi = document.getElementById('mdl-api');
+if (_mdlApi) _mdlApi.onclick = addModelApi;
+const _mmprojBtn = document.getElementById('mdl-mmproj');
+if (_mmprojBtn) _mmprojBtn.onclick = function () {
+  const sel = document.getElementById('mmprojfor');
+  if (!sel || !sel.value) { alert('Add a local model first.'); return; }
+  _mmprojBtn.disabled = true; _mmprojBtn.textContent = '...';
+  fetch('/api/pick_model', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ what: 'mmproj', id: sel.value }) })
+    .then(function (r) { return r.json(); })
+    .then(function (j) {
+      if (j.cancelled) return;
+      if (!j.ok) { alert('Could not set the projector:\n' + (j.error || 'unknown error')); return; }
+      renderModels(j);
+    })
+    .catch(function () { alert('Could not open the file browser'); })
+    .then(function () { _mmprojBtn.disabled = false; _mmprojBtn.innerHTML = 'Browse&hellip;'; });
+};
+const _mmprojClear = document.getElementById('mdl-mmproj-clear');
+if (_mmprojClear) _mmprojClear.onclick = function () { setMmproj(''); };
+const _mmprojSel = document.getElementById('mmprojfor');
+if (_mmprojSel) _mmprojSel.onchange = function () { renderMmprojList(window.__lastModels || { models: [] }); };
+const _mdlClose = document.getElementById('addmdl-close');
+if (_mdlClose) _mdlClose.onclick = closeAddMdl;
+const _mdl = document.getElementById('addmdl');
+if (_mdl) _mdl.onclick = function (ev) { if (ev.target === _mdl) closeAddMdl(); };
+document.addEventListener('keydown', function (ev) {
+  if (ev.key === 'Escape') closeAddMdl();
+});
+refreshModels();
 const inp = document.getElementById('user-input');
 inp.addEventListener('input', function () { this.style.height = 'auto'; this.style.height = Math.min(this.scrollHeight, 160) + 'px'; });
 inp.addEventListener('keydown', function (ev) { if (ev.key === 'Enter' && !ev.shiftKey) { ev.preventDefault(); handleSubmit(ev); } });

@@ -172,7 +172,7 @@
     "type": "function",
     "function": {
       "name": "run_command",
-      "description": "Run a shell command on this Windows PC and return its output. Use it to build, test, install, debug or check system info: python, pip, git, npm, node, dir, tasklist, systeminfo, ping, etc. Runs in the workspace folder by default. Max 45 seconds by default - raise 'timeout' for long-running commands (up to 600s). Output truncated to ~8 KB. In PLAN mode this tool is disabled.",
+      "description": "Run a shell command on this PC and return its output. Use it to build, test, install, debug or check system info: python, pip, git, npm, node, ls, dir, ps, ping, etc. Runs in the workspace folder by default. Max 45 seconds by default - raise 'timeout' for long-running commands (up to 600s). Output truncated to ~8 KB. In PLAN mode this tool is disabled.",
       "parameters": {
         "type": "object",
         "properties": {

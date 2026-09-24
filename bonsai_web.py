@@ -9,6 +9,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -38,34 +39,63 @@ except Exception:
 
 HOST, PORT = "127.0.0.1", 8081
 
+IS_WINDOWS = os.name == "nt"
+IS_LINUX = sys.platform.startswith("linux")
+
 # ---- model backends ----
-BONSAI_DIR = os.environ.get("BONSAI_DIR", r"C:\Users\drago\Desktop\bonsai2")
-LLAMA_EXE = os.path.join(os.environ.get("LOCALAPPDATA", ""),
-                         "Programs", "prism-llama", "llama-server.exe")
+BONSAI_DIR = os.environ.get("BONSAI_DIR", os.path.dirname(os.path.abspath(__file__)))
+
+def _default_llama_exe():
+    if IS_WINDOWS:
+        return os.path.join(os.environ.get("LOCALAPPDATA", ""),
+                            "Programs", "prism-llama", "llama-server.exe")
+    return shutil.which("llama-server") or os.path.join(BONSAI_DIR, "llama-server")
+
+LLAMA_EXE = os.environ.get("PC_LLAMA_SERVER") or _default_llama_exe()
 BONSAI_MODEL = os.path.join(BONSAI_DIR, "Ternary-Bonsai-2-27B-PQ2_0.gguf")
 BONSAI_MMPROJ = os.path.join(BONSAI_DIR, "Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf")
 BONSAI_BASE = "http://127.0.0.1:8080"
 BONSAI_MODEL_ID = "bonsai2"
 BONSAI_CTX = 32768
 BONSAI_KEEP_ALIVE = 120
-CHATS_FILE = os.path.join(os.path.expandvars(r"%APPDATA%"), "BonsaiAsistent", "chats.json")
+if IS_WINDOWS:
+    CHATS_FILE = os.path.join(os.path.expandvars(r"%APPDATA%"),
+                              "BonsaiAsistent", "chats.json")
+else:
+    _cfg_dir = os.environ.get("XDG_CONFIG_HOME") or \
+        os.path.expanduser("~/.config")
+    CHATS_FILE = os.path.join(_cfg_dir, "BonsaiAsistent", "chats.json")
 # Tool calls are effectively unlimited - the model calls tools for as long as it
 # needs and the conversation context is the natural stop. The guard counter only
 # exists to catch a pathological infinite loop; tune it with BONSAI_MAX_TOOL_ROUNDS
 # (e.g. 1000, or 0 for no guard at all).
 MAX_TOOL_ROUNDS = int(os.environ.get("BONSAI_MAX_TOOL_ROUNDS", "1000")) or 10 ** 9
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
+MAX_REQUEST_BYTES = 40 * 1024 * 1024
 MAX_TEXT_FILE_BYTES = 200 * 1024
 MAX_FILE_BYTES = 1024 * 1024
 MAX_SEARCH_RESULTS = 200
 MODE_BUILD = "build"
 MODE_PLAN = "plan"
-WORKDIR = os.path.realpath(os.environ.get("PC_WORKDIR", r"C:\Users\drago\Desktop\workspace"))
+_DEF_WORKDIR = (r"C:\Users\drago\Desktop\workspace" if IS_WINDOWS
+                else os.path.expanduser("~/bonsai_workspace"))
+WORKDIR = os.path.realpath(os.environ.get("PC_WORKDIR", _DEF_WORKDIR))
 PIPER_DIR = os.environ.get("PC_PIPER_DIR", os.path.join(BONSAI_DIR, "piper"))
+MODELS_FILE = os.path.join(BONSAI_DIR, "models.json")
+MODELS_DIR = os.path.join(BONSAI_DIR, "models")
 
-CREATE_NO_WINDOW = 0x08000000
+CREATE_NO_WINDOW = 0x08000000 if IS_WINDOWS else 0
+
+try:
+    os.makedirs(WORKDIR, exist_ok=True)
+except Exception:
+    pass
 
 _BONSAI_LOCK = threading.Lock()
+_BONSAI_PROC = None
+_MODELS = []
+_ACTIVE_MODEL = None
+_MODELS_LOCK = threading.RLock()
 _ASKS = {}
 _ASKS_LOCK = threading.Lock()
 _TODOS = []
@@ -296,7 +326,36 @@ def _canonical(name):
     return _ALIASES.get(text, text)
 
 
+def _open_path(path):
+    """Open a file or URI with the OS default handler (os.startfile on
+    Windows, xdg-open / gio on Linux, browser as last resort)."""
+    try:
+        if IS_WINDOWS:
+            os.startfile(path)
+            return True
+    except Exception:
+        pass
+    for opener in ("xdg-open", "gio", "kde-open"):
+        exe = shutil.which(opener)
+        if exe:
+            try:
+                subprocess.Popen([exe, str(path)],
+                                 stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL,
+                                 creationflags=CREATE_NO_WINDOW)
+                return True
+            except Exception:
+                continue
+    try:
+        webbrowser.open(str(path))
+        return True
+    except Exception:
+        return False
+
+
 def _store_appid(name):
+    if not IS_WINDOWS:
+        return None
     if not _NAME_RE.match(name or ""):
         return None
     script = "Get-StartApps | Select-Object Name,AppID | ConvertTo-Json -Compress"
@@ -324,23 +383,30 @@ def _store_appid(name):
 
 def _launch(name):
     key = _canonical(name)
-    error, ok = None, None
+    error = None
     for kind, value in _APPS.get(key, []):
         try:
             if kind == "uri":
-                os.startfile(value)
+                _open_path(value)
             elif kind == "cmd":
-                subprocess.Popen(["cmd", "/c", "start", "", value])
+                if IS_WINDOWS:
+                    subprocess.Popen(["cmd", "/c", "start", "", value],
+                                     creationflags=CREATE_NO_WINDOW)
+                else:
+                    exe = shutil.which(value)
+                    if not exe:
+                        continue
+                    subprocess.Popen([exe], creationflags=CREATE_NO_WINDOW)
             elif kind == "path":
                 path = os.path.expandvars(value)
                 if not os.path.exists(path):
                     continue
-                os.startfile(path)
+                _open_path(path)
             elif kind == "glob":
                 hits = glob.glob(os.path.expandvars(value))
                 if not hits:
                     continue
-                os.startfile(hits[0])
+                _open_path(hits[0])
         except Exception as exc:
             error = f"{kind}:{value} -> {exc}"
             continue
@@ -349,7 +415,7 @@ def _launch(name):
         store = _store_appid(key)
         if store:
             try:
-                os.startfile("shell:AppsFolder\\" + store["AppID"])
+                _open_path("shell:AppsFolder\\" + store["AppID"])
             except Exception as exc:
                 return {"error": f"could not open '{key}': {exc}"}
             return {"launched": store.get("Name", key), "result": "ok", "method": "start menu app"}
@@ -443,16 +509,24 @@ def _open_one(name):
     store = _store_appid(key)
     if store:
         try:
-            os.startfile("shell:AppsFolder\\" + store["AppID"])
+            _open_path("shell:AppsFolder\\" + store["AppID"])
         except Exception as exc:
             return {"error": f"could not open '{name}': {exc}"}
         return {"launched": store.get("Name", key), "result": "ok", "method": "start menu app"}
+    if not IS_WINDOWS:
+        exe = shutil.which(key)
+        if exe:
+            try:
+                subprocess.Popen([exe], creationflags=CREATE_NO_WINDOW)
+            except Exception as exc:
+                return {"error": f"could not open '{name}': {exc}"}
+            return {"launched": key, "result": "ok", "method": "linux-bin"}
     local = _local_file_target(name)
     if local:
         if not os.path.isfile(local):
             return {"error": f"file not found: {local}"}
         try:
-            os.startfile(local)
+            _open_path(local)
         except Exception as exc:
             return {"error": f"could not open '{name}': {exc}"}
         return {"opened": local, "result": "ok", "method": "file"}
@@ -603,11 +677,65 @@ def _preview_html(path):
             "preview_url": _preview_url(relpath)}
 
 
+_PREVIEW_MIME = {
+    ".css": "text/css; charset=utf-8",
+    ".js": "text/javascript; charset=utf-8",
+    ".mjs": "text/javascript; charset=utf-8",
+    ".json": "application/json; charset=utf-8",
+    ".map": "application/json; charset=utf-8",
+    ".svg": "image/svg+xml",
+    ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+    ".gif": "image/gif", ".webp": "image/webp", ".avif": "image/avif",
+    ".ico": "image/x-icon", ".bmp": "image/bmp",
+    ".woff": "font/woff", ".woff2": "font/woff2",
+    ".ttf": "font/ttf", ".otf": "font/otf",
+    ".wasm": "application/wasm",
+    ".txt": "text/plain; charset=utf-8", ".md": "text/plain; charset=utf-8",
+    ".csv": "text/csv; charset=utf-8", ".xml": "text/xml; charset=utf-8",
+    ".webmanifest": "application/manifest+json",
+    ".mp3": "audio/mpeg", ".wav": "audio/wav", ".ogg": "audio/ogg",
+    ".mp4": "video/mp4", ".webm": "video/webm",
+}
+
+
+def _preview_base_href(target):
+    """A <base> so relative assets inside a previewed page resolve to the
+    /previewfile route instead of the server root."""
+    rel = os.path.relpath(target, os.path.realpath(WORKDIR)).replace("\\", "/")
+    folder = os.path.dirname(rel)
+    quoted = "/".join(urllib.parse.quote(seg) for seg in folder.split("/") if seg)
+    return "/previewfile/" + (quoted + "/" if quoted else "")
+
+
+def _inject_base(html_text, href):
+    """Insert <base href=...> into <head> unless the page already has one."""
+    low = html_text.lower()
+    if "<base" in low[:4000]:
+        return html_text
+    tag = '<base href="%s">' % href
+    i = low.find("<head")
+    if i != -1:
+        j = low.find(">", i)
+        if j != -1:
+            return html_text[:j + 1] + tag + html_text[j + 1:]
+    i = low.find("<html")
+    if i != -1:
+        j = low.find(">", i)
+        if j != -1:
+            return html_text[:j + 1] + "<head>" + tag + "</head>" + html_text[j + 1:]
+    return tag + html_text
+
+
 def _search_files(pattern, path):
+    if not str(pattern or "").strip():
+        return {"error": "pattern is required (a regular expression to search for)"}
     target = _safe_path(path) if path else os.path.realpath(WORKDIR)
     if not os.path.isdir(target):
         return {"error": f"not a directory: {target}"}
-    rx = re.compile(pattern, re.IGNORECASE | re.UNICODE)
+    try:
+        rx = re.compile(pattern, re.IGNORECASE | re.UNICODE)
+    except re.error as exc:
+        return {"error": f"invalid regular expression: {exc}"}
     hits = []
     for root, dirs, files in os.walk(target):
         dirs[:] = [d for d in dirs if not d.startswith(".") and d != "__pycache__"]
@@ -1295,7 +1423,8 @@ def _blender_status_payload():
             "tools": names, "detail": detail}
 
 
-SYSTEM = ("You are the friendly assistant living on the user's Windows PC. Reply "
+SYSTEM = ("You are the friendly assistant living on the user's "
+          + ("Windows" if IS_WINDOWS else "Linux") + " PC. Reply "
           "concisely and naturally, in the same language the user writes in. "
           "You have vision: if the user "
           "attaches one or more images or text files - or asks you to inspect "
@@ -1340,22 +1469,31 @@ def _bonsai_ready():
 
 
 def _start_bonsai():
+    global _BONSAI_PROC
+    entry = _active_model()
+    if not entry or entry.get("type") == "api":
+        return _bonsai_ready()
+    model = entry.get("path") or ""
+    mmproj = entry.get("mmproj") or ""
+    port = int(entry.get("port") or 8080)
     log_out = os.path.join(BONSAI_DIR, "bonsai-server.out.log")
     log_err = os.path.join(BONSAI_DIR, "bonsai-server.err.log")
     if not os.path.exists(LLAMA_EXE):
         print(f"llama-server not found at {LLAMA_EXE}", flush=True)
         return False
-    if not os.path.exists(BONSAI_MODEL):
-        print(f"model not found at {BONSAI_MODEL}", flush=True)
+    if not model or not os.path.exists(model):
+        print(f"model not found at {model}", flush=True)
         return False
-    args = [LLAMA_EXE, "-m", BONSAI_MODEL,
-            "--mmproj", BONSAI_MMPROJ,
-            "--alias", BONSAI_MODEL_ID,
-            "--port", "8080", "--ctx-size", "32768", "-ngl", "99",
-            "--flash-attn", "on", "--temp", "1.0", "--top-p", "0.95",
-            "--top-k", "20"]
+    args = [LLAMA_EXE, "-m", model]
+    if mmproj and os.path.exists(mmproj):
+        args += ["--mmproj", mmproj]
+    args += ["--alias", entry["id"], "--port", str(port),
+             "--ctx-size", str(int(entry.get("ctx") or 32768)),
+             "-ngl", "99", "--flash-attn", "on", "--temp", "1.0",
+             "--top-p", "0.95", "--top-k", "20"]
     with open(log_out, "ab") as o, open(log_err, "ab") as e:
-        subprocess.Popen(args, stdout=o, stderr=e, creationflags=CREATE_NO_WINDOW)
+        _BONSAI_PROC = subprocess.Popen(args, stdout=o, stderr=e,
+                                        creationflags=CREATE_NO_WINDOW)
     for _ in range(100):
         if _bonsai_ready():
             return True
@@ -1364,13 +1502,480 @@ def _start_bonsai():
 
 
 def _ensure_bonsai():
+    entry = _active_model()
+    if entry and entry.get("type") == "api":
+        return _bonsai_ready()
     if _bonsai_ready():
         return True
     with _BONSAI_LOCK:
         if _bonsai_ready():
             return True
-        print("Bonsai 2 server not running - starting it...", flush=True)
+        print("Model server not running - starting it...", flush=True)
         return _start_bonsai()
+
+
+def _stop_local_server(port=8080):
+    """Stop the locally-managed llama-server (tracked process, else by port)."""
+    global _BONSAI_PROC
+    proc = _BONSAI_PROC
+    if proc is not None and proc.poll() is None:
+        try:
+            proc.terminate()
+            proc.wait(timeout=20)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        _BONSAI_PROC = None
+        return True
+    if IS_WINDOWS:
+        ps = ("$c = Get-NetTCPConnection -LocalPort %d -State Listen "
+              "-ErrorAction SilentlyContinue; if ($c) { $c | ForEach-Object "
+              "{ Stop-Process -Id $_.OwningProcess -Force "
+              "-ErrorAction SilentlyContinue } }" % int(port))
+        try:
+            subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                           capture_output=True, timeout=30,
+                           creationflags=CREATE_NO_WINDOW)
+        except Exception:
+            pass
+        return True
+    for tool, argv in (("fuser", ["-k", "%d/tcp" % int(port)]),
+                       ("lsof", None)):
+        exe = shutil.which(tool)
+        if not exe:
+            continue
+        try:
+            if tool == "lsof":
+                out = subprocess.run([exe, "-ti", "tcp:%d" % int(port)],
+                                     capture_output=True, text=True,
+                                     timeout=15).stdout
+                for pid in out.split():
+                    subprocess.run(["kill", "-9", pid], capture_output=True,
+                                   timeout=10)
+            else:
+                subprocess.run([exe] + argv, capture_output=True, timeout=15)
+        except Exception:
+            pass
+        return True
+    return False
+
+
+# ---------------- Model registry (selector) ----------------
+
+def _default_model_entry():
+    return {"id": "bonsai2", "label": "Bonsai 2 27B", "type": "local",
+            "path": BONSAI_MODEL, "mmproj": BONSAI_MMPROJ,
+            "ctx": 32768, "port": 8080}
+
+
+def _model_id_from(stem):
+    return re.sub(r"[^a-z0-9]+", "-", str(stem).lower()).strip("-")[:48] or "model"
+
+
+def _common_prefix_tokens(a, b):
+    at = re.split(r"[-_.]+", str(a).lower())
+    bt = re.split(r"[-_.]+", str(b).lower())
+    n = 0
+    for x, y in zip(at, bt):
+        if x == y:
+            n += 1
+        else:
+            break
+    return n
+
+
+def _discover_models(existing):
+    found = []
+    seen = set()
+    for m in existing:
+        if m.get("type", "local") == "local" and m.get("path"):
+            seen.add(os.path.normcase(os.path.abspath(m["path"])))
+    for folder in (BONSAI_DIR, MODELS_DIR):
+        if not os.path.isdir(folder):
+            continue
+        names = sorted(os.listdir(folder))
+        mmprojs = [n for n in names if n.lower().endswith(".gguf")
+                   and "mmproj" in n.lower()]
+        for name in names:
+            if not name.lower().endswith(".gguf") or "mmproj" in name.lower():
+                continue
+            path = os.path.join(folder, name)
+            key = os.path.normcase(os.path.abspath(path))
+            if key in seen:
+                continue
+            stem = os.path.splitext(name)[0]
+            best, best_score = "", 1
+            for cand in mmprojs:
+                score = _common_prefix_tokens(stem, os.path.splitext(cand)[0])
+                if score > best_score:
+                    best, best_score = cand, score
+            mmproj = os.path.join(folder, best) if best else ""
+            found.append({"id": _model_id_from(stem), "label": stem,
+                          "type": "local", "path": path, "mmproj": mmproj,
+                          "ctx": 32768, "port": 8080})
+            seen.add(key)
+    return found
+
+
+def _apply_model(entry):
+    global BONSAI_BASE, BONSAI_MODEL_ID, BONSAI_CTX, BONSAI_MODEL, \
+        BONSAI_MMPROJ, _ACTIVE_MODEL
+    if not entry:
+        return
+    _ACTIVE_MODEL = entry["id"]
+    if entry.get("type") == "api":
+        BONSAI_BASE = (entry.get("base_url") or "http://127.0.0.1:8080").rstrip("/")
+        BONSAI_MODEL_ID = entry.get("model") or entry["id"]
+        BONSAI_CTX = int(entry.get("ctx") or BONSAI_CTX)
+    else:
+        BONSAI_BASE = "http://127.0.0.1:%d" % int(entry.get("port") or 8080)
+        BONSAI_MODEL_ID = entry["id"]
+        BONSAI_MODEL = entry.get("path") or BONSAI_MODEL
+        BONSAI_MMPROJ = entry.get("mmproj") or ""
+        BONSAI_CTX = int(entry.get("ctx") or 32768)
+
+
+def _active_model():
+    with _MODELS_LOCK:
+        for m in _MODELS:
+            if m.get("id") == _ACTIVE_MODEL:
+                return dict(m)
+        return dict(_MODELS[0]) if _MODELS else None
+
+
+def _save_models():
+    with _MODELS_LOCK:
+        data = {"active": _ACTIVE_MODEL, "models": _MODELS}
+    try:
+        os.makedirs(os.path.dirname(MODELS_FILE), exist_ok=True)
+        with open(MODELS_FILE, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2, ensure_ascii=False)
+        return True
+    except Exception:
+        return False
+
+
+def _load_models():
+    global _MODELS, _ACTIVE_MODEL
+    data = None
+    try:
+        with open(MODELS_FILE, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception:
+        data = None
+    models, active = [], None
+    if isinstance(data, dict):
+        models = [m for m in (data.get("models") or [])
+                  if isinstance(m, dict) and m.get("id")]
+        active = data.get("active")
+    default = _default_model_entry()
+    if not any(m.get("type", "local") == "local"
+               and os.path.normcase(m.get("path") or "") == os.path.normcase(default["path"])
+               for m in models):
+        models.insert(0, default)
+    models.extend(_discover_models(models))
+    for m in models:
+        _pair_mmproj(m)
+    ids = [m["id"] for m in models]
+    with _MODELS_LOCK:
+        _MODELS = models
+        _ACTIVE_MODEL = active if active in ids else models[0]["id"]
+    _apply_model(_active_model())
+
+
+def _pair_mmproj(entry):
+    """Attach a vision projector to a local model when one can be matched
+    (by filename prefix) and the entry does not have a working one already."""
+    if not entry or entry.get("type", "local") != "local":
+        return False
+    path = entry.get("path") or ""
+    if not path or not os.path.isfile(path):
+        return False
+    current = entry.get("mmproj") or ""
+    if current and os.path.isfile(current):
+        return False
+    folder = os.path.dirname(path)
+    found = _mmproj_for(folder, path)
+    if found and os.path.isfile(found) and os.path.normcase(found) != \
+            os.path.normcase(current):
+        entry["mmproj"] = found
+        return True
+    return False
+
+
+def _public_models():
+    entry = _active_model()
+    out = []
+    with _MODELS_LOCK:
+        models = [dict(m) for m in _MODELS]
+    for m in models:
+        mtype = m.get("type") or "local"
+        item = {"id": m["id"], "label": m.get("label") or m["id"],
+                "type": mtype}
+        if mtype == "local":
+            item["path"] = m.get("path")
+            item["available"] = bool(m.get("path") and os.path.exists(m["path"]))
+            item["ctx"] = m.get("ctx")
+            item["mmproj"] = m.get("mmproj") or ""
+            item["vision"] = bool(item["mmproj"]
+                                  and os.path.isfile(item["mmproj"]))
+        else:
+            item["base_url"] = m.get("base_url")
+            item["model"] = m.get("model")
+        out.append(item)
+    return {"active": entry["id"] if entry else None,
+            "active_label": (entry or {}).get("label"),
+            "managed": (entry or {}).get("type") == "local",
+            "vision": (entry or {}).get("type") == "local"
+                      and bool((entry or {}).get("mmproj")
+                               and os.path.isfile((entry or {}).get("mmproj"))),
+            "models": out}
+
+
+def _select_model(mid):
+    with _MODELS_LOCK:
+        entry = next((dict(m) for m in _MODELS if m["id"] == mid), None)
+    if not entry:
+        return {"ok": False, "error": "unknown model '%s'" % mid}
+    if mid == _ACTIVE_MODEL and _bonsai_ready():
+        return {"ok": True, "already": True, **_public_models()}
+    if entry.get("type") == "api":
+        _apply_model(entry)
+        _save_models()
+        return {"ok": True, "type": "api", "ready": _bonsai_ready(),
+                **_public_models()}
+    if not entry.get("path") or not os.path.exists(entry["path"]):
+        return {"ok": False, "error": "model file not found: %s" % entry.get("path")}
+    _apply_model(entry)
+    _stop_local_server(int(entry.get("port") or 8080))
+    ok = _start_bonsai()
+    if ok:
+        _save_models()
+    return {"ok": ok, "type": "local", "ready": ok,
+            **({"error": "the model server did not come up in time"} if not ok else {}),
+            **_public_models()}
+
+
+def _gguf_files(folder, recursive=False, max_depth=3):
+    """Every .gguf model file in a folder (mmproj files excluded)."""
+    out = []
+    folder = os.path.realpath(folder)
+    if not os.path.isdir(folder):
+        return out
+    if not recursive:
+        try:
+            for n in sorted(os.listdir(folder)):
+                p = os.path.join(folder, n)
+                if (os.path.isfile(p) and n.lower().endswith(".gguf")
+                        and "mmproj" not in n.lower()):
+                    out.append(p)
+        except Exception:
+            pass
+        return out
+    for root, dirs, files in os.walk(folder):
+        rel = os.path.relpath(root, folder)
+        if rel != "." and rel.count(os.sep) + 1 >= max_depth:
+            dirs[:] = []
+        dirs[:] = [d for d in dirs
+                   if not d.startswith(".") and d != "__pycache__"]
+        for n in sorted(files):
+            if n.lower().endswith(".gguf") and "mmproj" not in n.lower():
+                out.append(os.path.join(root, n))
+    return out
+
+
+def _mmproj_for(folder, model_path):
+    """Best-matching mmproj for a model file (by filename prefix)."""
+    try:
+        cands = [n for n in os.listdir(folder)
+                 if n.lower().endswith(".gguf") and "mmproj" in n.lower()]
+    except Exception:
+        return ""
+    stem = os.path.splitext(os.path.basename(model_path))[0]
+    best, score = "", 1
+    for cand in cands:
+        s = _common_prefix_tokens(stem, os.path.splitext(cand)[0])
+        if s > score:
+            best, score = cand, s
+    return os.path.join(folder, best) if best else ""
+
+
+def _unique_model_id(base):
+    with _MODELS_LOCK:
+        taken = {m["id"] for m in _MODELS}
+    mid = base
+    n = 2
+    while mid in taken:
+        mid = "%s-%d" % (base, n)
+        n += 1
+    return mid
+
+
+def _add_model_folder(folder):
+    folder = os.path.realpath(str(folder or ""))
+    if not os.path.isdir(folder):
+        return {"ok": False, "error": "not a folder: %s" % folder}
+    files = _gguf_files(folder, recursive=True)
+    if not files:
+        return {"ok": False,
+                "error": "no .gguf model files found in that folder"}
+    added, skipped = [], 0
+    with _MODELS_LOCK:
+        known = {os.path.normcase(os.path.abspath(m.get("path") or ""))
+                 for m in _MODELS if m.get("type", "local") == "local"}
+        for p in files:
+            key = os.path.normcase(os.path.abspath(p))
+            if key in known:
+                skipped += 1
+                continue
+            stem = os.path.splitext(os.path.basename(p))[0]
+            entry = {"id": _unique_model_id(_model_id_from(stem)),
+                     "label": stem, "type": "local", "path": p,
+                     "mmproj": _mmproj_for(os.path.dirname(p), p),
+                     "ctx": 32768, "port": 8080}
+            _MODELS.append(entry)
+            known.add(key)
+            added.append(entry)
+    _save_models()
+    return {"ok": True, "added": added, "skipped": skipped,
+            "folder": folder, **_public_models()}
+
+
+def _run_tk_picker(code):
+    try:
+        out = subprocess.run([sys.executable, "-c", code],
+                             capture_output=True, text=True, timeout=300)
+        path = (out.stdout or "").strip()
+        return os.path.realpath(path) if path else None
+    except Exception:
+        return None
+
+
+def _pick_model_file():
+    init = json.dumps(BONSAI_DIR)
+    code = ("import tkinter as tk; from tkinter import filedialog; "
+            "r = tk.Tk(); r.withdraw(); r.attributes('-topmost', True); "
+            "p = filedialog.askopenfilename("
+            "title='Choose a GGUF model file', initialdir=" + init + ", "
+            "filetypes=[('GGUF models', '*.gguf'), ('All files', '*.*')]); "
+            "r.destroy(); print(p or '')")
+    return _run_tk_picker(code)
+
+
+def _pick_model_folder():
+    init = json.dumps(BONSAI_DIR)
+    code = ("import tkinter as tk; from tkinter import filedialog; "
+            "r = tk.Tk(); r.withdraw(); r.attributes('-topmost', True); "
+            "p = filedialog.askdirectory("
+            "title='Choose a folder to scan for .gguf models', "
+            "initialdir=" + init + "); r.destroy(); print(p or '')")
+    return _run_tk_picker(code)
+
+
+def _pick_vision_file():
+    init = json.dumps(BONSAI_DIR)
+    code = ("import tkinter as tk; from tkinter import filedialog; "
+            "r = tk.Tk(); r.withdraw(); r.attributes('-topmost', True); "
+            "p = filedialog.askopenfilename("
+            "title='Choose a vision projector (mmproj .gguf)', "
+            "initialdir=" + init + ", filetypes=["
+            "('Vision projector (mmproj)', '*mmproj*.gguf'), "
+            "('GGUF models', '*.gguf'), ('All files', '*.*')]); "
+            "r.destroy(); print(p or '')")
+    return _run_tk_picker(code)
+
+
+def _add_model(body):
+    mtype = str(body.get("type") or "local").strip().lower()
+    label = str(body.get("label") or "").strip()
+    mid = str(body.get("id") or "").strip()
+    if mtype == "api":
+        base = str(body.get("base_url") or "").strip().rstrip("/")
+        model = str(body.get("model") or "").strip()
+        if not base.startswith(("http://", "https://")):
+            return {"ok": False, "error": "base_url must start with http:// or https://"}
+        if not model:
+            return {"ok": False, "error": "model id is required for an API endpoint"}
+        mid = mid or _model_id_from(label or model)
+        entry = {"id": mid, "label": label or model, "type": "api",
+                 "base_url": base, "model": model}
+    else:
+        path = str(body.get("path") or "").strip()
+        if not path:
+            return {"ok": False, "error": "path is required for a local model"}
+        path = os.path.abspath(path)
+        if not os.path.isfile(path):
+            return {"ok": False, "error": "model file not found: %s" % path}
+        mmproj = str(body.get("mmproj") or "").strip()
+        try:
+            ctx = int(body.get("ctx") or 32768)
+        except Exception:
+            ctx = 32768
+        try:
+            port = int(body.get("port") or 8080)
+        except Exception:
+            port = 8080
+        stem = os.path.splitext(os.path.basename(path))[0]
+        mid = mid or _model_id_from(stem)
+        entry = {"id": mid, "label": label or stem, "type": "local",
+                 "path": path,
+                 "mmproj": os.path.abspath(mmproj) if mmproj else "",
+                 "ctx": ctx, "port": port}
+    with _MODELS_LOCK:
+        if any(m["id"] == mid for m in _MODELS):
+            return {"ok": False, "error": "a model with id '%s' already exists" % mid}
+        _MODELS.append(entry)
+    _save_models()
+    return {"ok": True, "added": entry, **_public_models()}
+
+
+def _remove_model(mid):
+    with _MODELS_LOCK:
+        if mid == _ACTIVE_MODEL:
+            return {"ok": False, "error": "cannot remove the active model - switch first"}
+        before = len(_MODELS)
+        _MODELS[:] = [m for m in _MODELS if m["id"] != mid]
+        if len(_MODELS) == before:
+            return {"ok": False, "error": "unknown model '%s'" % mid}
+    _save_models()
+    return {"ok": True, **_public_models()}
+
+
+def _set_model_mmproj(mid, mmproj):
+    """Attach, replace or clear a model's vision projector."""
+    mmproj = str(mmproj or "").strip()
+    if mmproj:
+        mmproj = os.path.abspath(mmproj)
+        if not os.path.isfile(mmproj):
+            return {"ok": False, "error": "projector not found: %s" % mmproj}
+        if not mmproj.lower().endswith(".gguf"):
+            return {"ok": False, "error": "a vision projector must be a .gguf file"}
+    with _MODELS_LOCK:
+        entry = next((m for m in _MODELS if m["id"] == mid), None)
+        if not entry:
+            return {"ok": False, "error": "unknown model '%s'" % mid}
+        if entry.get("type", "local") != "local":
+            return {"ok": False,
+                    "error": "vision projectors only apply to local models"}
+        entry["mmproj"] = mmproj
+    _save_models()
+    return {"ok": True, "id": mid, "mmproj": mmproj, **_public_models()}
+
+
+def _scan_models():
+    with _MODELS_LOCK:
+        found = _discover_models(_MODELS)
+        _MODELS.extend(found)
+        paired = sum(1 for m in _MODELS if _pair_mmproj(m))
+    if found or paired:
+        _save_models()
+    return {"ok": True, "added": len(found), "paired": paired,
+            **_public_models()}
+
+
+_load_models()
 
 
 def _touch_activity():
@@ -1379,15 +1984,49 @@ def _touch_activity():
         _LAST_ACTIVITY = time.time()
 
 
-def _unload_bonsai():
+def _port_listening(port=8080, host="127.0.0.1", timeout=1.5):
+    """True if something accepts connections on the port. Unlike /health this
+    also sees a llama-server that is still loading the model."""
     try:
-        _http_json(BONSAI_BASE + "/v1/chat/completions",
-                   {"model": BONSAI_MODEL_ID,
-                    "messages": [{"role": "user", "content": "unload"}],
-                    "max_tokens": 1, "keep_alive": 0}, timeout=60)
-        return {"ok": True}
-    except Exception as exc:
-        return {"ok": False, "error": str(exc)}
+        with socket.create_connection((host, int(port)), timeout=timeout):
+            return True
+    except Exception:
+        return False
+
+
+def _unload_bonsai():
+    """Free the model's RAM/VRAM now. Local models: stop the llama-server
+    process (it is restarted automatically on the next message). External API
+    models: best-effort soft unload via keep_alive=0."""
+    entry = _active_model()
+    if entry and entry.get("type") == "api":
+        try:
+            _http_json(BONSAI_BASE + "/v1/chat/completions",
+                       {"model": BONSAI_MODEL_ID,
+                        "messages": [{"role": "user", "content": "unload"}],
+                        "max_tokens": 1, "keep_alive": 0}, timeout=60)
+            return {"ok": True, "method": "keep_alive",
+                    "detail": "asked the external server to unload the model"}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+    port = int(entry.get("port") or 8080) if entry else 8080
+    was_running = _port_listening(port)
+    _stop_local_server(port)
+    for _ in range(60):
+        if not _port_listening(port):
+            break
+        time.sleep(0.5)
+    stopped = not _port_listening(port)
+    if not was_running:
+        return {"ok": True, "method": "already stopped",
+                "detail": "the model server was not running"}
+    if stopped:
+        return {"ok": True, "method": "stopped", "port": port,
+                "detail": "model server stopped - RAM/VRAM freed; it "
+                          "restarts automatically on the next message"}
+    return {"ok": False, "port": port,
+            "error": "the model server did not stop (port %d still "
+                     "listening)" % port}
 
 
 def set_bonsai_effort(effort):
@@ -1421,10 +2060,10 @@ SHELL_TOOL = {
     "type": "function",
     "function": {
         "name": "run_command",
-        "description": "Run a shell command on this Windows PC and return its "
+        "description": "Run a shell command on this PC and return its "
                        "output. Use it to build, test, install, debug or check "
-                       "system info: python, pip, git, npm, node, dir, "
-                       "tasklist, systeminfo, ping, etc. Runs in the workspace "
+                       "system info: python, pip, git, npm, node, ls, dir, "
+                       "ps, ping, etc. Runs in the workspace "
                        "folder by default. Max 45 seconds by default - raise "
                        "'timeout' for long-running commands (up to 600s). "
                        "Output truncated to ~8 KB. In PLAN mode this tool is "
@@ -2118,7 +2757,13 @@ def build_messages(raw_messages, mode=MODE_BUILD):
                     ftext = str(part.get("text", ""))
                     texts.append(f"[Fișier atașat: {fname}]\n{ftext}")
                 elif part.get("type") == "image_url":
-                    images.append(part)
+                    url = str((part.get("image_url") or {}).get("url") or "")
+                    if url and len(url) > MAX_IMAGE_BYTES:
+                        texts.append("[Image skipped: it is larger than the "
+                                     "%d MB limit]" % (MAX_IMAGE_BYTES //
+                                                        (1024 * 1024)))
+                    else:
+                        images.append(part)
             clean = [{"type": "text", "text": t} for t in texts if t]
             clean.extend(images)
             if clean:
@@ -2154,6 +2799,34 @@ def public_result(result):
     return result
 
 
+def _linux_capture_png(bbox=None):
+    """Capture the full screen on Linux via scrot / ImageMagick (X11)."""
+    from PIL import Image
+    exe = shutil.which("scrot") or shutil.which("import")
+    if not exe:
+        raise RuntimeError("screenshot capture failed on Linux: install scrot "
+                           "or imagemagick (import) - sudo apt install scrot "
+                           "(X11 session required)")
+    import tempfile
+    tmp = tempfile.mktemp(suffix=".png")
+    try:
+        if os.path.basename(exe) == "scrot":
+            subprocess.run([exe, "-z", tmp], check=True, timeout=30,
+                           creationflags=CREATE_NO_WINDOW)
+        else:
+            subprocess.run([exe, "-window", "root", tmp], check=True,
+                           timeout=30, creationflags=CREATE_NO_WINDOW)
+        img = Image.open(tmp)
+        if bbox:
+            img = img.crop(bbox)
+        return img
+    finally:
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+
+
 def _take_screenshot(args):
     try:
         from PIL import Image, ImageGrab
@@ -2174,7 +2847,14 @@ def _take_screenshot(args):
     try:
         img = ImageGrab.grab(bbox=bbox, all_screens=True)
     except Exception as exc:
-        return {"error": f"screenshot capture failed: {exc}"}
+        if IS_LINUX:
+            try:
+                img = _linux_capture_png(bbox)
+            except Exception as exc2:
+                return {"error": f"screenshot capture failed: {exc}; "
+                                 f"{exc2}"}
+        else:
+            return {"error": f"screenshot capture failed: {exc}"}
     out_dir = os.path.join(WORKDIR, "screenshots")
     try:
         os.makedirs(out_dir, exist_ok=True)
@@ -2415,7 +3095,23 @@ def _play_wav(path):
             winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC)
             return None
         except Exception:
-            return None
+            pass
+        for player in ("paplay", "aplay", "ffplay"):
+            exe = shutil.which(player)
+            if not exe:
+                continue
+            try:
+                cmd = [exe, path]
+                if player == "ffplay":
+                    cmd = [exe, "-nodisp", "-autoexit", "-loglevel",
+                           "quiet", path]
+                subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL,
+                                 creationflags=CREATE_NO_WINDOW)
+                return None
+            except Exception:
+                continue
+        return None
 
 
 def _tts_speak(args):
@@ -2468,7 +3164,44 @@ def _tts_speak(args):
 
 # ---------------- Window management ----------------
 
+def _wmctrl():
+    return shutil.which("wmctrl")
+
+
+def _linux_window_rows():
+    wm = _wmctrl()
+    if not wm:
+        return None
+    try:
+        proc = subprocess.run([wm, "-l", "-x"], capture_output=True,
+                              text=True, timeout=10, creationflags=CREATE_NO_WINDOW)
+    except Exception:
+        return None
+    rows = []
+    for line in (proc.stdout or "").splitlines():
+        parts = line.split(None, 3)
+        if len(parts) < 2 or not parts[0].startswith("0x"):
+            continue
+        row = {"id": parts[0], "desktop": parts[1] if len(parts) > 1 else "",
+               "process": parts[2] if len(parts) > 2 else "",
+               "title": (parts[3] if len(parts) > 3 else "")[:160], "pid": None}
+        rows.append(row)
+    return rows
+
+
+def _linux_windows():
+    rows = _linux_window_rows()
+    if rows is None:
+        return {"error": "window tools on Linux need 'wmctrl' (X11): "
+                         "sudo apt install wmctrl  (Wayland compositors "
+                         "support window management only partially)"}
+    rows.sort(key=lambda w: (w.get("process") or "").lower())
+    return {"result": "ok", "windows": rows[:80], "count": len(rows)}
+
+
 def _window_list():
+    if not IS_WINDOWS:
+        return _linux_windows()
     if not _WIN_UI:
         return {"error": "window tools need pywin32 + psutil on Windows"}
     out = []
@@ -2500,6 +3233,20 @@ def _window_list():
 
 
 def _window_find(title=None, process=None, pid=None):
+    if not IS_WINDOWS:
+        rows = _linux_window_rows()
+        if not rows:
+            return None
+        t = str(title or "").strip().lower() if title else None
+        p = str(process or "").strip().lower() if process else None
+        fallback = None
+        for w in rows:
+            if t and t in w.get("title", "").lower():
+                return w["id"]
+            if p and p in w.get("process", "").lower():
+                if fallback is None:
+                    fallback = w["id"]
+        return fallback
     if not _WIN_UI:
         return None
     if pid is not None:
@@ -2542,6 +3289,38 @@ def _window_find(title=None, process=None, pid=None):
 
 
 def _window_action(args):
+    if not IS_WINDOWS:
+        wm = _wmctrl()
+        if not wm:
+            return {"error": "window tools on Linux need 'wmctrl' (X11): "
+                             "sudo apt install wmctrl  (Wayland compositors "
+                             "support window management only partially)"}
+        action = str(args.get("action") or "focus")
+        wid = str(args.get("id") or "")
+        if not wid:
+            wid = _window_find(args.get("title"), args.get("process"),
+                               args.get("pid"))
+        if not wid:
+            return {"error": "no matching window found (list windows first "
+                            "with window_list, or pass an 'id' from it)"}
+        try:
+            if action == "minimize":
+                subprocess.run([wm, "-ir", wid, "-b", "add,hidden"],
+                               capture_output=True, timeout=10,
+                               creationflags=CREATE_NO_WINDOW)
+            elif action == "maximize":
+                subprocess.run([wm, "-ir", wid, "-b",
+                                "add,maximized_vert,maximized_horz"],
+                               capture_output=True, timeout=10,
+                               creationflags=CREATE_NO_WINDOW)
+            else:  # focus / restore
+                subprocess.run([wm, "-ia", wid], capture_output=True,
+                               timeout=10, creationflags=CREATE_NO_WINDOW)
+        except Exception as exc:
+            return {"error": f"window action failed: {exc}"}
+        rows = {w["id"]: w for w in (_linux_window_rows() or [])}
+        return {"result": "ok", "action": action,
+                "window": (rows.get(wid, {}).get("title") or "")[:160]}
     if not _WIN_UI:
         return {"error": "window tools need pywin32 + psutil on Windows"}
     action = str(args.get("action") or "focus")
@@ -3258,65 +4037,91 @@ PAGE = """<!doctype html>
 <title>BONSAI - PC Assistant</title>
 <style>
   :root {
-    --cyan-glow: #00f0ff;
-    --blue-glow: #0072ff;
-    --gold-glow: #ffd700;
-    --red-glow: #ff0055;
-    --hud-bg: rgba(6, 15, 25, 0.88);
-    --panel-border: rgba(0, 240, 255, 0.3);
+    color-scheme: dark;
+    --bg: #0a0a0c;
+    --bg2: #121216;
+    --bg3: #191920;
+    --bg4: #22222a;
+    --bd: #272730;
+    --bd2: #35353f;
+    --txt: #e8e8ec;
+    --txt2: #c2c2cb;
+    --mut: #85858f;
+    --acc: #38bdf8;
+    --acc2: #0ea5e9;
+    --ok: #34d399;
+    --warn: #fbbf24;
+    --err: #f87171;
+    --violet: #a78bfa;
+    --hud-bg: var(--bg2);
+    --panel-border: var(--bd);
+    --cyan-glow: #38bdf8;
+    --blue-glow: #0ea5e9;
+    --gold-glow: #fbbf24;
+    --red-glow: #f87171;
   }
   * { box-sizing: border-box; }
   html, body { height: 100%; margin: 0; }
   body {
-    font-family: "Segoe UI", system-ui, sans-serif;
-    background-color: #02060d; color: #00f0ff; overflow-x: hidden;
-    background-image:
-      radial-gradient(circle at 50% 50%, rgba(0, 114, 255, 0.15) 0%, transparent 70%),
-      linear-gradient(rgba(0,240,255,.03) 1px, transparent 1px),
-      linear-gradient(90deg, rgba(0,240,255,.03) 1px, transparent 1px);
-    background-size: 100% 100%, 30px 30px, 30px 30px;
+    font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+    background: var(--bg); color: var(--txt); overflow-x: hidden;
   }
   .mono { font-family: Consolas, "Courier New", monospace; }
-  ::-webkit-scrollbar { width: 5px; height: 5px; }
-  ::-webkit-scrollbar-track { background: rgba(2,6,13,.8); }
-  ::-webkit-scrollbar-thumb { background: rgba(0,240,255,.4); border-radius: 3px; }
-  ::-webkit-scrollbar-thumb:hover { background: rgba(0,240,255,.8); }
+  ::-webkit-scrollbar { width: 9px; height: 9px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: #33333c; border-radius: 6px; }
+  ::-webkit-scrollbar-thumb:hover { background: #45454f; }
 
-  .hud-border {
-    border: 1px solid var(--panel-border);
-    box-shadow: 0 0 15px rgba(0,240,255,.15), inset 0 0 15px rgba(0,240,255,.05);
-    backdrop-filter: blur(12px); background: var(--hud-bg); position: relative;
-  }
-  .hud-border::before, .hud-border::after { content: ''; position: absolute; width: 10px; height: 10px; pointer-events: none; }
-  .hud-border::before { top: -2px; left: -2px; border-top: 2px solid #00f0ff; border-left: 2px solid #00f0ff; }
-  .hud-border::after { bottom: -2px; right: -2px; border-bottom: 2px solid #00f0ff; border-right: 2px solid #00f0ff; }
+  .hud-border { background: var(--bg2); border: 1px solid var(--bd); border-radius: 12px; position: relative; }
 
-  .app { display: flex; flex-direction: column; height: 100vh; padding: 10px; }
-  header { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 10px; padding: 10px 14px; border-radius: 10px; }
+  .app { display: flex; flex-direction: column; height: 100vh; padding: 12px; }
+  header { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 10px; padding: 10px 14px; }
   .brand { display: flex; align-items: center; gap: 10px; }
   .brand .chip-ic {
-    width: 34px; height: 34px; border-radius: 50%; border: 1px solid #00f0ff;
-    display: flex; align-items: center; justify-content: center; background: rgba(0,240,255,.08); font-size: 16px;
+    width: 34px; height: 34px; border-radius: 50%; border: 1px solid var(--bd2);
+    display: flex; align-items: center; justify-content: center; background: var(--bg3); color: var(--acc); font-size: 14px;
   }
-  .brand h1 { font-size: 19px; margin: 0; letter-spacing: 3px; color: #67e8f9; font-family: Consolas, monospace; font-weight: 700; }
-  .brand p { margin: 0; font-size: 11px; color: #0e7490; letter-spacing: 2px; font-family: Consolas, monospace; }
-  .hstatus { display: flex; gap: 16px; font-size: 13px; color: #9ca3af; font-family: Consolas, monospace; }
-  .hstatus b { color: inherit; }
-  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #34d399; margin-right: 4px; }
+  .brand h1 { font-size: 18px; margin: 0; letter-spacing: 3px; color: var(--txt); font-family: Consolas, monospace; font-weight: 700; }
+  .brand p { margin: 0; font-size: 10.5px; color: var(--mut); letter-spacing: 1.5px; font-family: Consolas, monospace; }
+  .hstatus { display: flex; gap: 16px; font-size: 12.5px; color: var(--mut); font-family: Consolas, monospace; }
+  .hstatus b { color: var(--txt2); font-weight: 600; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--ok); margin-right: 4px; }
   .hclock { text-align: right; font-family: Consolas, monospace; }
-  .hclock .t { font-size: 18px; font-weight: 700; color: #67e8f9; }
-  .hclock .d { font-size: 11px; color: #0e7490; }
+  .hclock .t { font-size: 17px; font-weight: 700; color: var(--txt); }
+  .hclock .d { font-size: 11px; color: var(--mut); }
   .hbtn {
-    background: rgba(0,240,255,.05); border: 1px solid rgba(0,240,255,.3); color: #67e8f9;
-    padding: 8px 12px; border-radius: 8px; cursor: pointer; font-size: 13px; transition: all .2s;
+    background: var(--bg3); border: 1px solid var(--bd2); color: var(--txt2);
+    padding: 8px 12px; border-radius: 8px; cursor: pointer; font-size: 12.5px; transition: all .15s;
   }
-  .hbtn:hover { background: rgba(0,240,255,.2); border-color: #00f0ff; box-shadow: 0 0 12px rgba(0,240,255,.4); }
-  .hbtn.on { background: rgba(74,222,128,.15); border-color: #4ade80; color: #86efac; }
-  .hbtn.on:hover { background: rgba(74,222,128,.3); box-shadow: 0 0 12px rgba(74,222,128,.4); }
+  .hbtn:hover { background: var(--bg4); border-color: var(--acc); color: var(--txt); }
+  .hbtn.on { background: rgba(52, 211, 153, .14); border-color: var(--ok); color: var(--ok); }
+  .hbtn.add { padding: 8px 11px; font-weight: 700; font-size: 14px; }
+  select.hbtn { appearance: none; -webkit-appearance: none; max-width: 190px; text-overflow: ellipsis; }
+  select.hbtn option { background: #16161b; color: var(--txt2); }
+  .modelsel.off { border-color: var(--err); color: var(--err); }
+
+  /* add-model modal */
+  .mdl { position: fixed; inset: 0; z-index: 90; display: none; align-items: center; justify-content: center; background: rgba(0,0,0,.62); backdrop-filter: blur(3px); }
+  .mdl.on { display: flex; }
+  .mdlbox { width: min(560px, 92vw); background: var(--bg2); border: 1px solid var(--bd2); border-radius: 14px; padding: 18px; font-family: Consolas, monospace; }
+  .mdlbox h4 { margin: 0 0 12px; font-size: 13px; letter-spacing: 1.5px; color: var(--acc); }
+  .mdlbox .act { display: block; width: 100%; text-align: left; background: var(--bg3); border: 1px solid var(--bd2); color: var(--txt2); border-radius: 10px; padding: 10px 12px; margin-bottom: 8px; cursor: pointer; font: inherit; font-size: 13px; }
+  .mdlbox .act:hover { background: var(--bg4); border-color: var(--acc); color: var(--txt); }
+  .mdlbox .act small { display: block; color: var(--mut); font-size: 11px; margin-top: 3px; }
+  .mdlbox .act.inline { width: auto; margin: 0; padding: 10px 16px; }
+  .mdlbox .mdlsep { color: var(--mut); font-size: 11px; letter-spacing: 1px; text-transform: uppercase; margin: 14px 0 8px; }
+  .mdlbox .row { display: flex; gap: 8px; }
+  .mdlbox input { flex: 1; min-width: 0; background: var(--bg3); border: 1px solid var(--bd2); border-radius: 10px; padding: 10px; color: var(--txt); font: inherit; font-size: 12.5px; outline: none; }
+  .mdlbox input:focus { border-color: var(--acc); }
+  .mdlbox select { flex: 1; min-width: 0; background: var(--bg3); border: 1px solid var(--bd2); border-radius: 10px; padding: 10px; color: var(--txt); font: inherit; font-size: 12.5px; outline: none; }
+  .mdlbox select option { background: #16161b; color: var(--txt2); }
+  .mdlbox .hint { color: var(--mut); font-size: 11.5px; margin-top: 8px; }
+  .mdlbox .close { margin-top: 14px; text-align: center; color: var(--mut); cursor: pointer; font-size: 12.5px; }
+  .mdlbox .close:hover { color: var(--err); }
 
   main.grid {
-    display: grid; grid-template-columns: 250px 1fr 1.35fr; gap: 10px;
-    flex: 1; min-height: 0; margin: 10px 0;
+    display: grid; grid-template-columns: 250px 1fr 1.35fr; gap: 12px;
+    flex: 1; min-height: 0; margin: 12px 0;
   }
   @media (max-width: 1180px) {
     main.grid { grid-template-columns: 220px 1fr; }
@@ -3327,38 +4132,41 @@ PAGE = """<!doctype html>
     .left { display: none; }
   }
 
-  .panel { border-radius: 10px; display: flex; flex-direction: column; min-height: 0; }
+  .panel { border-radius: 12px; display: flex; flex-direction: column; min-height: 0; }
   .center { align-items: center; justify-content: center; padding: 20px; }
   .right { min-height: 0; }
 
-  .ptitle { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #164e63; padding: 10px 12px; font-size: 11px; letter-spacing: 2px; color: #22d3ee; font-family: Consolas, monospace; }
+  .ptitle { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--bd); padding: 10px 12px; font-size: 10.5px; letter-spacing: 1.5px; color: var(--mut); font-family: Consolas, monospace; text-transform: uppercase; }
 
   /* left: chat history */
   .left .new { margin: 10px 12px; }
   #chatlist { flex: 1; overflow-y: auto; padding: 4px 8px; }
-  .chat-item { display: flex; align-items: center; gap: 8px; padding: 9px 10px; border-radius: 8px; cursor: pointer; font-size: 14px; color: #99f6e4; }
-  .chat-item:hover { background: rgba(0,240,255,.08); }
-  .chat-item.active { background: rgba(0,240,255,.16); border: 1px solid rgba(0,240,255,.35); }
+  .chat-item { display: flex; align-items: center; gap: 8px; padding: 9px 10px; border-radius: 8px; cursor: pointer; font-size: 13.5px; color: var(--txt2); }
+  .chat-item:hover { background: var(--bg3); }
+  .chat-item.active { background: var(--bg4); color: var(--txt); }
   .chat-item .tit { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .chat-item .del { background: none; border: none; color: #0e7490; cursor: pointer; font-size: 14px; }
-  .chat-item .del:hover { color: #ff0055; }
+  .chat-item .del { background: none; border: none; color: var(--mut); cursor: pointer; font-size: 14px; }
+  .chat-item .del:hover { color: var(--err); }
 
   /* center: arc reactor */
   .arc-container { position: relative; width: 210px; height: 210px; display: flex; align-items: center; justify-content: center; }
-  .arc-container { --ring: rgba(0,240,255,.55); --core1: #00f0ff; --core2: rgba(0,114,255,.8); --glow1: #00f0ff; --glow2: #0072ff; }
+  .arc-container { --ring: rgba(56,189,248,.45); --core1: #7dd3fc; --core2: rgba(14,165,233,.75); --glow1: #38bdf8; --glow2: #0ea5e9; }
   .arc-ring-outer { position: absolute; width: 100%; height: 100%; border-radius: 50%; border: 2px dashed var(--ring); animation: rotC 20s linear infinite; transition: border-color .3s; }
   .arc-ring-mid { position: absolute; width: 78%; height: 78%; border-radius: 50%; border: 2px solid transparent; border-top-color: var(--glow1); border-bottom-color: var(--glow2); animation: rotCC 8s linear infinite; transition: border-color .3s; }
   .arc-ring-inner { position: absolute; width: 58%; height: 58%; border-radius: 50%; border: 3px dotted var(--ring); animation: rotC 12s linear infinite; transition: border-color .3s; }
   .arc-core {
     position: absolute; width: 38%; height: 38%; border-radius: 50%;
-    background: radial-gradient(circle, #fff 0%, var(--core1) 40%, var(--core2) 70%, transparent 100%);
-    box-shadow: 0 0 35px var(--glow1), 0 0 60px var(--glow2); transition: all .3s ease;
+    background: radial-gradient(circle, #f8fafc 0%, var(--core1) 40%, var(--core2) 70%, transparent 100%);
+    box-shadow: 0 0 26px var(--glow1), 0 0 48px var(--glow2); transition: all .3s ease;
   }
   @keyframes rotC { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
   @keyframes rotCC { from { transform: rotate(360deg); } to { transform: rotate(0deg); } }
 
-  .arc-container.thinking { --ring: rgba(255,215,0,.55); --core1: #ffd700; --core2: rgba(255,136,0,.8); --glow1: #ffd700; --glow2: #ff8800; }
-  .arc-container.tools { --ring: rgba(57,255,20,.55); --core1: #39ff14; --core2: rgba(0,255,136,.8); --glow1: #39ff14; --glow2: #00e676; }
+  .arc-container.thinking { --ring: rgba(251,191,36,.45); --core1: #fcd34d; --core2: rgba(245,158,11,.7); --glow1: #fbbf24; --glow2: #f59e0b; }
+  .arc-container.tools { --ring: rgba(52,211,153,.45); --core1: #6ee7b7; --core2: rgba(16,185,129,.7); --glow1: #34d399; --glow2: #10b981; }
+  .arc-container.planmode { --ring: rgba(167,139,250,.5); --core1: #c4b5fd; --core2: rgba(124,58,237,.75); --glow1: #a78bfa; --glow2: #7c3aed; }
+  .arc-container.rainbow { animation: hueSpin 9s linear infinite; }
+  @keyframes hueSpin { from { filter: hue-rotate(0deg) saturate(1.15); } to { filter: hue-rotate(360deg) saturate(1.15); } }
 
   .arc-container.thinking .arc-core { animation: pulseFast .3s infinite alternate; }
   .arc-container.tools .arc-core { animation: pulseGreen .4s infinite alternate; }
@@ -3367,11 +4175,11 @@ PAGE = """<!doctype html>
   .arc-container.thinking .arc-ring-inner { animation-duration: 5s; }
   .arc-container.tools .arc-ring-inner { animation-duration: 3.5s; }
   @keyframes pulseFast { 0% { transform: scale(.95); opacity: .8; } 100% { transform: scale(1.1); opacity: 1; } }
-  @keyframes pulseGreen { 0% { transform: scale(.92); box-shadow: 0 0 20px var(--glow1); } 100% { transform: scale(1.18); box-shadow: 0 0 55px var(--glow1), 0 0 85px var(--glow2); } }
+  @keyframes pulseGreen { 0% { transform: scale(.92); box-shadow: 0 0 16px var(--glow1); } 100% { transform: scale(1.18); box-shadow: 0 0 42px var(--glow1), 0 0 66px var(--glow2); } }
   #waveform { display: flex; align-items: center; justify-content: center; gap: 6px; height: 40px; margin: 16px 0; }
-  .wave-bar { width: 3px; height: 14px; border-radius: 2px; background-color: #00f0ff; transition: background-color .3s; }
-  body.thinking .wave-bar { background-color: #ffd700; }
-  body.tools .wave-bar { background-color: #39ff14; }
+  .wave-bar { width: 3px; height: 14px; border-radius: 2px; background-color: var(--acc); transition: background-color .3s; }
+  body.thinking .wave-bar { background-color: var(--warn); }
+  body.tools .wave-bar { background-color: var(--ok); }
   .active-wave .wave-bar { animation: waveAnim .8s infinite ease-in-out alternate; }
   .wave-bar:nth-child(2) { animation-delay: .1s; } .wave-bar:nth-child(3) { animation-delay: .2s; }
   .wave-bar:nth-child(4) { animation-delay: .3s; } .wave-bar:nth-child(5) { animation-delay: .4s; }
@@ -3379,18 +4187,18 @@ PAGE = """<!doctype html>
   .wave-bar:nth-child(8) { animation-delay: .7s; } .wave-bar:nth-child(9) { animation-delay: .8s; }
   .wave-bar:nth-child(10) { animation-delay: .9s; }
   @keyframes waveAnim { 0% { height: 6px; } 100% { height: 35px; } }
-  #bonsai-state-label { font-size: 13px; letter-spacing: 3px; color: #22d3ee; text-align: center; font-family: Consolas, monospace; text-transform: uppercase; margin: 0; }
-  .sub { font-size: 11px; color: #0e7490; margin: 6px 0 0; text-align: center; font-family: Consolas, monospace; }
+  #bonsai-state-label { font-size: 12px; letter-spacing: 3px; color: var(--txt2); text-align: center; font-family: Consolas, monospace; text-transform: uppercase; margin: 0; }
+  .sub { font-size: 11px; color: var(--mut); margin: 6px 0 0; text-align: center; font-family: Consolas, monospace; }
 
   /* meters for metrics */
   .meterrow { padding: 10px 12px; }
   .meter { margin-bottom: 12px; }
   .meter:last-child { margin-bottom: 0; }
-  .meter .lab { display: flex; justify-content: space-between; font-size: 13px; margin-bottom: 5px; color: #9ca3af; font-family: Consolas, monospace; }
-  .meter .lab b { color: #67e8f9; }
-  .meter .bar { height: 6px; background: #0b1522; border: 1px solid #164e63; border-radius: 4px; overflow: hidden; }
-  .meter .fill { height: 100%; border-radius: 4px; width: 0%; transition: width .5s; background: linear-gradient(90deg, #0072ff, #00f0ff); }
-  .fill.gold { background: linear-gradient(90deg, #b45309, #ffd700); }
+  .meter .lab { display: flex; justify-content: space-between; font-size: 12.5px; margin-bottom: 5px; color: var(--mut); font-family: Consolas, monospace; }
+  .meter .lab b { color: var(--txt2); }
+  .meter .bar { height: 6px; background: var(--bg3); border: 1px solid var(--bd); border-radius: 4px; overflow: hidden; }
+  .meter .fill { height: 100%; border-radius: 4px; width: 0%; transition: width .5s; background: linear-gradient(90deg, var(--acc2), var(--acc)); }
+  .fill.gold { background: linear-gradient(90deg, #d97706, var(--warn)); }
 
   /* right: chat console */
   .right .chat-wrap { flex: 1; min-height: 0; display: flex; flex-direction: column; padding: 10px; }
@@ -3398,149 +4206,152 @@ PAGE = """<!doctype html>
   .msgrow { display: flex; gap: 10px; padding: 12px 0; }
   .msgrow.user { flex-direction: row-reverse; }
   .av { width: 30px; height: 30px; border-radius: 8px; flex-shrink: 0; display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: 700; font-family: Consolas, monospace; }
-  .av.bonsai { background: rgba(0,240,255,.15); border: 1px solid rgba(0,240,255,.4); color: #67e8f9; }
-  .av.me { background: rgba(255,215,0,.12); border: 1px solid rgba(255,215,0,.4); color: #fde047; }
-  .bubble { max-width: 82%; padding: 10px 14px; border-radius: 12px; font-size: 16px; line-height: 1.6; overflow-wrap: anywhere; color: #d1f5f7; }
-  .msgrow.user .bubble { background: rgba(0,240,255,.06); border: 1px solid rgba(0,240,255,.25); }
-  .msgrow.bonsai .bubble { background: rgba(15,23,42,.55); border: 1px solid rgba(0,240,255,.2); box-shadow: 0 0 15px rgba(0,240,255,.06); }
+  .av.bonsai { background: var(--bg3); border: 1px solid var(--bd2); color: var(--acc); }
+  .av.me { background: var(--bg4); border: 1px solid var(--bd2); color: var(--txt2); }
+  .bubble { max-width: 82%; padding: 10px 14px; border-radius: 12px; font-size: 15px; line-height: 1.6; overflow-wrap: anywhere; color: var(--txt); }
+  .msgrow.user .bubble { background: var(--bg3); border: 1px solid var(--bd); }
+  .msgrow.bonsai .bubble { background: var(--bg2); border: 1px solid var(--bd); }
   .bubble p { margin: 0 0 10px; } .bubble p:last-child { margin-bottom: 0; }
-  .bubble code { background: rgba(0,240,255,.1); border-radius: 4px; padding: 1px 5px; font-family: Consolas, monospace; font-size: 14px; color: #a5f3fc; }
-  .bubble pre { background: #041018; border: 1px solid #164e63; border-radius: 8px; padding: 12px; overflow-x: auto; font-size: 14px; color: #a5f3fc; }
-  .bubble a { color: #22d3ee; }
-  .toolchip { display: inline-flex; align-items: center; gap: 6px; background: rgba(0,240,255,.08); border: 1px solid rgba(0,240,255,.4); color: #67e8f9; border-radius: 999px; padding: 4px 12px; margin: 4px 6px 4px 0; font-size: 13px; font-family: Consolas, monospace; }
-  .statschip { display: inline-block; background: rgba(255,215,0,.08); border: 1px solid rgba(255,215,0,.35); color: #fcd34d; border-radius: 6px; padding: 3px 10px; margin: 6px 0 2px; font-size: 11px; font-family: Consolas, monospace; }
-  .toolchip.err { background: rgba(255,0,85,.08); border-color: rgba(255,0,85,.5); color: #ff859b; }
-  .think { color: #0e7490; font-style: italic; font-size: 14px; display: flex; align-items: center; gap: 8px; font-family: Consolas, monospace; }
-  .dots { display: inline-flex; gap: 3px; } .dots i { width: 5px; height: 5px; border-radius: 50%; background: #0e7490; animation: bl 1.2s infinite; } .dots i:nth-child(2){animation-delay:.2s} .dots i:nth-child(3){animation-delay:.4s}
+  .bubble code { background: var(--bg4); border-radius: 4px; padding: 1px 5px; font-family: Consolas, monospace; font-size: 13.5px; color: var(--acc); }
+  .bubble pre { background: #0d0d11; border: 1px solid var(--bd); border-radius: 8px; padding: 12px; overflow-x: auto; font-size: 13.5px; color: var(--txt2); }
+  .bubble a { color: var(--acc); }
+  .abody table { border-collapse: collapse; margin: 8px 0; }
+  .abody th, .abody td { border: 1px solid var(--bd); padding: 5px 9px; }
+  .toolchip { display: inline-flex; align-items: center; gap: 6px; background: var(--bg3); border: 1px solid var(--bd2); color: var(--txt2); border-radius: 999px; padding: 4px 12px; margin: 4px 6px 4px 0; font-size: 12.5px; font-family: Consolas, monospace; }
+  .statschip { display: inline-block; background: var(--bg3); border: 1px solid var(--bd2); color: var(--mut); border-radius: 6px; padding: 3px 10px; margin: 6px 0 2px; font-size: 11px; font-family: Consolas, monospace; }
+  .toolchip.err { background: rgba(248,113,113,.1); border-color: rgba(248,113,113,.45); color: var(--err); }
+  .think { color: var(--mut); font-style: italic; font-size: 13.5px; display: flex; align-items: center; gap: 8px; font-family: Consolas, monospace; }
+  .dots { display: inline-flex; gap: 3px; } .dots i { width: 5px; height: 5px; border-radius: 50%; background: var(--mut); animation: bl 1.2s infinite; } .dots i:nth-child(2){animation-delay:.2s} .dots i:nth-child(3){animation-delay:.4s}
   @keyframes bl { 0%,60%,100%{opacity:.25} 30%{opacity:1} }
-  .caret::after { content: "\\258C"; color: #00f0ff; margin-left: 2px; animation: blink 1s steps(1) infinite; }
+  .caret::after { content: "\\258C"; color: var(--acc); margin-left: 2px; animation: blink 1s steps(1) infinite; }
   @keyframes blink { 50% { opacity: 0; } }
   .imggrid { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
-  .imggrid img { width: 90px; height: 90px; object-fit: cover; border-radius: 10px; border: 1px solid #164e63; }
-  .filechip { display: inline-flex; align-items: center; gap: 6px; background: rgba(0,240,255,.06); border: 1px solid rgba(0,240,255,.35); color: #67e8f9; border-radius: 8px; padding: 5px 10px; margin: 2px 6px 2px 0; font-size: 13px; font-family: Consolas, monospace; }
+  .imggrid img { width: 90px; height: 90px; object-fit: cover; border-radius: 10px; border: 1px solid var(--bd); }
+  .filechip { display: inline-flex; align-items: center; gap: 6px; background: var(--bg3); border: 1px solid var(--bd2); color: var(--txt2); border-radius: 8px; padding: 5px 10px; margin: 2px 6px 2px 0; font-size: 12.5px; font-family: Consolas, monospace; }
   .filechip .fname { font-weight: 700; }
 
   .composer { display: flex; align-items: flex-end; gap: 8px; padding: 8px 0 2px; }
   .field {
     flex: 1; position: relative; display: flex; align-items: flex-end; gap: 6px;
-    background: rgba(2,10,20,.7); border: 1px solid rgba(0,240,255,.3); border-radius: 12px; padding: 8px; min-height: 52px;
+    background: var(--bg3); border: 1px solid var(--bd2); border-radius: 12px; padding: 8px; min-height: 52px;
   }
-  .field:focus-within { border-color: #00f0ff; box-shadow: 0 0 12px rgba(0,240,255,.3); }
+  .field:focus-within { border-color: var(--acc); }
   #filein { display: none; }
   #user-input {
-    flex: 1; background: transparent; border: none; outline: none; resize: none; color: #d1f5f7;
-    font: inherit; font-size: 15px; padding: 8px 6px; max-height: 160px; min-width: 0;
+    flex: 1; background: transparent; border: none; outline: none; resize: none; color: var(--txt);
+    font: inherit; font-size: 14.5px; padding: 8px 6px; max-height: 160px; min-width: 0;
   }
-  #user-input::placeholder { color: #0e7490; }
-  .iconbtn { background: none; border: none; cursor: pointer; font-size: 17px; padding: 8px; border-radius: 8px; color: #22d3ee; }
-  .iconbtn:hover { background: rgba(0,240,255,.12); }
+  #user-input::placeholder { color: var(--mut); }
+  .iconbtn { background: none; border: none; cursor: pointer; font-size: 16px; padding: 8px; border-radius: 8px; color: var(--mut); }
+  .iconbtn:hover { background: var(--bg4); color: var(--txt2); }
   #send {
-    background: linear-gradient(135deg, #00f0ff, #0072ff); color: #02060d; border: none; border-radius: 12px;
-    padding: 13px 16px; cursor: pointer; font-size: 14px; font-weight: 700; font-family: Consolas, monospace; transition: all .2s;
+    background: var(--acc); color: #04212e; border: none; border-radius: 12px;
+    padding: 13px 16px; cursor: pointer; font-size: 14px; font-weight: 700; font-family: Consolas, monospace; transition: all .15s;
   }
-  #send:hover { box-shadow: 0 0 18px rgba(0,240,255,.6); }
-  #send:disabled { opacity: .4; cursor: default; box-shadow: none; }
-  #send.stop { background: linear-gradient(135deg, #ff4d6d, #ff0055); color: #fff; box-shadow: 0 0 15px rgba(255,0,85,.5); }
+  #send:hover { background: #7dd3fc; }
+  #send:disabled { opacity: .4; cursor: default; }
+  #send.stop { background: var(--err); color: #fff; }
   #queue {
-    background: transparent; border: 1px solid rgba(0,240,255,.4); color: #22d3ee; border-radius: 12px;
-    padding: 13px 12px; cursor: pointer; font-size: 13px; font-weight: 700; font-family: Consolas, monospace; transition: all .2s; white-space: nowrap;
+    background: transparent; border: 1px solid var(--bd2); color: var(--mut); border-radius: 12px;
+    padding: 13px 12px; cursor: pointer; font-size: 12.5px; font-weight: 700; font-family: Consolas, monospace; transition: all .15s; white-space: nowrap;
   }
-  #queue:hover { background: rgba(0,240,255,.12); box-shadow: 0 0 12px rgba(0,240,255,.4); }
-  #queue.hasq { background: rgba(0,240,255,.2); border-color: #00f0ff; color: #67e8f9; }
+  #queue:hover { background: var(--bg3); color: var(--txt2); }
+  #queue.hasq { background: var(--bg4); border-color: var(--acc); color: var(--acc); }
 
   #preview { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
   .thumb { position: relative; }
-  .thumb img { width: 62px; height: 62px; object-fit: cover; border-radius: 8px; border: 1px solid #164e63; }
-  .thumb .x { position: absolute; top: -6px; right: -6px; background: #ff0055; color: #fff; border: none; border-radius: 50%; width: 20px; height: 20px; cursor: pointer; font-size: 12px; line-height: 1; }
-  .pf { display: inline-flex; align-items: center; gap: 6px; background: rgba(0,240,255,.07); border: 1px solid rgba(0,240,255,.35); color: #67e8f9; border-radius: 8px; padding: 5px 10px; font-size: 13px; font-family: Consolas, monospace; }
-  .pf .x { background: none; border: none; color: #ff859b; cursor: pointer; font-size: 13px; }
+  .thumb img { width: 62px; height: 62px; object-fit: cover; border-radius: 8px; border: 1px solid var(--bd); }
+  .thumb .x { position: absolute; top: -6px; right: -6px; background: var(--err); color: #fff; border: none; border-radius: 50%; width: 20px; height: 20px; cursor: pointer; font-size: 12px; line-height: 1; }
+  .pf { display: inline-flex; align-items: center; gap: 6px; background: var(--bg3); border: 1px solid var(--bd2); color: var(--txt2); border-radius: 8px; padding: 5px 10px; font-size: 12.5px; font-family: Consolas, monospace; }
+  .pf .x { background: none; border: none; color: var(--mut); cursor: pointer; font-size: 13px; }
+  .pf .x:hover { color: var(--err); }
 
   /* reason / thinking box */
-  .reasonbox { border: 1px solid rgba(180,120,255,.35); border-radius: 10px; background: rgba(40,15,70,.25); margin-bottom: 8px; overflow: hidden; }
-  .reasonbox summary { cursor: pointer; padding: 6px 10px; font-size: 13px; font-family: Consolas, monospace; color: #c4b5fd; list-style: none; display: flex; align-items: center; gap: 6px; user-select: none; }
+  .reasonbox { border: 1px solid rgba(167,139,250,.3); border-radius: 10px; background: rgba(167,139,250,.06); margin-bottom: 8px; overflow: hidden; }
+  .reasonbox summary { cursor: pointer; padding: 6px 10px; font-size: 12.5px; font-family: Consolas, monospace; color: var(--violet); list-style: none; display: flex; align-items: center; gap: 6px; user-select: none; }
   .reasonbox summary::-webkit-details-marker { display: none; }
   .reasonbox summary::before { content: '\\25B8'; transition: transform .15s; }
   .reasonbox[open] summary::before { transform: rotate(90deg); }
-  .reasonbox .rc { padding: 2px 10px 8px; max-height: 220px; overflow-y: auto; font-size: 12.5px; line-height: 1.55; color: #d6c7ff; white-space: pre-wrap; font-family: Consolas, monospace; }
-  .reasonbox.live summary::after { content: '\\25CF'; color: #e879f9; animation: bl 1.2s infinite; margin-left: 4px; }
-  .reasonbox.errtitle summary { color: #ff859b; }
+  .reasonbox .rc { padding: 2px 10px 8px; max-height: 220px; overflow-y: auto; font-size: 12.5px; line-height: 1.55; color: #c4b5fd; white-space: pre-wrap; font-family: Consolas, monospace; }
+  .reasonbox.live summary::after { content: '\\25CF'; color: var(--violet); animation: bl 1.2s infinite; margin-left: 4px; }
+  .reasonbox.errtitle summary { color: var(--err); }
 
   /* tool log */
-  .toollog { border: 1px solid rgba(0,240,255,.3); border-radius: 10px; background: rgba(0,25,40,.25); margin-bottom: 8px; overflow: hidden; }
-  .toollog summary { cursor: pointer; padding: 6px 10px; font-size: 13px; font-family: Consolas, monospace; color: #67e8f9; list-style: none; display: flex; align-items: center; gap: 6px; user-select: none; }
+  .toollog { border: 1px solid var(--bd); border-radius: 10px; background: var(--bg3); margin-bottom: 8px; overflow: hidden; }
+  .toollog summary { cursor: pointer; padding: 6px 10px; font-size: 12.5px; font-family: Consolas, monospace; color: var(--txt2); list-style: none; display: flex; align-items: center; gap: 6px; user-select: none; }
   .toollog summary::-webkit-details-marker { display: none; }
   .toollog summary::before { content: '\\25B8'; transition: transform .15s; }
   .toollog[open] summary::before { transform: rotate(90deg); }
   .toollog .tl { padding: 2px 10px 8px; max-height: 260px; overflow-y: auto; display: flex; flex-direction: column; gap: 6px; }
-  .tlitem { border: 1px solid rgba(0,240,255,.18); border-radius: 8px; background: rgba(2,10,20,.6); padding: 6px 8px; font-size: 13px; font-family: Consolas, monospace; }
-  .tlitem .nm { color: #00f0ff; font-weight: 700; }
-  .tlitem .rs { color: #7dd3fc; white-space: pre-wrap; margin-top: 4px; }
-  .tlitem .ar { color: #9ca3af; white-space: pre-wrap; margin-top: 2px; }
-  .tlitem.err { border-color: rgba(255,0,85,.4); } .tlitem.err .nm { color: #ff859b; }
+  .tlitem { border: 1px solid var(--bd); border-radius: 8px; background: var(--bg2); padding: 6px 8px; font-size: 12.5px; font-family: Consolas, monospace; }
+  .tlitem .nm { color: var(--acc); font-weight: 700; }
+  .tlitem .rs { color: var(--txt2); white-space: pre-wrap; margin-top: 4px; }
+  .tlitem .ar { color: var(--mut); white-space: pre-wrap; margin-top: 2px; }
+  .tlitem.err { border-color: rgba(248,113,113,.4); } .tlitem.err .nm { color: var(--err); }
 
   /* mode toggle + workdir */
-  .modebtn { background: rgba(255,215,0,.08); border: 1px solid rgba(255,215,0,.45); color: #fde047; padding: 7px 12px; border-radius: 8px; cursor: pointer; font-size: 13px; font-family: Consolas, monospace; font-weight: 700; letter-spacing: 1px; transition: all .2s; }
-  .modebtn:hover { background: rgba(255,215,0,.2); box-shadow: 0 0 12px rgba(255,215,0,.4); }
-  .modebtn.plan { border-color: rgba(103,232,249,.5); background: rgba(0,240,255,.1); color: #67e8f9; }
-  .wbtn { background: rgba(0,240,255,.05); border: 1px solid rgba(0,240,255,.3); color: #67e8f9; padding: 7px 10px; border-radius: 8px; cursor: pointer; font-size: 12px; font-family: Consolas, monospace; max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .wbtn:hover { background: rgba(0,240,255,.18); }
-  .blstatus { color: #9ca3af; font-size: 12px; font-family: Consolas, monospace; padding: 7px 6px; letter-spacing: .5px; white-space: nowrap; }
-  .blstatus.on { color: #34d399; text-shadow: 0 0 8px rgba(52,211,153,.5); }
-  .blstatus.mid { color: #fbbf24; }
-  .blstatus.off { color: #f87171; }
+  .modebtn { background: var(--bg3); border: 1px solid var(--bd2); color: var(--txt2); padding: 7px 12px; border-radius: 8px; cursor: pointer; font-size: 12.5px; font-family: Consolas, monospace; font-weight: 700; letter-spacing: 1px; transition: all .15s; }
+  .modebtn:hover { background: var(--bg4); color: var(--txt); }
+  .modebtn.plan { border-color: var(--acc); color: var(--acc); }
+  .wbtn { background: var(--bg3); border: 1px solid var(--bd2); color: var(--txt2); padding: 7px 10px; border-radius: 8px; cursor: pointer; font-size: 12px; font-family: Consolas, monospace; max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .wbtn:hover { background: var(--bg4); color: var(--txt); }
+  .blstatus { color: var(--mut); font-size: 12px; font-family: Consolas, monospace; padding: 7px 6px; letter-spacing: .5px; white-space: nowrap; }
+  .blstatus.on { color: var(--ok); }
+  .blstatus.mid { color: var(--warn); }
+  .blstatus.off { color: var(--err); }
 
-  footer { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px; padding: 6px 14px; border-radius: 10px; font-size: 13px; color: #0e7490; font-family: Consolas, monospace; letter-spacing: 1px; }
-  footer b { color: #22d3ee; }
-  .fine { text-align: center; color: #0e7490; font-size: 12px; margin-top: 6px; font-family: Consolas, monospace; }
-  .statsline { min-height: 16px; padding: 2px 4px 0; font-size: 11px; color: #67e8f9; font-family: Consolas, monospace; letter-spacing: 0; opacity: .85; }
-  .statsline b { color: #00f0ff; font-weight: 600; }
-  .statsline .sdim { color: #0e7490; }
+  footer { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px; padding: 6px 14px; border-radius: 12px; font-size: 12.5px; color: var(--mut); font-family: Consolas, monospace; letter-spacing: 1px; }
+  footer b { color: var(--txt2); }
+  .fine { text-align: center; color: var(--mut); font-size: 12px; margin-top: 6px; font-family: Consolas, monospace; }
+  .statsline { min-height: 16px; padding: 2px 4px 0; font-size: 11px; color: var(--txt2); font-family: Consolas, monospace; letter-spacing: 0; opacity: .85; }
+  .statsline b { color: var(--acc); font-weight: 600; }
+  .statsline .sdim { color: var(--mut); }
 
   /* thinking effort selector */
   #effort-sel {
-    background: rgba(0,240,255,.05); border: 1px solid rgba(0,240,255,.3); color: #67e8f9;
+    background: var(--bg3); border: 1px solid var(--bd2); color: var(--txt2);
     border-radius: 12px; padding: 13px 8px; cursor: pointer; font-size: 12px; font-family: Consolas, monospace;
-    font-weight: 700; outline: none; transition: all .2s;
+    font-weight: 700; outline: none; transition: all .15s;
   }
-  #effort-sel option { background: #031018; color: #99f6e4; }
-  #effort-sel:hover { border-color: #00f0ff; box-shadow: 0 0 12px rgba(0,240,255,.3); }
+  #effort-sel option { background: #16161b; color: var(--txt2); }
+  #effort-sel:hover { border-color: var(--acc); }
 
   /* todo panel */
   #todopanel { display: none; padding: 4px 8px; }
   #todopanel.on { display: block; }
   #todopanel .todo { display: flex; align-items: flex-start; gap: 8px; padding: 5px 6px; border-radius: 6px; font-size: 13px; font-family: Consolas, monospace; }
   #todopanel .todo .st { width: 14px; flex: 0 0 14px; }
-  #todopanel .todo.pending { color: #94a3b8; }
-  #todopanel .todo.in_progress { color: #fde047; }
-  #todopanel .todo.completed { color: #4ade80; text-decoration: line-through; opacity: .75; }
+  #todopanel .todo.pending { color: var(--mut); }
+  #todopanel .todo.in_progress { color: var(--warn); }
+  #todopanel .todo.completed { color: var(--ok); text-decoration: line-through; opacity: .75; }
 
   /* ask_user dialog */
-  .askov { position: fixed; inset: 0; background: rgba(2,6,16,.72); backdrop-filter: blur(3px); display: flex; align-items: center; justify-content: center; z-index: 60; }
-  .askbox { width: min(540px, 92vw); background: #031018; border: 1px solid rgba(0,240,255,.5); border-radius: 14px; padding: 18px; box-shadow: 0 0 30px rgba(0,240,255,.35); font-family: Consolas, monospace; }
-  .askbox h4 { margin: 0 0 10px; color: #00f0ff; font-size: 14px; letter-spacing: 1px; }
-  .askbox .aq { color: #d1f5f7; font-size: 15px; line-height: 1.5; white-space: pre-wrap; }
+  .askov { position: fixed; inset: 0; background: rgba(5,5,8,.75); backdrop-filter: blur(3px); display: flex; align-items: center; justify-content: center; z-index: 60; }
+  .askbox { width: min(540px, 92vw); background: var(--bg2); border: 1px solid var(--bd2); border-radius: 14px; padding: 18px; font-family: Consolas, monospace; }
+  .askbox h4 { margin: 0 0 10px; color: var(--acc); font-size: 14px; letter-spacing: 1px; }
+  .askbox .aq { color: var(--txt); font-size: 15px; line-height: 1.5; white-space: pre-wrap; }
   .askbox .opts { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
-  .askbox .opt { background: rgba(0,240,255,.08); border: 1px solid rgba(0,240,255,.45); color: #67e8f9; border-radius: 10px; padding: 8px 14px; cursor: pointer; font-size: 13px; font-family: Consolas, monospace; }
-  .askbox .opt:hover { background: rgba(0,240,255,.2); box-shadow: 0 0 12px rgba(0,240,255,.4); }
+  .askbox .opt { background: var(--bg3); border: 1px solid var(--bd2); color: var(--txt2); border-radius: 10px; padding: 8px 14px; cursor: pointer; font-size: 13px; font-family: Consolas, monospace; }
+  .askbox .opt:hover { background: var(--bg4); border-color: var(--acc); color: var(--txt); }
   .askbox .afree { display: flex; gap: 8px; margin-top: 14px; }
-  .askbox .afree input { flex: 1; min-width: 0; background: rgba(2,10,20,.8); border: 1px solid rgba(0,240,255,.35); border-radius: 10px; padding: 10px; color: #d1f5f7; font-size: 14px; font-family: Consolas, monospace; outline: none; }
-  .askbox .afree input:focus { border-color: #00f0ff; }
-  .askbox .afree button { background: linear-gradient(135deg, #00f0ff, #0072ff); color: #02060d; border: none; border-radius: 10px; padding: 10px 16px; font-weight: 700; cursor: pointer; font-size: 14px; font-family: Consolas, monospace; }
+  .askbox .afree input { flex: 1; min-width: 0; background: var(--bg3); border: 1px solid var(--bd2); border-radius: 10px; padding: 10px; color: var(--txt); font-size: 14px; font-family: Consolas, monospace; outline: none; }
+  .askbox .afree input:focus { border-color: var(--acc); }
+  .askbox .afree button { background: var(--acc); color: #04212e; border: none; border-radius: 10px; padding: 10px 16px; font-weight: 700; cursor: pointer; font-size: 14px; font-family: Consolas, monospace; }
 
   /* screenshot thumb in tool log */
-  .tlitem .tthumb { max-width: 220px; border-radius: 6px; border: 1px solid #164e63; margin-top: 6px; display: block; }
+  .tlitem .tthumb { max-width: 220px; border-radius: 6px; border: 1px solid var(--bd); margin-top: 6px; display: block; }
   .tlprev { margin-top: 8px; }
-  .tlprev a { font-size: 11px; color: #00f0ff; }
-  .tlprev .tlframe { width: 100%; height: 280px; border: 1px dashed rgba(0,240,255,.35); border-radius: 8px; background: #060b18; margin-top: 6px; }
+  .tlprev a { font-size: 11px; color: var(--acc); }
+  .tlprev .tlframe { width: 100%; height: 280px; border: 1px dashed var(--bd2); border-radius: 8px; background: #0d0d11; margin-top: 6px; }
 
   /* drag & drop attach overlay */
   .chat-wrap { position: relative; }
   .dropov { position: absolute; inset: 0; z-index: 70; display: none; align-items: center; justify-content: center;
-    background: rgba(0,240,255,.07); border: 2px dashed #00f0ff; border-radius: 14px;
-    font-family: Consolas, monospace; color: #67e8f9; font-size: 15px; letter-spacing: 1px;
-    text-shadow: 0 0 10px rgba(0,240,255,.8); pointer-events: none; }
+    background: rgba(56,189,248,.08); border: 2px dashed var(--acc); border-radius: 14px;
+    font-family: Consolas, monospace; color: var(--acc); font-size: 15px; letter-spacing: 1px;
+    pointer-events: none; }
   .dropov.on { display: flex; }
-  .dropov b { color: #00f0ff; }
+  .dropov b { color: var(--txt); }
 </style>
 </head>
 <body>
@@ -3556,20 +4367,43 @@ PAGE = """<!doctype html>
     <div class="hstatus">
       <span><span class="dot" id="sdot"></span>STATUS: <b id="system-status-text">ONLINE / OPTIMAL</b></span>
       <span>MODEL: <b id="modelbadge">Bonsai 2 &middot; 27B</b></span>
-      <span>VISION: <b>mmproj ON</b></span>
+      <span>VISION: <b id="visionbadge">mmproj ON</b></span>
     </div>
     <div class="hstatus" style="gap:10px; align-items:center;">
       <div class="hclock">
         <div class="t" id="clock-time">00:00:00</div>
         <div class="d" id="clock-date"></div>
       </div>
-      <button class="modebtn" id="modebtn" title="Switch Plan / Build mode">BUILD</button>
       <button class="wbtn" id="workbtn" title="Click to choose the workspace folder">\\WORKSPACE</button>
+      <select class="hbtn modelsel" id="modelsel" title="Active AI model - pick a local .gguf or an external OpenAI-compatible endpoint"></select>
+      <button class="hbtn add" id="addmodelbtn" title="Add a model (local .gguf file or an external API endpoint)">+</button>
       <button class="hbtn" id="ttsbtn" title="Text-to-speech (Piper) - speak replies aloud. Off by default.">TTS: OFF</button>
-      <button class="hbtn" id="ejectbtn" title="Unload the model from RAM/VRAM now (it loads back on the next message)">EJECT</button>
+      <button class="hbtn" id="ejectbtn" title="Stop the model server now and free its RAM/VRAM (it restarts automatically on the next message)">EJECT</button>
       <span class="blstatus off" id="blstatus" title="Blender MCP status">BLENDER: CHECKING</span>
     </div>
   </header>
+
+  <div class="mdl" id="addmdl">
+    <div class="mdlbox">
+      <h4>ADD A MODEL</h4>
+      <button class="act" id="mdl-file">Model file (.gguf) &mdash; browse&hellip;<small>Pick a single GGUF model from anywhere on this PC.</small></button>
+      <button class="act" id="mdl-folder">Model folder &mdash; browse&hellip;<small>Scan a folder (and its subfolders) and add every .gguf it finds.</small></button>
+      <div class="mdlsep">or connect to an API server</div>
+      <div class="row">
+        <input id="apibase" placeholder="base URL, e.g. http://127.0.0.1:1234/v1">
+        <input id="apimodel" placeholder="model id, e.g. qwen3-8b">
+        <button class="act inline" id="mdl-api">Add</button>
+      </div>
+      <div class="mdlsep">vision projector (optional - enables screenshots &amp; images)</div>
+      <div class="row">
+        <select id="mmprojfor"></select>
+        <button class="act inline" id="mdl-mmproj">Browse&hellip;</button>
+        <button class="act inline" id="mdl-mmproj-clear">Clear</button>
+      </div>
+      <div class="hint" id="mmprojhint"></div>
+      <div class="close" id="addmdl-close">Cancel</div>
+    </div>
+  </div>
 
   <main class="grid">
     <section class="left panel hud-border">
@@ -3594,7 +4428,7 @@ PAGE = """<!doctype html>
         <div class="wave-bar"></div>
       </div>
       <p id="bonsai-state-label">BONSAI READY</p>
-      <p class="sub">Awaiting your command</p>
+      <p id="bonsai-sub" class="sub">Awaiting your command</p>
       <div class="meterrow" style="width:100%; margin-top:8px;">
         <div class="meter"><div class="lab"><span>CPU</span><b id="cpu-val">0%</b></div><div class="bar"><div class="fill" id="cpu-bar"></div></div></div>
         <div class="meter"><div class="lab"><span>RAM</span><b id="ram-val">0%</b></div><div class="bar"><div class="fill" id="ram-bar"></div></div></div>
@@ -3612,6 +4446,7 @@ PAGE = """<!doctype html>
             <textarea id="user-input" rows="1" placeholder="Type a command..."></textarea>
             <button type="button" class="iconbtn" id="attach" title="Attach images / files">&#128206;</button>
             <button type="button" class="iconbtn" id="mic-btn" title="Microphone">&#127908;</button>
+            <button type="button" class="modebtn" id="modebtn" title="Switch Plan / Build mode - Plan is read-only (no tools run)">BUILD</button>
             <button type="button" id="queue" title="Queue this message - I will answer it after the current reply">QUEUE</button>
             <select id="effort-sel" title="Thinking effort - how deeply BONSAI reasons (this can change the response quality)">
               <option value="off">THINK: OFF</option>
@@ -3629,7 +4464,7 @@ PAGE = """<!doctype html>
 
   <footer class="hud-border">
     <div>SYSTEM STATUS: <b>100% OPERATIONAL</b></div>
-    <div>MODEL: <b>BONSAI 2 27B</b> &middot; VISION+TOOLS</div>
+    <div>MODEL: <b id="footer-model">BONSAI 2 27B</b> &middot; <span id="footer-caps">VISION+TOOLS</span></div>
     <div>BONSAI &middot; PC ASSISTANT</div>
   </footer>
 </div>
@@ -3646,20 +4481,39 @@ let msgQueue = [];
 let chatMode = localStorage.getItem('jarvis_mode') === 'plan' ? 'plan' : 'build';
 let workdir = '';
 
-function load() {
-  try { return JSON.parse(localStorage.getItem('jarvis_chats') || '[]'); } catch (e) { return []; }
+function load() { try { const v = JSON.parse(localStorage.getItem('jarvis_chats') || '[]'); return Array.isArray(v) ? v : []; } catch (e) { return []; } }
+const IMG_KEEP = 200 * 1024;
+function stripHeavyImages(m) {
+  if (!Array.isArray(m.content)) return;
+  const keep = [];
+  let dropped = 0;
+  m.content.forEach(function (p) {
+    if (p.type === 'image_url' && p.image_url && (p.image_url.url || '').length > IMG_KEEP) { dropped++; return; }
+    keep.push(p);
+  });
+  if (dropped) m.content = keep.length ? keep : '[large image removed from history]';
+}
+function buildPersist(keepRecentImages) {
+  let ids = null;
+  if (keepRecentImages) {
+    ids = {};
+    chats.slice().sort(function (a, b) { return (b.ts || 0) - (a.ts || 0); })
+      .slice(0, 5).forEach(function (c) { ids[c.id] = 1; });
+  }
+  return chats.slice(-200).map(function (ch) {
+    const copy = JSON.parse(JSON.stringify(ch));
+    (copy.messages || []).forEach(function (m) {
+      if (m.calls) (m.calls).forEach(function (cl) { if (cl.preview) delete cl.preview; });
+      if (!ids || !ids[ch.id]) stripHeavyImages(m);
+    });
+    return copy;
+  });
 }
 function save() {
+  try { localStorage.setItem('jarvis_chats', JSON.stringify(buildPersist(false))); } catch (e) {}
   try {
-    const c = chats.slice(-200).map(function (ch) {
-      const copy = JSON.parse(JSON.stringify(ch));
-      (copy.messages || []).forEach(function (m) {
-        if (m.calls) (m.calls).forEach(function (cl) { if (cl.preview) delete cl.preview; });
-      });
-      return copy;
-    });
-    localStorage.setItem('jarvis_chats', JSON.stringify(c));
-    fetch('/api/chats', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ chats: c }) }).catch(function () {});
+    fetch('/api/chats', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chats: buildPersist(true) }) }).catch(function () {});
   } catch (e) {}
 }
 async function serverLoad() {
@@ -3667,7 +4521,25 @@ async function serverLoad() {
     const r = await fetch('/api/chats');
     const j = await r.json();
     if (j && Array.isArray(j.chats) && j.chats.length) {
-      chats = j.chats;
+      const byId = {};
+      chats.forEach(function (c, i) { byId[c.id] = i; });
+      let changed = false;
+      j.chats.forEach(function (c) {
+        if (!c || !c.id) return;
+        const i = byId[c.id];
+        if (i === undefined) { byId[c.id] = chats.length; chats.push(c); changed = true; return; }
+        const loc = chats[i];
+        if ((c.messages || []).length > (loc.messages || []).length) { chats[i] = c; changed = true; }
+        else if ((c.ts || 0) > (loc.ts || 0)) { loc.ts = c.ts; changed = true; }
+      });
+      const before = chats.length;
+      dedupeChats();
+      if (chats.length !== before) changed = true;
+      if (cur) {
+        const keep = chats.filter(function (c) { return c.id === cur.id; })[0];
+        if (keep) cur = keep;
+      }
+      if (changed) save();
       if (!cur || !chats.some(function (c) { return c.id === cur.id; })) cur = chats[chats.length - 1];
       renderAll();
       return true;
@@ -3692,6 +4564,7 @@ function newChat() {
 function init() {
   bindModeBtn();
   loadWorkdir();
+  dedupeChats();
   if (!chats.length) newChat();
   else cur = chats[chats.length - 1];
   renderAll();
@@ -3713,6 +4586,7 @@ function bindModeBtn() {
     chatMode = chatMode === 'plan' ? 'build' : 'plan';
     localStorage.setItem('jarvis_mode', chatMode);
     update();
+    if (typeof setBonsaiState === 'function') setBonsaiState(bonsaiState || 'idle');
   };
 }
 async function loadWorkdir() {
@@ -3723,12 +4597,31 @@ async function loadWorkdir() {
   } catch (e) { /* offline */ }
 }
 function renderAll() { renderList(); renderConv(); }
+function dedupeChats() {
+  const byId = {};
+  const out = [];
+  (chats || []).forEach(function (c) {
+    if (!c || !c.id) return;
+    const prev = byId[c.id];
+    if (!prev) { byId[c.id] = c; out.push(c); return; }
+    const a = (c.messages || []).length, b = (prev.messages || []).length;
+    if (a > b || (a === b && (c.ts || 0) > (prev.ts || 0))) {
+      const i = out.indexOf(prev);
+      if (i !== -1) out[i] = c;
+      byId[c.id] = c;
+    }
+  });
+  chats = out;
+}
 function renderList() {
   const el = document.getElementById('chatlist');
   el.innerHTML = '';
+  let marked = false;
   chats.slice().sort(function (a, b) { return (b.ts || 0) - (a.ts || 0); }).forEach(function (c) {
     const row = document.createElement('div');
-    row.className = 'chat-item' + (cur && c.id === cur.id ? ' active' : '');
+    const isActive = !marked && cur && c.id === cur.id;
+    if (isActive) marked = true;
+    row.className = 'chat-item' + (isActive ? ' active' : '');
     const t = document.createElement('span'); t.className = 'tit'; t.textContent = c.title; t.title = c.title;
     const d = document.createElement('button'); d.className = 'del'; d.textContent = '\u00d7';
     d.onclick = function (e) { e.stopPropagation(); chats = chats.filter(function (x) { return x.id !== c.id; }); if (!chats.length) { cur = null; newChat(); } else { if (cur && cur.id === c.id) cur = chats[chats.length - 1]; save(); renderAll(); } };
@@ -4390,11 +5283,13 @@ document.getElementById('ejectbtn').onclick = function () {
   const btn = document.getElementById('ejectbtn');
   if (btn.disabled) return;
   btn.disabled = true;
+  btn.textContent = 'EJECTING...';
   btn.style.opacity = '0.5';
   fetch('/api/eject', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
     .then(function (r) { return r.json(); })
     .then(function (j) {
       btn.textContent = j.ok ? 'EJECTED' : 'FAILED';
+      btn.title = j.detail || j.error || (j.ok ? 'Model unloaded - it reloads on the next message' : 'Eject failed');
       setTimeout(function () {
         btn.textContent = 'EJECT';
         btn.disabled = false;
@@ -4403,6 +5298,7 @@ document.getElementById('ejectbtn').onclick = function () {
     })
     .catch(function () {
       btn.textContent = 'FAILED';
+      btn.title = 'The eject request failed.';
       setTimeout(function () {
         btn.textContent = 'EJECT';
         btn.disabled = false;
@@ -4435,6 +5331,165 @@ document.getElementById('ttsbtn').onclick = function () {
 };
 refreshTts();
 
+/* ---------- MODEL selector ---------- */
+function modelLabel(m) {
+  return (m.type === 'api' ? '\u2601 ' : '\u25C9 ') + (m.label || m.id);
+}
+function renderModels(j) {
+  const sel = document.getElementById('modelsel');
+  if (!sel) return;
+  sel.innerHTML = '';
+  (j.models || []).forEach(function (m) {
+    const o = document.createElement('option');
+    o.value = m.id;
+    o.textContent = modelLabel(m) + (m.type === 'local' && m.vision ? ' · vision' : '') +
+      (m.type === 'local' && m.available === false ? ' (missing)' : '');
+    if (m.id === j.active) o.selected = true;
+    sel.appendChild(o);
+  });
+  sel.classList.toggle('off', !j.managed);
+  sel.setAttribute('data-prev', j.active || '');
+  const badge = document.getElementById('modelbadge');
+  if (badge && j.active_label) badge.textContent = j.active_label;
+  const vs = document.getElementById('visionbadge');
+  if (vs) vs.textContent = j.vision ? 'mmproj ON' : 'mmproj OFF';
+  const fm = document.getElementById('footer-model');
+  if (fm && j.active_label) fm.textContent = j.active_label;
+  const fc = document.getElementById('footer-caps');
+  if (fc) fc.textContent = (j.vision ? 'VISION' : 'TEXT-ONLY') + '+TOOLS';
+  window.__lastModels = j;
+  renderMmprojList(j);
+}
+function renderMmprojList(j) {
+  const sel = document.getElementById('mmprojfor');
+  const hint = document.getElementById('mmprojhint');
+  if (!sel) return;
+  const keep = sel.value;
+  sel.innerHTML = '';
+  (j.models || []).filter(function (m) { return m.type === 'local'; })
+    .forEach(function (m) {
+      const o = document.createElement('option');
+      o.value = m.id;
+      o.textContent = (m.label || m.id) + (m.vision ? '  (vision on)' : '');
+      sel.appendChild(o);
+    });
+  if (keep) sel.value = keep;
+  const cur = (j.models || []).filter(function (m) { return m.id === sel.value; })[0];
+  if (hint) {
+    hint.textContent = !cur ? 'No local models yet.'
+      : (cur.vision ? 'Projector: ' + String(cur.mmproj).split(/[\\/]/).pop()
+                    : 'No projector attached - this model is text-only.');
+  }
+}
+function setMmproj(mmproj) {
+  const sel = document.getElementById('mmprojfor');
+  if (!sel || !sel.value) { alert('Add a local model first.'); return; }
+  fetch('/api/models', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action: 'mmproj', id: sel.value, mmproj: mmproj }) })
+    .then(function (r) { return r.json(); })
+    .then(function (j) {
+      if (!j.ok) { alert('Could not set the projector:\\n' + (j.error || 'unknown error')); return; }
+      renderModels(j);
+    })
+    .catch(function () { alert('Could not set the projector'); });
+}
+function refreshModels() {
+  fetch('/api/models')
+    .then(function (r) { return r.json(); })
+    .then(renderModels)
+    .catch(function () {});
+}
+document.getElementById('modelsel').onchange = function () {
+  const sel = document.getElementById('modelsel');
+  const id = sel.value;
+  const prev = sel.getAttribute('data-prev') || '';
+  sel.disabled = true;
+  sel.title = 'Switching model - a local model restarts the model server, this can take up to a minute...';
+  fetch('/api/models', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'select', id: id }) })
+    .then(function (r) { return r.json(); })
+    .then(function (j) {
+      sel.disabled = false;
+      renderModels(j);
+      if (!j.ok) { alert('Could not switch model: ' + (j.error || 'unknown error')); sel.value = prev; }
+    })
+    .catch(function () { sel.disabled = false; sel.value = prev; alert('Model switch failed'); });
+};
+/* ---------- ADD MODEL modal (native file / folder browser) ---------- */
+function openAddMdl() { const m = document.getElementById('addmdl'); if (m) m.classList.add('on'); }
+function closeAddMdl() { const m = document.getElementById('addmdl'); if (m) m.classList.remove('on'); }
+function afterAdd(j, what) {
+  if (j.cancelled) return;
+  if (!j.ok) { alert('Could not add the model:\\n' + (j.error || 'unknown error')); return; }
+  renderModels(j);
+  if (what === 'folder') {
+    alert('Added ' + ((j.added && j.added.length) || 0) + ' model(s) from that folder' +
+          (j.skipped ? ' (' + j.skipped + ' already in the list)' : '') +
+          '.\\n\\nPick the one you want from the dropdown.');
+  } else if (what === 'file') {
+    alert('Model added. Pick it from the dropdown to use it.');
+  }
+  closeAddMdl();
+}
+function addModelPick(what) {
+  const btn = document.getElementById('addmodelbtn');
+  if (btn) { btn.disabled = true; btn.textContent = '...'; }
+  fetch('/api/pick_model', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ what: what }) })
+    .then(function (r) { return r.json(); })
+    .then(function (j) { afterAdd(j, what); })
+    .catch(function () { alert('Could not open the file browser'); })
+    .then(function () { if (btn) { btn.disabled = false; btn.textContent = '+'; } });
+}
+function addModelApi() {
+  const base = (document.getElementById('apibase').value || '').trim();
+  const model = (document.getElementById('apimodel').value || '').trim();
+  if (!base || !model) { alert('Fill in both the base URL and the model id.'); return; }
+  fetch('/api/models', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action: 'add', type: 'api', label: model, base_url: base, model: model }) })
+    .then(function (r) { return r.json(); })
+    .then(function (j) {
+      if (!j.ok) { alert('Could not add the model:\\n' + (j.error || 'unknown error')); return; }
+      renderModels(j); closeAddMdl();
+      document.getElementById('apibase').value = '';
+      document.getElementById('apimodel').value = '';
+    })
+    .catch(function () { alert('Add failed'); });
+}
+document.getElementById('addmodelbtn').onclick = openAddMdl;
+const _mdlFile = document.getElementById('mdl-file');
+if (_mdlFile) _mdlFile.onclick = function () { addModelPick('file'); };
+const _mdlFolder = document.getElementById('mdl-folder');
+if (_mdlFolder) _mdlFolder.onclick = function () { addModelPick('folder'); };
+const _mdlApi = document.getElementById('mdl-api');
+if (_mdlApi) _mdlApi.onclick = addModelApi;
+const _mmprojBtn = document.getElementById('mdl-mmproj');
+if (_mmprojBtn) _mmprojBtn.onclick = function () {
+  const sel = document.getElementById('mmprojfor');
+  if (!sel || !sel.value) { alert('Add a local model first.'); return; }
+  _mmprojBtn.disabled = true; _mmprojBtn.textContent = '...';
+  fetch('/api/pick_model', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ what: 'mmproj', id: sel.value }) })
+    .then(function (r) { return r.json(); })
+    .then(function (j) {
+      if (j.cancelled) return;
+      if (!j.ok) { alert('Could not set the projector:\\n' + (j.error || 'unknown error')); return; }
+      renderModels(j);
+    })
+    .catch(function () { alert('Could not open the file browser'); })
+    .then(function () { _mmprojBtn.disabled = false; _mmprojBtn.innerHTML = 'Browse&hellip;'; });
+};
+const _mmprojClear = document.getElementById('mdl-mmproj-clear');
+if (_mmprojClear) _mmprojClear.onclick = function () { setMmproj(''); };
+const _mmprojSel = document.getElementById('mmprojfor');
+if (_mmprojSel) _mmprojSel.onchange = function () { renderMmprojList(window.__lastModels || { models: [] }); };
+const _mdlClose = document.getElementById('addmdl-close');
+if (_mdlClose) _mdlClose.onclick = closeAddMdl;
+const _mdl = document.getElementById('addmdl');
+if (_mdl) _mdl.onclick = function (ev) { if (ev.target === _mdl) closeAddMdl(); };
+document.addEventListener('keydown', function (ev) {
+  if (ev.key === 'Escape') closeAddMdl();
+});
+refreshModels();
+
 const inp = document.getElementById('user-input');
 inp.addEventListener('input', function () { this.style.height = 'auto'; this.style.height = Math.min(this.scrollHeight, 160) + 'px'; });
 inp.addEventListener('keydown', function (ev) { if (ev.key === 'Enter' && !ev.shiftKey) { ev.preventDefault(); handleSubmit(ev); } });
@@ -4446,34 +5501,47 @@ function updateClock() {
   document.getElementById('clock-date').textContent = now.toLocaleDateString('ro-RO');
 }
 function startMetrics() {
-  setInterval(function () {
-    const cpu = Math.floor(8 + Math.random() * 30);
-    const ram = Math.floor(40 + Math.random() * 20);
-    const gpu = Math.floor(10 + Math.random() * 35);
-    document.getElementById('cpu-val').textContent = cpu + '%';
-    document.getElementById('cpu-bar').style.width = cpu + '%';
-    document.getElementById('ram-val').textContent = ram + '%';
-    document.getElementById('ram-bar').style.width = ram + '%';
-    document.getElementById('gpu-val').textContent = gpu + '%';
-    document.getElementById('gpu-bar').style.width = gpu + '%';
-  }, 2500);
+  const set = function (id, v) {
+    const el = document.getElementById(id + '-val');
+    const bar = document.getElementById(id + '-bar');
+    if (el) el.textContent = (v === null || v === undefined) ? 'n/a' : v + '%';
+    if (bar) bar.style.width = (v === null || v === undefined) ? '0%' : Math.max(0, Math.min(100, v)) + '%';
+  };
+  const tick = function () {
+    fetch('/api/sysinfo')
+      .then(function (r) { return r.json(); })
+      .then(function (j) { set('cpu', j.cpu); set('ram', j.ram); set('gpu', j.gpu); })
+      .catch(function () { set('cpu', null); set('ram', null); set('gpu', null); });
+  };
+  tick();
+  setInterval(tick, 2500);
 }
 
 const reactor = document.getElementById('arc-reactor');
 const waveform = document.getElementById('waveform');
 const stateLabel = document.getElementById('bonsai-state-label');
+const subLabel = document.getElementById('bonsai-sub');
+let bonsaiState = 'idle';
 function setBonsaiState(state) {
-  ['thinking', 'tools'].forEach(function (s) { reactor.classList.remove(s); document.body.classList.remove(s); });
+  bonsaiState = state;
+  ['thinking', 'tools', 'rainbow', 'planmode'].forEach(function (s) {
+    reactor.classList.remove(s); document.body.classList.remove(s);
+  });
   waveform.classList.remove('active-wave');
   if (state === 'thinking') {
     reactor.classList.add('thinking'); document.body.classList.add('thinking');
     stateLabel.textContent = 'PROCESSING COMMAND...';
+    if (subLabel) subLabel.textContent = 'Thinking it through...';
   } else if (state === 'tools') {
     reactor.classList.add('tools'); document.body.classList.add('tools');
     waveform.classList.add('active-wave');
     stateLabel.textContent = 'EXECUTING TOOLS...';
+    if (subLabel) subLabel.textContent = 'Working on your PC...';
   } else {
-    stateLabel.textContent = 'BONSAI READY';
+    const plan = chatMode === 'plan';
+    reactor.classList.add(plan ? 'planmode' : 'rainbow');
+    stateLabel.textContent = plan ? 'PLAN MODE' : 'BONSAI READY';
+    if (subLabel) subLabel.textContent = plan ? 'Read-only - no tools will run' : 'Awaiting your command';
   }
 }
 
@@ -4557,6 +5625,23 @@ PAGE_GPT = """<!doctype html>
   .btn-ghost.on { background: rgba(74,222,128,.15); border-color: #4ade80; color: #86efac; }
   .btn-ghost.on:hover { background: rgba(74,222,128,.3); }
   .btn-ghost:hover { border-color: var(--mut); }
+  .mdl { position: fixed; inset: 0; z-index: 90; display: none; align-items: center; justify-content: center; background: rgba(0,0,0,.55); }
+  .mdl.on { display: flex; }
+  .mdlbox { width: min(560px, 92vw); background: var(--bg2); border: 1px solid var(--bd); border-radius: 14px; padding: 18px; }
+  .mdlbox h4 { margin: 0 0 12px; font-size: 12px; letter-spacing: 1.5px; color: var(--mut); text-transform: uppercase; }
+  .mdlbox .act { display: block; width: 100%; text-align: left; background: transparent; border: 1px solid var(--bd); color: var(--txt); border-radius: 10px; padding: 11px 12px; margin-bottom: 8px; cursor: pointer; font-size: 13px; font-weight: 500; }
+  .mdlbox .act:hover { background: var(--bg3); border-color: var(--mut); }
+  .mdlbox .act small { display: block; color: var(--mut); font-size: 11.5px; margin-top: 3px; font-weight: 400; }
+  .mdlbox .act.inline { width: auto; margin: 0; padding: 10px 16px; }
+  .mdlbox .mdlsep { color: var(--mut); font-size: 11px; letter-spacing: 1px; text-transform: uppercase; margin: 14px 0 8px; }
+  .mdlbox .row { display: flex; gap: 8px; }
+  .mdlbox input { flex: 1; min-width: 0; background: transparent; border: 1px solid var(--bd); border-radius: 10px; padding: 10px; color: var(--txt); font-size: 13px; outline: none; }
+  .mdlbox input:focus { border-color: var(--mut); }
+  .mdlbox select { flex: 1; min-width: 0; background: transparent; border: 1px solid var(--bd); border-radius: 10px; padding: 10px; color: var(--txt); font-size: 13px; outline: none; }
+  .mdlbox select option { background: #17171a; color: var(--txt); }
+  .mdlbox .hint { color: var(--mut); font-size: 11.5px; margin-top: 8px; }
+  .mdlbox .close { margin-top: 14px; text-align: center; color: var(--mut); cursor: pointer; font-size: 12.5px; }
+  .mdlbox .close:hover { color: var(--err); }
   .wd { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 100%; text-align: left; }
   .foot-row { display: flex; gap: 6px; }
   .foot-row a { text-decoration: none; color: var(--mut); flex: 1; text-align: center; }
@@ -4667,7 +5752,7 @@ PAGE_GPT = """<!doctype html>
         <a href="/" title="Classic UI">Classic UI</a>
         <button class="btn-ghost" id="ttsbtn" title="Text-to-speech (Piper) - speak replies aloud. Off by default.">TTS: OFF</button>
         <button class="btn-ghost" id="themebtn" title="Toggle theme"></button>
-        <button class="btn-ghost" id="ejectbtn" title="Unload the model from RAM/VRAM">EJECT</button>
+        <button class="btn-ghost" id="ejectbtn" title="Stop the model server now and free its RAM/VRAM (it restarts automatically on the next message)">EJECT</button>
       </div>
     </div>
   </nav>
@@ -4675,6 +5760,8 @@ PAGE_GPT = """<!doctype html>
     <header class="topbar">
       <div class="tb-r" style="display:flex;align-items:center;gap:10px">
         <button class="pill" id="modebtn" title="Plan = pure reasoning without tools">BUILD</button>
+        <select class="pill" id="modelsel" title="Active AI model - pick a local .gguf or an external OpenAI-compatible endpoint" style="max-width:190px"></select>
+        <button class="pill" id="addmodelbtn" title="Add a model (local .gguf file or an external API endpoint)">+</button>
         <select class="pill" id="effort-sel" title="Thinking effort - how deeply BONSAI reasons">
           <option value="off">Effort: off</option>
           <option value="low">Effort: low</option>
@@ -4684,6 +5771,29 @@ PAGE_GPT = """<!doctype html>
         <span class="state" id="state-label">READY</span>
       </div>
     </header>
+
+    <div class="mdl" id="addmdl">
+      <div class="mdlbox">
+        <h4>ADD A MODEL</h4>
+        <button class="act" id="mdl-file">Model file (.gguf) &mdash; browse&hellip;<small>Pick a single GGUF model from anywhere on this PC.</small></button>
+        <button class="act" id="mdl-folder">Model folder &mdash; browse&hellip;<small>Scan a folder (and its subfolders) and add every .gguf it finds.</small></button>
+        <div class="mdlsep">or connect to an API server</div>
+        <div class="row">
+          <input id="apibase" placeholder="base URL, e.g. http://127.0.0.1:1234/v1">
+          <input id="apimodel" placeholder="model id, e.g. qwen3-8b">
+          <button class="act inline" id="mdl-api">Add</button>
+        </div>
+        <div class="mdlsep">vision projector (optional - enables screenshots &amp; images)</div>
+        <div class="row">
+          <select id="mmprojfor"></select>
+          <button class="act inline" id="mdl-mmproj">Browse&hellip;</button>
+          <button class="act inline" id="mdl-mmproj-clear">Clear</button>
+        </div>
+        <div class="hint" id="mmprojhint"></div>
+        <div class="close" id="addmdl-close">Cancel</div>
+      </div>
+    </div>
+
     <div class="messages" id="messages">
       <div class="inner">
         <div class="empty" id="empty">
@@ -4725,13 +5835,28 @@ let statsVals = { think_ms: 0, respond_ms: 0, tok_s: 0, ctx_used: 0, ctx_left: 0
 const SEND_SVG = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path d="M12 19V5M5 12l7-7 7 7"/></svg>';
 const STOP_SVG = '<svg width="13" height="13" viewBox="0 0 24 24"><rect x="5" y="5" width="14" height="14" rx="2" fill="currentColor"/></svg>';
 
-function load() { try { return JSON.parse(localStorage.getItem('bonsai_gpt_chats') || '[]'); } catch (e) { return []; } }
+function load() { try { const v = JSON.parse(localStorage.getItem('bonsai_gpt_chats') || '[]'); return Array.isArray(v) ? v : []; } catch (e) { return []; } }
+const IMG_KEEP = 200 * 1024;
+function stripHeavyImages(m) {
+  if (!Array.isArray(m.content)) return;
+  const keep = [];
+  let dropped = 0;
+  m.content.forEach(function (p) {
+    if (p.type === 'image_url' && p.image_url && (p.image_url.url || '').length > IMG_KEEP) { dropped++; return; }
+    keep.push(p);
+  });
+  if (dropped) m.content = keep.length ? keep : '[large image removed from history]';
+}
 function save() {
   try {
+    const recent = {};
+    chats.slice().sort(function (a, b) { return (b.ts || 0) - (a.ts || 0); })
+      .slice(0, 5).forEach(function (c) { recent[c.id] = 1; });
     const c = chats.slice(-200).map(function (ch) {
       const copy = JSON.parse(JSON.stringify(ch));
       (copy.messages || []).forEach(function (m) {
         if (m.calls) (m.calls).forEach(function (cl) { if (cl.preview) delete cl.preview; });
+        if (!recent[ch.id]) stripHeavyImages(m);
       });
       return copy;
     });
@@ -4746,6 +5871,7 @@ function newChat() {
 }
 function init() {
   bindModeBtn(); bindTheme(); loadWorkdir();
+  dedupeChats();
   if (!chats.length) newChat(); else cur = chats[chats.length - 1];
   renderAll(); setSendUI(); setQueueUI();
   fetch('/api/todos').then(function (r) { return r.json(); }).then(function (j) {
@@ -4785,12 +5911,31 @@ function setWorkdirInUI(wd) {
   w.title = 'Working folder: ' + workdir;
 }
 function renderAll() { renderList(); renderConv(); }
+function dedupeChats() {
+  const byId = {};
+  const out = [];
+  (chats || []).forEach(function (c) {
+    if (!c || !c.id) return;
+    const prev = byId[c.id];
+    if (!prev) { byId[c.id] = c; out.push(c); return; }
+    const a = (c.messages || []).length, b = (prev.messages || []).length;
+    if (a > b || (a === b && (c.ts || 0) > (prev.ts || 0))) {
+      const i = out.indexOf(prev);
+      if (i !== -1) out[i] = c;
+      byId[c.id] = c;
+    }
+  });
+  chats = out;
+}
 function renderList() {
   const el = document.getElementById('chatlist');
   el.innerHTML = '';
+  let marked = false;
   chats.slice().sort(function (a, b) { return (b.ts || 0) - (a.ts || 0); }).forEach(function (c) {
     const row = document.createElement('div');
-    row.className = 'chat-item' + (cur && c.id === cur.id ? ' active' : '');
+    const isActive = !marked && cur && c.id === cur.id;
+    if (isActive) marked = true;
+    row.className = 'chat-item' + (isActive ? ' active' : '');
     const t = document.createElement('span'); t.className = 'tit'; t.textContent = c.title; t.title = c.title;
     const d = document.createElement('button'); d.className = 'del'; d.textContent = '\u00d7';
     d.onclick = function (e) {
@@ -5355,15 +6500,18 @@ document.getElementById('ejectbtn').onclick = function () {
   const btn = document.getElementById('ejectbtn');
   if (btn.disabled) return;
   btn.disabled = true;
+  btn.textContent = 'EJECTING...';
   btn.style.opacity = '0.5';
   fetch('/api/eject', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
     .then(function (r) { return r.json(); })
     .then(function (j) {
       btn.textContent = j.ok ? 'EJECTED' : 'FAILED';
+      btn.title = j.detail || j.error || (j.ok ? 'Model unloaded - it reloads on the next message' : 'Eject failed');
       setTimeout(function () { btn.textContent = 'EJECT'; btn.disabled = false; btn.style.opacity = '1'; }, 2500);
     })
     .catch(function () {
       btn.textContent = 'FAILED';
+      btn.title = 'The eject request failed.';
       setTimeout(function () { btn.textContent = 'EJECT'; btn.disabled = false; btn.style.opacity = '1'; }, 2500);
     });
 };
@@ -5390,6 +6538,165 @@ document.getElementById('ttsbtn').onclick = function () {
     .catch(function () { alert('TTS toggle failed'); });
 };
 refreshTts();
+
+/* ---------- MODEL selector ---------- */
+function modelLabel(m) {
+  return (m.type === 'api' ? '\u2601 ' : '\u25C9 ') + (m.label || m.id);
+}
+function renderModels(j) {
+  const sel = document.getElementById('modelsel');
+  if (!sel) return;
+  sel.innerHTML = '';
+  (j.models || []).forEach(function (m) {
+    const o = document.createElement('option');
+    o.value = m.id;
+    o.textContent = modelLabel(m) + (m.type === 'local' && m.vision ? ' · vision' : '') +
+      (m.type === 'local' && m.available === false ? ' (missing)' : '');
+    if (m.id === j.active) o.selected = true;
+    sel.appendChild(o);
+  });
+  sel.classList.toggle('off', !j.managed);
+  sel.setAttribute('data-prev', j.active || '');
+  const badge = document.getElementById('modelbadge');
+  if (badge && j.active_label) badge.textContent = j.active_label;
+  const vs = document.getElementById('visionbadge');
+  if (vs) vs.textContent = j.vision ? 'mmproj ON' : 'mmproj OFF';
+  const fm = document.getElementById('footer-model');
+  if (fm && j.active_label) fm.textContent = j.active_label;
+  const fc = document.getElementById('footer-caps');
+  if (fc) fc.textContent = (j.vision ? 'VISION' : 'TEXT-ONLY') + '+TOOLS';
+  window.__lastModels = j;
+  renderMmprojList(j);
+}
+function renderMmprojList(j) {
+  const sel = document.getElementById('mmprojfor');
+  const hint = document.getElementById('mmprojhint');
+  if (!sel) return;
+  const keep = sel.value;
+  sel.innerHTML = '';
+  (j.models || []).filter(function (m) { return m.type === 'local'; })
+    .forEach(function (m) {
+      const o = document.createElement('option');
+      o.value = m.id;
+      o.textContent = (m.label || m.id) + (m.vision ? '  (vision on)' : '');
+      sel.appendChild(o);
+    });
+  if (keep) sel.value = keep;
+  const cur = (j.models || []).filter(function (m) { return m.id === sel.value; })[0];
+  if (hint) {
+    hint.textContent = !cur ? 'No local models yet.'
+      : (cur.vision ? 'Projector: ' + String(cur.mmproj).split(/[\\/]/).pop()
+                    : 'No projector attached - this model is text-only.');
+  }
+}
+function setMmproj(mmproj) {
+  const sel = document.getElementById('mmprojfor');
+  if (!sel || !sel.value) { alert('Add a local model first.'); return; }
+  fetch('/api/models', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action: 'mmproj', id: sel.value, mmproj: mmproj }) })
+    .then(function (r) { return r.json(); })
+    .then(function (j) {
+      if (!j.ok) { alert('Could not set the projector:\\n' + (j.error || 'unknown error')); return; }
+      renderModels(j);
+    })
+    .catch(function () { alert('Could not set the projector'); });
+}
+function refreshModels() {
+  fetch('/api/models')
+    .then(function (r) { return r.json(); })
+    .then(renderModels)
+    .catch(function () {});
+}
+document.getElementById('modelsel').onchange = function () {
+  const sel = document.getElementById('modelsel');
+  const id = sel.value;
+  const prev = sel.getAttribute('data-prev') || '';
+  sel.disabled = true;
+  sel.title = 'Switching model - a local model restarts the model server, this can take up to a minute...';
+  fetch('/api/models', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action: 'select', id: id }) })
+    .then(function (r) { return r.json(); })
+    .then(function (j) {
+      sel.disabled = false;
+      renderModels(j);
+      if (!j.ok) { alert('Could not switch model: ' + (j.error || 'unknown error')); sel.value = prev; }
+    })
+    .catch(function () { sel.disabled = false; sel.value = prev; alert('Model switch failed'); });
+};
+/* ---------- ADD MODEL modal (native file / folder browser) ---------- */
+function openAddMdl() { const m = document.getElementById('addmdl'); if (m) m.classList.add('on'); }
+function closeAddMdl() { const m = document.getElementById('addmdl'); if (m) m.classList.remove('on'); }
+function afterAdd(j, what) {
+  if (j.cancelled) return;
+  if (!j.ok) { alert('Could not add the model:\\n' + (j.error || 'unknown error')); return; }
+  renderModels(j);
+  if (what === 'folder') {
+    alert('Added ' + ((j.added && j.added.length) || 0) + ' model(s) from that folder' +
+          (j.skipped ? ' (' + j.skipped + ' already in the list)' : '') +
+          '.\\n\\nPick the one you want from the dropdown.');
+  } else if (what === 'file') {
+    alert('Model added. Pick it from the dropdown to use it.');
+  }
+  closeAddMdl();
+}
+function addModelPick(what) {
+  const btn = document.getElementById('addmodelbtn');
+  if (btn) { btn.disabled = true; btn.textContent = '...'; }
+  fetch('/api/pick_model', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ what: what }) })
+    .then(function (r) { return r.json(); })
+    .then(function (j) { afterAdd(j, what); })
+    .catch(function () { alert('Could not open the file browser'); })
+    .then(function () { if (btn) { btn.disabled = false; btn.textContent = '+'; } });
+}
+function addModelApi() {
+  const base = (document.getElementById('apibase').value || '').trim();
+  const model = (document.getElementById('apimodel').value || '').trim();
+  if (!base || !model) { alert('Fill in both the base URL and the model id.'); return; }
+  fetch('/api/models', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action: 'add', type: 'api', label: model, base_url: base, model: model }) })
+    .then(function (r) { return r.json(); })
+    .then(function (j) {
+      if (!j.ok) { alert('Could not add the model:\\n' + (j.error || 'unknown error')); return; }
+      renderModels(j); closeAddMdl();
+      document.getElementById('apibase').value = '';
+      document.getElementById('apimodel').value = '';
+    })
+    .catch(function () { alert('Add failed'); });
+}
+document.getElementById('addmodelbtn').onclick = openAddMdl;
+const _mdlFile = document.getElementById('mdl-file');
+if (_mdlFile) _mdlFile.onclick = function () { addModelPick('file'); };
+const _mdlFolder = document.getElementById('mdl-folder');
+if (_mdlFolder) _mdlFolder.onclick = function () { addModelPick('folder'); };
+const _mdlApi = document.getElementById('mdl-api');
+if (_mdlApi) _mdlApi.onclick = addModelApi;
+const _mmprojBtn = document.getElementById('mdl-mmproj');
+if (_mmprojBtn) _mmprojBtn.onclick = function () {
+  const sel = document.getElementById('mmprojfor');
+  if (!sel || !sel.value) { alert('Add a local model first.'); return; }
+  _mmprojBtn.disabled = true; _mmprojBtn.textContent = '...';
+  fetch('/api/pick_model', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ what: 'mmproj', id: sel.value }) })
+    .then(function (r) { return r.json(); })
+    .then(function (j) {
+      if (j.cancelled) return;
+      if (!j.ok) { alert('Could not set the projector:\\n' + (j.error || 'unknown error')); return; }
+      renderModels(j);
+    })
+    .catch(function () { alert('Could not open the file browser'); })
+    .then(function () { _mmprojBtn.disabled = false; _mmprojBtn.innerHTML = 'Browse&hellip;'; });
+};
+const _mmprojClear = document.getElementById('mdl-mmproj-clear');
+if (_mmprojClear) _mmprojClear.onclick = function () { setMmproj(''); };
+const _mmprojSel = document.getElementById('mmprojfor');
+if (_mmprojSel) _mmprojSel.onchange = function () { renderMmprojList(window.__lastModels || { models: [] }); };
+const _mdlClose = document.getElementById('addmdl-close');
+if (_mdlClose) _mdlClose.onclick = closeAddMdl;
+const _mdl = document.getElementById('addmdl');
+if (_mdl) _mdl.onclick = function (ev) { if (ev.target === _mdl) closeAddMdl(); };
+document.addEventListener('keydown', function (ev) {
+  if (ev.key === 'Escape') closeAddMdl();
+});
+refreshModels();
 const inp = document.getElementById('user-input');
 inp.addEventListener('input', function () { this.style.height = 'auto'; this.style.height = Math.min(this.scrollHeight, 160) + 'px'; });
 inp.addEventListener('keydown', function (ev) { if (ev.key === 'Enter' && !ev.shiftKey) { ev.preventDefault(); handleSubmit(ev); } });
@@ -5434,23 +6741,119 @@ def sse(handler, event, obj):
     handler.wfile.flush()
 
 
-def _load_chats():
+def _valid_chat(c):
+    return (isinstance(c, dict) and isinstance(c.get("messages"), list)
+            and all(isinstance(m, dict) and m.get("role") in
+                    ("user", "assistant", "system", "tool")
+                    for m in c["messages"]))
+
+
+def _read_chat_file(path):
     try:
-        with open(CHATS_FILE, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        return data if isinstance(data, list) else []
     except Exception:
-        return []
+        return None
+    if not isinstance(data, list):
+        return None
+    return [c for c in data if _valid_chat(c)]
+
+
+_SYSINFO_CACHE = {"ts": 0, "data": {}}
+_SYSINFO_TTL = 2.0
+
+
+def _gpu_percent():
+    """GPU utilisation from nvidia-smi (cached; None when unavailable)."""
+    try:
+        exe = shutil.which("nvidia-smi")
+        if not exe:
+            return None
+        out = subprocess.run(
+            [exe, "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=4,
+            creationflags=CREATE_NO_WINDOW).stdout
+        vals = [int(x) for x in out.replace("%", "").split() if x.strip().isdigit()]
+        if not vals:
+            return None
+        return max(0, min(100, round(sum(vals) / len(vals))))
+    except Exception:
+        return None
+
+
+def _sample_sysinfo():
+    data = {"cpu": None, "ram": None, "gpu": None,
+            "cpu_cores": os.cpu_count()}
+    try:
+        import psutil
+        data["cpu"] = int(round(psutil.cpu_percent(interval=None)))
+        vm = psutil.virtual_memory()
+        data["ram"] = int(round(vm.percent))
+        data["ram_total"] = int(round(vm.total / (1024 ** 3)))
+    except Exception:
+        data["cpu"] = None
+    data["gpu"] = _gpu_percent()
+    _SYSINFO_CACHE["ts"] = time.time()
+    _SYSINFO_CACHE["data"] = data
+    return data
+
+
+def _sysinfo_loop():
+    """Samples CPU/RAM/GPU on one dedicated thread.
+
+    psutil's cpu_percent() averages since its previous call and returns 0.0
+    the first time it is called from a new thread, so the sampling has to stay
+    on a single thread instead of running inside request handlers."""
+    try:
+        import psutil
+        psutil.cpu_percent(interval=None)  # discard the first sample
+    except Exception:
+        pass
+    while True:
+        try:
+            _sample_sysinfo()
+        except Exception:
+            pass
+        time.sleep(1.5)
+
+
+def _sysinfo():
+    """Latest real CPU / RAM / GPU usage for the HUD meters."""
+    d = _SYSINFO_CACHE.get("data") or {}
+    if d:
+        return d
+    return {"cpu": None, "ram": None, "gpu": None,
+            "cpu_cores": os.cpu_count()}
+
+
+def _load_chats():
+    data = _read_chat_file(CHATS_FILE)
+    if data is None:
+        data = _read_chat_file(CHATS_FILE + ".bak")
+    return data if isinstance(data, list) else []
 
 
 def _save_chats(chats):
+    if not isinstance(chats, list):
+        return False
+    keep = [c for c in chats if _valid_chat(c)][-200:]
+    tmp = CHATS_FILE + ".tmp"
     try:
         os.makedirs(os.path.dirname(CHATS_FILE), exist_ok=True)
-        with open(CHATS_FILE, "w", encoding="utf-8") as f:
-            json.dump(chats[-200:] if isinstance(chats, list) else [],
-                      f, ensure_ascii=False, default=str)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(keep, f, ensure_ascii=False, default=str)
+        if os.path.exists(CHATS_FILE):
+            try:
+                os.replace(CHATS_FILE, CHATS_FILE + ".bak")
+            except Exception:
+                pass
+        os.replace(tmp, CHATS_FILE)
         return True
     except Exception:
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
         return False
 
 
@@ -5488,7 +6891,44 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:
             self._send(500, "preview read error: %s" % exc, "text/plain")
             return
+        try:
+            text = data.decode("utf-8")
+            text = _inject_base(text, _preview_base_href(target))
+            data = text.encode("utf-8")
+        except Exception:
+            pass
         self._send(200, data, "text/html; charset=utf-8")
+
+    def _serve_preview_asset(self, rel):
+        """Serve a non-HTML file from the workspace for a previewed page."""
+        rel = urllib.parse.unquote(rel or "").lstrip("/")
+        if not rel:
+            self._send(400, "preview: missing file", "text/plain")
+            return
+        try:
+            target = _safe_path(rel)
+        except ValueError as exc:
+            self._send(400, str(exc), "text/plain")
+            return
+        ext = os.path.splitext(target)[1].lower()
+        if ext in (".html", ".htm"):
+            self._send(400, "preview: HTML files are served from /preview",
+                       "text/plain")
+            return
+        ctype = _PREVIEW_MIME.get(ext)
+        if not ctype:
+            self._send(415, "preview: unsupported asset type", "text/plain")
+            return
+        if not os.path.isfile(target):
+            self._send(404, "file not found", "text/plain")
+            return
+        try:
+            with open(target, "rb") as fh:
+                data = fh.read()
+        except Exception as exc:
+            self._send(500, "preview read error: %s" % exc, "text/plain")
+            return
+        self._send(200, data, ctype)
 
     def do_GET(self):
         _touch_activity()
@@ -5509,8 +6949,14 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/tts":
             self._send(200, json.dumps({"enabled": tts_enabled(),
                                         "folder": PIPER_DIR}))
+        elif path == "/api/models":
+            self._send(200, json.dumps(_public_models(), default=str))
+        elif path == "/api/sysinfo":
+            self._send(200, json.dumps(_sysinfo(), default=str))
         elif path == "/preview":
             self._serve_preview()
+        elif path.startswith("/previewfile/"):
+            self._serve_preview_asset(path[len("/previewfile/"):])
         else:
             self._send(404, "not found", "text/plain")
 
@@ -5521,10 +6967,15 @@ class Handler(BaseHTTPRequestHandler):
             if path not in ("/api", "/api/stream", "/api/workdir",
                             "/api/pick_workdir", "/api/chats",
                             "/api/answer", "/api/effort", "/api/eject",
-                            "/api/tts"):
+                            "/api/tts", "/api/models", "/api/pick_model"):
                 self._send(404, "not found", "text/plain")
                 return
-            length = int(self.headers.get("Content-Length", 0))
+            length = int(self.headers.get("Content-Length", 0) or 0)
+            if length > MAX_REQUEST_BYTES:
+                self._send(413, json.dumps(
+                    {"error": "request too large (max %d MB)"
+                               % (MAX_REQUEST_BYTES // (1024 * 1024))}))
+                return
             body = json.loads(self.rfile.read(length) or b"{}")
             if path == "/api/eject":
                 self._send(200, json.dumps(_unload_bonsai()))
@@ -5554,6 +7005,51 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/tts":
                 enabled = set_tts_enabled(body.get("enabled"))
                 self._send(200, json.dumps({"ok": True, "enabled": enabled}))
+                return
+            if path == "/api/models":
+                action = str(body.get("action") or "select").strip().lower()
+                if action == "add":
+                    res = _add_model(body)
+                elif action == "remove":
+                    res = _remove_model(str(body.get("id") or ""))
+                elif action == "mmproj":
+                    res = _set_model_mmproj(str(body.get("id") or ""),
+                                            body.get("mmproj"))
+                elif action == "scan":
+                    res = _scan_models()
+                else:
+                    res = _select_model(str(body.get("id") or ""))
+                self._send(200, json.dumps(res, default=str))
+                return
+            if path == "/api/pick_model":
+                what = str(body.get("what") or "file").strip().lower()
+                if what == "mmproj":
+                    chosen = _pick_vision_file()
+                    if not chosen:
+                        self._send(200, json.dumps({"cancelled": True}))
+                        return
+                    self._send(200, json.dumps(
+                        _set_model_mmproj(str(body.get("id") or ""), chosen),
+                        default=str))
+                    return
+                chosen = (_pick_model_folder() if what == "folder"
+                          else _pick_model_file())
+                if not chosen:
+                    self._send(200, json.dumps({"cancelled": True}))
+                    return
+                if what == "folder":
+                    res = _add_model_folder(chosen)
+                else:
+                    res = _add_model(
+                        {"type": "local", "path": chosen,
+                         "label": os.path.splitext(
+                             os.path.basename(chosen))[0],
+                         "mmproj": _mmproj_for(os.path.dirname(chosen),
+                                               chosen)})
+                    if res.get("ok") and isinstance(res.get("added"), dict):
+                        res["added"] = [res["added"]]
+                    res.setdefault("skipped", 0)
+                self._send(200, json.dumps(res, default=str))
                 return
             if path == "/api/workdir":
                 global WORKDIR
@@ -5655,6 +7151,8 @@ def main():
 
     threading.Thread(target=_ensure_bonsai, daemon=True).start()
     threading.Thread(target=_blender_kickoff, daemon=True).start()
+    threading.Thread(target=_sysinfo_loop, daemon=True,
+                     name="bonsai-sysinfo").start()
     print("BONSAI is READY on http://127.0.0.1:8081", flush=True)
     webbrowser.open(f"http://{HOST}:{PORT}")
     ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()

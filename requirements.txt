@@ -8,8 +8,8 @@ pyautogui
 pillow
 pyperclip
 
-# Window management                 -> window_list, window_action
-pywin32
+# Window management                 -> window_list, window_action (Windows only)
+pywin32; sys_platform == "win32"
 psutil
 
 # API client + WebSocket            -> api_call, ws_test
