@@ -939,7 +939,7 @@
     "type": "function",
     "function": {
       "name": "schedule_task",
-      "description": "Schedule a shell command to run later (and while this PC is on): once after a delay, on an interval, or on a cron schedule. Intervals are 'every N seconds'. Cron is a 5-field expression: minute hour day-of-month month day-of-week (0 or 7 = Sunday). Examples: '15 3 * * *' daily at 03:15; '*/5 * * * *' every 5 minutes; '0 9 * * 1-5' weekdays at 09:00. The command runs via the system shell (cmd). Check runs with list_schedules; cancel with unschedule_task.",
+      "description": "Schedule a shell command to run later (and while this PC is on): once after a delay, on an interval, or on a cron schedule. Intervals are 'every N seconds'. Cron is a 5-field expression: minute hour day-of-month month day-of-week (0 or 7 = Sunday). Examples: '15 3 * * *' daily at 03:15; '*/5 * * * *' every 5 minutes; '0 9 * * 1-5' weekdays at 09:00. The command runs via the system shell (cmd). Tasks are saved, so they survive a restart of Bonsai, and a one-shot task that came due while Bonsai was closed runs as soon as it starts again. Check runs with list_schedules; cancel with unschedule_task.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -988,7 +988,7 @@
     "type": "function",
     "function": {
       "name": "list_schedules",
-      "description": "List all scheduled tasks: name, schedule kind, next run time, last run, how many times it ran and the tail of its last output.",
+      "description": "List all scheduled tasks: name, schedule kind, status (active, running or completed), next run time, last run, how many times it ran and the tail of its last output. One-shot tasks stay in the list with status 'completed' after they run, so their output stays visible until you remove them.",
       "parameters": {
         "type": "object",
         "properties": {},
@@ -1000,7 +1000,7 @@
     "type": "function",
     "function": {
       "name": "unschedule_task",
-      "description": "Cancel a scheduled task by name. Already-started runs are not interrupted.",
+      "description": "Cancel a scheduled task by name, or delete a completed one from the list. Already-started runs are not interrupted.",
       "parameters": {
         "type": "object",
         "properties": {

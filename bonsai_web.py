@@ -110,6 +110,9 @@ _EFFORT_LOCK = threading.Lock()
 _SCHED = {}
 _SCHED_LOCK = threading.Lock()
 _SCHED_THREAD_ON = False
+_SCHED_LOADED = False
+_SCHED_EVENTS = []
+_SCHED_DONE_MAX = 25
 
 _TTS_ENABLED = False
 _TTS_LOCK = threading.Lock()
@@ -2760,8 +2763,11 @@ SCHEDULE_TOOL = {
                        "day-of-week (0 or 7 = Sunday). Examples: '15 3 * * *' "
                        "daily at 03:15; '*/5 * * * *' every 5 minutes; "
                        "'0 9 * * 1-5' weekdays at 09:00. The command runs via the "
-                       "system shell (cmd). Check runs with list_schedules; "
-                       "cancel with unschedule_task.",
+                       "system shell (cmd). Tasks are saved, so they survive a "
+                       "restart of Bonsai, and a one-shot task that came due "
+                       "while Bonsai was closed runs as soon as it starts again. "
+                       "Check runs with list_schedules; cancel with "
+                       "unschedule_task.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -2780,15 +2786,18 @@ SCHEDULE_TOOL = {
 
 LIST_SCHEDULES_TOOL = _pc_tool(
     "list_schedules",
-    "List all scheduled tasks: name, schedule kind, next run time, last run, "
-    "how many times it ran and the tail of its last output.",
+    "List all scheduled tasks: name, schedule kind, status (active, running or "
+    "completed), next run time, last run, how many times it ran and the tail of "
+    "its last output. One-shot tasks stay in the list with status 'completed' "
+    "after they run, so their output stays visible until you remove them.",
     {},
     []
 )
 
 UNSCHEDULE_TOOL = _pc_tool(
     "unschedule_task",
-    "Cancel a scheduled task by name. Already-started runs are not interrupted.",
+    "Cancel a scheduled task by name, or delete a completed one from the list. "
+    "Already-started runs are not interrupted.",
     {"name": {"type": "string", "description": "Task name to cancel."}},
     ["name"]
 )
@@ -4630,14 +4639,114 @@ def _cron_next(expr, after):
 
 def _sched_public(job):
     nxt = job.get("next_fire")
+    if job.get("done"):
+        status = "completed"
+    elif job.get("_running"):
+        status = "running"
+    else:
+        status = "active"
     return {"name": job["name"], "when": job.get("when"),
             "command": job.get("command"),
+            "status": status,
             "next_run": datetime.datetime.fromtimestamp(nxt).isoformat(timespec="seconds") if nxt else None,
             "last_run": job.get("last_fire"),
             "count": job.get("count", 0),
             "interval_seconds": job.get("interval"),
             "cron": job.get("cron"),
             "last_output": job.get("last_output")}
+
+
+def _sched_file():
+    return os.path.join(BONSAI_DIR, "schedules.json")
+
+
+def _sched_save_locked():
+    jobs = []
+    for job in _SCHED.values():
+        if job.get("_cancel"):
+            continue
+        jobs.append({k: job.get(k) for k in
+                     ("name", "command", "when", "timeout", "count", "next_fire",
+                      "last_fire", "last_output", "interval", "cron", "delay",
+                      "done")})
+    path = _sched_file()
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"version": 1, "jobs": jobs}, fh, indent=1)
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+
+def _sched_load():
+    global _SCHED_LOADED
+    with _SCHED_LOCK:
+        if _SCHED_LOADED:
+            return
+        _SCHED_LOADED = True
+    try:
+        with open(_sched_file(), encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception:
+        return
+    now = time.time()
+    restored = []
+    for raw in data.get("jobs") or []:
+        if not isinstance(raw, dict):
+            continue
+        name = str(raw.get("name") or "").strip()
+        command = str(raw.get("command") or "").strip()
+        when = str(raw.get("when") or "once")
+        if not name or not command or when not in ("once", "interval", "cron"):
+            continue
+        job = {"name": name, "command": command, "when": when,
+               "timeout": int(raw.get("timeout") or 180),
+               "count": int(raw.get("count") or 0),
+               "last_fire": raw.get("last_fire"),
+               "last_output": raw.get("last_output"),
+               "_running": False, "_cancel": False}
+        if when == "cron":
+            expr = str(raw.get("cron") or "").strip()
+            nxt = _cron_next(expr, datetime.datetime.now()) if len(expr.split()) == 5 else None
+            if not nxt:
+                continue
+            job["cron"] = expr
+            job["next_fire"] = nxt.timestamp()
+        elif when == "interval":
+            job["interval"] = max(5, int(raw.get("interval") or 60))
+            due = float(raw.get("next_fire") or 0)
+            job["next_fire"] = now if due and due <= now else (due or now + job["interval"])
+        else:
+            due = float(raw.get("next_fire") or 0)
+            if raw.get("done") or not due:
+                job["done"] = True
+                job["next_fire"] = 0
+            else:
+                job["next_fire"] = due
+        restored.append(job)
+    if restored:
+        with _SCHED_LOCK:
+            for job in restored:
+                _SCHED.setdefault(job["name"], job)
+        _ensure_sched_thread()
+
+
+def _sched_push_event(job, out):
+    with _SCHED_LOCK:
+        _SCHED_EVENTS.append({"name": job["name"], "command": job["command"],
+                              "when": job.get("when"),
+                              "ran_at": job.get("last_fire"),
+                              "output": (out or "")[:2000]})
+        if len(_SCHED_EVENTS) > 50:
+            del _SCHED_EVENTS[:-50]
+
+
+def _sched_take_events():
+    with _SCHED_LOCK:
+        events = list(_SCHED_EVENTS)
+        del _SCHED_EVENTS[:]
+    return events
 
 
 def _schedule_task(args):
@@ -4675,6 +4784,7 @@ def _schedule_task(args):
         return {"error": "when must be one of: once, interval, cron"}
     with _SCHED_LOCK:
         _SCHED[name] = job
+        _sched_save_locked()
     _ensure_sched_thread()
     return {"result": "ok", "scheduled": True, "task": _sched_public(job)}
 
@@ -4682,6 +4792,7 @@ def _schedule_task(args):
 def _list_schedules(args):
     with _SCHED_LOCK:
         items = [_sched_public(j) for j in _SCHED.values() if not j.get("_cancel")]
+    items.sort(key=lambda j: (j.get("status") == "completed", j.get("name") or ""))
     return {"result": "ok", "scheduled_tasks": items, "count": len(items)}
 
 
@@ -4691,13 +4802,20 @@ def _unschedule_task(args):
         return {"error": "task name is required"}
     with _SCHED_LOCK:
         job = _SCHED.pop(name, None)
+        if not job:
+            for key in [n for n in _SCHED if n.lower() == name.lower()]:
+                job = _SCHED.pop(key, None)
+                break
         if job:
             job["_cancel"] = True
-    return {"result": "ok", "removed": bool(job), "name": name}
+        _sched_save_locked()
+    return {"result": "ok", "removed": bool(job), "name": name,
+            "detail": "removed" if job else "no scheduled task with that name"}
 
 
 def _ensure_sched_thread():
     global _SCHED_THREAD_ON
+    _sched_load()
     with _SCHED_LOCK:
         if _SCHED_THREAD_ON:
             return
@@ -4708,20 +4826,22 @@ def _ensure_sched_thread():
 def _sched_loop():
     while True:
         time.sleep(0.5)
-        if not _SCHED:
+        with _SCHED_LOCK:
+            pending = bool(_SCHED)
+        if not pending:
             continue
         now = time.time()
         to_fire = []
         with _SCHED_LOCK:
             for name, job in list(_SCHED.items()):
-                if job.get("_cancel") or job.get("_running"):
+                if job.get("_cancel") or job.get("_running") or job.get("done"):
                     continue
                 n = job.get("next_fire")
                 if n and n <= now:
                     to_fire.append(job)
         for job in to_fire:
             with _SCHED_LOCK:
-                if job.get("_cancel") or job.get("_running"):
+                if job.get("_cancel") or job.get("_running") or job.get("done"):
                     continue
                 job["_running"] = True
             threading.Thread(target=_sched_run, args=(job,), daemon=True).start()
@@ -4748,17 +4868,21 @@ def _sched_run(job):
         job["count"] = job.get("count", 0) + 1
         job["_running"] = False
         if job["when"] == "once":
-            job["_cancel"] = True
+            job["done"] = True
+            job["next_fire"] = 0
         elif job["when"] == "interval":
             job["next_fire"] = time.time() + max(5, int(job.get("interval") or 60))
         elif job["when"] == "cron":
             nxt = _cron_next(job["cron"], datetime.datetime.now())
             job["next_fire"] = nxt.timestamp() if nxt else 0
             if not nxt:
-                job["_cancel"] = True
-    with _SCHED_LOCK:
-        for name in [n for n, j in _SCHED.items() if j.get("_cancel") and j.get("count")]:
-            _SCHED.pop(name, None)
+                job["done"] = True
+        finished = sorted((j for j in _SCHED.values() if j.get("done")),
+                          key=lambda j: j.get("last_fire") or "")
+        for stale in finished[:-_SCHED_DONE_MAX]:
+            _SCHED.pop(stale["name"], None)
+        _sched_save_locked()
+    _sched_push_event(job, out)
 
 
 def execute_tool_call(tc, hooks=None):
@@ -5206,7 +5330,17 @@ PAGE = """<!doctype html>
   }
 
   .panel { border-radius: 12px; display: flex; flex-direction: column; min-height: 0; }
-  .center { align-items: center; justify-content: center; padding: 20px; }
+  .center { align-items: center; justify-content: center; padding: 20px; position: relative; }
+  #reactorwrap { display: flex; flex-direction: column; align-items: center; justify-content: center; width: 100%; }
+  .center.previewing #reactorwrap { display: none; }
+  .stage { display: none; position: absolute; inset: 0; flex-direction: column; background: var(--bg2); border-radius: 12px; overflow: hidden; }
+  .center.previewing .stage { display: flex; }
+  .stagehd { display: flex; align-items: center; gap: 10px; padding: 7px 10px; border-bottom: 1px solid var(--bd); font-size: 11px; letter-spacing: 1.5px; color: var(--mut); font-family: Consolas, monospace; flex: none; }
+  .stagehd b { color: var(--acc); }
+  .stagehd #stagename { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; letter-spacing: 0; }
+  .stagex { background: var(--bg3); border: 1px solid var(--bd2); color: var(--txt2); border-radius: 6px; cursor: pointer; font-size: 15px; line-height: 1; padding: 2px 9px; }
+  .stagex:hover { border-color: var(--err); color: var(--err); }
+  .stageframe { flex: 1; width: 100%; border: none; background: #0d0d11; }
   .right { min-height: 0; }
 
   .ptitle { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--bd); padding: 10px 12px; font-size: 10.5px; letter-spacing: 1.5px; color: var(--mut); font-family: Consolas, monospace; text-transform: uppercase; }
@@ -5421,8 +5555,38 @@ PAGE = """<!doctype html>
 
   /* screenshot thumb in tool log */
   .tlitem .tthumb { max-width: 220px; border-radius: 6px; border: 1px solid var(--bd); margin-top: 6px; display: block; }
+  .shotcard { margin-top: 8px; border: 1px solid var(--bd); border-radius: 10px; overflow: hidden; background: var(--bg2); }
+  .shotcard .shothd { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 5px 8px; font-size: 11px; color: var(--mut); border-bottom: 1px solid var(--bd); }
+  .shotcard .shothd b { color: var(--txt); font-weight: 600; }
+  .shotcard .shotimg { display: block; width: 100%; height: auto; cursor: zoom-in; background: var(--bg); }
+  .shotcard .shotpath { padding: 4px 8px; font-size: 10.5px; color: var(--mut); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .shotcard { margin-top: 8px; border: 1px solid var(--bd2); border-radius: 8px; overflow: hidden; background: var(--bg2); }
+  .shotcard .shothd { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 5px 8px; font-size: 11px; color: var(--mut); border-bottom: 1px solid var(--bd); font-family: Consolas, monospace; }
+  .shotcard .shothd b { color: var(--txt2); font-weight: 600; }
+  .shotcard .shotimg { display: block; width: 100%; height: auto; cursor: zoom-in; background: #0d0d11; }
+  .shotcard .shotpath { padding: 4px 8px; font-size: 10.5px; color: var(--mut); font-family: Consolas, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .tlprev { margin-top: 8px; }
   .tlprev a { font-size: 11px; color: var(--acc); }
+  .tlprev .tlprevbtn { margin-left: 8px; background: var(--bg3); border: 1px solid var(--bd2); color: var(--txt2); border-radius: 6px; padding: 2px 8px; font-size: 11px; cursor: pointer; font-family: Consolas, monospace; }
+  .tlprev .tlprevbtn:hover { border-color: var(--acc); color: var(--acc); }
+  .pvbox { position: fixed; inset: 0; z-index: 95; display: none; flex-direction: column; background: var(--bg2); }
+  .pvbox.on { display: flex; }
+  .pvboxhd { display: flex; align-items: center; gap: 10px; padding: 8px 12px; border-bottom: 1px solid var(--bd); font-size: 11px; letter-spacing: 1.5px; color: var(--mut); flex: none; }
+  .pvboxhd b { color: var(--txt); }
+  .pvboxhd span { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; letter-spacing: 0; }
+  .pvboxx { background: transparent; border: 1px solid var(--bd); color: var(--txt); border-radius: 6px; cursor: pointer; font-size: 16px; line-height: 1; padding: 2px 10px; }
+  .pvboxx:hover { border-color: var(--err); color: var(--err); }
+  .pvboxframe { flex: 1; width: 100%; border: none; background: var(--bg); }
+  .shots { margin: 6px 0 10px; display: flex; flex-direction: column; gap: 8px; }
+  #toasts { position: fixed; right: 14px; bottom: 122px; z-index: 90; display: flex; flex-direction: column; gap: 8px; max-width: 380px; pointer-events: none; }
+  .toast { position: relative; background: var(--bg2); border: 1px solid var(--acc); border-left-width: 3px; border-radius: 8px; padding: 9px 30px 10px 11px; box-shadow: 0 6px 22px rgba(0,0,0,.55); animation: toastin .22s ease-out; pointer-events: auto; }
+  @keyframes toastin { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+  .toasthd { font-size: 10px; letter-spacing: 1.2px; color: var(--acc); margin-bottom: 5px; }
+  .toastx { position: absolute; top: 5px; right: 6px; background: transparent; border: none; color: var(--mut); font-size: 15px; line-height: 1; cursor: pointer; }
+  .toastx:hover { color: var(--err); }
+  .toastcmd { font-family: Consolas, monospace; font-size: 11px; color: var(--txt2); word-break: break-all; margin-bottom: 5px; }
+  .toastout { font-family: Consolas, monospace; font-size: 11px; color: var(--txt); background: var(--bg); border: 1px solid var(--bd); border-radius: 5px; padding: 5px 7px; margin: 0; max-height: 130px; overflow: auto; white-space: pre-wrap; word-break: break-word; }
+  .toastwhen { font-size: 10px; color: var(--mut); margin-top: 5px; }
   .tlprev .tlframe { width: 100%; height: 280px; border: 1px dashed var(--bd2); border-radius: 8px; background: #0d0d11; margin-top: 6px; }
 
   /* drag & drop attach overlay */
@@ -5515,7 +5679,16 @@ PAGE = """<!doctype html>
       <div id="todopanel"></div>
     </section>
 
-    <section class="center panel hud-border">
+    <section class="center panel hud-border" id="centerpanel">
+      <div class="stage" id="previewstage">
+        <div class="stagehd">
+          <b>LIVE PREVIEW</b>
+          <span id="stagename"></span>
+          <button class="stagex" id="stageclose" title="Close the preview and bring back the reactor">&times;</button>
+        </div>
+        <iframe id="stageframe" class="stageframe" title="HTML preview" sandbox="allow-scripts"></iframe>
+      </div>
+      <div id="reactorwrap">
       <div id="arc-reactor" class="arc-container" title="PC Assistant">
         <div class="arc-ring-outer"></div>
         <div class="arc-ring-mid"></div>
@@ -5534,6 +5707,7 @@ PAGE = """<!doctype html>
         <div class="meter"><div class="lab"><span>CPU</span><b id="cpu-val">0%</b></div><div class="bar"><div class="fill" id="cpu-bar"></div></div></div>
         <div class="meter"><div class="lab"><span>RAM</span><b id="ram-val">0%</b></div><div class="bar"><div class="fill" id="ram-bar"></div></div></div>
         <div class="meter"><div class="lab"><span>GPU</span><b id="gpu-val">0%</b></div><div class="bar"><div class="fill gold" id="gpu-bar"></div></div></div>
+      </div>
       </div>
     </section>
 
@@ -5672,6 +5846,7 @@ function init() {
   setSendUI();
   setQueueUI();
   serverLoad();
+  startSchedWatch();
   fetch('/api/todos').then(function (r) { return r.json(); }).then(function (j) {
     if (j && j.todos) renderTodo(j.todos);
   }).catch(function () {});
@@ -5832,28 +6007,75 @@ function addToolLog(container, calls) {
     it.appendChild(nm); it.appendChild(rs);
     const pv = previewIframeDom(c.result);
     if (pv) it.appendChild(pv);
-    if (c.preview) {
-      const im = document.createElement('img'); im.className = 'tthumb';
-      im.src = c.preview; im.title = 'screenshot - click to enlarge';
-      im.onclick = function () { window.open(c.preview); };
-      it.appendChild(im);
-    }
     l.appendChild(it);
   });
   d.appendChild(s); d.appendChild(l);
   container.appendChild(d);
+  const shots = document.createElement('div'); shots.className = 'shots';
+  let shotCount = 0;
+  calls.forEach(function (c) {
+    if (!(c.preview || c.image_data)) return;
+    const sc = shotCardDom(c);
+    if (sc) { shots.appendChild(sc); shotCount++; }
+  });
+  if (shotCount) container.insertBefore(shots, d);
 }
+function openPreviewStage(url, name) {
+  if (!url) return false;
+  const panel = document.getElementById('centerpanel');
+  const frame = document.getElementById('stageframe');
+  if (panel && frame) {
+    frame.src = url;
+    const nm = document.getElementById('stagename');
+    if (nm) nm.textContent = name || '';
+    panel.classList.add('previewing');
+    return true;
+  }
+  const box = document.getElementById('pvbox');
+  const lf = document.getElementById('pvframe');
+  if (box && lf) {
+    lf.src = url;
+    const ln = document.getElementById('pvname');
+    if (ln) ln.textContent = name || '';
+    box.classList.add('on');
+    return true;
+  }
+  window.open(url, '_blank');
+  return false;
+}
+function closePreviewStage() {
+  const panel = document.getElementById('centerpanel');
+  const frame = document.getElementById('stageframe');
+  if (panel && frame) {
+    frame.src = 'about:blank';
+    panel.classList.remove('previewing');
+  }
+  const box = document.getElementById('pvbox');
+  const lf = document.getElementById('pvframe');
+  if (box && lf) {
+    lf.src = 'about:blank';
+    box.classList.remove('on');
+  }
+}
+const _stageClose = document.getElementById('stageclose');
+if (_stageClose) _stageClose.onclick = closePreviewStage;
+const _pvClose = document.getElementById('pvclose');
+if (_pvClose) _pvClose.onclick = closePreviewStage;
 function previewIframeDom(r) {
   const url = r && typeof r === 'object' ? (r.preview_url || '') : '';
   if (!url) return null;
   const w = document.createElement('div');
   w.className = 'tlprev';
   const a = document.createElement('a');
-  a.href = url; a.target = '_blank';
-  a.textContent = 'live preview - open in new tab';
-  const ifr = document.createElement('iframe');
-  ifr.className = 'tlframe'; ifr.src = url; ifr.sandbox = 'allow-scripts';
-  w.appendChild(a); w.appendChild(ifr);
+  a.href = url; a.target = '_blank'; a.rel = 'noreferrer';
+  a.textContent = 'preview shown in the center stage \u2014 click to open in a new tab';
+  a.onclick = function () { openPreviewStage(url, r && (r.path || '')); };
+  const b2 = document.createElement('button');
+  b2.className = 'tlprevbtn';
+  b2.textContent = 'Show';
+  b2.title = 'Show it in the center stage';
+  b2.onclick = function () { openPreviewStage(url, r && (r.path || '')); };
+  w.appendChild(a); w.appendChild(b2);
   return w;
 }
 function toolChip(container, c) {
@@ -6060,6 +6282,35 @@ function toolResultText(r) {
   Object.keys(r).forEach(function (k) { if (k !== 'preview' && k !== 'preview_url') copy[k] = r[k]; });
   return JSON.stringify(copy, null, 2);
 }
+function shotCardDom(call) {
+  if (!call) return null;
+  const src = call.preview || call.image_data || '';
+  if (!src) return null;
+  const r = call.result || {};
+  const saved = r.saved || r.path || '';
+  const box = document.createElement('div'); box.className = 'shotcard';
+  const head = document.createElement('div'); head.className = 'shothd';
+  const name = document.createElement('b');
+  name.textContent = '\\ud83d\\udcbe ' + (r.matched ? 'window: ' + r.matched : 'screenshot');
+  head.appendChild(name);
+  if (r.width && r.height) {
+    const d = document.createElement('span');
+    d.textContent = r.width + '\u00d7' + r.height;
+    head.appendChild(d);
+  }
+  box.appendChild(head);
+  const im = document.createElement('img'); im.className = 'shotimg';
+  im.src = src; im.alt = 'screenshot captured by Bonsai';
+  im.title = 'Click to open full size';
+  im.onclick = function () { window.open(src, '_blank'); };
+  box.appendChild(im);
+  if (saved) {
+    const p = document.createElement('div'); p.className = 'shotpath';
+    p.textContent = saved;
+    box.appendChild(p);
+  }
+  return box;
+}
 function toolItemDom(call) {
   const it = document.createElement('div');
   it.className = 'tlitem' + (call.result && call.result.error ? ' err' : '');
@@ -6070,12 +6321,6 @@ function toolItemDom(call) {
   it.appendChild(nm); it.appendChild(rs);
   const pv = previewIframeDom(call.result);
   if (pv) it.appendChild(pv);
-  if (call.preview) {
-    const im = document.createElement('img'); im.className = 'tthumb';
-    im.src = call.preview; im.title = 'screenshot - click to enlarge';
-    im.onclick = function () { window.open(call.preview); };
-    it.appendChild(im);
-  }
   return it;
 }
 function onTool(call) {
@@ -6102,6 +6347,11 @@ function onTool(call) {
   const sum = thinkingRow.toolEl.querySelector('summary');
   sum.textContent = 'Tools: ' + liveCalls.length;
   thinkingRow.toolEl.querySelector('.tl').appendChild(toolItemDom(call));
+  const live = shotCardDom(call);
+  if (live) thinkingRow.b.insertBefore(live, thinkingRow.toolEl);
+  if (call.result && call.result.preview_url) {
+    openPreviewStage(call.result.preview_url, call.result.path || '');
+  }
   scrollBottom();
 }
 function doneThinking(errMsg) {
@@ -6677,6 +6927,49 @@ function updateClock() {
   document.getElementById('clock-time').textContent = now.toLocaleTimeString('ro-RO');
   document.getElementById('clock-date').textContent = now.toLocaleDateString('ro-RO');
 }
+function schedToast(ev) {
+  let box = document.getElementById('toasts');
+  if (!box) {
+    box = document.createElement('div');
+    box.id = 'toasts';
+    document.body.appendChild(box);
+  }
+  const t = document.createElement('div');
+  t.className = 'toast';
+  const h = document.createElement('div');
+  h.className = 'toasthd';
+  h.textContent = 'SCHEDULED TASK RAN: ' + ev.name + (ev.when ? '  (' + ev.when + ')' : '');
+  const x = document.createElement('button');
+  x.className = 'toastx';
+  x.textContent = '\u00d7';
+  x.title = 'dismiss';
+  x.onclick = function () { if (t.parentNode) t.parentNode.removeChild(t); };
+  const c = document.createElement('div');
+  c.className = 'toastcmd';
+  c.textContent = ev.command || '';
+  const o = document.createElement('pre');
+  o.className = 'toastout';
+  o.textContent = (ev.output || '').slice(0, 500) || '(no output)';
+  t.appendChild(h); t.appendChild(x); t.appendChild(c); t.appendChild(o);
+  if (ev.ran_at) {
+    const w = document.createElement('div');
+    w.className = 'toastwhen';
+    w.textContent = 'ran at ' + ev.ran_at;
+    t.appendChild(w);
+  }
+  box.appendChild(t);
+  while (box.children.length > 4) box.removeChild(box.firstChild);
+  setTimeout(function () { if (t.parentNode) t.parentNode.removeChild(t); }, 30000);
+}
+function startSchedWatch() {
+  const tick = function () {
+    fetch('/api/sched_results').then(function (r) { return r.json(); })
+      .then(function (j) { (j.events || []).forEach(schedToast); })
+      .catch(function () {});
+  };
+  tick();
+  setInterval(tick, 4000);
+}
 function startMetrics() {
   const set = function (id, v) {
     const el = document.getElementById(id + '-val');
@@ -6879,6 +7172,23 @@ PAGE_GPT = """<!doctype html>
   .tlprev a { font-size: 11px; color: var(--acc); }
   .tlprev .tlframe { width: 100%; height: 280px; border: 1px dashed var(--bd); border-radius: 8px; background: var(--bg2); margin-top: 6px; }
   .toolsline { margin: 2px 0 8px; display: flex; flex-wrap: wrap; gap: 6px; }
+  #toasts { position: fixed; right: 14px; bottom: 122px; z-index: 90; display: flex; flex-direction: column; gap: 8px; max-width: 380px; pointer-events: none; }
+  .toast { position: relative; background: var(--bg2); border: 1px solid var(--acc); border-left-width: 3px; border-radius: 8px; padding: 9px 30px 10px 11px; box-shadow: 0 6px 22px rgba(0,0,0,.55); animation: toastin .22s ease-out; pointer-events: auto; }
+  @keyframes toastin { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+  .toasthd { font-size: 10px; letter-spacing: 1.2px; color: var(--acc); margin-bottom: 5px; }
+  .toastx { position: absolute; top: 5px; right: 6px; background: transparent; border: none; color: var(--mut); font-size: 15px; line-height: 1; cursor: pointer; }
+  .toastx:hover { color: var(--err); }
+  .toastcmd { font-family: Consolas, monospace; font-size: 11px; color: var(--txt2); word-break: break-all; margin-bottom: 5px; }
+  .toastout { font-family: Consolas, monospace; font-size: 11px; color: var(--txt); background: var(--bg); border: 1px solid var(--bd); border-radius: 5px; padding: 5px 7px; margin: 0; max-height: 130px; overflow: auto; white-space: pre-wrap; word-break: break-word; }
+  .toastwhen { font-size: 10px; color: var(--mut); margin-top: 5px; }
+  .pvbox { position: fixed; inset: 0; z-index: 95; display: none; flex-direction: column; background: var(--bg2); }
+  .pvbox.on { display: flex; }
+  .pvboxhd { display: flex; align-items: center; gap: 10px; padding: 8px 12px; border-bottom: 1px solid var(--bd); font-size: 11px; letter-spacing: 1.5px; color: var(--mut); flex: none; }
+  .pvboxhd b { color: var(--txt); }
+  .pvboxhd span { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; letter-spacing: 0; }
+  .pvboxx { background: transparent; border: 1px solid var(--bd); color: var(--txt); border-radius: 6px; cursor: pointer; font-size: 16px; line-height: 1; padding: 2px 10px; }
+  .pvboxx:hover { border-color: var(--err); color: var(--err); }
+  .pvboxframe { flex: 1; width: 100%; border: none; background: var(--bg); }
   .chip { font-size: 11.5px; color: var(--mut); background: var(--bg3); border: 1px solid var(--bd); border-radius: 999px; padding: 4px 11px; font-weight: 600; }
   .chip.ok { color: var(--ok); }
   .chip.err { color: var(--err); border-color: var(--err); }
@@ -7076,11 +7386,55 @@ function newChat() {
   cur = { id: 'c' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6), title: 'New chat', ts: Date.now(), messages: [] };
   chats.push(cur); started = false; save(); renderAll();
 }
+function schedToast(ev) {
+  let box = document.getElementById('toasts');
+  if (!box) {
+    box = document.createElement('div');
+    box.id = 'toasts';
+    document.body.appendChild(box);
+  }
+  const t = document.createElement('div');
+  t.className = 'toast';
+  const h = document.createElement('div');
+  h.className = 'toasthd';
+  h.textContent = 'SCHEDULED TASK RAN: ' + ev.name + (ev.when ? '  (' + ev.when + ')' : '');
+  const x = document.createElement('button');
+  x.className = 'toastx';
+  x.textContent = '\u00d7';
+  x.title = 'dismiss';
+  x.onclick = function () { if (t.parentNode) t.parentNode.removeChild(t); };
+  const c = document.createElement('div');
+  c.className = 'toastcmd';
+  c.textContent = ev.command || '';
+  const o = document.createElement('pre');
+  o.className = 'toastout';
+  o.textContent = (ev.output || '').slice(0, 500) || '(no output)';
+  t.appendChild(h); t.appendChild(x); t.appendChild(c); t.appendChild(o);
+  if (ev.ran_at) {
+    const w = document.createElement('div');
+    w.className = 'toastwhen';
+    w.textContent = 'ran at ' + ev.ran_at;
+    t.appendChild(w);
+  }
+  box.appendChild(t);
+  while (box.children.length > 4) box.removeChild(box.firstChild);
+  setTimeout(function () { if (t.parentNode) t.parentNode.removeChild(t); }, 30000);
+}
+function startSchedWatch() {
+  const tick = function () {
+    fetch('/api/sched_results').then(function (r) { return r.json(); })
+      .then(function (j) { (j.events || []).forEach(schedToast); })
+      .catch(function () {});
+  };
+  tick();
+  setInterval(tick, 4000);
+}
 function init() {
   bindModeBtn(); bindTheme(); loadWorkdir();
   dedupeChats();
   if (!chats.length) newChat(); else cur = chats[chats.length - 1];
   renderAll(); setSendUI(); setQueueUI();
+  startSchedWatch();
   fetch('/api/todos').then(function (r) { return r.json(); }).then(function (j) {
     if (j && j.todos) renderTodo(j.todos);
   }).catch(function () {});
@@ -7217,17 +7571,62 @@ function toolResultText(r) {
   Object.keys(r).forEach(function (k) { if (k !== 'preview' && k !== 'preview_url') copy[k] = r[k]; });
   return JSON.stringify(copy, null, 2);
 }
+function openPreviewStage(url, name) {
+  if (!url) return false;
+  const panel = document.getElementById('centerpanel');
+  const frame = document.getElementById('stageframe');
+  if (panel && frame) {
+    frame.src = url;
+    const nm = document.getElementById('stagename');
+    if (nm) nm.textContent = name || '';
+    panel.classList.add('previewing');
+    return true;
+  }
+  const box = document.getElementById('pvbox');
+  const lf = document.getElementById('pvframe');
+  if (box && lf) {
+    lf.src = url;
+    const ln = document.getElementById('pvname');
+    if (ln) ln.textContent = name || '';
+    box.classList.add('on');
+    return true;
+  }
+  window.open(url, '_blank');
+  return false;
+}
+function closePreviewStage() {
+  const panel = document.getElementById('centerpanel');
+  const frame = document.getElementById('stageframe');
+  if (panel && frame) {
+    frame.src = 'about:blank';
+    panel.classList.remove('previewing');
+  }
+  const box = document.getElementById('pvbox');
+  const lf = document.getElementById('pvframe');
+  if (box && lf) {
+    lf.src = 'about:blank';
+    box.classList.remove('on');
+  }
+}
+const _stageClose = document.getElementById('stageclose');
+if (_stageClose) _stageClose.onclick = closePreviewStage;
+const _pvClose = document.getElementById('pvclose');
+if (_pvClose) _pvClose.onclick = closePreviewStage;
 function previewIframeDom(r) {
   const url = r && typeof r === 'object' ? (r.preview_url || '') : '';
   if (!url) return null;
   const w = document.createElement('div');
   w.className = 'tlprev';
   const a = document.createElement('a');
-  a.href = url; a.target = '_blank';
-  a.textContent = 'live preview - open in new tab';
-  const ifr = document.createElement('iframe');
-  ifr.className = 'tlframe'; ifr.src = url; ifr.sandbox = 'allow-scripts';
-  w.appendChild(a); w.appendChild(ifr);
+  a.href = url; a.target = '_blank'; a.rel = 'noreferrer';
+  a.textContent = 'preview shown in the center stage \u2014 click to open in a new tab';
+  a.onclick = function () { openPreviewStage(url, r && (r.path || '')); };
+  const b2 = document.createElement('button');
+  b2.className = 'tlprevbtn';
+  b2.textContent = 'Show';
+  b2.title = 'Show it in the center stage';
+  b2.onclick = function () { openPreviewStage(url, r && (r.path || '')); };
+  w.appendChild(a); w.appendChild(b2);
   return w;
 }
 function toolItemDom(call) {
@@ -7238,12 +7637,6 @@ function toolItemDom(call) {
   it.appendChild(nm); it.appendChild(rs);
   const pv = previewIframeDom(call.result);
   if (pv) it.appendChild(pv);
-  if (call.preview) {
-    const im = document.createElement('img'); im.className = 'tthumb';
-    im.src = call.preview; im.title = 'screenshot - click to enlarge';
-    im.onclick = function () { window.open(call.preview); };
-    it.appendChild(im);
-  }
   return it;
 }
 function toolGroups(calls) {
@@ -7275,6 +7668,14 @@ function addToolLog(container, calls) {
   const l = document.createElement('div'); l.className = 'tl';
   (calls).forEach(function (c) { l.appendChild(toolItemDom(c)); });
   d.appendChild(s); d.appendChild(l); container.appendChild(d);
+  const shots = document.createElement('div'); shots.className = 'shots';
+  let shotCount = 0;
+  (calls).forEach(function (c) {
+    if (!(c.preview || c.image_data)) return;
+    const sc = shotCardDom(c);
+    if (sc) { shots.appendChild(sc); shotCount++; }
+  });
+  if (shotCount) container.insertBefore(shots, d);
 }
 function addReasonBox(container, text, live) {
   const d = document.createElement('details'); d.className = 'reasonbox';
@@ -7352,6 +7753,8 @@ function onTool(call) {
   }
   thinkingRow.tlog.s.textContent = 'Tool log \u00b7 ' + liveCalls.length + ' running...';
   thinkingRow.tlog.l.appendChild(toolItemDom(call));
+  const live = shotCardDom(call);
+  if (live) thinkingRow.b.insertBefore(live, thinkingRow.tlog.d);
   scrollBottom();
 }
 function doneThinking(errMsg) {
@@ -8005,14 +8408,31 @@ micBtn.onclick = function () {
 };
 init();
 </script>
+<div class="pvbox" id="pvbox">
+  <div class="pvboxhd">
+    <b>LIVE PREVIEW</b>
+    <span id="pvname"></span>
+    <button class="pvboxx" id="pvclose" title="Close the preview">&times;</button>
+  </div>
+  <iframe id="pvframe" class="pvboxframe" title="HTML preview" sandbox="allow-scripts"></iframe>
+</div>
 </body>
 </html>"""
 
 
 def _strip_full(record):
+    """The tool payload streamed to the UI.
+
+    The big base64 image lives under `image_data` internally (so it is easy to
+    pull out and feed to the model) but the UIs render a `preview` key, so
+    expose it under that name too - that is what makes a screenshot appear in
+    the chat automatically, with no help from the model."""
     if isinstance(record, dict):
         out = dict(record)
         out.pop("full_result", None)
+        img = out.get("image_data")
+        if img and not out.get("preview"):
+            out["preview"] = img
         return out
     return record
 
@@ -8235,6 +8655,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, json.dumps(_public_models(), default=str))
         elif path == "/api/sysinfo":
             self._send(200, json.dumps(_sysinfo(), default=str))
+        elif path == "/api/sched_results":
+            self._send(200, json.dumps({"events": _sched_take_events()}, default=str))
         elif path == "/preview":
             self._serve_preview()
         elif path.startswith("/previewfile/"):
@@ -8440,6 +8862,7 @@ def main():
     threading.Thread(target=_blender_kickoff, daemon=True).start()
     threading.Thread(target=_sysinfo_loop, daemon=True,
                      name="bonsai-sysinfo").start()
+    _sched_load()
     print("BONSAI is READY on http://127.0.0.1:8081", flush=True)
     webbrowser.open(f"http://{HOST}:{PORT}")
     ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()

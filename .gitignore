@@ -37,6 +37,10 @@ piper/*.wav
 # Model selector config (per-machine model list + active choice)
 models.json
 
+# Scheduled shell tasks (per-machine state written by schedule_task)
+schedules.json
+schedules.json.tmp
+
 # OS / editor
 Thumbs.db
 Desktop.ini

@@ -131,12 +131,13 @@ in order).
 | **Shell + sandbox** | `run_command` executes real shell commands - PowerShell/cmd on Windows, `sh` on Linux (configurable timeout, up to 600s); `run_code` runs snippets in an isolated temp folder (auto-detects what's installed on the PC: Python + Node by default, plus Go/Lua/PHP/Ruby/Perl/Bash when present; timeouts up to 600s) |
 | **Asks you questions** | `ask_user` pauses and asks you a question (with optional clickable options) exactly like a human would - just like opencode |
 | **Todo list** | `todo_write` shows a live, visible checklist on the left panel as it works through longer tasks |
-| **Live HTML preview** | any `.html` page Bonsai writes (or `preview_html` explicitly) is shown as a live iframe right in the conversation - served from this PC, so JavaScript and local assets (CSS/JS/images next to the page) work |
+| **Live HTML preview** | any `.html` page Bonsai writes (or `preview_html` explicitly) takes over the **center stage** - the arc reactor slides away and the page is shown full-panel, with a name and an **X** to bring the reactor back. Served from this PC, so JavaScript and local assets (CSS/JS/images next to the page) work. In the GPT-style chat (`/chat`) the same page opens as a full-screen lightbox |
+| **Screenshots appear in the chat** | every `take_screenshot` / `screenshot_window` / `click_text` result is drawn as a labelled card (dimensions + saved path, click to open full size) **above** the collapsed tool log - no need to expand anything |
 | **Real system meters** | live CPU / RAM / GPU usage under the reactor, read from `psutil` + `nvidia-smi` instead of placeholder numbers |
 | **Window management** | `window_list` lists every open window (title, process, PID) and `window_action` brings one to the front, maximizes, minimizes or restores it - so Bonsai can switch apps before acting |
 | **Docker / containers** | `docker_ps`, `docker_images`, `docker_start`, `docker_stop`, `docker_restart`, `docker_logs` and `docker_exec` drive the Docker CLI (works with Docker Desktop) |
 | **API client** | `api_call` speaks REST/GraphQL (any HTTP method, JSON or raw bodies, custom headers) and `ws_test` connects to WebSocket endpoints, sends and collects replies |
-| **Scheduled tasks** | `schedule_task` (once / every N seconds / 5-field cron), `list_schedules`, `unschedule_task` - run shell commands in the background while the PC is on |
+| **Scheduled tasks** | `schedule_task` (once / every N seconds / 5-field cron), `list_schedules`, `unschedule_task` - run shell commands in the background while the PC is on. Tasks are **saved to `schedules.json`** in the BONSAI folder, so they survive a restart, a one-shot that came due while Bonsai was closed runs as soon as it starts again, and every finished run pops up as a **toast in the corner** with its output. Completed one-shots stay in `list_schedules` (status `completed`) until you remove them |
 | **Speaks out loud** | `tts_speak` reads text aloud with the local neural Piper engine (English + Romanian voices) and saves the WAV in the workspace; no cloud, no Windows voices, no media player - streams straight to the speakers with `sounddevice`. **Off by default** - flip the **TTS** header button to let Bonsai speak |
 | **Thinking effort** | **THINK: OFF / LOW / MED / HIGH** selector in the composer controls how deep Bonsai reasons (maps to `enable_thinking` / `reasoning_effort`) |
 | **STOP / QUEUE** | abort a reply mid-stream, or queue a follow-up to be answered immediately after |
@@ -177,12 +178,12 @@ always produced at the end.
 | `docker_ps` / `docker_images` / `docker_start` / `docker_stop` / `docker_restart` / `docker_logs` / `docker_exec` | Manage Docker containers and images | shells out to the `docker` CLI (Docker Desktop); clean error if not installed |
 | `api_call` | Any HTTP method to REST or GraphQL APIs, JSON or raw body, custom headers | needs `requests`; returns status, headers, elapsed ms and body |
 | `ws_test` | Connects to a `ws://`/`wss://` endpoint, optionally sends a message, collects replies | needs `websocket-client` |
-| `schedule_task` / `list_schedules` / `unschedule_task` | Run a shell command later: once, every N seconds, or by 5-field cron | in-process scheduler thread; survives only while the server runs |
+| `schedule_task` / `list_schedules` / `unschedule_task` | Run a shell command later: once, every N seconds, or by 5-field cron | in-process scheduler thread, persisted to `schedules.json` in the BONSAI folder (survives restarts, missed one-shots run on the next start); each finished run appears as a corner toast with its output; `list_schedules` keeps completed one-shots until removed |
 | `tts_voices` / `tts_speak` | Lists local Piper voices; speaks text aloud and saves the WAV (`out\tts\`) | needs `piper-tts` + `onnxruntime` + `sounddevice`; voice models live in the project's `piper\` - run `python piper\download_voices.py` once; `tts_speak` only works after the **TTS** header button is turned on |
 | `web_search` / `web_fetch` | Look up current information online when it's not sure | `web_search` returns **structured** results (title, url, domain, snippet, source) plus `did_you_mean` and `related_searches`, so a typo like `serach` recovers in one call; `action="suggest"` is the cheap autocomplete-only check. `web_fetch` reads a page |
 | `run_command` | Runs a real shell command (cmd/PowerShell on Windows, `sh` on Linux) | timeout default 45s, configurable up to 600s, output capped to ~8 KB |
 | `run_code` | Runs snippets in many languages (auto-detected: Python + Node by default; Go/Lua/PHP/Ruby/Perl/Bash when installed) | isolated temp folder, deleted afterwards; timeout default 30s, up to 600s; ~8 KB output cap |
-| `preview_html` | Live-preview an `.html` page from the workspace in an iframe inside the chat | also auto-suggested when `write_file` targets an `.html`/`.htm` file (returns a `preview_url`) |
+| `preview_html` | Live-preview an `.html` page from the workspace: it takes over the center stage (reactor hidden, **X** restores it), or opens as a lightbox in `/chat` | also auto-suggested when `write_file` targets an `.html`/`.htm` file (returns a `preview_url`) |
 | `get_scene_info` | Lists the open Blender scene: objects, types, locations (Mesh, Camera, Light, ...) | requires Blender running with the *MCP for Blender* addon enabled |
 | `get_object_info` | Details on one object (location, rotation, scale, ...) | |
 | `execute_blender_code` | Runs real Python inside Blender's `bpy` context | add cubes, move them, re-parent, set materials - always step by step |
@@ -295,6 +296,12 @@ How it behaves:
 - **GPT UI history is browser-only.** Clearing site data, using another browser
   or a private window loses it - copy anything you want to keep. The classic
   UI is the one that survives a wiped browser.
+- **Scheduled tasks are persisted separately** in `schedules.json` in the same
+  BONSAI folder (`%APPDATA%\BonsaiAsistent` on Windows, `$XDG_CONFIG_HOME` or
+  `~/.config` on Linux). On startup Bonsai reloads it: `interval` and `cron`
+  jobs get their next future slot, and a `once` job whose moment passed while
+  Bonsai was closed runs immediately. Deleting a task (or clearing the file)
+  removes it.
 
 ## 8. Configuration
 
@@ -412,12 +419,16 @@ Useful links:
 - HTML previews are served only from the workspace: `/preview` serves only
   `.html`/`.htm`, and its companion `/previewfile/…` route serves the page's
   **non-HTML** assets (CSS/JS/images/fonts, with a fixed MIME allow-list) so
-  local assets resolve. Both are confined to the workspace, the preview
-  `<iframe>` runs with `sandbox="allow-scripts"` (so a previewed page is in an
-  opaque origin and cannot touch the rest of the UI), and the file is never
-  executed on the server.
+  local assets resolve. Both are confined to the workspace, both preview
+  `<iframe>`s (the center stage and the `/chat` lightbox) run with
+  `sandbox="allow-scripts"` (so a previewed page is in an opaque origin and
+  cannot touch the rest of the UI), and the file is never executed on the
+  server.
 - Chat history lives on your PC only (`%APPDATA%\BonsaiAsistent\chats.json`,
   written atomically with a `.bak` copy).
+- Scheduled tasks are stored in `schedules.json` next to it. They only run while
+  Bonsai is running, but a one-shot whose moment passed while it was closed runs
+  on the next start.
 - Don't expose the server to the internet; it's an assistant, not a web service.
 
 ## 11. Troubleshooting
