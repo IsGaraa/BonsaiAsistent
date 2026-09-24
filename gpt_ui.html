@@ -926,6 +926,7 @@ document.getElementById('ejectbtn').onclick = function () {
     .then(function (j) {
       btn.textContent = j.ok ? 'EJECTED' : 'FAILED';
       btn.title = j.detail || j.error || (j.ok ? 'Model unloaded - it reloads on the next message' : 'Eject failed');
+      if (typeof setModelStatus === 'function') setModelStatus(false, false);
       setTimeout(function () { btn.textContent = 'EJECT'; btn.disabled = false; btn.style.opacity = '1'; }, 2500);
     })
     .catch(function () {
@@ -962,6 +963,15 @@ refreshTts();
 function modelLabel(m) {
   return (m.type === 'api' ? '☁ ' : '◉ ') + (m.label || m.id);
 }
+function setModelStatus(ready, loading) {
+  const t = document.getElementById('system-status-text');
+  const dot = document.getElementById('sdot');
+  if (dot) dot.className = 'dot' + (loading ? ' busy' : (ready ? '' : ' idle'));
+  if (!t) return;
+  t.textContent = loading ? 'LOADING MODEL...' : (ready ? 'ONLINE / LOADED' : 'ONLINE / IDLE');
+  t.title = loading ? 'The model is being loaded into RAM/VRAM - this only happens on your first message.'
+    : (ready ? 'The model is resident in RAM/VRAM.' : 'The model is not loaded. It loads the first time you send a message.');
+}
 function renderModels(j) {
   const sel = document.getElementById('modelsel');
   if (!sel) return;
@@ -984,6 +994,7 @@ function renderModels(j) {
   if (fm && j.active_label) fm.textContent = j.active_label;
   const fc = document.getElementById('footer-caps');
   if (fc) fc.textContent = (j.vision ? 'VISION' : 'TEXT-ONLY') + '+TOOLS';
+  if (typeof setModelStatus === 'function') setModelStatus(!!j.ready, false);
   window.__lastModels = j;
   renderMmprojList(j);
 }

@@ -70,12 +70,15 @@ xclip for the clipboard, wmctrl for window tools, scrot/ImageMagick for
 screenshots) and downloads the Piper voices. Window tools are X11-only
 (Wayland compositors manage windows only partially).
 
-It starts the assistant UI at **http://localhost:8081**, auto-starts the
-Bonsai 2 model server on port 8080 if it isn't running yet, and opens your
-browser. On Windows the model server is `prism-llama`'s `llama-server.exe`; on
-Linux any `llama-server` binary found on `PATH` is used (set `PC_LLAMA_SERVER`
-to point at one explicitly). To stop the model server, double-click `stop.cmd`
-on Windows or run `./stop.sh` on Linux.
+It starts the assistant UI at **http://localhost:8081** and opens your browser.
+**The model is not loaded at startup** - it loads into RAM/VRAM the first time
+you send a message (so just opening the UI costs nothing), and the header shows
+`ONLINE / IDLE` → `LOADING MODEL...` → `ONLINE / LOADED`. EJECT stops it again,
+and the next message brings it back. On Windows the model server is
+`prism-llama`'s `llama-server.exe`; on Linux any `llama-server` binary found on
+`PATH` is used (set `PC_LLAMA_SERVER` to point at one explicitly). To stop the
+model server manually, double-click `stop.cmd` on Windows or run `./stop.sh` on
+Linux.
 
 A second, cleaner chat UI is available at **http://localhost:8081/chat**
 (GPT-style look, same backend and features: tools, thinking, streaming, plan/build
@@ -324,9 +327,11 @@ Use the **+** button when models live somewhere else:
 
 How each type behaves:
 
-- **Local `.gguf`** entries are served by the bundled `llama-server`. Switching to
-  a local model **restarts the local model server** (port 8080) with the new
-  file, which can take up to a minute.
+- **Local `.gguf`** entries are served by the bundled `llama-server`. Switching
+  between them is also lazy: the old model is stopped immediately (freeing its
+  VRAM) and the newly selected one loads on your next message - so browsing the
+  dropdown never costs a model load, and you can never accidentally be answered
+  by the model you just switched away from.
 - **Vision projectors (`mmproj`)** turn a text-only model into a seeing one.
   They are auto-matched to their model by **filename prefix** (`Qwen3-8B-…`
   pairs with `Qwen3-8B-mmproj-…`), both at startup and whenever a new file

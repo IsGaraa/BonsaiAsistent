@@ -1728,6 +1728,7 @@ def _public_models():
     return {"active": entry["id"] if entry else None,
             "active_label": (entry or {}).get("label"),
             "managed": (entry or {}).get("type") == "local",
+            "ready": _bonsai_ready(),
             "vision": (entry or {}).get("type") == "local"
                       and bool((entry or {}).get("mmproj")
                                and os.path.isfile((entry or {}).get("mmproj"))),
@@ -1749,12 +1750,12 @@ def _select_model(mid):
     if not entry.get("path") or not os.path.exists(entry["path"]):
         return {"ok": False, "error": "model file not found: %s" % entry.get("path")}
     _apply_model(entry)
+    # Stop whatever is running so the newly selected model is the one that
+    # loads on the next message (and so the old weights free their VRAM now).
     _stop_local_server(int(entry.get("port") or 8080))
-    ok = _start_bonsai()
-    if ok:
-        _save_models()
-    return {"ok": ok, "type": "local", "ready": ok,
-            **({"error": "the model server did not come up in time"} if not ok else {}),
+    _save_models()
+    return {"ok": True, "type": "local", "ready": _bonsai_ready(),
+            "detail": "model selected - it loads on your next message",
             **_public_models()}
 
 
@@ -4086,6 +4087,8 @@ PAGE = """<!doctype html>
   .hstatus { display: flex; gap: 16px; font-size: 12.5px; color: var(--mut); font-family: Consolas, monospace; }
   .hstatus b { color: var(--txt2); font-weight: 600; }
   .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--ok); margin-right: 4px; }
+  .dot.idle { background: var(--mut); }
+  .dot.busy { background: var(--warn); }
   .hclock { text-align: right; font-family: Consolas, monospace; }
   .hclock .t { font-size: 17px; font-weight: 700; color: var(--txt); }
   .hclock .d { font-size: 11px; color: var(--mut); }
@@ -4290,7 +4293,7 @@ PAGE = """<!doctype html>
   .tlitem.err { border-color: rgba(248,113,113,.4); } .tlitem.err .nm { color: var(--err); }
 
   /* mode toggle + workdir */
-  .modebtn { background: var(--bg3); border: 1px solid var(--bd2); color: var(--txt2); padding: 7px 12px; border-radius: 8px; cursor: pointer; font-size: 12.5px; font-family: Consolas, monospace; font-weight: 700; letter-spacing: 1px; transition: all .15s; }
+  .modebtn { background: var(--bg3); border: 1px solid var(--bd2); color: var(--txt2); border-radius: 12px; padding: 13px 12px; cursor: pointer; font-size: 12.5px; font-family: Consolas, monospace; font-weight: 700; letter-spacing: 1px; transition: all .15s; white-space: nowrap; }
   .modebtn:hover { background: var(--bg4); color: var(--txt); }
   .modebtn.plan { border-color: var(--acc); color: var(--acc); }
   .wbtn { background: var(--bg3); border: 1px solid var(--bd2); color: var(--txt2); padding: 7px 10px; border-radius: 8px; cursor: pointer; font-size: 12px; font-family: Consolas, monospace; max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -4365,7 +4368,7 @@ PAGE = """<!doctype html>
       </div>
     </div>
     <div class="hstatus">
-      <span><span class="dot" id="sdot"></span>STATUS: <b id="system-status-text">ONLINE / OPTIMAL</b></span>
+      <span><span class="dot idle" id="sdot"></span>STATUS: <b id="system-status-text" title="The model loads the first time you send a message.">ONLINE / IDLE</b></span>
       <span>MODEL: <b id="modelbadge">Bonsai 2 &middot; 27B</b></span>
       <span>VISION: <b id="visionbadge">mmproj ON</b></span>
     </div>
@@ -5113,7 +5116,8 @@ async function streamRun(messages, chat) {
         });
         if (!data) continue;
         let j; try { j = JSON.parse(data); } catch (e) { continue; }
-        if (ev === 'delta') { reply += j.text; onDelta(j.text); statsVals.respond_ms = Date.now() - startedAt; }
+        if (ev === 'start') { setModelStatus(!!j.model_ready, !j.model_ready); }
+        else if (ev === 'delta') { reply += j.text; onDelta(j.text); statsVals.respond_ms = Date.now() - startedAt; }
         else if (ev === 'reason') { reason += j.text; onReason(j.text); setBonsaiState('thinking'); statsVals.think_ms = Date.now() - startedAt; }
         else if (ev === 'tool') { calls.push(j.call); onTool(j.call); setBonsaiState('tools'); }
         else if (ev === 'stats') { onStats(j); }
@@ -5290,6 +5294,7 @@ document.getElementById('ejectbtn').onclick = function () {
     .then(function (j) {
       btn.textContent = j.ok ? 'EJECTED' : 'FAILED';
       btn.title = j.detail || j.error || (j.ok ? 'Model unloaded - it reloads on the next message' : 'Eject failed');
+      if (typeof setModelStatus === 'function') setModelStatus(false, false);
       setTimeout(function () {
         btn.textContent = 'EJECT';
         btn.disabled = false;
@@ -5335,6 +5340,15 @@ refreshTts();
 function modelLabel(m) {
   return (m.type === 'api' ? '\u2601 ' : '\u25C9 ') + (m.label || m.id);
 }
+function setModelStatus(ready, loading) {
+  const t = document.getElementById('system-status-text');
+  const dot = document.getElementById('sdot');
+  if (dot) dot.className = 'dot' + (loading ? ' busy' : (ready ? '' : ' idle'));
+  if (!t) return;
+  t.textContent = loading ? 'LOADING MODEL...' : (ready ? 'ONLINE / LOADED' : 'ONLINE / IDLE');
+  t.title = loading ? 'The model is being loaded into RAM/VRAM - this only happens on your first message.'
+    : (ready ? 'The model is resident in RAM/VRAM.' : 'The model is not loaded. It loads the first time you send a message.');
+}
 function renderModels(j) {
   const sel = document.getElementById('modelsel');
   if (!sel) return;
@@ -5357,6 +5371,7 @@ function renderModels(j) {
   if (fm && j.active_label) fm.textContent = j.active_label;
   const fc = document.getElementById('footer-caps');
   if (fc) fc.textContent = (j.vision ? 'VISION' : 'TEXT-ONLY') + '+TOOLS';
+  if (typeof setModelStatus === 'function') setModelStatus(!!j.ready, false);
   window.__lastModels = j;
   renderMmprojList(j);
 }
@@ -6507,6 +6522,7 @@ document.getElementById('ejectbtn').onclick = function () {
     .then(function (j) {
       btn.textContent = j.ok ? 'EJECTED' : 'FAILED';
       btn.title = j.detail || j.error || (j.ok ? 'Model unloaded - it reloads on the next message' : 'Eject failed');
+      if (typeof setModelStatus === 'function') setModelStatus(false, false);
       setTimeout(function () { btn.textContent = 'EJECT'; btn.disabled = false; btn.style.opacity = '1'; }, 2500);
     })
     .catch(function () {
@@ -6543,6 +6559,15 @@ refreshTts();
 function modelLabel(m) {
   return (m.type === 'api' ? '\u2601 ' : '\u25C9 ') + (m.label || m.id);
 }
+function setModelStatus(ready, loading) {
+  const t = document.getElementById('system-status-text');
+  const dot = document.getElementById('sdot');
+  if (dot) dot.className = 'dot' + (loading ? ' busy' : (ready ? '' : ' idle'));
+  if (!t) return;
+  t.textContent = loading ? 'LOADING MODEL...' : (ready ? 'ONLINE / LOADED' : 'ONLINE / IDLE');
+  t.title = loading ? 'The model is being loaded into RAM/VRAM - this only happens on your first message.'
+    : (ready ? 'The model is resident in RAM/VRAM.' : 'The model is not loaded. It loads the first time you send a message.');
+}
 function renderModels(j) {
   const sel = document.getElementById('modelsel');
   if (!sel) return;
@@ -6565,6 +6590,7 @@ function renderModels(j) {
   if (fm && j.active_label) fm.textContent = j.active_label;
   const fc = document.getElementById('footer-caps');
   if (fc) fc.textContent = (j.vision ? 'VISION' : 'TEXT-ONLY') + '+TOOLS';
+  if (typeof setModelStatus === 'function') setModelStatus(!!j.ready, false);
   window.__lastModels = j;
   renderMmprojList(j);
 }
@@ -7149,7 +7175,9 @@ def main():
     except Exception as exc:
         print(f"WARN: could not create workdir {WORKDIR}: {exc}", flush=True)
 
-    threading.Thread(target=_ensure_bonsai, daemon=True).start()
+    # The model server is deliberately NOT started here: it loads on the first
+    # message you send, so starting the UI costs no VRAM until you actually
+    # use it (see _ensure_bonsai, which the chat endpoints call).
     threading.Thread(target=_blender_kickoff, daemon=True).start()
     threading.Thread(target=_sysinfo_loop, daemon=True,
                      name="bonsai-sysinfo").start()
