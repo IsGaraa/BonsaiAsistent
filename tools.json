@@ -134,13 +134,21 @@
     "type": "function",
     "function": {
       "name": "web_search",
-      "description": "Search the internet when you need up-to-date information, facts, news, documentation or anything you are not sure about. Returns a short list of titles, links and snippets. Then read details with web_fetch on the most relevant link.",
+      "description": "Search the internet when you need up-to-date information, facts, news, documentation or anything you are not sure about. Returns STRUCTURED results - title, url, domain, snippet, source - plus 'did_you_mean' when your query looks like a typo and 'related_searches' for autocomplete, so you can recover from a misspelling in a single call. Use action='suggest' for the cheap autocomplete check only (no page scraping), then retry with the corrected query. Read details with web_fetch on the most relevant link.",
       "parameters": {
         "type": "object",
         "properties": {
           "query": {
             "type": "string",
             "description": "Search query, e.g. 'latest node.js LTS version'."
+          },
+          "action": {
+            "type": "string",
+            "enum": [
+              "search",
+              "suggest"
+            ],
+            "description": "'search' (default) returns full results; 'suggest' returns only autocomplete/'did you mean' candidates - use it to fix a typo cheaply."
           }
         },
         "required": [
@@ -512,6 +520,194 @@
         },
         "required": [
           "action"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "screenshot_window",
+      "description": "Screenshot ONE specific window, matched by a substring of its title (or a process name / PID), and look at it. Use this instead of take_screenshot + guessing: it crops to the window and the image is fed straight to your eyes. A minimized window is restored automatically; the list of open windows is suggested in the error if nothing matches.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Substring of the window title, e.g. 'YouTube' or 'Visual Studio Code'."
+          },
+          "process": {
+            "type": "string",
+            "description": "Process name to match instead of the title, e.g. 'chrome'."
+          },
+          "pid": {
+            "type": "integer",
+            "description": "Exact window PID (from window_list)."
+          },
+          "focus": {
+            "type": "boolean",
+            "description": "Bring the window to the front first (default false)."
+          },
+          "save": {
+            "type": "boolean",
+            "description": "Also save a PNG copy in the workspace."
+          }
+        },
+        "required": []
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "wait_for",
+      "description": "Wait until something becomes true instead of polling with screenshots. Kinds: 'file' (a file appears, optionally reaching min_bytes - perfect for a download finishing), 'port' (a port starts accepting connections), 'url' (an HTTP 2xx/3xx), 'process' (an app launches), 'window' (a window title appears), 'text' (a string shows up in a file), 'screen_text' (text becomes visible on screen, needs OCR). Combine with must_disappear to wait for something to go away. Never returns an error on timeout - it reports timed_out plus what it last saw.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "file",
+              "port",
+              "url",
+              "process",
+              "window",
+              "text",
+              "screen_text"
+            ],
+            "description": "What to wait for."
+          },
+          "target": {
+            "type": "string",
+            "description": "File path (workspace-relative or absolute inside it), URL, process name, or window title."
+          },
+          "port": {
+            "type": "integer",
+            "description": "Port number when kind=port."
+          },
+          "text": {
+            "type": "string",
+            "description": "Text to look for when kind=text or kind=screen_text."
+          },
+          "min_bytes": {
+            "type": "integer",
+            "description": "kind=file: wait until the file is at least this many bytes (0 = any size)."
+          },
+          "must_disappear": {
+            "type": "boolean",
+            "description": "Wait until the condition is FALSE instead (e.g. a spinner is gone)."
+          },
+          "timeout": {
+            "type": "integer",
+            "description": "Give up after this many seconds (1-600, default 30)."
+          },
+          "poll_interval": {
+            "type": "number",
+            "description": "Seconds between checks (default 0.5)."
+          }
+        },
+        "required": [
+          "kind"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "copy_to_clipboard",
+      "description": "Put text on the system clipboard so any other app can paste it (hand a result from one app to another). Use format=json for structured data - it is validated before being copied. Pair with paste_from_clipboard.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string",
+            "description": "The text to copy."
+          },
+          "format": {
+            "type": "string",
+            "enum": [
+              "text",
+              "json",
+              "html"
+            ],
+            "description": "Type hint. json is validated first so you never paste broken JSON. Default text."
+          }
+        },
+        "required": [
+          "text"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "paste_from_clipboard",
+      "description": "Read the system clipboard. format=auto (default) picks up a copied PICTURE and returns it as an image you can see, plus any text alongside it. Use text for plain text and json to get the clipboard parsed into an object.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "format": {
+            "type": "string",
+            "enum": [
+              "auto",
+              "text",
+              "json",
+              "image"
+            ],
+            "description": "What you expect on the clipboard. 'auto' also detects images. Default auto."
+          },
+          "max_chars": {
+            "type": "integer",
+            "description": "Truncate text after this many characters (default 8000)."
+          }
+        },
+        "required": []
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "click_text",
+      "description": "Click a button or link by the TEXT it shows - no pixel guessing. The screen (or one named window) is read with OCR, the best match is located - tolerating typos - and its centre is clicked. If the text cannot be found the error lists close matches under 'did_you_mean'. Use dry_run first to see what would be clicked, and prefer a window= argument so background windows are not scanned.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string",
+            "description": "The visible label to click, e.g. 'Subscribe'."
+          },
+          "window": {
+            "type": "string",
+            "description": "Only look inside this window (substring of its title) instead of the whole screen."
+          },
+          "exact": {
+            "type": "boolean",
+            "description": "Require the exact word instead of a phrase/fuzzy match."
+          },
+          "button": {
+            "type": "string",
+            "enum": [
+              "left",
+              "right",
+              "middle"
+            ],
+            "description": "Mouse button. Default left."
+          },
+          "double_click": {
+            "type": "boolean",
+            "description": "Double-click instead of single-click."
+          },
+          "dry_run": {
+            "type": "boolean",
+            "description": "Only report what would be clicked; do not click."
+          }
+        },
+        "required": [
+          "text"
         ]
       }
     }

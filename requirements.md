@@ -35,7 +35,7 @@ system-level optionals (Docker, WSL2, Blender MCP).
 | `requests` | HTTP/REST/GraphQL client | `api_call`, `tools/scraper.py` |
 | `websocket-client` | WebSocket client | `ws_test` |
 | `beautifulsoup4` | page parsing | `tools/scraper.py` |
-| `pytesseract` | OCR | `tools/ocr.py` *(engine too: Tesseract OCR, see below)* |
+| `pytesseract` | OCR | `tools/ocr.py`, plus the `click_text` and `wait_for(kind=screen_text)` tools *(engine too: Tesseract OCR, see below)* |
 | `piper-tts` + `onnxruntime` | local neural speech synthesis (Piper engine) | `tts_speak`, `tts_voices` |
 | `sounddevice` | plays the synthesized WAV straight to the speakers (bundled PortAudio - no media player involved) | playback half of `tts_speak`; falls back to `winsound` on Windows and `paplay`/`aplay`/`ffplay` on Linux |
 

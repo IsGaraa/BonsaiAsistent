@@ -123,9 +123,10 @@ in order).
 | **Model selector** | swap the active AI model from the header dropdown - pick another local `.gguf` (Bonsai restarts the local model server with it) or an external OpenAI-compatible endpoint (LM Studio, Ollama, another port). Add models with the **+** button; see §8 |
 | **Live reasoning** | shows its chain of thought in real time, streaming as it is produced |
 | **Tool calls** | decides autonomously when to use a tool and surfaces every call (see §4) |
-| **Vision + screen capture** | understands attached images *and* can `take_screenshot` the live screen - it actually sees what's displayed (apps, error dialogs, terminal output) |
-| **PC control** | `control_input` moves the mouse, clicks, drags, scrolls and types, like a human using the PC |
-| **Clipboard** | reads or writes the system clipboard with `clipboard` (get / set) |
+| **Vision + screen capture** | understands attached images, can `take_screenshot` the live screen, and `screenshot_window` captures just the window it needs - it actually sees what's displayed (apps, error dialogs, terminal output) |
+| **PC control** | `control_input` moves the mouse, clicks, drags, scrolls and types like a human; `click_text` clicks a control by its visible label (no pixel guessing) |
+| **Waits instead of polling** | `wait_for` blocks until a file/download, port, URL, process, window or on-screen text is ready - so no more screenshot loops |
+| **Clipboard as a channel** | `copy_to_clipboard` / `paste_from_clipboard` with type hints, including pasting an image from another app straight into the conversation |
 | **Downloads & archives** | `download_file` saves files from the web into the workspace; `archive` creates/extracts zip & tar |
 | **Shell + sandbox** | `run_command` executes real shell commands - PowerShell/cmd on Windows, `sh` on Linux (configurable timeout, up to 600s); `run_code` runs snippets in an isolated temp folder (auto-detects what's installed on the PC: Python + Node by default, plus Go/Lua/PHP/Ruby/Perl/Bash when present; timeouts up to 600s) |
 | **Asks you questions** | `ask_user` pauses and asks you a question (with optional clickable options) exactly like a human would - just like opencode |
@@ -162,8 +163,12 @@ always produced at the end.
 | `launch_or_open` | Opens apps, websites, files and settings by name | Notepad, Steam, Chrome, Spotify, YouTube, workspace files, system settings... |
 | `list_dir` / `read_file` / `search_files` / `write_file` / `edit_file` | Work on your files | strictly confined to the **workspace folder** |
 | `take_screenshot` | Captures the screen (or a region) and **feeds the image to Bonsai's eyes** | also saves a PNG in the workspace; shown as a thumbnail in the tool log |
+| `screenshot_window` | Captures **one named window** (title substring / process / PID) and feeds it to Bonsai's eyes | no more guesswork between `window_list` and a full-screen grab; a minimized window is restored first, and the list of open windows is suggested if nothing matches |
+| `wait_for` | Waits until something is true instead of polling screenshots | `kind`: `file` (appears, or reaches `min_bytes` - a download finishing), `port` (starts listening), `url` (HTTP 2xx/3xx), `process` (app launched), `window` (title appears), `text` (string in a file), `screen_text` (visible on screen, needs OCR); `must_disappear` waits for the opposite; reports `timed_out` + what it last saw instead of erroring |
 | `control_input` | Moves the mouse, clicks, double/right-clicks, drags, scrolls, types text, presses keys/hotkeys | screen-pixel coordinates; pair with `take_screenshot` to see the result |
+| `click_text` | Clicks a button/link **by the text it shows** - OCR locates it, typos are tolerated, and its centre is clicked | scope it with `window=` so background windows are not scanned; `dry_run` reports what would be clicked without clicking; a miss returns close matches as `did_you_mean`. Needs OCR (pytesseract + Tesseract) |
 | `clipboard` | Reads (`get`) or writes (`set`) the system clipboard | |
+| `copy_to_clipboard` / `paste_from_clipboard` | First-class clipboard channel with type hints | `copy` validates `format=json` before copying; `paste` with `format=auto` also picks up a copied **picture** and returns it as an image Bonsai can see (`text`/`json`/`image`) |
 | `download_file` | Downloads a file from a URL into the workspace | returns path, size and a text preview when possible |
 | `archive` | Creates / extracts zip, tar, tar.gz, tgz archives | unpack or pack inside the workspace |
 | `ask_user` | Asks you a question and **waits for your answer** (options or free text) | pauses its work like opencode's question skill |
@@ -174,7 +179,7 @@ always produced at the end.
 | `ws_test` | Connects to a `ws://`/`wss://` endpoint, optionally sends a message, collects replies | needs `websocket-client` |
 | `schedule_task` / `list_schedules` / `unschedule_task` | Run a shell command later: once, every N seconds, or by 5-field cron | in-process scheduler thread; survives only while the server runs |
 | `tts_voices` / `tts_speak` | Lists local Piper voices; speaks text aloud and saves the WAV (`out\tts\`) | needs `piper-tts` + `onnxruntime` + `sounddevice`; voice models live in the project's `piper\` - run `python piper\download_voices.py` once; `tts_speak` only works after the **TTS** header button is turned on |
-| `web_search` / `web_fetch` | Look up current information online when it's not sure | documents itself before answering |
+| `web_search` / `web_fetch` | Look up current information online when it's not sure | `web_search` returns **structured** results (title, url, domain, snippet, source) plus `did_you_mean` and `related_searches`, so a typo like `serach` recovers in one call; `action="suggest"` is the cheap autocomplete-only check. `web_fetch` reads a page |
 | `run_command` | Runs a real shell command (cmd/PowerShell on Windows, `sh` on Linux) | timeout default 45s, configurable up to 600s, output capped to ~8 KB |
 | `run_code` | Runs snippets in many languages (auto-detected: Python + Node by default; Go/Lua/PHP/Ruby/Perl/Bash when installed) | isolated temp folder, deleted afterwards; timeout default 30s, up to 600s; ~8 KB output cap |
 | `preview_html` | Live-preview an `.html` page from the workspace in an iframe inside the chat | also auto-suggested when `write_file` targets an `.html`/`.htm` file (returns a `preview_url`) |
@@ -186,9 +191,10 @@ always produced at the end.
 
 The **Blender** tools run through `mcp-for-blender` (a stdio MCP server that talks to
 the addon on `localhost:9876`). Bonsai keeps full control of the tool loop and
-reasoning - only the actual Blender commands are delegated. A status light in the
-header shows the connection: green **BLENDER: CONNECTED**, yellow *ADDON OFF*
-(Blender open but addon not enabled), red *OFF*.
+reasoning - only the actual Blender commands are delegated. A status indicator in
+the header shows the connection: the Blender logo with a **green** dot
+(*connected*), **yellow** (*addon off*) or **red** (*not connected*); hover it
+for the detail.
 
 The **workspace** is the only area the file tools touch. You can pick any folder
 from the UI (📁 button in the header) with a native folder dialog, or set

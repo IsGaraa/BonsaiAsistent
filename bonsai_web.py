@@ -10,6 +10,7 @@ import os
 import re
 import shutil
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -823,26 +824,143 @@ def _parse_wikipedia_search(query, limit):
 
 def _trim_results(results, limit=5, snippet=240):
     out = []
-    for r in (results or [])[:limit]:
+    seen = set()
+    for r in (results or []):
+        if len(out) >= limit:
+            break
+        url = (r.get("url") or "").strip()
+        key = url.rstrip("/").lower() or (r.get("title") or "").lower()
+        if key and key in seen:
+            continue
+        seen.add(key)
         snip = (r.get("snippet") or "").strip()
         if len(snip) > snippet:
             snip = snip[:snippet].rstrip() + "..."
-        out.append({"title": (r.get("title") or "").strip()[:180],
-                    "url": r.get("url") or "",
-                    "snippet": snip})
+        item = {"title": (r.get("title") or "").strip()[:180],
+                "url": url,
+                "snippet": snip,
+                "source": r.get("source") or ""}
+        try:
+            if url:
+                item["domain"] = urllib.parse.urlparse(url).netloc.lower()
+        except Exception:
+            pass
+        out.append(item)
     return out
 
 
-def _web_search(query, max_results=6):
-    if not str(query or "").strip():
+def _fetch_text(url, timeout=15):
+    """Fetch a URL and return its body as text (for JSON APIs etc.)."""
+    req = urllib.request.Request(url, headers={"User-Agent": _WEB_UA,
+                                               "Accept": "*/*"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read().decode("utf-8", errors="replace")
+
+
+def _coerce_suggestions(data):
+    """Flatten an autocomplete payload into a list of strings.
+
+    DuckDuckGo answers with a JSON list whose single element is itself a
+    JSON-encoded list, e.g. ["[\"search console\",\"search\"]"]."""
+    out = []
+    if not isinstance(data, list):
+        return out
+    for item in data:
+        if isinstance(item, list):
+            out.extend(str(x) for x in item)
+        elif isinstance(item, str) and item.strip().startswith("["):
+            try:
+                inner = json.loads(item)
+            except Exception:
+                inner = None
+            if isinstance(inner, list):
+                out.extend(str(x) for x in inner)
+            else:
+                out.append(item)
+        elif item is not None:
+            out.append(str(item))
+    return out
+
+
+def _search_suggestions(query, limit=6):
+    """Autocomplete / 'did you mean' candidates for a query."""
+    q = str(query or "").strip()
+    if not q:
+        return []
+    out = []
+    try:
+        raw = _fetch_text("https://duckduckgo.com/ac/?q=" +
+                          urllib.parse.quote(q) + "&type=list") or "[]"
+        out = _coerce_suggestions(json.loads(raw))
+    except Exception:
+        out = []
+    if not out:
+        try:
+            raw = _fetch_text("https://api.bing.com/osjson.aspx?query=" +
+                              urllib.parse.quote(q)) or "[]"
+            data = json.loads(raw)
+            if isinstance(data, list) and len(data) > 1:
+                out = _coerce_suggestions(data[1:2])
+        except Exception:
+            pass
+    seen, uniq = {q.lower()}, []
+    for s in out:
+        s = s.strip()
+        k = s.lower()
+        if s and k not in seen:
+            seen.add(k)
+            uniq.append(s)
+    return uniq[:limit]
+
+
+def _did_you_mean(query, suggestions):
+    """The most likely correction when the query looks like a typo."""
+    q = str(query or "").strip()
+    if not q or not suggestions:
+        return None
+    ql = q.lower()
+    for s in suggestions:
+        if s.lower() == ql:
+            return None
+    best, best_score = None, 0.0
+    for s in suggestions:
+        score = _similarity(ql, s.lower())
+        if score > best_score:
+            best, best_score = s, score
+    if best and best_score >= 0.72:
+        return best
+    return None
+
+
+def _similarity(a, b):
+    """Rough 0..1 similarity (difflib ratio, stdlib only)."""
+    try:
+        import difflib
+        return difflib.SequenceMatcher(None, a, b).ratio()
+    except Exception:
+        return 0.0
+
+
+def _web_search(query, max_results=6, suggest_only=False):
+    q = str(query or "").strip()
+    if not q:
         return {"error": "query is required"}
-    results = _parse_wikipedia_search(query, max_results)
+    suggestions = _search_suggestions(q)
+    correction = _did_you_mean(q, suggestions)
+    base = {"result": "ok", "query": q,
+            "did_you_mean": correction,
+            "related_searches": [s for s in suggestions if s.lower() != q.lower()]}
+    if suggest_only:
+        base["suggestions"] = suggestions
+        return base
+    results = _parse_wikipedia_search(q, max_results)
     if results:
-        return {"result": "ok", "query": str(query), "results": _trim_results(results),
-                "note": "from Wikipedia"}
+        out = dict(base)
+        out.update({"results": _trim_results(results), "source": "wikipedia"})
+        return out
     urls = [
-        "https://html.duckduckgo.com/html/?q=" + urllib.parse.quote(str(query)),
-        "https://www.bing.com/search?q=" + urllib.parse.quote(str(query)) + "&count=10&setlang=en",
+        "https://html.duckduckgo.com/html/?q=" + urllib.parse.quote(q),
+        "https://www.bing.com/search?q=" + urllib.parse.quote(q) + "&count=10&setlang=en",
     ]
     for target in urls:
         try:
@@ -850,23 +968,36 @@ def _web_search(query, max_results=6):
         except Exception:
             continue
         if "duckduckgo.com" in target:
+            results = []
             anchors = re.findall(r'(?is)<a[^>]*class="result__a"[^>]*href="([^"]*)"[^>]*>(.*?)</a>', markup)
             snippets = re.findall(r'(?is)<a[^>]*class="result__snippet"[^>]*>(.*?)</a>', markup)
             for i, (href, atext) in enumerate(anchors[:max_results]):
                 title = html.unescape(re.sub(r"(?is)<[^>]+>", "", atext)).strip()
-                m = re.search(r"uddg=([^&]+)", href)
-                real = urllib.parse.unquote(m.group(1)) if m else href
+                mm = re.search(r"uddg=([^&]+)", href)
+                real = urllib.parse.unquote(mm.group(1)) if mm else href
                 snip = ""
                 if i < len(snippets):
                     snip = html.unescape(re.sub(r"(?is)<[^>]+>", "", snippets[i])).strip()
                 if real.startswith("http") and title:
-                    results.append({"title": title, "url": real, "snippet": snip})
+                    results.append({"title": title, "url": real, "snippet": snip,
+                                    "source": "duckduckgo"})
         else:
             results = _parse_bing(markup, max_results)
+            for r in results:
+                r.setdefault("source", "bing")
         if results:
-            return {"result": "ok", "query": str(query), "results": _trim_results(results)}
-    return {"result": "ok", "query": str(query), "results": [],
-            "note": "no results found"}
+            out = dict(base)
+            out.update({"results": _trim_results(results, limit=max_results),
+                        "source": results[0].get("source", "web")})
+            if not out["results"] and correction:
+                out["hint"] = ("no results for the query as typed; a likely "
+                                "correction is %r - retry with it" % correction)
+            return out
+    out = dict(base)
+    out.update({"results": [], "source": "none",
+                "hint": ("no results found%s" %
+                         (("; try %r instead" % correction) if correction else ""))})
+    return out
 
 
 def _wiki_read(title):
@@ -912,14 +1043,25 @@ WEB_TOOLS = {
             "name": "web_search",
             "description": "Search the internet when you need up-to-date information, "
                            "facts, news, documentation or anything you are not sure "
-                           "about. Returns a short list of titles, links and snippets. "
-                           "Then read details with web_fetch on the most relevant link.",
+                           "about. Returns STRUCTURED results - title, url, domain, "
+                           "snippet, source - plus 'did_you_mean' when your query "
+                           "looks like a typo and 'related_searches' for "
+                           "autocomplete, so you can recover from a misspelling in a "
+                           "single call. Use action='suggest' for the cheap "
+                           "autocomplete check only (no page scraping), then retry "
+                           "with the corrected query. Read details with web_fetch on "
+                           "the most relevant link.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
                         "description": "Search query, e.g. 'latest node.js LTS version'."
+                    },
+                    "action": {
+                        "type": "string",
+                        "enum": ["search", "suggest"],
+                        "description": "'search' (default) returns full results; 'suggest' returns only autocomplete/'did you mean' candidates - use it to fix a typo cheaply."
                     }
                 },
                 "required": ["query"]
@@ -2679,7 +2821,153 @@ TTS_SPEAK_TOOL = {
     }
 }
 
+SCREENSHOT_WINDOW_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "screenshot_window",
+        "description": "Screenshot ONE specific window, matched by a substring of "
+                       "its title (or a process name / PID), and look at it. "
+                       "Use this instead of take_screenshot + guessing: it crops "
+                       "to the window and the image is fed straight to your eyes. "
+                       "A minimized window is restored automatically; the list of "
+                       "open windows is suggested in the error if nothing matches.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string",
+                         "description": "Substring of the window title, e.g. 'YouTube' or 'Visual Studio Code'."},
+                "process": {"type": "string",
+                            "description": "Process name to match instead of the title, e.g. 'chrome'."},
+                "pid": {"type": "integer",
+                        "description": "Exact window PID (from window_list)."},
+                "focus": {"type": "boolean",
+                          "description": "Bring the window to the front first (default false)."},
+                "save": {"type": "boolean",
+                         "description": "Also save a PNG copy in the workspace."}
+            },
+            "required": []
+        }
+    }
+}
+
+WAIT_FOR_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "wait_for",
+        "description": "Wait until something becomes true instead of polling with "
+                       "screenshots. Kinds: 'file' (a file appears, optionally "
+                       "reaching min_bytes - perfect for a download finishing), "
+                       "'port' (a port starts accepting connections), 'url' (an "
+                       "HTTP 2xx/3xx), 'process' (an app launches), 'window' (a "
+                       "window title appears), 'text' (a string shows up in a "
+                       "file), 'screen_text' (text becomes visible on screen, "
+                       "needs OCR). Combine with must_disappear to wait for "
+                       "something to go away. Never returns an error on timeout - "
+                       "it reports timed_out plus what it last saw.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "kind": {"type": "string",
+                         "enum": ["file", "port", "url", "process", "window",
+                                  "text", "screen_text"],
+                         "description": "What to wait for."},
+                "target": {"type": "string",
+                           "description": "File path (workspace-relative or absolute inside it), URL, process name, or window title."},
+                "port": {"type": "integer",
+                         "description": "Port number when kind=port."},
+                "text": {"type": "string",
+                         "description": "Text to look for when kind=text or kind=screen_text."},
+                "min_bytes": {"type": "integer",
+                              "description": "kind=file: wait until the file is at least this many bytes (0 = any size)."},
+                "must_disappear": {"type": "boolean",
+                                   "description": "Wait until the condition is FALSE instead (e.g. a spinner is gone)."},
+                "timeout": {"type": "integer",
+                            "description": "Give up after this many seconds (1-600, default 30)."},
+                "poll_interval": {"type": "number",
+                                  "description": "Seconds between checks (default 0.5)."}
+            },
+            "required": ["kind"]
+        }
+    }
+}
+
+COPY_CLIPBOARD_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "copy_to_clipboard",
+        "description": "Put text on the system clipboard so any other app can "
+                       "paste it (hand a result from one app to another). Use "
+                       "format=json for structured data - it is validated before "
+                       "being copied. Pair with paste_from_clipboard.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "The text to copy."},
+                "format": {"type": "string", "enum": ["text", "json", "html"],
+                           "description": "Type hint. json is validated first so you never paste broken JSON. Default text."}
+            },
+            "required": ["text"]
+        }
+    }
+}
+
+PASTE_CLIPBOARD_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "paste_from_clipboard",
+        "description": "Read the system clipboard. format=auto (default) picks up "
+                       "a copied PICTURE and returns it as an image you can see, "
+                       "plus any text alongside it. Use text for plain text and "
+                       "json to get the clipboard parsed into an object.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "format": {"type": "string",
+                           "enum": ["auto", "text", "json", "image"],
+                           "description": "What you expect on the clipboard. 'auto' also detects images. Default auto."},
+                "max_chars": {"type": "integer",
+                              "description": "Truncate text after this many characters (default 8000)."}
+            },
+            "required": []
+        }
+    }
+}
+
+CLICK_TEXT_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "click_text",
+        "description": "Click a button or link by the TEXT it shows - no pixel "
+                       "guessing. The screen (or one named window) is read with "
+                       "OCR, the best match is located - tolerating typos - and "
+                       "its centre is clicked. If the text cannot be found the "
+                       "error lists close matches under 'did_you_mean'. Use "
+                       "dry_run first to see what would be clicked, and prefer a "
+                       "window= argument so background windows are not scanned.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string",
+                         "description": "The visible label to click, e.g. 'Subscribe'."},
+                "window": {"type": "string",
+                           "description": "Only look inside this window (substring of its title) instead of the whole screen."},
+                "exact": {"type": "boolean",
+                          "description": "Require the exact word instead of a phrase/fuzzy match."},
+                "button": {"type": "string", "enum": ["left", "right", "middle"],
+                           "description": "Mouse button. Default left."},
+                "double_click": {"type": "boolean",
+                                 "description": "Double-click instead of single-click."},
+                "dry_run": {"type": "boolean",
+                            "description": "Only report what would be clicked; do not click."}
+            },
+            "required": ["text"]
+        }
+    }
+}
+
 NEW_TOOLS = [WINDOW_LIST_TOOL, WINDOW_ACTION_TOOL,
+             SCREENSHOT_WINDOW_TOOL, WAIT_FOR_TOOL,
+             COPY_CLIPBOARD_TOOL, PASTE_CLIPBOARD_TOOL, CLICK_TEXT_TOOL,
              DOCKER_PS_TOOL, DOCKER_IMAGES_TOOL, DOCKER_START_TOOL,
              DOCKER_STOP_TOOL, DOCKER_RESTART_TOOL, DOCKER_LOGS_TOOL,
              DOCKER_EXEC_TOOL, API_CALL_TOOL, WS_TEST_TOOL,
@@ -2998,6 +3286,508 @@ def _control_input(args):
     return result
 
 
+_WAIT_KINDS = ("file", "port", "url", "process", "window", "text",
+               "screen_text")
+
+
+def _proc_running(name):
+    name = str(name or "").strip().lower()
+    if not name:
+        return False
+    if IS_WINDOWS:
+        out = subprocess.run(["tasklist", "/fo", "csv", "/nh"],
+                             capture_output=True, text=True, timeout=15,
+                             creationflags=CREATE_NO_WINDOW).stdout
+        return any(name in line.lower() for line in out.splitlines())
+    try:
+        out = subprocess.run(["pgrep", "-if", name], capture_output=True,
+                             text=True, timeout=10).stdout
+        return bool(out.strip())
+    except Exception:
+        return False
+
+
+def _url_status(url, timeout=8):
+    req = urllib.request.Request(url, headers={"User-Agent": _WEB_UA},
+                                 method="GET")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return int(getattr(resp, "status", 200) or 200)
+
+
+def _ocr_available():
+    try:
+        import importlib.util
+        return (importlib.util.find_spec("pytesseract") is not None and
+                importlib.util.find_spec("PIL") is not None)
+    except Exception:
+        return False
+
+
+def _full_screen_bbox():
+    try:
+        from PIL import ImageGrab
+        im = ImageGrab.grab(all_screens=True)
+        return (0, 0, im.size[0], im.size[1])
+    except Exception:
+        pass
+    try:
+        import ctypes
+        user32 = ctypes.windll.user32  # noqa: F841
+        return (0, 0, user32.GetSystemMetrics(78), user32.GetSystemMetrics(79))
+    except Exception:
+        return (0, 0, 1920, 1080)
+
+
+def _wait_for(args):
+    kind = str(args.get("kind") or "file").strip().lower()
+    if kind not in _WAIT_KINDS:
+        return {"error": "kind must be one of: %s" % ", ".join(_WAIT_KINDS)}
+    try:
+        timeout = min(max(float(args.get("timeout") or 30), 1), 600)
+    except Exception:
+        timeout = 30.0
+    try:
+        interval = min(max(float(args.get("poll_interval") or 0.5), 0.1), 10)
+    except Exception:
+        interval = 0.5
+    target = args.get("target")
+    if kind == "port":
+        target = args.get("port", args.get("target"))
+    if kind in ("file", "text"):
+        if not str(target or "").strip():
+            return {"error": "target (the file path) is required for kind=%s"
+                             % kind}
+        try:
+            _safe_path(str(target))
+        except ValueError as exc:
+            return {"error": str(exc)}
+    started = time.time()
+    deadline = started + timeout
+    checks = 0
+    last_detail = ""
+    want_gone = bool(args.get("must_disappear"))
+
+    def probe():
+        if kind == "file":
+            path = str(target or "")
+            p = _safe_path(path)
+            if not os.path.exists(p):
+                return False, "not found: %s" % path
+            size = 0
+            try:
+                size = os.path.getsize(p)
+            except Exception:
+                pass
+            if args.get("min_bytes") is not None:
+                try:
+                    if size < int(args["min_bytes"]):
+                        return False, "still smaller than %s bytes" % args["min_bytes"]
+                except Exception:
+                    return False, "size unavailable"
+            return True, "%s (%d bytes)" % (p, size)
+        if kind == "port":
+            port = int(target)
+            if _port_listening(port):
+                return True, "port %d is accepting connections" % port
+            return False, "port %d not open" % port
+        if kind == "url":
+            code = _url_status(str(target), timeout=min(10, max(2, timeout)))
+            return (200 <= code < 400), "HTTP %s" % code
+        if kind == "process":
+            if _proc_running(target):
+                return True, "process %r is running" % str(target)
+            return False, "process %r not running" % str(target)
+        if kind == "window":
+            if _window_find(title=str(target or "")):
+                return True, "window %r is open" % str(target)
+            return False, "no window matching %r" % str(target)
+        if kind == "text":
+            path = str(target or "")
+            p = _safe_path(path)
+            if not os.path.isfile(p):
+                return False, "not a file: %s" % path
+            try:
+                with open(p, "r", encoding="utf-8", errors="replace") as fh:
+                    body = fh.read()
+            except Exception as exc:
+                return False, "unreadable: %s" % exc
+            needle = str(args.get("text") or "")
+            hit = needle in body
+            return hit, ("found %r" % needle if hit
+                         else "%r not in the file yet" % needle)
+        # kind == screen_text
+        if not _ocr_available():
+            return False, ("OCR unavailable - install pytesseract + the "
+                           "Tesseract engine")
+        needle = str(args.get("text") or "").strip().lower()
+        if not needle:
+            return False, "text is required for kind=screen_text"
+        try:
+            import pytesseract
+            img = _capture_bbox(_full_screen_bbox())
+            body = (pytesseract.image_to_string(img) or "").lower()
+        except Exception as exc:
+            return False, "OCR failed: %s" % exc
+        hit = needle in body
+        return hit, ("saw %r on screen" % needle if hit
+                     else "%r not visible yet" % needle)
+
+    while True:
+        checks += 1
+        try:
+            ok, detail = probe()
+        except Exception as exc:
+            ok, detail = False, "probe error: %s" % exc
+        last_detail = detail
+        if want_gone:
+            if not ok:
+                return {"result": "ok", "kind": kind, "target": target,
+                        "detail": "gone: " + detail,
+                        "elapsed": round(time.time() - started, 2),
+                        "checks": checks, "timed_out": False}
+        elif ok:
+            return {"result": "ok", "kind": kind, "target": target,
+                    "detail": detail, "elapsed": round(time.time() - started, 2),
+                    "checks": checks, "timed_out": False}
+        if time.time() >= deadline:
+            break
+        time.sleep(interval)
+    return {"result": "ok", "kind": kind, "target": target, "timed_out": True,
+            "detail": last_detail, "elapsed": round(time.time() - started, 2),
+            "checks": checks,
+            "hint": "still not true after %.0fs - take a screenshot to see the "
+                    "current state" % timeout}
+
+
+_CLIP_FORMATS = ("text", "json", "html", "auto", "image")
+
+
+def _clip_write(text, fmt="text"):
+    fmt = str(fmt or "text").strip().lower()
+    if fmt not in _CLIP_FORMATS:
+        return {"error": "format must be one of: %s" % ", ".join(_CLIP_FORMATS)}
+    payload = "" if text is None else str(text)
+    if fmt == "json":
+        try:
+            json.loads(payload)
+        except Exception as exc:
+            return {"error": "that is not valid JSON: %s" % exc}
+    if fmt == "image":
+        return {"error": "use paste_from_clipboard to read an image; "
+                         "copy_to_clipboard writes text/json/html"}
+    try:
+        import pyperclip
+    except Exception as exc:
+        return {"error": "pyperclip is not installed: %s" % exc}
+    try:
+        pyperclip.copy(payload)
+    except Exception as exc:
+        return {"error": "could not write to the clipboard: %s" % exc}
+    return {"result": "ok", "action": "copy", "format": fmt,
+            "chars": len(payload), "preview": payload[:120]}
+
+
+def _clip_read(fmt="auto", max_chars=8000):
+    fmt = str(fmt or "auto").strip().lower()
+    if fmt not in _CLIP_FORMATS:
+        return {"error": "format must be one of: %s" % ", ".join(_CLIP_FORMATS)}
+    out = {"result": "ok", "action": "paste", "format": fmt}
+    if fmt in ("auto", "image"):
+        img = _clipboard_image()
+        if img is not None:
+            data_uri, w, h = _image_payload(img, quality=85, max_edge=1280)
+            out.update({"type": "image", "width": w, "height": h,
+                        "image": data_uri})
+            if fmt == "image":
+                return out
+    try:
+        import pyperclip
+    except Exception as exc:
+        if out.get("type") == "image":
+            return out
+        return {"error": "pyperclip is not installed: %s" % exc}
+    try:
+        text = pyperclip.paste() or ""
+    except Exception as exc:
+        if out.get("type") == "image":
+            return out
+        return {"error": "could not read the clipboard: %s" % exc}
+    out["text"] = text[:max_chars]
+    out["chars"] = len(text)
+    out["truncated"] = len(text) > max_chars
+    if fmt == "json":
+        try:
+            out["json"] = json.loads(text)
+        except Exception as exc:
+            out["json_error"] = str(exc)
+    if out.get("type") == "image":
+        out["text"] = text[:max_chars] if text else ""
+    return out
+
+
+def _dib_to_image(raw):
+    """Build a PIL image straight from a Windows CF_DIB payload.
+
+    Pillow's ImageGrab.grabclipboard() returns a lazy DibImageFile that can
+    fail to materialise ('image file is truncated'), so decode the bitmap
+    ourselves for the common 24/32-bit uncompressed cases."""
+    try:
+        from PIL import Image
+    except Exception:
+        return None
+    if not raw or len(raw) < 40:
+        return None
+    try:
+        header = struct.unpack_from("<IiiHHIIiiII", raw, 0)
+        (_size, width, height, planes, bpp, _comp, _img_size,
+         _xppm, _yppm, _clr_used, _clr_important) = header
+    except Exception:
+        return None
+    if planes != 1 or bpp not in (16, 24, 32):
+        return None
+    if header[5] not in (0, 3):  # BI_RGB / BI_BITFIELDS
+        return None
+    flip = height > 0            # positive height = bottom-up rows
+    height = abs(height)
+    if width <= 0 or height <= 0 or width * height > 80_000_000:
+        return None
+    stride = ((width * bpp + 31) // 32) * 4
+    offset = struct.unpack_from("<I", raw, 0)[0]
+    if bpp <= 8:
+        offset += 4 * (1 << bpp)
+    need = offset + stride * height
+    if len(raw) < need:
+        return None
+    pixels = raw[offset:need]
+    mode, rawmode = ("BGRX", "BGRX") if bpp == 32 else ("RGB", "BGR")
+    try:
+        img = Image.frombuffer("RGB", (width, height), pixels, "raw",
+                               rawmode, stride, 1)
+    except Exception:
+        return None
+    if flip:
+        try:
+            img = img.transpose(Image.FLIP_TOP_BOTTOM)
+        except Exception:
+            pass
+    return img
+
+
+def _clipboard_image():
+    """Return a PIL image of the clipboard picture, or None."""
+    try:
+        from PIL import Image
+    except Exception:
+        return None
+    try:
+        from PIL import ImageGrab
+        data = ImageGrab.grabclipboard()
+    except Exception:
+        data = None
+    if isinstance(data, Image.Image):
+        for attempt in (lambda: data.convert("RGB"), lambda: data.copy()):
+            try:
+                return attempt()
+            except Exception:
+                continue
+    elif isinstance(data, list):
+        for item in data:
+            try:
+                if os.path.isfile(item):
+                    return Image.open(item).convert("RGB")
+            except Exception:
+                continue
+    if IS_WINDOWS:
+        try:
+            import win32clipboard
+            import win32con
+            win32clipboard.OpenClipboard()
+            try:
+                raw = win32clipboard.GetClipboardData(win32con.CF_DIB)
+            finally:
+                win32clipboard.CloseClipboard()
+            return _dib_to_image(bytes(raw))
+        except Exception:
+            return None
+    if IS_LINUX:
+        exe = shutil.which("xclip")
+        if exe:
+            try:
+                out = subprocess.run([exe, "-selection", "clipboard",
+                                      "-t", "image/png", "-o"],
+                                     capture_output=True, timeout=5)
+                if out.stdout:
+                    import io
+                    return Image.open(io.BytesIO(out.stdout)).convert("RGB")
+            except Exception:
+                pass
+    return None
+
+
+def _ocr_words(img):
+    """[(word, confidence, x, y, w, h)] from pytesseract, or None."""
+    try:
+        import pytesseract
+    except Exception:
+        return None
+    try:
+        data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
+    except Exception as exc:
+        raise exc
+    words = []
+    n = len(data.get("text") or [])
+    for i in range(n):
+        text = (data["text"][i] or "").strip()
+        if not text:
+            continue
+        try:
+            conf = float(data["conf"][i])
+        except Exception:
+            conf = -1
+        if conf < 30:
+            continue
+        words.append({"text": text, "conf": conf,
+                      "x": int(data["left"][i]), "y": int(data["top"][i]),
+                      "w": int(data["width"][i]), "h": int(data["height"][i])})
+    return words
+
+
+def _click_text(args):
+    """Find text on screen (OCR) and click it - no pixel guessing needed."""
+    target = str(args.get("text") or "").strip()
+    if not target:
+        return {"error": "text is required (the visible label to click)"}
+    win = str(args.get("window") or "").strip() or None
+    exact = bool(args.get("exact"))
+    button = str(args.get("button") or "left").strip().lower()
+    clicks = 2 if args.get("double_click") else 1
+    if not _ocr_available():
+        return {"error": "click_text needs OCR - install pytesseract and the "
+                         "Tesseract engine (winget install UB-Mannheim.TesseractOCR)"}
+    offset = (0, 0)
+    scope = "screen"
+    if win:
+        geo = _window_geometry(win)
+        if not geo:
+            return {"error": "no window matched %r - use window_list" % win}
+        bbox = geo["bbox"]
+        offset = (bbox[0], bbox[1])
+        scope = "window:%s" % (geo["title"] or win)
+    else:
+        bbox = _full_screen_bbox()
+    try:
+        img = _capture_bbox(bbox)
+    except Exception as exc:
+        return {"error": "could not capture the screen: %s" % exc}
+    try:
+        words = _ocr_words(img)
+    except Exception as exc:
+        return {"error": "OCR failed: %s" % exc}
+    if not words:
+        return {"error": "OCR found no readable text in the %s - try taking a "
+                         "screenshot to see what is visible" % scope}
+    needle = target.lower()
+    hit = None
+    if exact:
+        for w in words:
+            if w["text"].lower() == needle:
+                hit = w
+                break
+    else:
+        # 1) a single word that already contains the needle wins outright
+        run1 = None
+        for w in words:
+            if needle in w["text"].lower():
+                run1 = [w]
+                break
+        # 2) otherwise the shortest multi-word run on one line that contains it
+        run2 = None
+        if run1 is None:
+            for i in range(len(words)):
+                run, joined = [words[i]], words[i]["text"].lower()
+                for j in range(i + 1, min(i + 6, len(words))):
+                    nxt, prev = words[j], words[j - 1]
+                    if nxt["y"] - prev["y"] > max(14, words[i]["h"]):
+                        break
+                    run.append(nxt)
+                    joined = joined + " " + nxt["text"].lower()
+                    if needle in joined:
+                        run2 = run
+                        break
+                if run2:
+                    break
+        # 3) last resort: the closest single word, if the length is plausible
+        scored = []
+        if run1 is None and run2 is None:
+            for w in words:
+                wl = w["text"].lower()
+                s = _similarity(needle, wl)
+                if abs(len(wl) - len(needle)) <= max(2, len(needle) // 3) \
+                        and s >= 0.75:
+                    scored.append((s, w))
+            if scored:
+                scored.sort(key=lambda p: p[0], reverse=True)
+                run1 = [scored[0][1]]
+        best_run = run1 or run2
+        if best_run:
+            xs = [w["x"] for w in best_run]
+            ys = [w["y"] for w in best_run]
+            x2 = [w["x"] + w["w"] for w in best_run]
+            y2 = [w["y"] + w["h"] for w in best_run]
+            hit = {"text": " ".join(w["text"] for w in best_run),
+                   "conf": round(min(w["conf"] for w in best_run), 1),
+                   "x": min(xs), "y": min(ys),
+                   "w": max(x2) - min(xs), "h": max(y2) - min(ys)}
+        else:
+            scored = []
+            for w in words:
+                wl = w["text"].lower()
+                s = _similarity(needle, wl)
+                if needle in wl:
+                    s = max(s, 0.85)
+                # only accept a fuzzy single-word hit when the lengths are
+                # plausible, so "OK" never matches the letter "k"
+                if abs(len(wl) - len(needle)) <= max(2, len(needle) // 3) \
+                        and s >= 0.75:
+                    scored.append((s, w))
+            if scored:
+                scored.sort(key=lambda p: p[0], reverse=True)
+                hit = scored[0][1]
+    if not hit:
+        near, seen_words = [], set()
+        for w in sorted(words, key=lambda w: _similarity(needle, w["text"].lower()),
+                        reverse=True):
+            t = w["text"]
+            if t.lower() in seen_words:
+                continue
+            seen_words.add(t.lower())
+            if _similarity(needle, t.lower()) > 0.45:
+                near.append(t)
+            if len(near) >= 8:
+                break
+        return {"error": "could not find %r on the %s" % (target, scope),
+                "did_you_mean": near,
+                "words_seen": len(words)}
+    cx = offset[0] + hit["x"] + hit["w"] // 2
+    cy = offset[1] + hit["y"] + hit["h"] // 2
+    if args.get("dry_run"):
+        return {"result": "ok", "action": "dry_run", "matched": hit["text"],
+                "confidence": hit["conf"], "scope": scope,
+                "x": cx, "y": cy}
+    try:
+        import pyautogui
+    except Exception as exc:
+        return {"error": "pyautogui is not installed: %s" % exc}
+    try:
+        pyautogui.moveTo(cx, cy, duration=0.15)
+        pyautogui.click(clicks=clicks, button=button)
+    except Exception as exc:
+        return {"error": "click failed: %s" % exc}
+    return {"result": "ok", "action": "click", "matched": hit["text"],
+            "confidence": hit["conf"], "scope": scope, "clicks": clicks,
+            "button": button, "x": cx, "y": cy}
+
+
 def _clipboard(args):
     action = str(args.get("action") or "get").strip().lower()
     try:
@@ -3290,6 +4080,194 @@ def _window_list():
     out = [w for w in out if w.get("pid")]
     out.sort(key=lambda w: (w.get("process") or "").lower())
     return {"result": "ok", "windows": out[:80], "count": len(out)}
+
+
+def _window_geometry(name=None, process=None, pid=None):
+    """Resolve a window to {'title','bbox','platform'} - None if not found.
+
+    Windows uses win32; Linux uses wmctrl -G (geometry) and falls back to
+    xdotool. Used by screenshot_window and click_text."""
+    if IS_WINDOWS:
+        if not _WIN_UI:
+            return None
+        hwnd = _window_find(name, process, pid)
+        if not hwnd:
+            return None
+        try:
+            if win32gui.IsIconic(hwnd):
+                # a minimized window reports an off-screen dummy rect
+                win32gui.ShowWindow(hwnd, 9)  # SW_RESTORE
+                time.sleep(0.35)
+        except Exception:
+            pass
+        try:
+            left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+        except Exception:
+            return None
+        w, h = right - left, bottom - top
+        if w <= 0 or h <= 0:
+            return None
+        try:
+            title = win32gui.GetWindowText(hwnd)
+        except Exception:
+            title = ""
+        return {"title": title, "bbox": (left, top, right, bottom),
+                "width": w, "height": h, "platform": "windows"}
+    rows = _linux_window_rows_geo()
+    if not rows:
+        return None
+    t = str(name or "").strip().lower() if name else None
+    p = str(process or "").strip().lower() if process else None
+    hit = None
+    for row in rows:
+        if t and t in (row.get("title") or "").lower():
+            hit = row
+            break
+        if p and p in (row.get("process") or "").lower() and hit is None:
+            hit = row
+    if not hit or not hit.get("bbox"):
+        return None
+    left, top, right, bottom = hit["bbox"]
+    return {"title": hit.get("title") or "", "bbox": (left, top, right, bottom),
+            "width": right - left, "height": bottom - top,
+            "platform": "linux"}
+
+
+def _linux_window_rows_geo():
+    """wmctrl rows including geometry: wmctrl -l -G -x"""
+    wm = _wmctrl()
+    rows = []
+    if wm:
+        try:
+            proc = subprocess.run([wm, "-l", "-G", "-x"], capture_output=True,
+                                  text=True, timeout=10,
+                                  creationflags=CREATE_NO_WINDOW)
+            for line in (proc.stdout or "").splitlines():
+                parts = line.split(None, 7)
+                # 0xID DESKTOP WM_CLASS X Y WIDTH HEIGHT HOSTNAME TITLE
+                if len(parts) >= 8 and parts[0].startswith("0x"):
+                    try:
+                        x, y, w, h = (int(v) for v in parts[3:7])
+                    except ValueError:
+                        continue
+                    rows.append({"id": parts[0], "process": parts[2],
+                                 "title": parts[7][:160], "bbox": (x, y, x + w, y + h)})
+        except Exception:
+            pass
+    if rows:
+        return rows
+    for row in (_linux_window_rows() or []):
+        geo = _xdotool_geometry(row.get("id"))
+        if geo:
+            row["bbox"] = geo
+            rows.append(row)
+    return rows
+
+
+def _xdotool_geometry(win_id):
+    exe = shutil.which("xdotool")
+    if not exe or not win_id:
+        return None
+    try:
+        out = subprocess.run([exe, "getwindowgeometry", "--shell", str(win_id)],
+                             capture_output=True, text=True,
+                             timeout=10).stdout
+        vals = {}
+        for line in out.splitlines():
+            if "=" in line:
+                k, v = line.split("=", 1)
+                vals[k.strip().upper()] = v.strip()
+        x, y = int(vals.get("X", 0)), int(vals.get("Y", 0))
+        w, h = int(vals.get("WIDTH", 0)), int(vals.get("HEIGHT", 0))
+        if w <= 0 or h <= 0:
+            return None
+        return (x, y, x + w, y + h)
+    except Exception:
+        return None
+
+
+def _capture_bbox(bbox):
+    """Grab a screen rectangle as a PIL image, with the Linux fallback."""
+    from PIL import ImageGrab
+    try:
+        return ImageGrab.grab(bbox=tuple(bbox), all_screens=True)
+    except Exception as exc:
+        if IS_LINUX:
+            return _linux_capture_png(tuple(bbox))
+        raise exc
+
+
+def _image_payload(img, quality=82, max_edge=1280):
+    """Downscale + JPEG-encode a PIL image, returning (data_uri, w, h)."""
+    from PIL import Image
+    w, h = img.size
+    view = img
+    if max(w, h) > max_edge:
+        r = max_edge / float(max(w, h))
+        size = (max(1, int(w * r)), max(1, int(h * r)))
+        try:
+            view = img.resize(size, Image.Resampling.LANCZOS)
+        except Exception:
+            view = img.resize(size)
+    if view.mode != "RGB":
+        view = view.convert("RGB")
+    buf = io.BytesIO()
+    view.save(buf, "JPEG", quality=quality)
+    data_uri = "data:image/jpeg;base64," + \
+        base64.b64encode(buf.getvalue()).decode("ascii")
+    return data_uri, w, h
+
+
+def _screenshot_window(args):
+    """Capture one specific window (matched by title substring or process)."""
+    name = str(args.get("name") or args.get("title") or "").strip()
+    process = str(args.get("process") or "").strip() or None
+    pid = args.get("pid")
+    if not name and not process and pid is None:
+        return {"error": "name (or process / pid) is required - it matches the "
+                         "window title; use window_list to see what is open"}
+    if args.get("focus"):
+        try:
+            _window_action({"action": "focus", "title": name or None,
+                            "process": process, "pid": pid})
+            time.sleep(0.4)
+        except Exception:
+            pass
+    geo = _window_geometry(name or None, process, pid)
+    if not geo:
+        avail = ""
+        try:
+            rows = _window_rows_public()
+            avail = " | open windows: " + ", ".join(
+                repr(r.get("title")) for r in rows[:8]) if rows else ""
+        except Exception:
+            pass
+        return {"error": "no window matched %r%s" % (name or process or pid, avail)}
+    try:
+        img = _capture_bbox(geo["bbox"])
+    except Exception as exc:
+        return {"error": "could not capture the window: %s" % exc}
+    data_uri, w, h = _image_payload(img)
+    out = {"result": "ok", "matched": geo["title"] or (name or process),
+           "width": w, "height": h, "platform": geo["platform"],
+           "image": data_uri}
+    save = args.get("save")
+    if save:
+        try:
+            out_dir = os.path.join(WORKDIR, "screenshots")
+            os.makedirs(out_dir, exist_ok=True)
+            png = os.path.join(out_dir, "window_" +
+                               time.strftime("%Y%m%d_%H%M%S") + ".png")
+            img.save(png, "PNG")
+            out["saved"] = png.replace("\\", "/")
+        except Exception:
+            pass
+    return out
+
+
+def _window_rows_public():
+    res = _window_list()
+    return res.get("windows") or []
 
 
 def _window_find(title=None, process=None, pid=None):
@@ -3792,7 +4770,9 @@ def execute_tool_call(tc, hooks=None):
     if name == "launch_or_open":
         raw_result = launch_or_open(args.get("name", ""))
     elif name == "web_search":
-        raw_result = _web_search(args.get("query"), 6)
+        raw_result = _web_search(args.get("query"), 6,
+                                 str(args.get("action") or "search").lower()
+                                 == "suggest")
     elif name == "web_fetch":
         raw_result = _web_fetch(args.get("url"))
     elif name == "run_command":
@@ -3806,6 +4786,28 @@ def execute_tool_call(tc, hooks=None):
         else:
             image_uri = shot.pop("image", None)
             raw_result = shot
+    elif name == "screenshot_window":
+        shot = _screenshot_window(args)
+        if shot.get("error"):
+            raw_result = {"error": shot["error"]}
+        else:
+            image_uri = shot.pop("image", None)
+            raw_result = shot
+    elif name == "wait_for":
+        raw_result = _wait_for(args)
+    elif name == "copy_to_clipboard":
+        raw_result = _clip_write(args.get("text"),
+                                 args.get("format") or "text")
+    elif name == "paste_from_clipboard":
+        pasted = _clip_read(args.get("format") or "auto",
+                            int(args.get("max_chars") or 8000))
+        if pasted.get("error"):
+            raw_result = {"error": pasted["error"]}
+        else:
+            image_uri = pasted.pop("image", None)
+            raw_result = pasted
+    elif name == "click_text":
+        raw_result = _click_text(args)
     elif name == "control_input":
         raw_result = _control_input(args)
     elif name == "clipboard":
