@@ -133,6 +133,7 @@ in order).
 | **Todo list** | `todo_write` shows a live, visible checklist on the left panel as it works through longer tasks |
 | **Live HTML preview** | any `.html` page Bonsai writes (or `preview_html` explicitly) takes over the **center stage** - the arc reactor slides away and the page is shown full-panel, with a name and an **X** to bring the reactor back. Served from this PC, so JavaScript and local assets (CSS/JS/images next to the page) work. In the GPT-style chat (`/chat`) the same page opens as a full-screen lightbox |
 | **Screenshots appear in the chat** | every `take_screenshot` / `screenshot_window` / `click_text` result is drawn as a labelled card (dimensions + saved path, click to open full size) **above** the collapsed tool log - no need to expand anything |
+| **Not locked to one folder** | **PATH SCOPE** in the sidebar decides how far Bonsai may reach: `WORKSPACE` (hard sandbox), `ASK` (the default - anything outside the workspace pops a **PERMISSION NEEDED** dialog with **ALLOW FOR THIS CONV** / **ALLOW ONCE** / **DENY**) or `SYSTEM` (no prompts). So "find my tax PDF" can mean a search across `C:\`, not just the workspace |
 | **Real system meters** | live CPU / RAM / GPU usage under the reactor, read from `psutil` + `nvidia-smi` instead of placeholder numbers |
 | **Window management** | `window_list` lists every open window (title, process, PID) and `window_action` brings one to the front, maximizes, minimizes or restores it - so Bonsai can switch apps before acting |
 | **Docker / containers** | `docker_ps`, `docker_images`, `docker_start`, `docker_stop`, `docker_restart`, `docker_logs` and `docker_exec` drive the Docker CLI (works with Docker Desktop) |
@@ -162,7 +163,7 @@ always produced at the end.
 | Tool | What it does | Notes |
 |---|---|---|
 | `launch_or_open` | Opens apps, websites, files and settings by name | Notepad, Steam, Chrome, Spotify, YouTube, workspace files, system settings... |
-| `list_dir` / `read_file` / `search_files` / `write_file` / `edit_file` | Work on your files | strictly confined to the **workspace folder** |
+| `list_dir` / `read_file` / `search_files` / `write_file` / `edit_file` | Work on your files | the **workspace folder** by default; with `PATH SCOPE: ASK` Bonsai may also use an absolute path anywhere on the PC and you approve it per folder (§4.1). `search_files` can sweep the whole disk |
 | `take_screenshot` | Captures the screen (or a region) and **feeds the image to Bonsai's eyes** | also saves a PNG in the workspace; shown as a thumbnail in the tool log |
 | `screenshot_window` | Captures **one named window** (title substring / process / PID) and feeds it to Bonsai's eyes | no more guesswork between `window_list` and a full-screen grab; a minimized window is restored first, and the list of open windows is suggested if nothing matches |
 | `wait_for` | Waits until something is true instead of polling screenshots | `kind`: `file` (appears, or reaches `min_bytes` - a download finishing), `port` (starts listening), `url` (HTTP 2xx/3xx), `process` (app launched), `window` (title appears), `text` (string in a file), `screen_text` (visible on screen, needs OCR); `must_disappear` waits for the opposite; reports `timed_out` + what it last saw instead of erroring |
@@ -197,9 +198,42 @@ the header shows the connection: the Blender logo with a **green** dot
 (*connected*), **yellow** (*addon off*) or **red** (*not connected*); hover it
 for the detail.
 
-The **workspace** is the only area the file tools touch. You can pick any folder
-from the UI (📁 button in the header) with a native folder dialog, or set
-`PC_WORKDIR` (see §8).
+The **workspace** is the default area for the file tools, and (with
+`PATH SCOPE: ASK`) not a wall - see §4.1. You can pick any folder from the UI
+(📁 button in the header) with a native folder dialog, or set `PC_WORKDIR`
+(see §8).
+
+### 4.1 Path scope - reaching the rest of the PC
+
+The **PATH SCOPE** button in the sidebar (classic UI: under the TODO list;
+GPT UI: above the footer links) has three modes. Click it to cycle:
+
+| Mode | Behaviour |
+|---|---|
+| `WORKSPACE` | hard sandbox - only the workspace, no prompts (the old behaviour) |
+| `ASK` *(default)* | anything outside the workspace raises a **PERMISSION NEEDED** dialog: **ALLOW FOR THIS CONV** · **ALLOW ONCE** · **DENY** |
+| `SYSTEM` | trusted - the whole PC is reachable, no prompts at all |
+
+- **ALLOW FOR THIS CONV** remembers that folder (and everything under it) for
+  the rest of the conversation, so a second look at the same place is silent.
+  Starting a new chat clears the list.
+- **ALLOW ONCE** lets that single tool call through, then asks again.
+- **DENY** refuses the call, and Bonsai is told so - it won't keep hammering you
+  with the same request, and it should ask you what to do instead.
+- Every approved/denied folder is listed under the button with an **×** to
+  revoke it, plus **CLEAR APPROVALS** to forget them all.
+- Applies to `list_dir`, `read_file`, `write_file`, `edit_file`, `search_files`,
+  `archive`, `download_file` and to the HTML preview routes. `search_files` with
+  a path like `C:\Users` or `C:\` is how Bonsai searches the entire machine
+  (heavy system folders such as `Windows`, `Program Files` and `node_modules` are
+  skipped, and a scan stops after 40 000 files / 45 s and says so).
+- Approvals are asked **only while a reply is streaming in the UI** - a tool run
+  in the background (API, script) gets a clean "no one is around to approve it"
+  error instead of blocking forever. Set `PC_PATH_POLICY=workspace|ask|system`
+  to choose the mode at startup.
+- `run_command` / `run_code` run a shell and can already reach the whole disk, so
+  they are not path-gated - that is the same trust level as giving Bonsai the
+  **SYSTEM** scope.
 
 ## 5. The console - controls & HUD
 
@@ -210,6 +244,7 @@ from the UI (📁 button in the header) with a native folder dialog, or set
 | **THINK: OFF / LOW / MED / HIGH** | Selects how deeply Bonsai reasons (`enable_thinking` / `reasoning_effort`); higher = deeper reasoning, slower replies. Default MED |
 | **TODO panel** | Live checklist on the left panel, updated by `todo_write` as longer tasks progress |
 | **Workspace (folder icon)** | Choose/open the working folder for the file tools |
+| **PATH SCOPE** | `WORKSPACE` / `ASK` / `SYSTEM` - how far the file tools may reach outside the workspace, and lists the folders you approved or denied (§4.1) |
 | **Model dropdown (+ ⚙)** | Pick the active model, add one, and - via the gear - set its runtime options (see §8) |
 | **Model status ball** | **Red** = no model loaded · **orange→green** cycling = loading into RAM/VRAM · **green** = loaded and resident |
 | **Blender icon + dot** | The Blender logo with a dot beside it: **green** = connected, **yellow** = addon off, **red** = not connected. Hover for the full reason |
@@ -313,6 +348,7 @@ project's local folders).
 |---|---|---|
 | `BONSAI_DIR` | Folder containing the `.gguf` model files | only if the model files live somewhere other than the project folder |
 | `PC_WORKDIR` | The workspace folder the file tools use | to point file access at a specific folder by default |
+| `PC_PATH_POLICY` | Default path scope: `workspace`, `ask` (default) or `system` | to start in a fixed mode instead of `ASK` (§4.1) |
 | `PC_LLAMA_SERVER` | Path to the `llama-server` binary used for local models | only if it isn't on `PATH` (Linux) or in the default PrismML location (Windows) |
 | `PC_PIPER_DIR` | Folder holding the Piper voice models | only if the voices live outside the project's `piper\` |
 
@@ -411,7 +447,9 @@ Useful links:
 ## 10. Security & privacy
 
 - Everything runs locally - the browser only talks to `127.0.0.1`.
-- File tools are confined to the configured workspace folder.
+- File tools are confined to the configured workspace folder **unless you widen
+  the path scope** (§4.1): `ASK` asks you per folder, `SYSTEM` trusts Bonsai with
+  the whole disk. Every approval is visible in the sidebar and can be revoked.
 - `run_code` runs in an isolated temp folder that is deleted afterwards (30s
   timeout by default, up to 600s). Note: it runs as your user on this PC, so
   snippets do have network access - prefer Python's sandbox tools where strict

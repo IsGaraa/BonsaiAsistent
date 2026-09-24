@@ -121,6 +121,27 @@
   .tlprev a { font-size: 11px; color: var(--acc); }
   .tlprev .tlframe { width: 100%; height: 280px; border: 1px dashed var(--bd); border-radius: 8px; background: var(--bg2); margin-top: 6px; }
   .toolsline { margin: 2px 0 8px; display: flex; flex-wrap: wrap; gap: 6px; }
+  .scopebtn { width: 100%; text-align: left; font-size: 11px; letter-spacing: 1px; color: var(--acc); background: transparent; border: 1px solid var(--bd); border-radius: 8px; padding: 7px 10px; cursor: pointer; }
+  .scopebtn:hover { border-color: var(--acc); }
+  .scopebtn.sc-system { color: var(--err); border-color: var(--err); }
+  .scopebtn.sc-workspace { color: var(--ok); border-color: var(--ok); }
+  .scopelist { display: flex; flex-direction: column; gap: 3px; }
+  .scoperow { display: flex; align-items: center; gap: 4px; font-size: 10.5px; font-family: Consolas, monospace; background: var(--bg2); border: 1px solid var(--bd); border-left-width: 2px; border-radius: 5px; padding: 3px 4px 3px 6px; }
+  .scoperow.allow { border-left-color: var(--ok); }
+  .scoperow.deny { border-left-color: var(--err); }
+  .scoperow .sp { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; direction: rtl; text-align: left; color: var(--mut); }
+  .scoperow.allow .sp { color: var(--ok); }
+  .scoperow.deny .sp { color: var(--err); }
+  .scoperow .sx { background: transparent; border: none; color: var(--mut); cursor: pointer; font-size: 13px; line-height: 1; padding: 0 3px; }
+  .scoperow .sx:hover { color: var(--err); }
+  .scopeclear { width: 100%; background: transparent; border: 1px dashed var(--bd); color: var(--mut); border-radius: 8px; font-size: 10px; letter-spacing: 1px; padding: 5px; cursor: pointer; }
+  .scopeclear:hover { color: var(--err); border-color: var(--err); }
+  .askpath { font-family: Consolas, monospace; font-size: 12px; color: var(--acc); background: var(--bg2); border: 1px solid var(--bd); border-radius: 6px; padding: 7px 9px; margin: 6px 0 5px; word-break: break-all; }
+  .asktool { font-size: 10.5px; color: var(--mut); margin-bottom: 4px; }
+  .opt.allow { border-color: var(--ok); color: var(--ok); }
+  .opt.allow:hover { background: var(--ok); color: #06210f; }
+  .opt.deny { border-color: var(--err); color: var(--err); }
+  .opt.deny:hover { background: var(--err); color: #2b0710; }
   #toasts { position: fixed; right: 14px; bottom: 122px; z-index: 90; display: flex; flex-direction: column; gap: 8px; max-width: 380px; pointer-events: none; }
   .toast { position: relative; background: var(--bg2); border: 1px solid var(--acc); border-left-width: 3px; border-radius: 8px; padding: 9px 30px 10px 11px; box-shadow: 0 6px 22px rgba(0,0,0,.55); animation: toastin .22s ease-out; pointer-events: auto; }
   @keyframes toastin { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
@@ -194,6 +215,9 @@
     <div class="side-foot">
       <div class="blrow" id="blstatus" title="Blender MCP status"><svg class="blicon" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 1.6C7.4 1.6 3.7 3.9 3.7 6.9c0 1.6 1.1 3 2.8 3.9-2.1.9-3.5 2.4-3.5 4.2 0 3.2 4 5.8 9 5.8 2.4 0 4.6-.7 6.2-1.8l3.4 2.8 1.7-2-3.3-2.7c.6-.9.9-1.9.9-3 0-1.9-1-3.6-2.6-4.9.3-.5.4-1.1.4-1.7 0-3-3.7-5.3-8.3-5.3Z"/><ellipse cx="12" cy="6.9" rx="4.2" ry="2.5" fill="#18181b"/></svg><span class="bldot off" id="bldot"></span></div>
       <button class="btn-ghost wd" id="workbtn"></button>
+      <button class="btn-ghost scopebtn" id="scopebtn" title="How far Bonsai may reach outside the workspace. Click to switch: WORKSPACE (hard sandbox) / ASK (ask me every time) / SYSTEM (no prompts).">SCOPE: ...</button>
+      <div class="scopelist" id="scopelist"></div>
+      <button class="btn-ghost scopeclear" id="scopeclear" title="Forget every approved and denied path">CLEAR APPROVALS</button>
       <div class="foot-row">
         <a href="/" title="Classic UI">Classic UI</a>
         <button class="btn-ghost" id="ttsbtn" title="Text-to-speech (Piper) - speak replies aloud. Off by default.">TTS: OFF</button>
@@ -334,6 +358,7 @@ function newChat() {
   if (cur && cur.messages.length > 0 && chats.indexOf(cur) === -1) chats.push(cur);
   cur = { id: 'c' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6), title: 'New chat', ts: Date.now(), messages: [] };
   chats.push(cur); started = false; save(); renderAll();
+  postPolicy({ clear: true });
 }
 function schedToast(ev) {
   let box = document.getElementById('toasts');
@@ -384,6 +409,7 @@ function init() {
   if (!chats.length) newChat(); else cur = chats[chats.length - 1];
   renderAll(); setSendUI(); setQueueUI();
   startSchedWatch();
+  bindScope();
   fetch('/api/todos').then(function (r) { return r.json(); }).then(function (j) {
     if (j && j.todos) renderTodo(j.todos);
   }).catch(function () {});
@@ -744,26 +770,96 @@ function onStats(j) {
   statsVals.completion_tokens = j.completion_tokens || 0;
   runningStats();
 }
+const SCOPES = ['workspace', 'ask', 'system'];
+function postPolicy(body) {
+  return fetch('/api/path_policy', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body) }).then(function (r) { return r.json(); })
+    .then(function (j) { renderPathPolicy(j); return j; }).catch(function () {});
+}
+function scopeRow(p, label, cls) {
+  const row = document.createElement('div'); row.className = 'scoperow ' + cls;
+  const t = document.createElement('span'); t.className = 'sp'; t.textContent = p; t.title = label;
+  const x = document.createElement('button'); x.className = 'sx'; x.textContent = '×';
+  x.title = 'revoke this ' + label.replace('d', '') + ' - Bonsai will ask again';
+  x.onclick = function () { postPolicy({ path: p }); };
+  row.appendChild(t); row.appendChild(x);
+  return row;
+}
+function renderPathPolicy(j) {
+  const btn = document.getElementById('scopebtn');
+  const list = document.getElementById('scopelist');
+  const clr = document.getElementById('scopeclear');
+  if (!btn) return;
+  const pol = (j && j.policy) || 'ask';
+  btn.textContent = 'SCOPE: ' + pol.toUpperCase();
+  const base = btn.className.split(' ').filter(function (c) { return c && c.indexOf('sc-') !== 0; }).join(' ');
+  btn.className = base + ' sc-' + pol;
+  if (list) {
+    list.innerHTML = '';
+    (j && j.grants || []).forEach(function (g) { list.appendChild(scopeRow(g.path, 'approved', 'allow')); });
+    (j && j.denies || []).forEach(function (d) { list.appendChild(scopeRow(d.path, 'denied', 'deny')); });
+  }
+  if (clr) {
+    const n = ((j && j.grants) || []).length + ((j && j.denies) || []).length;
+    clr.style.display = n ? '' : 'none';
+  }
+}
+function loadPathPolicy() {
+  fetch('/api/path_policy').then(function (r) { return r.json(); })
+    .then(renderPathPolicy).catch(function () {});
+}
+function cycleScope() {
+  const btn = document.getElementById('scopebtn');
+  if (!btn) return;
+  const cur = (btn.textContent || '').toLowerCase().replace('scope:', '').trim();
+  const i = SCOPES.indexOf(cur);
+  postPolicy({ policy: SCOPES[(i + 1 + SCOPES.length) % SCOPES.length] });
+}
+function bindScope() {
+  const btn = document.getElementById('scopebtn');
+  if (btn) btn.onclick = cycleScope;
+  const clr = document.getElementById('scopeclear');
+  if (clr) clr.onclick = function () { postPolicy({ clear: true }); };
+  loadPathPolicy();
+}
 function onAsk(j) {
   const old = document.getElementById('askov');
   if (old) old.remove();
   const ov = document.createElement('div'); ov.className = 'askov'; ov.id = 'askov';
   const box = document.createElement('div'); box.className = 'askbox';
-  const h = document.createElement('h4'); h.textContent = 'BONSAI IS ASKING YOU';
-  const q = document.createElement('div'); q.className = 'aq'; q.textContent = j.question || 'What should I do?';
-  box.appendChild(h); box.appendChild(q);
+  const perm = j.kind === 'path_approval';
+  const h = document.createElement('h4');
+  h.textContent = perm ? 'PERMISSION NEEDED' : 'BONSAI IS ASKING YOU';
+  box.appendChild(h);
+  if (perm) {
+    const p = document.createElement('div'); p.className = 'askpath'; p.textContent = j.path || '';
+    const w = document.createElement('div'); w.className = 'asktool';
+    w.textContent = 'tool: ' + (j.tool || 'file tool') + '  -  outside the workspace';
+    box.appendChild(p); box.appendChild(w);
+  } else {
+    const q = document.createElement('div'); q.className = 'aq'; q.textContent = j.question || 'What should I do?';
+    box.appendChild(q);
+  }
   const say = function (ans) {
     ov.remove();
+    if (perm) loadPathPolicy();
     fetch('/api/answer', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: j.id, answer: ans }) }).catch(function () {});
   };
   if (j.options && j.options.length) {
     const opts = document.createElement('div'); opts.className = 'opts';
     (j.options).forEach(function (o) {
-      const b = document.createElement('button'); b.className = 'opt'; b.textContent = o;
+      const b = document.createElement('button');
+      b.className = 'opt' + (/^ALLOW/.test(o) ? ' allow' : (/^DENY/.test(o) ? ' deny' : ''));
+      b.textContent = o;
       b.onclick = function () { say(o); };
       opts.appendChild(b);
     });
     box.appendChild(opts);
+  }
+  if (perm) {
+    ov.appendChild(box);
+    document.body.appendChild(ov);
+    return;
   }
   const free = document.createElement('div'); free.className = 'afree';
   const inp = document.createElement('input'); inp.placeholder = 'Type your answer...';

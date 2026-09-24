@@ -28,7 +28,7 @@
         "properties": {
           "path": {
             "type": "string",
-            "description": "Relative path inside the workspace, e.g. 'src', '' (default = workspace root)."
+            "description": "Relative path inside the workspace, e.g. 'src', '' (default = workspace root). An absolute path anywhere else on this PC also works - the user is asked to approve it."
           }
         },
         "required": []
@@ -39,7 +39,7 @@
     "type": "function",
     "function": {
       "name": "read_file",
-      "description": "Read a text file inside the workspace folder (relative path). Returns its full content.",
+      "description": "Read a text file (relative path inside the workspace, or an absolute path anywhere on this PC - the user approves out-of-workspace reads). Returns its full content.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -58,7 +58,7 @@
     "type": "function",
     "function": {
       "name": "search_files",
-      "description": "Regex search across files in the workspace folder and returns file + line matches.",
+      "description": "Regex search across files and returns file + line matches. The folder defaults to the whole workspace, but you can point it at any directory on this PC ('C:\\\\Users', 'C:\\\\', '/home/me') to search the entire machine - the user is asked to approve paths outside the workspace. Heavy system folders (Windows, Program Files, node_modules) are skipped.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -68,7 +68,7 @@
           },
           "path": {
             "type": "string",
-            "description": "Optional relative folder to search inside (default = whole workspace)."
+            "description": "Optional folder to search inside: relative to the workspace (default = whole workspace) or an absolute path anywhere on this PC (the user is asked to approve it)."
           }
         },
         "required": [

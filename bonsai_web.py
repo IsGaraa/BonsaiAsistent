@@ -114,6 +114,23 @@ _SCHED_LOADED = False
 _SCHED_EVENTS = []
 _SCHED_DONE_MAX = 25
 
+# ---------------------------------------------------------------------------
+# Path scope: how far outside the workspace the file tools may reach.
+#   workspace - hard sandbox (old behaviour): anything else is refused
+#   ask       - the UI pops ALLOW FOR THIS CONV / ALLOW ONCE / DENY
+#   system    - trusted: no prompts, the whole PC is fair game
+# ---------------------------------------------------------------------------
+_PATH_POLICY = str(os.environ.get("PC_PATH_POLICY") or "ask").strip().lower()
+if _PATH_POLICY not in ("workspace", "ask", "system"):
+    _PATH_POLICY = "ask"
+_PATH_LOCK = threading.RLock()
+_PATH_GRANTS = {}
+_PATH_DENIES = {}
+_PATH_TLS = threading.local()
+PATH_ASK_ONCE = "ALLOW ONCE"
+PATH_ASK_CONV = "ALLOW FOR THIS CONV"
+PATH_ASK_DENY = "DENY"
+
 _TTS_ENABLED = False
 _TTS_LOCK = threading.Lock()
 
@@ -589,6 +606,113 @@ TOOL_SPEC = {
     }
 }
 
+def _path_state():
+    with _PATH_LOCK:
+        return {"policy": _PATH_POLICY,
+                "workspace": os.path.realpath(WORKDIR),
+                "grants": [{"path": p, "at": g.get("at")} for p, g in _PATH_GRANTS.items()],
+                "denies": [{"path": p, "at": d.get("at")} for p, d in _PATH_DENIES.items()]}
+
+
+def _path_policy_set(value):
+    global _PATH_POLICY
+    value = str(value or "").strip().lower()
+    if value not in ("workspace", "ask", "system"):
+        return _path_state()
+    with _PATH_LOCK:
+        _PATH_POLICY = value
+    return _path_state()
+
+
+def _path_grant(path, scope="conv"):
+    with _PATH_LOCK:
+        _PATH_DENIES.pop(path, None)
+        _PATH_GRANTS[path] = {"scope": scope,
+                              "at": datetime.datetime.now().isoformat(timespec="seconds")}
+    if scope == "once":
+        once = getattr(_PATH_TLS, "once", None)
+        if once is None:
+            once = set()
+            _PATH_TLS.once = once
+        once.add(path)
+
+
+def _path_deny(path):
+    with _PATH_LOCK:
+        _PATH_GRANTS.pop(path, None)
+        _PATH_DENIES[path] = {"at": datetime.datetime.now().isoformat(timespec="seconds")}
+
+
+def _path_forget(path=None):
+    """Drop every conversation grant/deny, or just one root."""
+    with _PATH_LOCK:
+        if path:
+            _PATH_GRANTS.pop(os.path.realpath(str(path)), None)
+            _PATH_DENIES.pop(os.path.realpath(str(path)), None)
+        else:
+            _PATH_GRANTS.clear()
+            _PATH_DENIES.clear()
+    return _path_state()
+
+
+def _path_covered(path, table):
+    """True when path sits inside one of the roots in table (longest match)."""
+    best = None
+    for root in table:
+        if path == root or path.startswith(root + os.sep):
+            if best is None or len(root) > len(best):
+                best = root
+    return best
+
+
+def _path_approval(cand, what="access this path", tool=None):
+    """Gate a path outside the workspace. Returns (allowed, message)."""
+    cand = os.path.realpath(cand)
+    base = os.path.realpath(WORKDIR)
+    if cand == base or cand.startswith(base + os.sep):
+        return True, ""
+    with _PATH_LOCK:
+        policy = _PATH_POLICY
+        if policy == "system":
+            return True, ""
+        if policy == "workspace":
+            return False, ("access denied: path outside workspace '%s'. The path "
+                           "scope is set to WORKSPACE - switch it to ASK or SYSTEM "
+                           "in the sidebar if you want Bonsai to reach other places."
+                           % WORKDIR)
+        granted = _path_covered(cand, _PATH_GRANTS)
+        if granted and (_PATH_GRANTS[granted].get("scope") != "once"
+                        or granted in (getattr(_PATH_TLS, "once", None) or ())):
+            return True, ""
+        denied = _path_covered(cand, _PATH_DENIES)
+    if denied:
+        return False, ("access denied: '%s' is inside '%s', which you denied earlier "
+                       "in this conversation. Ask again if you changed your mind."
+                       % (cand, denied))
+    on_ask = getattr(_PATH_TLS, "on_ask", None)
+    if not on_ask:
+        return False, ("access denied: path outside workspace '%s' and no one is "
+                       "around to approve it (this tool only asks for permission "
+                       "while a reply is streaming in the UI)." % WORKDIR)
+    answer = str(on_ask({
+        "kind": "path_approval",
+        "question": "Bonsai wants to %s outside the workspace:\n\n%s" % (what, cand),
+        "path": cand,
+        "tool": tool or getattr(_PATH_TLS, "tool", "") or "a file tool",
+        "options": [PATH_ASK_CONV, PATH_ASK_ONCE, PATH_ASK_DENY],
+    }) or "").strip().upper()
+    if answer == PATH_ASK_CONV:
+        _path_grant(cand, "conv")
+        return True, ""
+    if answer == PATH_ASK_ONCE:
+        _path_grant(cand, "once")
+        return True, ""
+    _path_deny(cand)
+    return False, ("access denied: the user chose DENY for '%s'. Do not try this path "
+                   "again in this conversation - ask the user what to do instead."
+                   % cand)
+
+
 def _safe_path(p):
     if p is None:
         p = ""
@@ -599,7 +723,10 @@ def _safe_path(p):
     cand = os.path.realpath(os.path.join(base, text)) if not os.path.isabs(text) else os.path.realpath(text)
     if cand == base or cand.startswith(base + os.sep):
         return cand
-    raise ValueError(f"access denied: path outside workspace '{WORKDIR}'")
+    ok, message = _path_approval(cand, "open a file or folder at")
+    if ok:
+        return cand
+    raise PermissionError(message)
 
 
 def _list_dir(path):
@@ -731,6 +858,14 @@ def _inject_base(html_text, href):
     return tag + html_text
 
 
+_SEARCH_SKIP_DIRS = {"windows", "program files", "program files (x86)", "programdata",
+                     "$recycle.bin", "system volume information", "node_modules",
+                     ".git", ".svn", "__pycache__", ".venv", "venv", "site-packages",
+                     "appdata\\local\\temp", "appdata\\local\\microsoft\\windows\\inets"}
+_SEARCH_FILE_BUDGET = 40000
+_SEARCH_SECONDS = 45.0
+
+
 def _search_files(pattern, path):
     if not str(pattern or "").strip():
         return {"error": "pattern is required (a regular expression to search for)"}
@@ -741,28 +876,49 @@ def _search_files(pattern, path):
         rx = re.compile(pattern, re.IGNORECASE | re.UNICODE)
     except re.error as exc:
         return {"error": f"invalid regular expression: {exc}"}
+    base = os.path.realpath(WORKDIR)
+    outside = not (target == base or target.startswith(base + os.sep))
+    started = time.time()
     hits = []
+    scanned = 0
+    truncated = False
     for root, dirs, files in os.walk(target):
-        dirs[:] = [d for d in dirs if not d.startswith(".") and d != "__pycache__"]
+        dirs[:] = [d for d in dirs
+                   if not d.startswith(".")
+                   and d != "__pycache__"
+                   and os.path.join(d.lower(), "").rstrip("\\/") not in _SEARCH_SKIP_DIRS
+                   and not d.lower() in _SEARCH_SKIP_DIRS]
         for name in sorted(files):
             if name.startswith("."):
                 continue
             full = os.path.join(root, name)
-            if os.path.getsize(full) > MAX_FILE_BYTES:
+            try:
+                if os.path.getsize(full) > MAX_FILE_BYTES:
+                    continue
+            except OSError:
                 continue
+            scanned += 1
+            if scanned > _SEARCH_FILE_BUDGET or time.time() - started > _SEARCH_SECONDS:
+                truncated = True
+                return {"result": "ok", "matches": hits, "truncated": True,
+                        "path": target, "scanned_files": scanned,
+                        "note": "stopped early after %d files / %.0fs - narrow the "
+                                "path to get the rest" % (scanned, time.time() - started)}
             try:
                 with open(full, "r", encoding="utf-8", errors="replace") as fh:
                     for lineno, line in enumerate(fh, 1):
                         if rx.search(line):
-                            rel = os.path.relpath(full, WORKDIR).replace("\\", "/")
-                            hits.append({"file": rel, "line": lineno,
-                                        "text": line.rstrip()[:200]})
+                            shown = full if outside else os.path.relpath(full, base).replace("\\", "/")
+                            hits.append({"file": shown, "line": lineno,
+                                         "text": line.rstrip()[:200]})
                             if len(hits) >= MAX_SEARCH_RESULTS:
                                 return {"result": "ok", "matches": hits,
-                                        "truncated": True, "path": target}
+                                        "truncated": True, "path": target,
+                                        "scanned_files": scanned}
             except Exception:
                 continue
-    return {"result": "ok", "matches": hits, "truncated": False, "path": target}
+    return {"result": "ok", "matches": hits, "truncated": truncated,
+            "path": target, "scanned_files": scanned}
 
 
 _WEB_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) BonsaiAsistent/1.0"
@@ -1107,7 +1263,9 @@ FILE_TOOLS = {
                     "path": {
                         "type": "string",
                         "description": "Relative path inside the workspace, "
-                                       "e.g. 'src', '' (default = workspace root)."
+                                       "e.g. 'src', '' (default = workspace root). "
+                                       "An absolute path anywhere else on this PC "
+                                       "also works - the user is asked to approve it."
                     }
                 },
                 "required": []
@@ -1118,8 +1276,10 @@ FILE_TOOLS = {
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Read a text file inside the workspace folder "
-                           "(relative path). Returns its full content.",
+            "description": "Read a text file (relative path inside the "
+                           "workspace, or an absolute path anywhere on this PC "
+                           "- the user approves out-of-workspace reads). "
+                           "Returns its full content.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1136,8 +1296,13 @@ FILE_TOOLS = {
         "type": "function",
         "function": {
             "name": "search_files",
-            "description": "Regex search across files in the workspace folder "
-                           "and returns file + line matches.",
+            "description": "Regex search across files and returns file + line "
+                           "matches. The folder defaults to the whole workspace, "
+                           "but you can point it at any directory on this PC "
+                           "('C:\\\\Users', 'C:\\\\', '/home/me') to search the "
+                           "entire machine - the user is asked to approve paths "
+                           "outside the workspace. Heavy system folders "
+                           "(Windows, Program Files, node_modules) are skipped.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1147,8 +1312,10 @@ FILE_TOOLS = {
                     },
                     "path": {
                         "type": "string",
-                        "description": "Optional relative folder to search inside "
-                                       "(default = whole workspace)."
+                        "description": "Optional folder to search inside: relative "
+                                       "to the workspace (default = whole "
+                                       "workspace) or an absolute path anywhere on "
+                                       "this PC (the user is asked to approve it)."
                     }
                 },
                 "required": ["pattern"]
@@ -1581,7 +1748,16 @@ SYSTEM = ("You are the friendly assistant living on the user's "
           "the PC like a human: move the mouse, click, drag and type "
           "(control_input), read or write the system clipboard (clipboard) and "
           "download files from the web (download_file). You can also work on "
-          "files inside the workspace folder and on archives (archive). When "
+          "files inside the workspace folder and on archives (archive). The "
+          "workspace is your default folder, not a wall: when the user asks "
+          "about a file, folder or search somewhere else on the PC, pass that "
+          "absolute path to list_dir / read_file / search_files / write_file / "
+          "edit_file and the user will be asked to approve it (ALLOW FOR THIS "
+          "CONV, ALLOW ONCE or DENY). So do not refuse or guess - just try the "
+          "real path, and if the access is denied, respect it and ask the user "
+          "what to do instead. Prefer search_files with a path such as "
+          "'C:\\\\Users' or 'C:\\\\' to look across the whole PC instead of "
+          "guessing where a file might be. When "
           "you are not sure about something, are asked for recent/current "
           "information, or want to double-check a fact, you may search the web "
           "(web_search) and read pages (web_fetch) to document yourself. When "
@@ -4886,11 +5062,26 @@ def _sched_run(job):
 
 
 def execute_tool_call(tc, hooks=None):
-    global _TODOS
     fn = tc.get("function") or {}
     name = fn.get("name") or "launch_or_open"
     args = parse_arguments(fn.get("arguments"))
     image_uri = None
+    _PATH_TLS.on_ask = (hooks or {}).get("on_ask")
+    _PATH_TLS.tool = name
+    _PATH_TLS.once = set()
+    try:
+        return _execute_tool_call(name, args, tc, hooks, image_uri)
+    finally:
+        with _PATH_LOCK:
+            for gone in [p for p, g in _PATH_GRANTS.items() if g.get("scope") == "once"]:
+                _PATH_GRANTS.pop(gone, None)
+        _PATH_TLS.on_ask = None
+        _PATH_TLS.tool = None
+        _PATH_TLS.once = None
+
+
+def _execute_tool_call(name, args, tc, hooks, image_uri):
+    global _TODOS
     if name == "launch_or_open":
         raw_result = launch_or_open(args.get("name", ""))
     elif name == "web_search":
@@ -5577,6 +5768,27 @@ PAGE = """<!doctype html>
   .pvboxx { background: transparent; border: 1px solid var(--bd); color: var(--txt); border-radius: 6px; cursor: pointer; font-size: 16px; line-height: 1; padding: 2px 10px; }
   .pvboxx:hover { border-color: var(--err); color: var(--err); }
   .pvboxframe { flex: 1; width: 100%; border: none; background: var(--bg); }
+  .scopebtn { width: 100%; text-align: left; font-family: Consolas, monospace; font-size: 11px; letter-spacing: 1px; color: var(--acc); background: var(--bg3); border: 1px solid var(--bd2); border-radius: 6px; padding: 6px 8px; cursor: pointer; }
+  .scopebtn:hover { border-color: var(--acc); }
+  .scopebtn.sc-system { color: var(--err); border-color: var(--err); }
+  .scopebtn.sc-workspace { color: var(--ok); border-color: var(--ok); }
+  .scopelist { display: flex; flex-direction: column; gap: 3px; margin-top: 5px; }
+  .scoperow { display: flex; align-items: center; gap: 4px; font-size: 10.5px; font-family: Consolas, monospace; background: var(--bg); border: 1px solid var(--bd); border-left-width: 2px; border-radius: 5px; padding: 3px 4px 3px 6px; }
+  .scoperow.allow { border-left-color: var(--ok); }
+  .scoperow.deny { border-left-color: var(--err); }
+  .scoperow .sp { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; direction: rtl; text-align: left; color: var(--txt2); }
+  .scoperow.allow .sp { color: var(--ok); }
+  .scoperow.deny .sp { color: var(--err); }
+  .scoperow .sx { background: transparent; border: none; color: var(--mut); cursor: pointer; font-size: 13px; line-height: 1; padding: 0 3px; }
+  .scoperow .sx:hover { color: var(--err); }
+  .scopeclear { margin-top: 5px; width: 100%; background: transparent; border: 1px dashed var(--bd2); color: var(--mut); border-radius: 6px; font-size: 10px; letter-spacing: 1px; padding: 4px; cursor: pointer; }
+  .scopeclear:hover { color: var(--err); border-color: var(--err); }
+  .askpath { font-family: Consolas, monospace; font-size: 12px; color: var(--acc); background: var(--bg); border: 1px solid var(--bd2); border-radius: 6px; padding: 7px 9px; margin: 6px 0 5px; word-break: break-all; }
+  .asktool { font-size: 10.5px; color: var(--mut); margin-bottom: 4px; }
+  .opt.allow { border-color: var(--ok); color: var(--ok); }
+  .opt.allow:hover { background: var(--ok); color: #06210f; }
+  .opt.deny { border-color: var(--err); color: var(--err); }
+  .opt.deny:hover { background: var(--err); color: #2b0710; }
   .shots { margin: 6px 0 10px; display: flex; flex-direction: column; gap: 8px; }
   #toasts { position: fixed; right: 14px; bottom: 122px; z-index: 90; display: flex; flex-direction: column; gap: 8px; max-width: 380px; pointer-events: none; }
   .toast { position: relative; background: var(--bg2); border: 1px solid var(--acc); border-left-width: 3px; border-radius: 8px; padding: 9px 30px 10px 11px; box-shadow: 0 6px 22px rgba(0,0,0,.55); animation: toastin .22s ease-out; pointer-events: auto; }
@@ -5677,6 +5889,10 @@ PAGE = """<!doctype html>
       <div id="chatlist"></div>
       <div class="ptitle" style="margin-top:8px; border-top:1px solid #164e63; padding-top:8px;"><span>TODO</span><span id="todocount"></span></div>
       <div id="todopanel"></div>
+      <div class="ptitle" style="margin-top:8px; border-top:1px solid #164e63; padding-top:8px;"><span>PATH SCOPE</span></div>
+      <button class="scopebtn" id="scopebtn" title="How far Bonsai may reach outside the workspace. Click to switch: WORKSPACE (hard sandbox) / ASK (ask me every time) / SYSTEM (no prompts).">SCOPE: ...</button>
+      <div class="scopelist" id="scopelist"></div>
+      <button class="scopeclear" id="scopeclear" title="Forget every approved and denied path">CLEAR APPROVALS</button>
     </section>
 
     <section class="center panel hud-border" id="centerpanel">
@@ -5835,6 +6051,7 @@ function newChat() {
   started = false;
   save();
   renderAll();
+  postPolicy({ clear: true });
 }
 function init() {
   bindModeBtn();
@@ -5847,6 +6064,7 @@ function init() {
   setQueueUI();
   serverLoad();
   startSchedWatch();
+  bindScope();
   fetch('/api/todos').then(function (r) { return r.json(); }).then(function (j) {
     if (j && j.todos) renderTodo(j.todos);
   }).catch(function () {});
@@ -6375,28 +6593,99 @@ function effortValue() {
   return el ? el.value : 'med';
 }
 
+const SCOPES = ['workspace', 'ask', 'system'];
+function postPolicy(body) {
+  return fetch('/api/path_policy', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body) }).then(function (r) { return r.json(); })
+    .then(function (j) { renderPathPolicy(j); return j; }).catch(function () {});
+}
+function scopeRow(p, label, cls) {
+  const row = document.createElement('div'); row.className = 'scoperow ' + cls;
+  const t = document.createElement('span'); t.className = 'sp'; t.textContent = p; t.title = label;
+  const x = document.createElement('button'); x.className = 'sx'; x.textContent = '\u00d7';
+  x.title = 'revoke this ' + label.replace('d', '') + ' - Bonsai will ask again';
+  x.onclick = function () { postPolicy({ path: p }); };
+  row.appendChild(t); row.appendChild(x);
+  return row;
+}
+function renderPathPolicy(j) {
+  const btn = document.getElementById('scopebtn');
+  const list = document.getElementById('scopelist');
+  const clr = document.getElementById('scopeclear');
+  if (!btn) return;
+  const pol = (j && j.policy) || 'ask';
+  btn.textContent = 'SCOPE: ' + pol.toUpperCase();
+  const base = btn.className.split(' ').filter(function (c) { return c && c.indexOf('sc-') !== 0; }).join(' ');
+  btn.className = base + ' sc-' + pol;
+  if (list) {
+    list.innerHTML = '';
+    (j && j.grants || []).forEach(function (g) { list.appendChild(scopeRow(g.path, 'approved', 'allow')); });
+    (j && j.denies || []).forEach(function (d) { list.appendChild(scopeRow(d.path, 'denied', 'deny')); });
+  }
+  if (clr) {
+    const n = ((j && j.grants) || []).length + ((j && j.denies) || []).length;
+    clr.style.display = n ? '' : 'none';
+  }
+}
+function loadPathPolicy() {
+  fetch('/api/path_policy').then(function (r) { return r.json(); })
+    .then(renderPathPolicy).catch(function () {});
+}
+function cycleScope() {
+  const btn = document.getElementById('scopebtn');
+  if (!btn) return;
+  const cur = (btn.textContent || '').toLowerCase().replace('scope:', '').trim();
+  const i = SCOPES.indexOf(cur);
+  postPolicy({ policy: SCOPES[(i + 1 + SCOPES.length) % SCOPES.length] });
+}
+function bindScope() {
+  const btn = document.getElementById('scopebtn');
+  if (btn) btn.onclick = cycleScope;
+  const clr = document.getElementById('scopeclear');
+  if (clr) clr.onclick = function () { postPolicy({ clear: true }); };
+  loadPathPolicy();
+}
 function onAsk(j) {
   const old = document.getElementById('askov');
   if (old) old.remove();
   const ov = document.createElement('div'); ov.className = 'askov'; ov.id = 'askov';
   const box = document.createElement('div'); box.className = 'askbox';
-  const h = document.createElement('h4'); h.textContent = 'BONSAI is asking you';
-  const q = document.createElement('div'); q.className = 'aq';
-  q.textContent = j.question || 'What should I do?';
-  box.appendChild(h); box.appendChild(q);
+  const perm = j.kind === 'path_approval';
+  const h = document.createElement('h4');
+  h.textContent = perm ? 'PERMISSION NEEDED' : 'BONSAI is asking you';
+  box.appendChild(h);
+  if (perm) {
+    const p = document.createElement('div'); p.className = 'askpath';
+    p.textContent = j.path || '';
+    const w = document.createElement('div'); w.className = 'asktool';
+    w.textContent = 'tool: ' + (j.tool || 'file tool') + '  -  outside the workspace';
+    box.appendChild(p); box.appendChild(w);
+  } else {
+    const q = document.createElement('div'); q.className = 'aq';
+    q.textContent = j.question || 'What should I do?';
+    box.appendChild(q);
+  }
   const say = function (ans) {
     ov.remove();
+    if (perm) loadPathPolicy();
     fetch('/api/answer', { method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ id: j.id, answer: ans }) }).catch(function () {});
   };
   if (j.options && j.options.length) {
     const opts = document.createElement('div'); opts.className = 'opts';
     (j.options).forEach(function (o) {
-      const b = document.createElement('button'); b.className = 'opt'; b.textContent = o;
+      const b = document.createElement('button');
+      b.className = 'opt' + (/^ALLOW/.test(o) ? ' allow' : (/^DENY/.test(o) ? ' deny' : ''));
+      b.textContent = o;
       b.onclick = function () { say(o); };
       opts.appendChild(b);
     });
     box.appendChild(opts);
+  }
+  if (perm) {
+    ov.appendChild(box);
+    document.body.appendChild(ov);
+    return;
   }
   const free = document.createElement('div'); free.className = 'afree';
   const inp = document.createElement('input'); inp.placeholder = 'Type your answer...';
@@ -7172,6 +7461,27 @@ PAGE_GPT = """<!doctype html>
   .tlprev a { font-size: 11px; color: var(--acc); }
   .tlprev .tlframe { width: 100%; height: 280px; border: 1px dashed var(--bd); border-radius: 8px; background: var(--bg2); margin-top: 6px; }
   .toolsline { margin: 2px 0 8px; display: flex; flex-wrap: wrap; gap: 6px; }
+  .scopebtn { width: 100%; text-align: left; font-size: 11px; letter-spacing: 1px; color: var(--acc); background: transparent; border: 1px solid var(--bd); border-radius: 8px; padding: 7px 10px; cursor: pointer; }
+  .scopebtn:hover { border-color: var(--acc); }
+  .scopebtn.sc-system { color: var(--err); border-color: var(--err); }
+  .scopebtn.sc-workspace { color: var(--ok); border-color: var(--ok); }
+  .scopelist { display: flex; flex-direction: column; gap: 3px; }
+  .scoperow { display: flex; align-items: center; gap: 4px; font-size: 10.5px; font-family: Consolas, monospace; background: var(--bg2); border: 1px solid var(--bd); border-left-width: 2px; border-radius: 5px; padding: 3px 4px 3px 6px; }
+  .scoperow.allow { border-left-color: var(--ok); }
+  .scoperow.deny { border-left-color: var(--err); }
+  .scoperow .sp { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; direction: rtl; text-align: left; color: var(--mut); }
+  .scoperow.allow .sp { color: var(--ok); }
+  .scoperow.deny .sp { color: var(--err); }
+  .scoperow .sx { background: transparent; border: none; color: var(--mut); cursor: pointer; font-size: 13px; line-height: 1; padding: 0 3px; }
+  .scoperow .sx:hover { color: var(--err); }
+  .scopeclear { width: 100%; background: transparent; border: 1px dashed var(--bd); color: var(--mut); border-radius: 8px; font-size: 10px; letter-spacing: 1px; padding: 5px; cursor: pointer; }
+  .scopeclear:hover { color: var(--err); border-color: var(--err); }
+  .askpath { font-family: Consolas, monospace; font-size: 12px; color: var(--acc); background: var(--bg2); border: 1px solid var(--bd); border-radius: 6px; padding: 7px 9px; margin: 6px 0 5px; word-break: break-all; }
+  .asktool { font-size: 10.5px; color: var(--mut); margin-bottom: 4px; }
+  .opt.allow { border-color: var(--ok); color: var(--ok); }
+  .opt.allow:hover { background: var(--ok); color: #06210f; }
+  .opt.deny { border-color: var(--err); color: var(--err); }
+  .opt.deny:hover { background: var(--err); color: #2b0710; }
   #toasts { position: fixed; right: 14px; bottom: 122px; z-index: 90; display: flex; flex-direction: column; gap: 8px; max-width: 380px; pointer-events: none; }
   .toast { position: relative; background: var(--bg2); border: 1px solid var(--acc); border-left-width: 3px; border-radius: 8px; padding: 9px 30px 10px 11px; box-shadow: 0 6px 22px rgba(0,0,0,.55); animation: toastin .22s ease-out; pointer-events: auto; }
   @keyframes toastin { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
@@ -7245,6 +7555,9 @@ PAGE_GPT = """<!doctype html>
     <div class="side-foot">
       <div class="blrow" id="blstatus" title="Blender MCP status"><svg class="blicon" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 1.6C7.4 1.6 3.7 3.9 3.7 6.9c0 1.6 1.1 3 2.8 3.9-2.1.9-3.5 2.4-3.5 4.2 0 3.2 4 5.8 9 5.8 2.4 0 4.6-.7 6.2-1.8l3.4 2.8 1.7-2-3.3-2.7c.6-.9.9-1.9.9-3 0-1.9-1-3.6-2.6-4.9.3-.5.4-1.1.4-1.7 0-3-3.7-5.3-8.3-5.3Z"/><ellipse cx="12" cy="6.9" rx="4.2" ry="2.5" fill="#18181b"/></svg><span class="bldot off" id="bldot"></span></div>
       <button class="btn-ghost wd" id="workbtn"></button>
+      <button class="btn-ghost scopebtn" id="scopebtn" title="How far Bonsai may reach outside the workspace. Click to switch: WORKSPACE (hard sandbox) / ASK (ask me every time) / SYSTEM (no prompts).">SCOPE: ...</button>
+      <div class="scopelist" id="scopelist"></div>
+      <button class="btn-ghost scopeclear" id="scopeclear" title="Forget every approved and denied path">CLEAR APPROVALS</button>
       <div class="foot-row">
         <a href="/" title="Classic UI">Classic UI</a>
         <button class="btn-ghost" id="ttsbtn" title="Text-to-speech (Piper) - speak replies aloud. Off by default.">TTS: OFF</button>
@@ -7385,6 +7698,7 @@ function newChat() {
   if (cur && cur.messages.length > 0 && chats.indexOf(cur) === -1) chats.push(cur);
   cur = { id: 'c' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6), title: 'New chat', ts: Date.now(), messages: [] };
   chats.push(cur); started = false; save(); renderAll();
+  postPolicy({ clear: true });
 }
 function schedToast(ev) {
   let box = document.getElementById('toasts');
@@ -7435,6 +7749,7 @@ function init() {
   if (!chats.length) newChat(); else cur = chats[chats.length - 1];
   renderAll(); setSendUI(); setQueueUI();
   startSchedWatch();
+  bindScope();
   fetch('/api/todos').then(function (r) { return r.json(); }).then(function (j) {
     if (j && j.todos) renderTodo(j.todos);
   }).catch(function () {});
@@ -7795,26 +8110,96 @@ function onStats(j) {
   statsVals.completion_tokens = j.completion_tokens || 0;
   runningStats();
 }
+const SCOPES = ['workspace', 'ask', 'system'];
+function postPolicy(body) {
+  return fetch('/api/path_policy', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body) }).then(function (r) { return r.json(); })
+    .then(function (j) { renderPathPolicy(j); return j; }).catch(function () {});
+}
+function scopeRow(p, label, cls) {
+  const row = document.createElement('div'); row.className = 'scoperow ' + cls;
+  const t = document.createElement('span'); t.className = 'sp'; t.textContent = p; t.title = label;
+  const x = document.createElement('button'); x.className = 'sx'; x.textContent = '\u00d7';
+  x.title = 'revoke this ' + label.replace('d', '') + ' - Bonsai will ask again';
+  x.onclick = function () { postPolicy({ path: p }); };
+  row.appendChild(t); row.appendChild(x);
+  return row;
+}
+function renderPathPolicy(j) {
+  const btn = document.getElementById('scopebtn');
+  const list = document.getElementById('scopelist');
+  const clr = document.getElementById('scopeclear');
+  if (!btn) return;
+  const pol = (j && j.policy) || 'ask';
+  btn.textContent = 'SCOPE: ' + pol.toUpperCase();
+  const base = btn.className.split(' ').filter(function (c) { return c && c.indexOf('sc-') !== 0; }).join(' ');
+  btn.className = base + ' sc-' + pol;
+  if (list) {
+    list.innerHTML = '';
+    (j && j.grants || []).forEach(function (g) { list.appendChild(scopeRow(g.path, 'approved', 'allow')); });
+    (j && j.denies || []).forEach(function (d) { list.appendChild(scopeRow(d.path, 'denied', 'deny')); });
+  }
+  if (clr) {
+    const n = ((j && j.grants) || []).length + ((j && j.denies) || []).length;
+    clr.style.display = n ? '' : 'none';
+  }
+}
+function loadPathPolicy() {
+  fetch('/api/path_policy').then(function (r) { return r.json(); })
+    .then(renderPathPolicy).catch(function () {});
+}
+function cycleScope() {
+  const btn = document.getElementById('scopebtn');
+  if (!btn) return;
+  const cur = (btn.textContent || '').toLowerCase().replace('scope:', '').trim();
+  const i = SCOPES.indexOf(cur);
+  postPolicy({ policy: SCOPES[(i + 1 + SCOPES.length) % SCOPES.length] });
+}
+function bindScope() {
+  const btn = document.getElementById('scopebtn');
+  if (btn) btn.onclick = cycleScope;
+  const clr = document.getElementById('scopeclear');
+  if (clr) clr.onclick = function () { postPolicy({ clear: true }); };
+  loadPathPolicy();
+}
 function onAsk(j) {
   const old = document.getElementById('askov');
   if (old) old.remove();
   const ov = document.createElement('div'); ov.className = 'askov'; ov.id = 'askov';
   const box = document.createElement('div'); box.className = 'askbox';
-  const h = document.createElement('h4'); h.textContent = 'BONSAI IS ASKING YOU';
-  const q = document.createElement('div'); q.className = 'aq'; q.textContent = j.question || 'What should I do?';
-  box.appendChild(h); box.appendChild(q);
+  const perm = j.kind === 'path_approval';
+  const h = document.createElement('h4');
+  h.textContent = perm ? 'PERMISSION NEEDED' : 'BONSAI IS ASKING YOU';
+  box.appendChild(h);
+  if (perm) {
+    const p = document.createElement('div'); p.className = 'askpath'; p.textContent = j.path || '';
+    const w = document.createElement('div'); w.className = 'asktool';
+    w.textContent = 'tool: ' + (j.tool || 'file tool') + '  -  outside the workspace';
+    box.appendChild(p); box.appendChild(w);
+  } else {
+    const q = document.createElement('div'); q.className = 'aq'; q.textContent = j.question || 'What should I do?';
+    box.appendChild(q);
+  }
   const say = function (ans) {
     ov.remove();
+    if (perm) loadPathPolicy();
     fetch('/api/answer', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: j.id, answer: ans }) }).catch(function () {});
   };
   if (j.options && j.options.length) {
     const opts = document.createElement('div'); opts.className = 'opts';
     (j.options).forEach(function (o) {
-      const b = document.createElement('button'); b.className = 'opt'; b.textContent = o;
+      const b = document.createElement('button');
+      b.className = 'opt' + (/^ALLOW/.test(o) ? ' allow' : (/^DENY/.test(o) ? ' deny' : ''));
+      b.textContent = o;
       b.onclick = function () { say(o); };
       opts.appendChild(b);
     });
     box.appendChild(opts);
+  }
+  if (perm) {
+    ov.appendChild(box);
+    document.body.appendChild(ov);
+    return;
   }
   const free = document.createElement('div'); free.className = 'afree';
   const inp = document.createElement('input'); inp.placeholder = 'Type your answer...';
@@ -8577,7 +8962,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             target = _safe_path(rel)
-        except ValueError as exc:
+        except (ValueError, PermissionError) as exc:
             self._send(400, str(exc), "text/plain")
             return
         if not target.lower().endswith((".html", ".htm")):
@@ -8609,7 +8994,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             target = _safe_path(rel)
-        except ValueError as exc:
+        except (ValueError, PermissionError) as exc:
             self._send(400, str(exc), "text/plain")
             return
         ext = os.path.splitext(target)[1].lower()
@@ -8655,6 +9040,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, json.dumps(_public_models(), default=str))
         elif path == "/api/sysinfo":
             self._send(200, json.dumps(_sysinfo(), default=str))
+        elif path == "/api/path_policy":
+            self._send(200, json.dumps(_path_state(), default=str))
         elif path == "/api/sched_results":
             self._send(200, json.dumps({"events": _sched_take_events()}, default=str))
         elif path == "/preview":
@@ -8671,7 +9058,8 @@ class Handler(BaseHTTPRequestHandler):
             if path not in ("/api", "/api/stream", "/api/workdir",
                             "/api/pick_workdir", "/api/chats",
                             "/api/answer", "/api/effort", "/api/eject",
-                            "/api/tts", "/api/models", "/api/pick_model"):
+                            "/api/tts", "/api/models", "/api/pick_model",
+                            "/api/path_policy"):
                 self._send(404, "not found", "text/plain")
                 return
             length = int(self.headers.get("Content-Length", 0) or 0)
@@ -8690,6 +9078,14 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/chats":
                 _save_chats(body.get("chats"))
                 self._send(200, json.dumps({"ok": True}))
+                return
+            if path == "/api/path_policy":
+                if body.get("clear"):
+                    state = _path_forget()
+                else:
+                    state = _path_forget(body.get("path")) if body.get("path") \
+                        else _path_policy_set(body.get("policy"))
+                self._send(200, json.dumps(state, default=str))
                 return
             if path == "/api/answer":
                 ask_id = str(body.get("id") or "")
@@ -8785,7 +9181,10 @@ class Handler(BaseHTTPRequestHandler):
                     with _ASKS_LOCK:
                         _ASKS[ask_id] = entry
                     sse(self, "ask", {"id": ask_id,
+                                      "kind": q.get("kind") or "question",
                                       "question": q.get("question", ""),
+                                      "path": q.get("path") or "",
+                                      "tool": q.get("tool") or "",
                                       "options": q.get("options") or []})
                     _touch_activity()
                     try:
