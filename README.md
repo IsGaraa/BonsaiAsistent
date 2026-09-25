@@ -166,7 +166,7 @@ always produced at the end.
 | Tool | What it does | Notes |
 |---|---|---|
 | `launch_or_open` | Opens apps, websites, files and settings by name | Notepad, Steam, Chrome, Spotify, YouTube, workspace files, system settings... |
-| `list_dir` / `read_file` / `search_files` / `write_file` / `edit_file` | Work on your files | the **workspace folder** by default; with `PATH SCOPE: ASK` Bonsai may also use an absolute path anywhere on the PC and you approve it per folder (§4.1). `search_files` can sweep the whole disk |
+| `list_dir` / `read_file` / `grep` / `write_file` / `edit_file` | Work on your files | the **workspace folder** by default; with `PATH SCOPE: ASK` Bonsai may also use an absolute path anywhere on the PC and you approve it per folder (§4.1). `grep` can sweep the whole disk |
 | `take_screenshot` | Captures the screen (or a region) and **feeds the image to Bonsai's eyes** | also saves a PNG in the workspace; you see it as a card in the chat |
 | `screenshot_window` | Captures **one named window** (title substring / process / PID) and feeds it to Bonsai's eyes | no more guesswork between `window_list` and a full-screen grab; a minimized window is restored first, and the list of open windows is suggested if nothing matches |
 | `wait_for` | Waits until something is true instead of polling screenshots | `kind`: `file` (appears, or reaches `min_bytes` - a download finishing), `port` (starts listening), `url` (HTTP 2xx/3xx), `process` (app launched), `window` (title appears), `text` (string in a file), `screen_text` (visible on screen, needs OCR); `must_disappear` waits for the opposite; reports `timed_out` + what it last saw instead of erroring |
@@ -232,8 +232,8 @@ GPT UI: above the footer links) has three modes. Click it to cycle:
   with the same request, and it should ask you what to do instead.
 - Every approved/denied folder is listed under the button with an **×** to
   revoke it, plus **CLEAR APPROVALS** to forget them all.
-- Applies to `list_dir`, `read_file`, `write_file`, `edit_file`, `search_files`,
-  `archive`, `download_file` and to the HTML preview routes. `search_files` with
+- Applies to `list_dir`, `read_file`, `write_file`, `edit_file`, `grep`,
+  `archive`, `download_file` and to the HTML preview routes. `grep` with
   a path like `C:\Users` or `C:\` is how Bonsai searches the entire machine
   (heavy system folders such as `Windows`, `Program Files` and `node_modules` are
   skipped, and a scan stops after 40 000 files / 45 s and says so).

@@ -2,6 +2,7 @@ import asyncio
 import base64
 import ctypes
 import datetime
+import fnmatch
 import glob
 import hashlib
 import html
@@ -909,20 +910,61 @@ _SEARCH_FILE_BUDGET = 40000
 _SEARCH_SECONDS = 45.0
 
 
-def _search_files(pattern, path):
+def _grep_globs(include):
+    if include is None:
+        return None
+    if isinstance(include, (list, tuple)):
+        raw = [str(x) for x in include]
+    else:
+        raw = [x.strip() for x in str(include).split(",")]
+    globs = [x.lower() for x in raw if x.strip()]
+    return globs or None
+
+
+def _grep_wanted(name, globs):
+    if not globs:
+        return True
+    low = name.lower()
+    for g in globs:
+        if fnmatch.fnmatch(low, g) or fnmatch.fnmatch(low, "*" + g.lstrip("*")):
+            return True
+    return False
+
+
+def _grep(pattern, path=None, include=None, mode="content", context=0,
+          ignore_case=True, max_results=None):
     if not str(pattern or "").strip():
         return {"error": "pattern is required (a regular expression to search for)"}
+    mode = str(mode or "content").lower()
+    if mode not in ("content", "files", "count"):
+        return {"error": "mode must be 'content', 'files' or 'count'"}
+    try:
+        context = max(0, min(10, int(context or 0)))
+    except (TypeError, ValueError):
+        context = 0
+    if max_results is None:
+        limit = MAX_SEARCH_RESULTS
+    else:
+        try:
+            limit = max(1, min(500, int(max_results)))
+        except (TypeError, ValueError):
+            limit = MAX_SEARCH_RESULTS
+    globs = _grep_globs(include)
     target = _safe_path(path) if path else os.path.realpath(WORKDIR)
     if not os.path.isdir(target):
         return {"error": f"not a directory: {target}"}
     try:
-        rx = re.compile(pattern, re.IGNORECASE | re.UNICODE)
+        flags = re.UNICODE | re.IGNORECASE if ignore_case else re.UNICODE
+        rx = re.compile(pattern, flags)
     except re.error as exc:
         return {"error": f"invalid regular expression: {exc}"}
     base = os.path.realpath(WORKDIR)
     outside = not _within(target, base)
     started = time.time()
     hits = []
+    files_hit = []
+    seen_files = set()
+    counts = []
     scanned = 0
     truncated = False
     for root, dirs, files in os.walk(target):
@@ -934,6 +976,8 @@ def _search_files(pattern, path):
         for name in sorted(files):
             if name.startswith("."):
                 continue
+            if not _grep_wanted(name, globs):
+                continue
             full = os.path.join(root, name)
             try:
                 if os.path.getsize(full) > MAX_FILE_BYTES:
@@ -942,26 +986,59 @@ def _search_files(pattern, path):
                 continue
             scanned += 1
             if scanned > _SEARCH_FILE_BUDGET or time.time() - started > _SEARCH_SECONDS:
-                truncated = True
-                return {"result": "ok", "matches": hits, "truncated": True,
-                        "path": target, "scanned_files": scanned,
-                        "note": "stopped early after %d files / %.0fs - narrow the "
-                                "path to get the rest" % (scanned, time.time() - started)}
+                return _grep_out(mode, target, hits, files_hit, counts, scanned,
+                                 True, "stopped early after %d files / %.0fs - narrow "
+                                       "the path or add an include filter to get the "
+                                       "rest" % (scanned, time.time() - started))
+            shown = full if outside else os.path.relpath(full, base).replace("\\", "/")
             try:
                 with open(full, "r", encoding="utf-8", errors="replace") as fh:
-                    for lineno, line in enumerate(fh, 1):
-                        if rx.search(line):
-                            shown = full if outside else os.path.relpath(full, base).replace("\\", "/")
-                            hits.append({"file": shown, "line": lineno,
-                                         "text": line.rstrip()[:200]})
-                            if len(hits) >= MAX_SEARCH_RESULTS:
-                                return {"result": "ok", "matches": hits,
-                                        "truncated": True, "path": target,
-                                        "scanned_files": scanned}
+                    lines = fh.read().splitlines()
             except Exception:
                 continue
-    return {"result": "ok", "matches": hits, "truncated": truncated,
-            "path": target, "scanned_files": scanned}
+            found = 0
+            for i, line in enumerate(lines):
+                if not rx.search(line):
+                    continue
+                found += 1
+                if mode == "content":
+                    hit = {"file": shown, "line": i + 1, "text": line.rstrip()[:200]}
+                    if context:
+                        lo = max(0, i - context)
+                        hi = min(len(lines), i + context + 1)
+                        hit["block"] = "\n".join(
+                            "%d: %s" % (j + 1, lines[j][:200]) for j in range(lo, hi))
+                    hits.append(hit)
+                    if len(hits) >= limit:
+                        return _grep_out(mode, target, hits, files_hit, counts,
+                                         scanned, True,
+                                         "stopped at the max_results limit - narrow "
+                                         "the pattern or path for more")
+                elif mode == "files":
+                    if shown not in seen_files:
+                        seen_files.add(shown)
+                        files_hit.append(shown)
+                        if len(files_hit) >= limit:
+                            return _grep_out(mode, target, hits, files_hit, counts,
+                                             scanned, True,
+                                             "stopped at the max_results limit")
+            if found and mode == "count":
+                counts.append({"file": shown, "lines": found})
+    return _grep_out(mode, target, hits, files_hit, counts, scanned, truncated)
+
+
+def _grep_out(mode, target, hits, files_hit, counts, scanned, truncated, note=None):
+    if mode == "files":
+        out = {"files": files_hit}
+    elif mode == "count":
+        out = {"counts": counts, "total_lines": sum(c["lines"] for c in counts)}
+    else:
+        out = {"matches": hits}
+    out.update({"result": "ok", "mode": mode, "path": target,
+                "scanned_files": scanned, "truncated": bool(truncated)})
+    if note:
+        out["note"] = note
+    return out
 
 
 _WEB_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) BonsaiAsistent/1.0"
@@ -1335,23 +1412,28 @@ FILE_TOOLS = {
             }
         }
     },
-    "search_files": {
+    "grep": {
         "type": "function",
         "function": {
-            "name": "search_files",
-            "description": "Regex search across files and returns file + line "
-                           "matches. The folder defaults to the whole workspace, "
-                           "but you can point it at any directory on this PC "
-                           "('C:\\\\Users', 'C:\\\\', '/home/me') to search the "
-                           "entire machine - the user is asked to approve paths "
-                           "outside the workspace. Heavy system folders "
-                           "(Windows, Program Files, node_modules) are skipped.",
+            "name": "grep",
+            "description": "Search inside files for a regular expression and get back "
+                           "the matching lines with file and line number (this is "
+                           "grep). Use it to find where something is defined, used or "
+                           "broken instead of reading whole files. The folder defaults "
+                           "to the whole workspace, but you can point it at any "
+                           "directory on this PC ('C:\\\\Users', 'C:\\\\', "
+                           "'/home/me') to search the entire machine - the user is "
+                           "asked to approve paths outside the workspace. Narrow a big "
+                           "sweep with include (e.g. '*.py'). Heavy system folders "
+                           "(Windows, Program Files, node_modules) are skipped, and the "
+                           "sweep stops after 40000 files or 45s.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "pattern": {
                         "type": "string",
-                        "description": "Regular expression, e.g. 'def main'."
+                        "description": "Regular expression, e.g. 'def main', "
+                                       "'MAX_.*BYTES' or 'error|warning'."
                     },
                     "path": {
                         "type": "string",
@@ -1359,6 +1441,36 @@ FILE_TOOLS = {
                                        "to the workspace (default = whole "
                                        "workspace) or an absolute path anywhere on "
                                        "this PC (the user is asked to approve it)."
+                    },
+                    "include": {
+                        "type": "string",
+                        "description": "Only search files matching this glob, e.g. "
+                                       "'*.py', '*.json' or '*.log,*.txt'. Omit to "
+                                       "search every text file."
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["content", "files", "count"],
+                        "description": "'content' (default) returns the matching "
+                                       "lines, 'files' returns just the names of "
+                                       "files that matched, 'count' returns a "
+                                       "per-file tally of how many lines matched "
+                                       "(like grep -c)."
+                    },
+                    "context": {
+                        "type": "integer",
+                        "description": "Lines of context to include around each match "
+                                       "(0 = the matching line only, max 10)."
+                    },
+                    "ignore_case": {
+                        "type": "boolean",
+                        "description": "Case-insensitive by default; set false to "
+                                       "match exact case."
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "description": "Stop after this many matches (default 200, "
+                                       "max 500)."
                     }
                 },
                 "required": ["pattern"]
@@ -1559,8 +1671,11 @@ def _exec_file_tool(name, args):
             return _list_dir(args.get("path"))
         if name == "read_file":
             return _read_file(args.get("path"))
-        if name == "search_files":
-            return _search_files(args.get("pattern"), args.get("path"))
+        if name == "grep":
+            return _grep(args.get("pattern"), args.get("path"),
+                         args.get("include"), args.get("mode", "content"),
+                         args.get("context", 0), args.get("ignore_case", True),
+                         args.get("max_results"))
         if name == "write_file":
             return _write_file(args.get("path"), args.get("content"))
         if name == "edit_file":
@@ -1794,11 +1909,11 @@ SYSTEM = ("You are the friendly assistant living on the user's "
           "files inside the workspace folder and on archives (archive). The "
           "workspace is your default folder, not a wall: when the user asks "
           "about a file, folder or search somewhere else on the PC, pass that "
-          "absolute path to list_dir / read_file / search_files / write_file / "
+          "absolute path to list_dir / read_file / grep / write_file / "
           "edit_file and the user will be asked to approve it (ALLOW FOR THIS "
           "CONV, ALLOW ONCE or DENY). So do not refuse or guess - just try the "
           "real path, and if the access is denied, respect it and ask the user "
-          "what to do instead. Prefer search_files with a path such as "
+          "what to do instead. Prefer grep with a path such as "
           "'C:\\\\Users' or 'C:\\\\' to look across the whole PC instead of "
           "guessing where a file might be. When "
           "you are not sure about something, are asked for recent/current "
@@ -3435,7 +3550,7 @@ PC_TOOLS = [SHOT_TOOL, INPUT_TOOL, CLIPBOARD_TOOL,
 def _tools_for(mode):
     if mode == MODE_PLAN:
         return [FILE_TOOLS["list_dir"], FILE_TOOLS["read_file"],
-                FILE_TOOLS["search_files"]] + WEB_SPECS
+                FILE_TOOLS["grep"]] + WEB_SPECS
     return ([TOOL_SPEC] + list(FILE_TOOLS.values()) + WEB_SPECS +
             [SHELL_TOOL, CODE_TOOL] + PC_TOOLS + _blender_tool_schemas())
 

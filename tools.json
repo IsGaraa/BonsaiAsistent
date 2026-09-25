@@ -57,18 +57,43 @@
   {
     "type": "function",
     "function": {
-      "name": "search_files",
-      "description": "Regex search across files and returns file + line matches. The folder defaults to the whole workspace, but you can point it at any directory on this PC ('C:\\\\Users', 'C:\\\\', '/home/me') to search the entire machine - the user is asked to approve paths outside the workspace. Heavy system folders (Windows, Program Files, node_modules) are skipped.",
+      "name": "grep",
+      "description": "Search inside files for a regular expression and get back the matching lines with file and line number (this is grep). Use it to find where something is defined, used or broken instead of reading whole files. The folder defaults to the whole workspace, but you can point it at any directory on this PC ('C:\\\\Users', 'C:\\\\', '/home/me') to search the entire machine - the user is asked to approve paths outside the workspace. Narrow a big sweep with include (e.g. '*.py'). Heavy system folders (Windows, Program Files, node_modules) are skipped, and the sweep stops after 40000 files or 45s.",
       "parameters": {
         "type": "object",
         "properties": {
           "pattern": {
             "type": "string",
-            "description": "Regular expression, e.g. 'def main'."
+            "description": "Regular expression, e.g. 'def main', 'MAX_.*BYTES' or 'error|warning'."
           },
           "path": {
             "type": "string",
             "description": "Optional folder to search inside: relative to the workspace (default = whole workspace) or an absolute path anywhere on this PC (the user is asked to approve it)."
+          },
+          "include": {
+            "type": "string",
+            "description": "Only search files matching this glob, e.g. '*.py', '*.json' or '*.log,*.txt'. Omit to search every text file."
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "content",
+              "files",
+              "count"
+            ],
+            "description": "'content' (default) returns the matching lines, 'files' returns just the names of files that matched, 'count' returns a per-file tally of how many lines matched (like grep -c)."
+          },
+          "context": {
+            "type": "integer",
+            "description": "Lines of context to include around each match (0 = the matching line only, max 10)."
+          },
+          "ignore_case": {
+            "type": "boolean",
+            "description": "Case-insensitive by default; set false to match exact case."
+          },
+          "max_results": {
+            "type": "integer",
+            "description": "Stop after this many matches (default 200, max 500)."
           }
         },
         "required": [
