@@ -7803,8 +7803,11 @@ PAGE = """<!doctype html>
   .dlbtns { display: flex; gap: 5px; margin-top: 6px; }
   .dlbtn { background: transparent; border: 1px solid var(--bd); color: var(--mut); font-size: 9px; letter-spacing: 1px; padding: 3px 7px; border-radius: 4px; cursor: pointer; font-family: Consolas, monospace; }
   .dlbtn:hover { color: var(--acc); border-color: var(--acc); }
-  .dlclear { display: none; width: calc(100% - 24px); margin: 2px 12px 8px; background: transparent; border: 1px solid var(--bd); color: var(--mut); font-size: 9px; letter-spacing: 1px; padding: 4px 0; border-radius: 4px; cursor: pointer; font-family: Consolas, monospace; }
-  .dlclear:hover { color: var(--err); border-color: var(--err); }
+  .dlclearrow { display: none; gap: 6px; padding: 0 12px 8px; }
+  .dlclear { flex: 1; background: var(--bg3); border: 1px solid var(--bd2); color: var(--txt2); font-size: 10.5px; font-weight: 700; letter-spacing: .5px; padding: 6px 4px; border-radius: 6px; cursor: pointer; font-family: Consolas, monospace; white-space: nowrap; transition: all .15s; }
+  .dlclear:hover { color: var(--acc); border-color: var(--acc); }
+  .dlclear.danger:hover { color: var(--err); border-color: var(--err); }
+  .dlclear:disabled { opacity: .35; cursor: default; color: var(--mut); border-color: var(--bd); }
   .toastcmd { font-family: Consolas, monospace; font-size: 11px; color: var(--txt2); word-break: break-all; margin-bottom: 5px; }
   .toastout { font-family: Consolas, monospace; font-size: 11px; color: var(--txt); background: var(--bg); border: 1px solid var(--bd); border-radius: 5px; padding: 5px 7px; margin: 0; max-height: 130px; overflow: auto; white-space: pre-wrap; word-break: break-word; }
   .toastwhen { font-size: 10px; color: var(--mut); margin-top: 5px; }
@@ -7900,7 +7903,10 @@ PAGE = """<!doctype html>
       <div id="todopanel"></div>
       <div class="ptitle" style="margin-top:8px; border-top:1px solid #164e63; padding-top:8px;"><span>DOWNLOADS</span><span id="dlcount"></span></div>
       <div class="dllist" id="dllist"></div>
-      <button class="dlclear" id="dlclear">CLEAR FINISHED</button>
+      <div class="dlclearrow" id="dlclearrow">
+        <button class="dlclear" id="dlclear" title="Remove finished, failed and cancelled downloads from the list">CLEAR FINISHED</button>
+        <button class="dlclear danger" id="dlclearall" title="Remove every entry - finished, failed, cancelled, queued and paused. A download that is actively transferring right now is left to finish on its own.">CLEAR ALL</button>
+      </div>
       <div class="ptitle" style="margin-top:8px; border-top:1px solid #164e63; padding-top:8px;"><span>PATH SCOPE</span></div>
       <button class="scopebtn" id="scopebtn" title="How far Bonsai may reach outside the workspace. Click to switch: WORKSPACE (hard sandbox) / ASK (ask me every time) / SYSTEM (no prompts).">SCOPE: ...</button>
       <div class="scopelist" id="scopelist"></div>
@@ -9502,7 +9508,14 @@ function dlRender(state) {
   const cnt = document.getElementById('dlcount');
   if (cnt) cnt.textContent = active ? active + ' active' : '';
   const clr = document.getElementById('dlclear');
-  if (clr) clr.style.display = jobs.length ? '' : 'none';
+  const fin = jobs.filter(function (j) {
+    return j.status === 'done' || j.status === 'error' || j.status === 'canceled';
+  }).length;
+  const crow = document.getElementById('dlclearrow');
+  if (crow) crow.style.display = jobs.length ? 'flex' : 'none';
+  if (clr) { clr.textContent = fin ? 'CLEAR FINISHED (' + fin + ')' : 'CLEAR FINISHED'; clr.disabled = !fin; }
+  const call = document.getElementById('dlclearall');
+  if (call) call.disabled = !jobs.length;
   while (box.firstChild) box.removeChild(box.firstChild);
   if (!show.length) {
     const e = document.createElement('div');
@@ -9523,11 +9536,18 @@ function dlTick() {
     .then(dlRender).catch(function () {});
 }
 function startDlWatch() {
+  const post = function (where) {
+    return fetch('/api/dl_clear', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ where: where }) })
+      .then(function () { DL_SEEN = {}; dlTick(); }).catch(function () {});
+  };
   const clr = document.getElementById('dlclear');
-  if (clr) clr.onclick = function () {
-    fetch('/api/dl_clear', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ where: 'finished' }) })
-      .then(function () { dlTick(); }).catch(function () {});
+  if (clr) clr.onclick = function () { post('finished'); };
+  const call = document.getElementById('dlclearall');
+  if (call) call.onclick = function () {
+    if (!confirm('Clear every finished, failed, cancelled, queued and paused download?'
+      + '\\n\\nAnything actively transferring is left alone - it will finish, then you can clear it.')) return;
+    post('all');
   };
   dlTick();
   setInterval(dlTick, 900);
@@ -9797,8 +9817,11 @@ PAGE_GPT = """<!doctype html>
   .dlbtns { display: flex; gap: 5px; margin-top: 6px; }
   .dlbtn { background: transparent; border: 1px solid var(--bd); color: var(--mut); font-size: 9px; letter-spacing: 1px; padding: 3px 7px; border-radius: 4px; cursor: pointer; font-family: Consolas, monospace; }
   .dlbtn:hover { color: var(--acc); border-color: var(--acc); }
-  .dlclear { display: none; width: calc(100% - 24px); margin: 2px 12px 8px; background: transparent; border: 1px solid var(--bd); color: var(--mut); font-size: 9px; letter-spacing: 1px; padding: 4px 0; border-radius: 4px; cursor: pointer; font-family: Consolas, monospace; }
-  .dlclear:hover { color: var(--err); border-color: var(--err); }
+  .dlclearrow { display: none; gap: 6px; padding: 0 12px 8px; }
+  .dlclear { flex: 1; background: var(--bg3); border: 1px solid var(--bd2); color: var(--txt2); font-size: 10.5px; font-weight: 700; letter-spacing: .5px; padding: 6px 4px; border-radius: 6px; cursor: pointer; font-family: Consolas, monospace; white-space: nowrap; transition: all .15s; }
+  .dlclear:hover { color: var(--acc); border-color: var(--acc); }
+  .dlclear.danger:hover { color: var(--err); border-color: var(--err); }
+  .dlclear:disabled { opacity: .35; cursor: default; color: var(--mut); border-color: var(--bd); }
   .toastcmd { font-family: Consolas, monospace; font-size: 11px; color: var(--txt2); word-break: break-all; margin-bottom: 5px; }
   .toastout { font-family: Consolas, monospace; font-size: 11px; color: var(--txt); background: var(--bg); border: 1px solid var(--bd); border-radius: 5px; padding: 5px 7px; margin: 0; max-height: 130px; overflow: auto; white-space: pre-wrap; word-break: break-word; }
   .toastwhen { font-size: 10px; color: var(--mut); margin-top: 5px; }
@@ -9896,7 +9919,10 @@ PAGE_GPT = """<!doctype html>
     <div class="chatlist" id="chatlist"></div>
     <div class="dlhead"><span>DOWNLOADS</span><span id="dlcount"></span></div>
     <div class="dllist" id="dllist"></div>
-    <button class="dlclear" id="dlclear">CLEAR FINISHED</button>
+    <div class="dlclearrow" id="dlclearrow">
+      <button class="dlclear" id="dlclear" title="Remove finished, failed and cancelled downloads from the list">CLEAR FINISHED</button>
+      <button class="dlclear danger" id="dlclearall" title="Cancel anything still running and remove every download from the list">CLEAR ALL</button>
+    </div>
     <div class="side-foot">
       <div class="blrow" id="blstatus" title="Blender MCP status"><svg class="blicon" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 1.6C7.4 1.6 3.7 3.9 3.7 6.9c0 1.6 1.1 3 2.8 3.9-2.1.9-3.5 2.4-3.5 4.2 0 3.2 4 5.8 9 5.8 2.4 0 4.6-.7 6.2-1.8l3.4 2.8 1.7-2-3.3-2.7c.6-.9.9-1.9.9-3 0-1.9-1-3.6-2.6-4.9.3-.5.4-1.1.4-1.7 0-3-3.7-5.3-8.3-5.3Z"/><ellipse cx="12" cy="6.9" rx="4.2" ry="2.5" fill="#18181b"/></svg><span class="bldot off" id="bldot"></span></div>
       <button class="btn-ghost wd" id="workbtn"></button>
@@ -10209,7 +10235,14 @@ function dlRender(state) {
   const cnt = document.getElementById('dlcount');
   if (cnt) cnt.textContent = active ? active + ' active' : '';
   const clr = document.getElementById('dlclear');
-  if (clr) clr.style.display = jobs.length ? '' : 'none';
+  const fin = jobs.filter(function (j) {
+    return j.status === 'done' || j.status === 'error' || j.status === 'canceled';
+  }).length;
+  const crow = document.getElementById('dlclearrow');
+  if (crow) crow.style.display = jobs.length ? 'flex' : 'none';
+  if (clr) { clr.textContent = fin ? 'CLEAR FINISHED (' + fin + ')' : 'CLEAR FINISHED'; clr.disabled = !fin; }
+  const call = document.getElementById('dlclearall');
+  if (call) call.disabled = !jobs.length;
   while (box.firstChild) box.removeChild(box.firstChild);
   if (!show.length) {
     const e = document.createElement('div');
@@ -10230,11 +10263,18 @@ function dlTick() {
     .then(dlRender).catch(function () {});
 }
 function startDlWatch() {
+  const post = function (where) {
+    return fetch('/api/dl_clear', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ where: where }) })
+      .then(function () { DL_SEEN = {}; dlTick(); }).catch(function () {});
+  };
   const clr = document.getElementById('dlclear');
-  if (clr) clr.onclick = function () {
-    fetch('/api/dl_clear', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ where: 'finished' }) })
-      .then(function () { dlTick(); }).catch(function () {});
+  if (clr) clr.onclick = function () { post('finished'); };
+  const call = document.getElementById('dlclearall');
+  if (call) call.onclick = function () {
+    if (!confirm('Clear every finished, failed, cancelled, queued and paused download?'
+      + '\\n\\nAnything actively transferring is left alone - it will finish, then you can clear it.')) return;
+    post('all');
   };
   dlTick();
   setInterval(dlTick, 900);
