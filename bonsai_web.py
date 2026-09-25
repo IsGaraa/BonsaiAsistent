@@ -8822,10 +8822,17 @@ def _strip_full(record):
     return record
 
 
+CLIENT_GONE = (BrokenPipeError, ConnectionAbortedError, ConnectionResetError)
+
+
 def sse(handler, event, obj):
     data = json.dumps(obj, ensure_ascii=False)
-    handler.wfile.write(f"event: {event}\ndata: {data}\n\n".encode("utf-8"))
-    handler.wfile.flush()
+    try:
+        handler.wfile.write(f"event: {event}\ndata: {data}\n\n".encode("utf-8"))
+        handler.wfile.flush()
+    except CLIENT_GONE:
+        # the browser closed the tab / stopped reading - nothing to do
+        raise
 
 
 def _valid_chat(c):
@@ -8947,11 +8954,14 @@ def _save_chats(chats):
 class Handler(BaseHTTPRequestHandler):
     def _send(self, code, body, ctype="application/json; charset=utf-8"):
         data = body if isinstance(body, bytes) else body.encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        except CLIENT_GONE:
+            self.close_connection = True
 
     def _serve_preview(self):
         qs = self.path.partition("?")[2]
@@ -9249,6 +9259,18 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
+class BonsaiServer(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def handle_error(self, request, client_address):
+        """A browser that closes a tab mid-response is normal, not an error."""
+        exc = sys.exc_info()[1]
+        if isinstance(exc, CLIENT_GONE + (TimeoutError, OSError)):
+            return
+        traceback.print_exc()
+
+
 def main():
     try:
         os.makedirs(WORKDIR, exist_ok=True)
@@ -9264,7 +9286,7 @@ def main():
     _sched_load()
     print("BONSAI is READY on http://127.0.0.1:8081", flush=True)
     webbrowser.open(f"http://{HOST}:{PORT}")
-    ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
+    BonsaiServer((HOST, PORT), Handler).serve_forever()
 
 
 if __name__ == "__main__":
