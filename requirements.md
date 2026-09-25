@@ -55,6 +55,7 @@ Install everything with: `pip install -r requirements.txt -r tools\requirements.
 | Package | Powers |
 |---|---|
 | `mcp-for-blender` | lets BONSAI drive Blender (scenes, meshes, materials, viewport screenshots) when Blender + the "MCP for Blender" addon are running |
+| `yt-dlp` | the `download_media` tool (video, audio-only as mp3, subtitles, thumbnails) |
 
 ## Optional - system level
 

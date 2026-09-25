@@ -3,6 +3,7 @@ import base64
 import ctypes
 import datetime
 import glob
+import hashlib
 import html
 import io
 import json
@@ -76,6 +77,13 @@ MAX_REQUEST_BYTES = 40 * 1024 * 1024
 MAX_TEXT_FILE_BYTES = 200 * 1024
 MAX_FILE_BYTES = 1024 * 1024
 MAX_SEARCH_RESULTS = 200
+# No download size cap by default: files stream to disk in chunks, so RAM stays
+# flat no matter how big the file is. PC_MAX_DOWNLOAD_MB / a per-call max_mb can
+# still impose a ceiling, and the free disk space is checked before starting.
+MAX_DOWNLOAD_BYTES = (int(os.environ["PC_MAX_DOWNLOAD_MB"]) * 1024 * 1024
+                      if os.environ.get("PC_MAX_DOWNLOAD_MB") else 0)
+DOWNLOAD_CHUNK = 256 * 1024
+_DOWNLOAD_FLOOR_BYTES = 64 * 1024 * 1024
 MODE_BUILD = "build"
 MODE_PLAN = "plan"
 _DEF_WORKDIR = (r"C:\Users\drago\Desktop\workspace" if IS_WINDOWS
@@ -659,7 +667,7 @@ def _path_covered(path, table):
     """True when path sits inside one of the roots in table (longest match)."""
     best = None
     for root in table:
-        if path == root or path.startswith(root + os.sep):
+        if _within(path, root):
             if best is None or len(root) > len(best):
                 best = root
     return best
@@ -669,17 +677,17 @@ def _path_approval(cand, what="access this path", tool=None):
     """Gate a path outside the workspace. Returns (allowed, message)."""
     cand = os.path.realpath(cand)
     base = os.path.realpath(WORKDIR)
-    if cand == base or cand.startswith(base + os.sep):
+    if _within(cand, base):
         return True, ""
     with _PATH_LOCK:
         policy = _PATH_POLICY
         if policy == "system":
             return True, ""
         if policy == "workspace":
-            return False, ("access denied: path outside workspace '%s'. The path "
-                           "scope is set to WORKSPACE - switch it to ASK or SYSTEM "
-                           "in the sidebar if you want Bonsai to reach other places."
-                           % WORKDIR)
+            return False, ("access denied: '%s' is outside the workspace '%s'. The "
+                           "path scope is set to WORKSPACE - switch it to ASK or "
+                           "SYSTEM in the sidebar if you want Bonsai to reach other "
+                           "places." % (cand, WORKDIR))
         granted = _path_covered(cand, _PATH_GRANTS)
         if granted and (_PATH_GRANTS[granted].get("scope") != "once"
                         or granted in (getattr(_PATH_TLS, "once", None) or ())):
@@ -691,9 +699,10 @@ def _path_approval(cand, what="access this path", tool=None):
                        % (cand, denied))
     on_ask = getattr(_PATH_TLS, "on_ask", None)
     if not on_ask:
-        return False, ("access denied: path outside workspace '%s' and no one is "
-                       "around to approve it (this tool only asks for permission "
-                       "while a reply is streaming in the UI)." % WORKDIR)
+        return False, ("access denied: '%s' is outside the workspace '%s' and no "
+                       "one is around to approve it (this tool only asks for "
+                       "permission while a reply is streaming in the UI)."
+                       % (cand, WORKDIR))
     answer = str(on_ask({
         "kind": "path_approval",
         "question": "Bonsai wants to %s outside the workspace:\n\n%s" % (what, cand),
@@ -713,19 +722,53 @@ def _path_approval(cand, what="access this path", tool=None):
                    % cand)
 
 
+def _strip_long_prefix(path):
+    """Drop the Windows \\\\?\\ extended-length prefix for readable/short paths."""
+    text = str(path)
+    if IS_WINDOWS and text.startswith("\\\\?\\") and not text.startswith("\\\\?\\UNC\\"):
+        if len(text) < 240:
+            return text[4:]
+    return text
+
+
+def _norm_path(path):
+    """Comparable form of a path: no \\\\?\\ prefix, normalised, case-folded on Windows.
+
+    os.path.realpath() can hand back the \\\\?\\ form for a path that exists and the
+    plain form for one that does not, which used to make 'is this inside the
+    workspace?' flip depending on timing.
+    """
+    text = str(path or "")
+    if IS_WINDOWS:
+        if text.startswith("\\\\?\\UNC\\"):
+            text = "\\\\" + text[8:]
+        elif text.startswith("\\\\?\\"):
+            text = text[4:]
+    text = os.path.normpath(text) if text else text
+    if len(text) > 1 and text.endswith(os.sep):
+        text = text[:-1]
+    return os.path.normcase(text) if IS_WINDOWS else text
+
+
+def _within(cand, base):
+    """True when cand is base itself or lives under it (prefix-safe)."""
+    c, b = _norm_path(cand), _norm_path(base)
+    return c == b or c.startswith(b + os.sep)
+
+
 def _safe_path(p):
     if p is None:
         p = ""
     text = str(p).strip()
     base = os.path.realpath(WORKDIR)
     if not text:
-        return base
+        return _strip_long_prefix(base)
     cand = os.path.realpath(os.path.join(base, text)) if not os.path.isabs(text) else os.path.realpath(text)
-    if cand == base or cand.startswith(base + os.sep):
-        return cand
-    ok, message = _path_approval(cand, "open a file or folder at")
+    if _within(cand, base):
+        return _strip_long_prefix(cand)
+    ok, message = _path_approval(cand, "write a file at")
     if ok:
-        return cand
+        return _strip_long_prefix(cand)
     raise PermissionError(message)
 
 
@@ -877,7 +920,7 @@ def _search_files(pattern, path):
     except re.error as exc:
         return {"error": f"invalid regular expression: {exc}"}
     base = os.path.realpath(WORKDIR)
-    outside = not (target == base or target.startswith(base + os.sep))
+    outside = not _within(target, base)
     started = time.time()
     hits = []
     scanned = 0
@@ -924,9 +967,9 @@ def _search_files(pattern, path):
 _WEB_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) BonsaiAsistent/1.0"
 
 
-def _fetch_html(url, max_bytes=400000):
+def _fetch_html(url, max_bytes=400000, timeout=20):
     req = urllib.request.Request(url, headers={"User-Agent": _WEB_UA})
-    with urllib.request.urlopen(req, timeout=20) as resp:
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
         data = resp.read(max_bytes)
         enc = (resp.headers.get_content_charset() or "utf-8")
     return data.decode(enc, errors="replace")
@@ -2657,6 +2700,178 @@ DOWNLOAD_TOOL = {
 }
 
 
+DOWNLOAD_BATCH_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "download_batch",
+        "description": "Download MANY files in one call: pass a list of URLs, or "
+                       "point 'from_page' at a web page and let it collect the "
+                       "links (optionally filtered by 'match'). Files land in one "
+                       "folder, several at a time, and you get a per-file report "
+                       "of what succeeded and what failed. Use this instead of "
+                       "calling download_file in a loop.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "urls": {"type": "array", "items": {"type": "string"},
+                         "description": "Full http(s) URLs to download."},
+                "from_page": {"type": "string",
+                              "description": "Read this page and download the "
+                                             "links found on it (e.g. an index "
+                                             "of files)."},
+                "match": {"type": "string",
+                          "description": "Only keep links matching this regular "
+                                         "expression, e.g. '\\\\.pdf$'."},
+                "path": {"type": "string",
+                         "description": "Folder inside the workspace for the "
+                                        "files. Default 'downloads'."},
+                "max_files": {"type": "integer",
+                              "description": "Safety cap, default 25, max 200."},
+                "parallel": {"type": "integer",
+                             "description": "How many at once, default 4, max 8."},
+                "max_mb": {"type": "integer",
+                           "description": "Per-file size cap in MB."},
+                "timeout": {"type": "integer",
+                            "description": "Per-file timeout in seconds (default 120)."}
+            },
+            "required": []
+        }
+    }
+}
+
+DOWNLOAD_AUTHED_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "download_authed",
+        "description": "Download a file that needs credentials - a page behind a "
+                       "login, a private API, a file with a token. Pass 'bearer', "
+                       "'cookie' or full 'headers'. The secret values are never "
+                       "written to the chat history or printed back; only the "
+                       "header names are echoed. Prefer download_file for public "
+                       "URLs.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "Full http(s) URL."},
+                "bearer": {"type": "string",
+                           "description": "API token; sent as 'Authorization: "
+                                          "Bearer <token>'."},
+                "cookie": {"type": "string",
+                           "description": "Cookie header value, e.g. "
+                                          "'session=abc123'."},
+                "headers": {"type": "object",
+                            "description": "Extra request headers, e.g. "
+                                           "{'X-Api-Key': '...'}."},
+                "path": {"type": "string",
+                         "description": "Destination inside the workspace."},
+                "max_mb": {"type": "integer", "description": "Size cap in MB."},
+                "timeout": {"type": "integer", "description": "Timeout seconds."}
+            },
+            "required": ["url"]
+        }
+    }
+}
+
+DOWNLOAD_PAGE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "download_page",
+        "description": "Save a web page so it works OFFLINE: downloads the HTML "
+                       "plus its images, CSS, JS and fonts, rewrites the links to "
+                       "the local copies and writes index.html you can open later. "
+                       "Use it to keep a page, a docs page or an article.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "Page to save."},
+                "path": {"type": "string",
+                         "description": "Folder inside the workspace. Default "
+                                        "'pages'."},
+                "assets": {"type": "boolean",
+                           "description": "Download images/CSS/JS too. Default true."},
+                "max_assets": {"type": "integer",
+                               "description": "How many assets, default 60, max 400."},
+                "max_mb": {"type": "integer", "description": "Per-asset size cap."}
+            },
+            "required": ["url"]
+        }
+    }
+}
+
+DOWNLOAD_VERIFY_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "download_verify",
+        "description": "Download a file you must be sure about: big downloads "
+                       "continue where they stopped (HTTP resume), failed attempts "
+                       "retry, and the result is checked against the sha256 and/or "
+                       "the byte size you expected. Reports 'FAILED CHECK' instead "
+                       "of pretending it worked. Use it for installers, archives, "
+                       "datasets and model files.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "Full http(s) URL."},
+                "path": {"type": "string",
+                         "description": "Destination inside the workspace."},
+                "sha256": {"type": "string",
+                           "description": "Expected 64-char sha256 of the file."},
+                "bytes": {"type": "integer",
+                          "description": "Expected size in bytes."},
+                "resume": {"type": "boolean",
+                           "description": "Continue a partial download. Default true."},
+                "retries": {"type": "integer",
+                            "description": "Retry attempts, default 3, max 10."},
+                "max_mb": {"type": "integer", "description": "Size cap in MB."}
+            },
+            "required": ["url"]
+        }
+    }
+}
+
+DOWNLOAD_MEDIA_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "download_media",
+        "description": "Download video, audio or subtitles from a normal media site "
+                       "(YouTube, Vimeo, a direct .m3u8 stream, podcasts, etc.) "
+                       "using yt-dlp. Can pull the audio only as mp3, fetch "
+                       "subtitles and embed a thumbnail. Needs yt-dlp installed "
+                       "('pip install yt-dlp').",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "Media page or stream URL."},
+                "path": {"type": "string",
+                         "description": "Folder inside the workspace. Default 'media'."},
+                "audio_only": {"type": "boolean",
+                               "description": "Extract the audio as mp3 instead "
+                                              "of the video."},
+                "audio_format": {"type": "string",
+                                 "description": "Audio format, default mp3."},
+                "quality": {"type": "string",
+                            "description": "yt-dlp format string, e.g. "
+                                           "'bestvideo[height<=1080]+bestaudio'."},
+                "subtitles": {"type": "boolean",
+                              "description": "Download subtitles too."},
+                "sub_langs": {"type": "string",
+                              "description": "Subtitle languages, default 'en'."},
+                "thumbnail": {"type": "boolean",
+                              "description": "Save and embed a thumbnail image."},
+                "playlist": {"type": "boolean",
+                             "description": "Allow whole playlists/albums."},
+                "cookies_from_browser": {"type": "string",
+                                         "description": "Reuse cookies from "
+                                                        "chrome/firefox/edge for "
+                                                        "age or private videos."},
+                "timeout": {"type": "integer", "description": "Timeout seconds."}
+            },
+            "required": ["url"]
+        }
+    }
+}
+
+
 ARCHIVE_TOOL = {
     "type": "function",
     "function": {
@@ -3159,8 +3374,12 @@ NEW_TOOLS = [WINDOW_LIST_TOOL, WINDOW_ACTION_TOOL,
              SCHEDULE_TOOL, LIST_SCHEDULES_TOOL, UNSCHEDULE_TOOL,
              TTS_VOICES_TOOL, TTS_SPEAK_TOOL, PREVIEW_HTML_TOOL]
 
+DOWNLOAD_TOOLS = [DOWNLOAD_BATCH_TOOL, DOWNLOAD_AUTHED_TOOL,
+                  DOWNLOAD_PAGE_TOOL, DOWNLOAD_VERIFY_TOOL,
+                  DOWNLOAD_MEDIA_TOOL]
+
 PC_TOOLS = [SHOT_TOOL, INPUT_TOOL, CLIPBOARD_TOOL,
-            DOWNLOAD_TOOL, ARCHIVE_TOOL, ASK_TOOL, TODO_TOOL] + NEW_TOOLS
+            DOWNLOAD_TOOL, ARCHIVE_TOOL, ASK_TOOL, TODO_TOOL] + NEW_TOOLS + DOWNLOAD_TOOLS
 
 
 def _tools_for(mode):
@@ -3991,45 +4210,647 @@ def _clipboard(args):
     return {"error": "action must be 'get' or 'set'"}
 
 
-def _download_file(args):
-    url = str(args.get("url") or "").strip()
-    if not url.startswith(("http://", "https://")):
+def _url_ok(url):
+    return str(url or "").strip().lower().startswith(("http://", "https://"))
+
+
+def _name_from_response(url, headers):
+    """Best filename for a download: Content-Disposition, then the URL path."""
+    try:
+        disp = (headers or {}).get("Content-Disposition") or ""
+        m = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)"?', disp, re.I)
+        if m:
+            name = os.path.basename(urllib.parse.unquote(m.group(1)).strip())
+            if name:
+                return re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name)
+    except Exception:
+        pass
+    path = urllib.parse.urlsplit(url).path
+    name = os.path.basename(urllib.parse.unquote(path)).strip()
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name)
+    return name or "download.bin"
+
+
+def _unique_path(path):
+    if not os.path.exists(path):
+        return path
+    root, ext = os.path.splitext(path)
+    for i in range(1, 1000):
+        cand = "%s (%d)%s" % (root, i, ext)
+        if not os.path.exists(cand):
+            return cand
+    return "%s (%d)%s" % (root, int(time.time()), ext)
+
+
+def _free_bytes(path):
+    try:
+        probe = path if os.path.isdir(path) else os.path.dirname(path) or "."
+        while probe and not os.path.isdir(probe):
+            parent = os.path.dirname(probe)
+            if parent == probe:
+                break
+            probe = parent
+        return shutil.disk_usage(probe).free
+    except Exception:
+        return None
+
+
+def _content_length(url, headers=None, timeout=30):
+    """Ask the server how big the file is (HEAD, falling back to a ranged GET)."""
+    req_headers = {"User-Agent": _WEB_UA}
+    for k, v in (headers or {}).items():
+        if v is not None and str(k).strip():
+            req_headers[str(k)] = str(v)
+    try:
+        req = urllib.request.Request(url, headers=req_headers, method="HEAD")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            n = resp.headers.get("Content-Length")
+            if n:
+                return int(n)
+    except Exception:
+        pass
+    try:
+        req_headers["Range"] = "bytes=0-0"
+        req = urllib.request.Request(url, headers=req_headers)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            crange = resp.headers.get("Content-Range") or ""
+            m = re.search(r"/(\d+)$", crange)
+            if m:
+                return int(m.group(1))
+    except Exception:
+        pass
+    return None
+
+
+def _space_guard(url, dest, headers=None, need=None):
+    """Refuse early when the disk obviously cannot hold the download."""
+    free = _free_bytes(dest)
+    if free is None:
+        return None
+    want = need or _content_length(url, headers)
+    if not want or want <= 0:
+        return None
+    if free < want + _DOWNLOAD_FLOOR_BYTES:
+        return {"error": "not enough disk space: %s needs %.1f GB but only %.1f GB "
+                         "is free on %s - free some space or download it in parts"
+                         % (url, want / 1e9, free / 1e9,
+                            os.path.dirname(dest) or dest)}
+    return None
+
+
+def _fetch_to_file(url, dest, headers=None, timeout=180, max_bytes=None,
+                   resume=False, retries=0, method="GET"):
+    """Stream an http(s) URL straight to disk. Never buffers the whole file."""
+    if not _url_ok(url):
         return {"error": "url must start with http:// or https://"}
-    raw_path = str(args.get("path") or "").strip()
-    if not raw_path:
-        raw_path = url.split("/")[-1].split("?")[0] or "download.bin"
-    try:
-        dest = _safe_path(raw_path)
-        os.makedirs(os.path.dirname(dest), exist_ok=True)
-    except Exception as exc:
-        return {"error": f"bad destination path: {exc}"}
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=180) as resp:
-            data = resp.read()
-        with open(dest, "wb") as fh:
-            fh.write(data)
-    except Exception as exc:
-        return {"error": f"download failed: {exc}"}
-    info = {"result": "ok", "url": url,
-            "saved": dest.replace("\\", "/"), "bytes": len(data)}
-    if len(data) <= MAX_TEXT_FILE_BYTES and _looks_text(data):
+    cap = int(max_bytes or MAX_DOWNLOAD_BYTES)
+    req_headers = {"User-Agent": _WEB_UA, "Accept": "*/*"}
+    for k, v in (headers or {}).items():
+        if v is not None and str(k).strip():
+            req_headers[str(k)] = str(v)
+    have = 0
+    if resume and os.path.isfile(dest) and os.path.getsize(dest) > 0:
+        have = os.path.getsize(dest)
+        req_headers["Range"] = "bytes=%d-" % have
+    last = None
+    for attempt in range(max(1, int(retries or 0) + 1)):
         try:
-            text = data.decode("utf-8", errors="replace")
-            if len(text) > 2000:
-                text = text[:2000] + "\n[... preview truncated ...]"
-            info["preview"] = text
+            req = urllib.request.Request(url, headers=req_headers, method=method)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                code = getattr(resp, "status", 200) or 200
+                rheaders = {k.title(): v for k, v in resp.headers.items()}
+                mode = "ab"
+                if have and code != 206:
+                    have = 0
+                    mode = "wb"
+                written = have
+                os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
+                with open(dest, mode) as fh:
+                    while True:
+                        chunk = resp.read(DOWNLOAD_CHUNK)
+                        if not chunk:
+                            break
+                        written += len(chunk)
+                        if cap and written > cap:
+                            fh.close()
+                            try:
+                                os.remove(dest)
+                            except OSError:
+                                pass
+                            return {"error": "file too large: %s exceeds the %.2f MB "
+                                            "limit (raise it with max_mb)"
+                                    % (url, cap / (1024 * 1024))}
+                        fh.write(chunk)
+                want = rheaders.get("Content-Length")
+                if want:
+                    try:
+                        want = int(want) + (have if code == 206 else 0)
+                    except (TypeError, ValueError):
+                        want = None
+                if want and written < want:
+                    # the connection died mid-file: keep what we got and retry
+                    last = ("connection closed after %d of %d bytes"
+                            % (written, want))
+                    have = written
+                    if attempt < int(retries or 0):
+                        time.sleep(1.5 * (attempt + 1))
+                        req_headers["Range"] = "bytes=%d-" % have
+                        continue
+                    return {"error": "download incomplete: %s" % last}
+                return {"ok": True, "url": url, "status": code,
+                        "bytes": written, "resumed": bool(have),
+                        "content_type": rheaders.get("Content-Type"),
+                        "final_url": resp.geturl(), "headers": rheaders}
+        except urllib.error.HTTPError as exc:
+            last = "HTTP %s %s" % (exc.code, exc.reason)
+            if exc.code == 416 and have:
+                return {"ok": True, "url": url, "status": 206, "bytes": have,
+                        "resumed": True, "already_complete": True,
+                        "content_type": None, "final_url": url, "headers": {}}
+            if exc.code < 500:
+                break
+        except Exception as exc:
+            last = str(exc)
+        if attempt < int(retries or 0):
+            time.sleep(1.5 * (attempt + 1))
+    return {"error": "download failed: %s" % (last or "unknown error")}
+
+
+def _sha256_of(path, limit=None):
+    h = hashlib.sha256()
+    read = 0
+    with open(path, "rb") as fh:
+        while True:
+            chunk = fh.read(DOWNLOAD_CHUNK)
+            if not chunk:
+                break
+            h.update(chunk)
+            read += len(chunk)
+            if limit and read >= limit:
+                break
+    return h.hexdigest()
+
+
+def _download_one(url, raw_path, folder, headers=None, timeout=180,
+                  max_bytes=None, resume=False, retries=0, overwrite=False):
+    """Download one URL into the workspace, returning a per-file record.
+
+    The bytes land in a .part file first, so a half-finished transfer is never
+    mistaken for a finished file and the real name can still come from the
+    server's Content-Disposition header.
+    """
+    if not _url_ok(url):
+        return {"url": url, "error": "url must start with http:// or https://"}
+    explicit = bool(raw_path)
+    try:
+        if explicit:
+            dest = _safe_path(raw_path)
+            part = dest + ".part"
+        else:
+            guess = _name_from_response(url, None) or "download.bin"
+            if guess in (".", "..", ""):
+                guess = "download.bin"
+            dest = None
+            part = _safe_path(os.path.join(folder, guess + ".part") if folder
+                              else guess + ".part")
+        os.makedirs(os.path.dirname(part) or ".", exist_ok=True)
+    except Exception as exc:
+        return {"url": url, "error": "bad destination path: %s" % exc}
+    if not resume:
+        try:
+            if os.path.isfile(part):
+                os.remove(part)
+        except OSError:
+            pass
+    elif explicit and not os.path.isfile(part) and os.path.isfile(dest):
+        # an earlier run already left a partial file at the final path
+        try:
+            shutil.move(dest, part)
         except Exception:
             pass
-    return info
-
-
-def _looks_text(data):
+    if not os.path.isfile(part):
+        blocked = _space_guard(url, part, headers)
+        if blocked:
+            return {"url": url, "error": blocked["error"]}
+    got = _fetch_to_file(url, part, headers=headers, timeout=timeout,
+                         max_bytes=max_bytes, resume=resume, retries=retries)
+    if got.get("error"):
+        return {"url": url, "error": got["error"]}
     try:
-        data.decode("utf-8")
-        return True
+        if not explicit:
+            name = _name_from_response(url, got.get("headers")) or "download.bin"
+            dest = _safe_path(os.path.join(folder, name) if folder else name)
+        if not overwrite and os.path.exists(dest):
+            dest = _unique_path(dest)
+        os.replace(part, dest)
+    except Exception as exc:
+        return {"url": url, "error": "could not finalise the download: %s" % exc}
+    record = {"url": url, "saved": dest.replace("\\", "/"),
+              "bytes": got["bytes"], "status": got.get("status"),
+              "content_type": got.get("content_type"),
+              "resumed": got.get("resumed", False)}
+    if (got.get("headers", {}).get("Content-Type") or "").startswith("text/"):
+        try:
+            with open(dest, "r", encoding="utf-8", errors="replace") as fh:
+                record["preview"] = fh.read(1200)
+        except Exception:
+            pass
+    return record
+
+
+def _download_file(args):
+    url = str(args.get("url") or "").strip()
+    if not _url_ok(url):
+        return {"error": "url must start with http:// or https://"}
+    try:
+        timeout = min(max(int(args.get("timeout") or 180), 1), 900)
     except Exception:
-        return False
+        timeout = 180
+    try:
+        max_mb = float(args.get("max_mb") or 0)
+    except Exception:
+        max_mb = 0
+    rec = _download_one(url, str(args.get("path") or "").strip(), "",
+                        timeout=timeout,
+                        max_bytes=int(max_mb * 1024 * 1024) if max_mb else None,
+                        retries=int(args.get("retries") or 0),
+                        overwrite=bool(args.get("overwrite")))
+    if rec.get("error"):
+        return {"error": rec["error"]}
+    return {"result": "ok", "url": rec["url"], "saved": rec["saved"],
+            "bytes": rec["bytes"], "content_type": rec.get("content_type"),
+            "preview": rec.get("preview")}
+
+
+def _download_batch(args):
+    urls = [str(u).strip() for u in (args.get("urls") or []) if str(u).strip()]
+    page = str(args.get("from_page") or "").strip()
+    pattern = str(args.get("match") or "").strip()
+    if page:
+        if not _url_ok(page):
+            return {"error": "from_page must start with http:// or https://"}
+        try:
+            body = _fetch_html(page, 1500000)
+        except Exception as exc:
+            return {"error": "could not read the page: %s" % exc}
+        found = re.findall(r'(?:href|src)\s*=\s*["\']([^"\']+)["\']', body, re.I)
+        rx = re.compile(pattern, re.I) if pattern else None
+        base = page if page.endswith("/") else page.rsplit("/", 1)[0] + "/"
+        for link in found:
+            if link.startswith(("javascript:", "mailto:", "data:", "#")):
+                continue
+            full = urllib.parse.urljoin(base, link)
+            if _url_ok(full) and (not rx or rx.search(full)):
+                urls.append(full)
+        urls = list(dict.fromkeys(urls))
+    urls = [u for u in urls if _url_ok(u)]
+    if not urls:
+        return {"error": "nothing to download: give 'urls' or a 'from_page' whose "
+                         "links match 'match'"}
+    try:
+        max_files = min(max(int(args.get("max_files") or 25), 1), 200)
+    except Exception:
+        max_files = 25
+    if len(urls) > max_files:
+        urls = urls[:max_files]
+    folder = str(args.get("path") or "downloads").strip() or "downloads"
+    try:
+        timeout = min(max(int(args.get("timeout") or 120), 1), 900)
+    except Exception:
+        timeout = 120
+    try:
+        workers = min(max(int(args.get("parallel") or 4), 1), 8)
+    except Exception:
+        workers = 4
+    try:
+        max_mb = float(args.get("max_mb") or 0)
+    except Exception:
+        max_mb = 0
+    cap = int(max_mb * 1024 * 1024) if max_mb else None
+    results = [None] * len(urls)
+    lock = threading.Lock()
+    cursor = [0]
+
+    def worker():
+        while True:
+            with lock:
+                i = cursor[0]
+                cursor[0] += 1
+            if i >= len(urls):
+                return
+            results[i] = _download_one(urls[i], "", folder, timeout=timeout,
+                                       max_bytes=cap)
+
+    threads = [threading.Thread(target=worker, daemon=True)
+               for _ in range(min(workers, len(urls)))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    ok = [r for r in results if r and not r.get("error")]
+    bad = [r for r in results if not r or r.get("error")]
+    out = {"result": "ok", "requested": len(urls), "downloaded": len(ok),
+           "failed": len(bad), "folder": folder.replace("\\", "/"),
+           "files": [{"file": os.path.basename(r["saved"]), "bytes": r["bytes"],
+                      "url": r["url"]} for r in ok]}
+    if bad:
+        out["errors"] = [{"url": r.get("url") if r else None,
+                          "error": (r or {}).get("error", "unknown")} for r in bad][:20]
+    if not ok and bad:
+        return {"error": "all %d downloads failed: %s" % (len(bad), bad[0].get("error"))}
+    return out
+
+
+_SECRET_KEYS = ("authorization", "bearer", "cookie", "x-api-key", "api-key",
+                "apikey", "token", "secret", "password", "passwd", "session",
+                "auth")
+
+
+def _redact_secrets(args):
+    """Copy of the arguments with secret values masked, for storage/history."""
+    clean = {}
+    for key, val in (args or {}).items():
+        low = str(key).lower()
+        if any(s in low for s in _SECRET_KEYS) and val:
+            clean[key] = "***redacted***"
+        elif low == "headers" and isinstance(val, dict):
+            clean[key] = {k: ("***redacted***"
+                              if any(s in str(k).lower() for s in _SECRET_KEYS) and v
+                              else v)
+                          for k, v in val.items()}
+        else:
+            clean[key] = val
+    return clean
+
+
+def _auth_headers(args):
+    headers = {}
+    for k, v in (args.get("headers") or {}).items():
+        if v is not None and str(k).strip():
+            headers[str(k)] = str(v)
+    bearer = str(args.get("bearer") or "").strip()
+    if bearer:
+        headers["Authorization"] = (bearer if " " in bearer else "Bearer " + bearer)
+    cookie = str(args.get("cookie") or "").strip()
+    if cookie:
+        headers["Cookie"] = cookie
+    return headers
+
+
+def _download_authed(args):
+    url = str(args.get("url") or "").strip()
+    if not _url_ok(url):
+        return {"error": "url must start with http:// or https://"}
+    headers = _auth_headers(args)
+    if not headers:
+        return {"error": "no credentials given - pass 'bearer', 'cookie' or "
+                         "'headers' (the values are never saved or shown back)"}
+    try:
+        timeout = min(max(int(args.get("timeout") or 180), 1), 900)
+    except Exception:
+        timeout = 180
+    try:
+        max_mb = float(args.get("max_mb") or 0)
+    except Exception:
+        max_mb = 0
+    rec = _download_one(url, str(args.get("path") or "").strip(), "",
+                        headers=headers, timeout=timeout,
+                        max_bytes=int(max_mb * 1024 * 1024) if max_mb else None,
+                        retries=int(args.get("retries") or 1))
+    if rec.get("error"):
+        return {"error": rec["error"]}
+    return {"result": "ok", "url": rec["url"], "saved": rec["saved"],
+            "bytes": rec["bytes"], "content_type": rec.get("content_type"),
+            "sent_headers": sorted(headers.keys()), "preview": rec.get("preview")}
+
+
+_ASSET_ATTR = re.compile(
+    r'(?P<attr>\b(?:src|href|poster|data-src|data-original)\s*=\s*)(?P<q>["\'])(?P<url>[^"\']+)(?P=q)',
+    re.I)
+_SRCSET = re.compile(r'(?P<attr>\bsrcset\s*=\s*)(?P<q>["\'])(?P<val>[^"\']+)(?P=q)', re.I)
+_ASSET_EXT = (".css", ".js", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg",
+              ".ico", ".woff", ".woff2", ".ttf", ".otf", ".eot", ".mp4", ".webm",
+              ".mp3", ".wav", ".pdf", ".json", ".txt", ".xml")
+_SKIP_PREFIX = ("javascript:", "mailto:", "data:", "blob:", "#", "tel:")
+
+
+def _download_page(args):
+    url = str(args.get("url") or "").strip()
+    if not _url_ok(url):
+        return {"error": "url must start with http:// or https://"}
+    folder = str(args.get("path") or "").strip() or "pages"
+    want_assets = args.get("assets", True)
+    if isinstance(want_assets, str):
+        want_assets = want_assets.strip().lower() not in ("0", "false", "no", "off")
+    try:
+        max_assets = min(max(int(args.get("max_assets") or 60), 0), 400)
+    except Exception:
+        max_assets = 60
+    try:
+        timeout = min(max(int(args.get("timeout") or 60), 1), 300)
+    except Exception:
+        timeout = 60
+    try:
+        max_mb = float(args.get("max_mb") or 0)
+    except Exception:
+        max_mb = 0
+    cap = int(max_mb * 1024 * 1024) if max_mb else None
+    try:
+        body = _fetch_html(url, 3000000, timeout=timeout)
+    except Exception as exc:
+        return {"error": "could not read the page: %s" % exc}
+    try:
+        index_path = _safe_path(os.path.join(folder, "index.html"))
+        os.makedirs(os.path.dirname(index_path), exist_ok=True)
+    except Exception as exc:
+        return {"error": "bad destination path: %s" % exc}
+    base = url if url.endswith("/") else url.rsplit("/", 1)[0] + "/"
+    assets = []
+
+    def take(raw):
+        raw = raw.strip()
+        if not raw or raw.lower().startswith(_SKIP_PREFIX):
+            return None
+        return urllib.parse.urljoin(base, raw)
+
+    if want_assets and max_assets:
+        wanted = []
+        for m in _ASSET_ATTR.finditer(body):
+            raw = m.group("url")
+            full = take(raw)
+            if full and _url_ok(full):
+                wanted.append({"url": full, "raw": raw,
+                               "attr": m.group("attr"), "quote": m.group("q")})
+        for m in _SRCSET.finditer(body):
+            for part in m.group("val").split(","):
+                bits = part.strip().split()
+                if not bits:
+                    continue
+                full = take(bits[0])
+                if full and _url_ok(full):
+                    wanted.append({"url": full, "raw": bits[0],
+                                   "attr": m.group("attr"), "quote": m.group("q")})
+        seen = set()
+        for item in wanted[:max_assets]:
+            full = item["url"]
+            if full in seen:
+                continue
+            seen.add(full)
+            sub = os.path.join(folder, "assets")
+            rec = _download_one(full, "", sub, timeout=timeout, max_bytes=cap)
+            if rec.get("error"):
+                continue
+            rel = "assets/" + os.path.basename(rec["saved"]).replace("\\", "/")
+            assets.append({"file": rel, "bytes": rec["bytes"], "url": full})
+            needle = item["attr"] + item["quote"] + item["raw"] + item["quote"]
+            if needle in body:
+                body = body.replace(needle, item["attr"] + item["quote"] + rel + item["quote"])
+    title = ""
+    m = re.search(r"<title[^>]*>(.*?)</title>", body, re.I | re.S)
+    if m:
+        title = re.sub(r"\s+", " ", html.unescape(m.group(1))).strip()[:120]
+    try:
+        with open(index_path, "w", encoding="utf-8") as fh:
+            fh.write(body)
+    except Exception as exc:
+        return {"error": "could not save the page: %s" % exc}
+    return {"result": "ok", "url": url, "title": title,
+            "saved": index_path.replace("\\", "/"),
+            "bytes": len(body.encode("utf-8")),
+            "assets_saved": len(assets), "assets": assets[:40],
+            "note": "open the saved index.html - it works offline, assets are "
+                    "in the assets/ subfolder"}
+
+
+def _download_verify(args):
+    url = str(args.get("url") or "").strip()
+    if not _url_ok(url):
+        return {"error": "url must start with http:// or https://"}
+    want_sha = str(args.get("sha256") or "").strip().lower().replace(" ", "")
+    if want_sha and not re.fullmatch(r"[0-9a-f]{64}", want_sha):
+        return {"error": "sha256 must be 64 hex characters"}
+    try:
+        expect_size = int(args.get("bytes") or 0)
+    except Exception:
+        expect_size = 0
+    try:
+        timeout = min(max(int(args.get("timeout") or 300), 1), 1800)
+    except Exception:
+        timeout = 300
+    try:
+        retries = min(max(int(args.get("retries") or 3), 0), 10)
+    except Exception:
+        retries = 3
+    try:
+        max_mb = float(args.get("max_mb") or 0)
+    except Exception:
+        max_mb = 0
+    rec = _download_one(url, str(args.get("path") or "").strip(), "",
+                        timeout=timeout,
+                        max_bytes=int(max_mb * 1024 * 1024) if max_mb else None,
+                        resume=bool(args.get("resume", True)),
+                        retries=retries, overwrite=True)
+    if rec.get("error"):
+        return {"error": rec["error"]}
+    size = rec["bytes"]
+    out = {"result": "ok", "url": url, "saved": rec["saved"], "bytes": size,
+           "resumed": rec.get("resumed", False), "checks": {}}
+    if want_sha:
+        got = _sha256_of(rec["saved"].replace("/", os.sep))
+        out["checks"]["sha256"] = {"expected": want_sha, "actual": got,
+                                   "ok": got == want_sha}
+    if expect_size:
+        out["checks"]["size"] = {"expected": expect_size, "actual": size,
+                                 "ok": size == expect_size}
+    if out["checks"] and not all(c["ok"] for c in out["checks"].values()):
+        out["result"] = "FAILED CHECK"
+        out["verdict"] = ("the file downloaded but does NOT match what you asked "
+                          "for - keep it only if you know it is the right file")
+    return out
+
+
+def _download_media(args):
+    url = str(args.get("url") or "").strip()
+    if not _url_ok(url):
+        return {"error": "url must start with http:// or https://"}
+    exe = shutil.which("yt-dlp") or shutil.which("yt-dlp.exe")
+    if not exe:
+        try:
+            __import__("yt_dlp")
+            exe = sys.executable
+        except Exception:
+            return {"error": "yt-dlp is not installed - run "
+                             "'pip install yt-dlp' (or "
+                             "'python -m pip install yt-dlp') and try again"}
+    folder = str(args.get("path") or "media").strip() or "media"
+    try:
+        dest = _safe_path(folder)
+        os.makedirs(dest, exist_ok=True)
+    except Exception as exc:
+        return {"error": "bad destination path: %s" % exc}
+    cmd = [exe] if exe == sys.executable else [exe]
+    cmd += ["--no-playlist" if not args.get("playlist") else "--yes-playlist",
+            "--newline", "--no-warnings", "--print-json",
+            "--paths", dest, "-o", "%(title).80B [%(id)s].%(ext)s"]
+    audio_only = bool(args.get("audio_only"))
+    if audio_only:
+        cmd += ["-x", "--audio-format", str(args.get("audio_format") or "mp3")]
+    quality = str(args.get("quality") or "").strip()
+    if quality and not audio_only:
+        cmd += ["-f", quality]
+    if args.get("subtitles"):
+        cmd += ["--write-subs", "--write-auto-subs", "--sub-langs",
+                str(args.get("sub_langs") or "en"), "--embed-subs"]
+    if args.get("thumbnail"):
+        cmd += ["--write-thumbnail", "--embed-thumbnail"]
+    if str(args.get("cookies_from_browser") or "").strip():
+        cmd += ["--cookies-from-browser", str(args.get("cookies_from_browser")).strip()]
+    cmd.append(url)
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=min(max(int(args.get("timeout") or 900), 30), 3600),
+                              creationflags=CREATE_NO_WINDOW)
+    except subprocess.TimeoutExpired:
+        return {"error": "yt-dlp timed out"}
+    except Exception as exc:
+        return {"error": "yt-dlp failed to start: %s" % exc}
+    files = []
+    titles = []
+    for line in (proc.stdout or "").splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            info = json.loads(line)
+        except Exception:
+            continue
+        if info.get("title"):
+            titles.append(info["title"])
+        for entry in (info.get("requested_downloads") or []):
+            fp = entry.get("filepath") or entry.get("_filename")
+            if fp and os.path.isfile(fp):
+                files.append({"file": fp.replace("\\", "/"),
+                              "bytes": os.path.getsize(fp)})
+        if info.get("filepath") and os.path.isfile(info["filepath"]):
+            fp = info["filepath"]
+            if not any(f["file"].endswith(os.path.basename(fp)) for f in files):
+                files.append({"file": fp.replace("\\", "/"),
+                              "bytes": os.path.getsize(fp)})
+    if proc.returncode != 0 and not files:
+        tail = ((proc.stderr or "").strip().splitlines() or ["unknown error"])[-1]
+        return {"error": "yt-dlp: %s" % tail[:300]}
+    if not files:
+        try:
+            for name in sorted(os.listdir(dest)):
+                full = os.path.join(dest, name)
+                if os.path.isfile(full) and not name.endswith(".part"):
+                    files.append({"file": full.replace("\\", "/"),
+                                  "bytes": os.path.getsize(full)})
+        except Exception:
+            pass
+    return {"result": "ok", "url": url, "title": (titles[0] if titles else ""),
+            "folder": dest.replace("\\", "/"), "files": files[:20],
+            "audio_only": audio_only}
 
 
 def _archive(args):
@@ -5129,6 +5950,16 @@ def _execute_tool_call(name, args, tc, hooks, image_uri):
         raw_result = _clipboard(args)
     elif name == "download_file":
         raw_result = _download_file(args)
+    elif name == "download_batch":
+        raw_result = _download_batch(args)
+    elif name == "download_authed":
+        raw_result = _download_authed(args)
+    elif name == "download_page":
+        raw_result = _download_page(args)
+    elif name == "download_verify":
+        raw_result = _download_verify(args)
+    elif name == "download_media":
+        raw_result = _download_media(args)
     elif name == "archive":
         raw_result = _archive(args)
     elif name == "ask_user":
@@ -5214,7 +6045,8 @@ def _execute_tool_call(name, args, tc, hooks, image_uri):
         raw_result = _exec_file_tool(name, args)
     result = public_result(_clip_result(raw_result))
     full = _clip_result(raw_result)
-    record = {"name": name, "arguments": args, "result": result,
+    shown_args = _redact_secrets(args) if name == "download_authed" else args
+    record = {"name": name, "arguments": shown_args, "result": result,
               "full_result": full,
               "tool_call_id": tc.get("id") or "call_" + str(len(name))}
     if image_uri:

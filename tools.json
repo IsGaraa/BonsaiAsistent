@@ -1068,5 +1068,233 @@
         ]
       }
     }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "download_batch",
+      "description": "Download MANY files in one call: pass a list of URLs, or point 'from_page' at a web page and let it collect the links (optionally filtered by 'match'). Files land in one folder, several at a time, and you get a per-file report of what succeeded and what failed. Use this instead of calling download_file in a loop.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "urls": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Full http(s) URLs to download."
+          },
+          "from_page": {
+            "type": "string",
+            "description": "Read this page and download the links found on it (e.g. an index of files)."
+          },
+          "match": {
+            "type": "string",
+            "description": "Only keep links matching this regular expression, e.g. '\\\\.pdf$'."
+          },
+          "path": {
+            "type": "string",
+            "description": "Folder inside the workspace for the files. Default 'downloads'."
+          },
+          "max_files": {
+            "type": "integer",
+            "description": "Safety cap, default 25, max 200."
+          },
+          "parallel": {
+            "type": "integer",
+            "description": "How many at once, default 4, max 8."
+          },
+          "max_mb": {
+            "type": "integer",
+            "description": "Per-file size cap in MB."
+          },
+          "timeout": {
+            "type": "integer",
+            "description": "Per-file timeout in seconds (default 120)."
+          }
+        },
+        "required": []
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "download_authed",
+      "description": "Download a file that needs credentials - a page behind a login, a private API, a file with a token. Pass 'bearer', 'cookie' or full 'headers'. The secret values are never written to the chat history or printed back; only the header names are echoed. Prefer download_file for public URLs.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "url": {
+            "type": "string",
+            "description": "Full http(s) URL."
+          },
+          "bearer": {
+            "type": "string",
+            "description": "API token; sent as 'Authorization: Bearer <token>'."
+          },
+          "cookie": {
+            "type": "string",
+            "description": "Cookie header value, e.g. 'session=abc123'."
+          },
+          "headers": {
+            "type": "object",
+            "description": "Extra request headers, e.g. {'X-Api-Key': '...'}."
+          },
+          "path": {
+            "type": "string",
+            "description": "Destination inside the workspace."
+          },
+          "max_mb": {
+            "type": "integer",
+            "description": "Size cap in MB."
+          },
+          "timeout": {
+            "type": "integer",
+            "description": "Timeout seconds."
+          }
+        },
+        "required": [
+          "url"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "download_page",
+      "description": "Save a web page so it works OFFLINE: downloads the HTML plus its images, CSS, JS and fonts, rewrites the links to the local copies and writes index.html you can open later. Use it to keep a page, a docs page or an article.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "url": {
+            "type": "string",
+            "description": "Page to save."
+          },
+          "path": {
+            "type": "string",
+            "description": "Folder inside the workspace. Default 'pages'."
+          },
+          "assets": {
+            "type": "boolean",
+            "description": "Download images/CSS/JS too. Default true."
+          },
+          "max_assets": {
+            "type": "integer",
+            "description": "How many assets, default 60, max 400."
+          },
+          "max_mb": {
+            "type": "integer",
+            "description": "Per-asset size cap."
+          }
+        },
+        "required": [
+          "url"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "download_verify",
+      "description": "Download a file you must be sure about: big downloads continue where they stopped (HTTP resume), failed attempts retry, and the result is checked against the sha256 and/or the byte size you expected. Reports 'FAILED CHECK' instead of pretending it worked. Use it for installers, archives, datasets and model files.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "url": {
+            "type": "string",
+            "description": "Full http(s) URL."
+          },
+          "path": {
+            "type": "string",
+            "description": "Destination inside the workspace."
+          },
+          "sha256": {
+            "type": "string",
+            "description": "Expected 64-char sha256 of the file."
+          },
+          "bytes": {
+            "type": "integer",
+            "description": "Expected size in bytes."
+          },
+          "resume": {
+            "type": "boolean",
+            "description": "Continue a partial download. Default true."
+          },
+          "retries": {
+            "type": "integer",
+            "description": "Retry attempts, default 3, max 10."
+          },
+          "max_mb": {
+            "type": "integer",
+            "description": "Size cap in MB."
+          }
+        },
+        "required": [
+          "url"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "download_media",
+      "description": "Download video, audio or subtitles from a normal media site (YouTube, Vimeo, a direct .m3u8 stream, podcasts, etc.) using yt-dlp. Can pull the audio only as mp3, fetch subtitles and embed a thumbnail. Needs yt-dlp installed ('pip install yt-dlp').",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "url": {
+            "type": "string",
+            "description": "Media page or stream URL."
+          },
+          "path": {
+            "type": "string",
+            "description": "Folder inside the workspace. Default 'media'."
+          },
+          "audio_only": {
+            "type": "boolean",
+            "description": "Extract the audio as mp3 instead of the video."
+          },
+          "audio_format": {
+            "type": "string",
+            "description": "Audio format, default mp3."
+          },
+          "quality": {
+            "type": "string",
+            "description": "yt-dlp format string, e.g. 'bestvideo[height<=1080]+bestaudio'."
+          },
+          "subtitles": {
+            "type": "boolean",
+            "description": "Download subtitles too."
+          },
+          "sub_langs": {
+            "type": "string",
+            "description": "Subtitle languages, default 'en'."
+          },
+          "thumbnail": {
+            "type": "boolean",
+            "description": "Save and embed a thumbnail image."
+          },
+          "playlist": {
+            "type": "boolean",
+            "description": "Allow whole playlists/albums."
+          },
+          "cookies_from_browser": {
+            "type": "string",
+            "description": "Reuse cookies from chrome/firefox/edge for age or private videos."
+          },
+          "timeout": {
+            "type": "integer",
+            "description": "Timeout seconds."
+          }
+        },
+        "required": [
+          "url"
+        ]
+      }
+    }
   }
 ]
