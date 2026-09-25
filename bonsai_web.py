@@ -2207,25 +2207,47 @@ def _active_model():
 
 
 def _save_models():
+    # Keep the last known-good registry beside the real one. These are the user's
+    # own per-model sampling settings and they are not in git, so a bad write
+    # would silently reset them. Write to a sibling temp file and swap it in so
+    # an interrupted save can never truncate the live file.
     with _MODELS_LOCK:
         data = {"active": _ACTIVE_MODEL, "models": _MODELS}
     try:
         os.makedirs(os.path.dirname(MODELS_FILE), exist_ok=True)
-        with open(MODELS_FILE, "w", encoding="utf-8") as fh:
+        tmp = MODELS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(data, fh, indent=2, ensure_ascii=False)
+            fh.flush()
+            os.fsync(fh.fileno())
+        if os.path.exists(MODELS_FILE):
+            shutil.copyfile(MODELS_FILE, MODELS_FILE + ".bak")
+        os.replace(tmp, MODELS_FILE)
         return True
     except Exception:
+        try:
+            if os.path.exists(MODELS_FILE + ".tmp"):
+                os.remove(MODELS_FILE + ".tmp")
+        except Exception:
+            pass
         return False
 
 
 def _load_models():
     global _MODELS, _ACTIVE_MODEL
     data = None
-    try:
-        with open(MODELS_FILE, encoding="utf-8") as fh:
-            data = json.load(fh)
-    except Exception:
-        data = None
+    for candidate in (MODELS_FILE, MODELS_FILE + ".bak"):
+        try:
+            with open(candidate, encoding="utf-8") as fh:
+                data = json.load(fh)
+            if isinstance(data, dict) and data.get("models"):
+                if candidate != MODELS_FILE:
+                    print("models.json was unreadable - recovered from the backup",
+                          flush=True)
+                break
+            data = None
+        except Exception:
+            data = None
     models, active = [], None
     if isinstance(data, dict):
         models = [m for m in (data.get("models") or [])
