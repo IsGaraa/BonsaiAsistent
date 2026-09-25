@@ -325,7 +325,7 @@ THINK 2.8s · SPEAK 0.4s · 45.3 tok/s · tokens 138 · ctx 1638/32768
 - **THINK** - time spent reasoning before the first output token.
 - **SPEAK** - time spent generating the reply.
 - **tok/s** - average generation speed (RTX 4070 ≈ 44-48).
-- **ctx** - context slots used / total (32k window), refreshed live.
+- **ctx** - context slots used / total for the model you actually selected, refreshed live.
 
 A compact gold chip with the same numbers is saved onto each reply so the
 stats survive reloads.
@@ -456,12 +456,20 @@ model shows up without touching `models.json`.
 | **GPU layers (-ngl)** | 99 | how many layers to offload to the GPU. Lower it (e.g. 20) if the model doesn't fit in VRAM |
 
 These are stored **per model** in `models.json`, so each model keeps its own
-settings, and they are read when the model server is launched - so a saved
-change takes effect the **next time that model loads** (after a switch, an
-EJECT or a restart), never in the middle of a reply. **Defaults** restores
+settings. They are llama-server launch flags, so they are applied by starting a
+fresh server - never in the middle of a reply. **Save** does that for you: if the
+model is running it is stopped, and your next message brings it back with the new
+values. **EJECT**, re-clicking the already-selected model, and restarting the app
+do the same thing by hand. The context meter in the stats bar follows the saved
+value immediately, without waiting for the reload. **Defaults** restores
 32768 / 1.0 / 0.95 / 20 / 99, and values are clamped to sane ranges server-side.
 They apply to locally-served models; an external API endpoint is configured by
 its own server.
+
+If a conversation ever grows past the context window, BONSAI says so in plain
+language and names the model and its real context size instead of surfacing a raw
+server error. Start a new chat, raise the context size, or drop some long
+attachments.
 
 ## 9. The AI model
 

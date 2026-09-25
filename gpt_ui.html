@@ -351,7 +351,7 @@
 </div>
 <input type="file" id="filein" accept="image/*,.txt,.md,.py,.js,.ts,.json,.csv,.log,.ini,.cfg,.xml,.html,.css,.bat,.ps1,.sh,.yml,.yaml,.sql,.java,.cpp,.c,.h,.cs,.go,.rb,.php,.toml,.env,.gitignore" multiple>
 <script>
-const BONSAI_CTX = 32768;
+let BONSAI_CTX = 0;
 let chats = load();
 let cur = null, busy = false, pendingAtt = [], started = false, abortCtrl = null, msgQueue = [];
 let chatMode = localStorage.getItem('bonsai_gpt_mode') === 'plan' ? 'plan' : 'build';
@@ -987,7 +987,7 @@ function onStats(j) {
   statsVals.respond_ms = j.respond_ms || 0;
   statsVals.tok_s = j.tok_s || 0;
   statsVals.ctx_used = j.ctx_used || 0;
-  statsVals.ctx_left = j.ctx_left || (BONSAI_CTX - statsVals.ctx_used);
+  statsVals.ctx_left = j.ctx_left || Math.max(0, BONSAI_CTX - statsVals.ctx_used);
   statsVals.prompt_tokens = j.prompt_tokens || 0;
   statsVals.completion_tokens = j.completion_tokens || 0;
   runningStats();
@@ -1470,6 +1470,8 @@ function setModelStatus(ready, loading) {
 function renderModels(j) {
   const sel = document.getElementById('modelsel');
   if (!sel) return;
+  const _am = (j.models || []).filter(function (m) { return m.id === j.active; })[0];
+  if (_am && _am.ctx) BONSAI_CTX = _am.ctx;
   sel.innerHTML = '';
   (j.models || []).forEach(function (m) {
     const o = document.createElement('option');
@@ -1623,6 +1625,7 @@ function cfgFill(j) {
   const models = (j && j.models) || [];
   const act = models.filter(function (m) { return m.id === (j && j.active); })[0];
   const cfg = (act && act.cfg) || (j && j.defaults) || { ctx: 32768, temp: 1, top_p: 0.95, top_k: 20, ngl: 99 };
+  if (act && act.ctx) BONSAI_CTX = act.ctx;
   const set = function (id, v) { const e = document.getElementById(id); if (e) e.value = v; };
   set('cfg_ctx', cfg.ctx); set('cfg_temp', cfg.temp);
   set('cfg_top_p', cfg.top_p); set('cfg_top_k', cfg.top_k); set('cfg_ngl', cfg.ngl);
@@ -1632,7 +1635,7 @@ function cfgFill(j) {
   if (hint) {
     hint.textContent = !act ? 'No local model selected.'
       : (act.type === 'api' ? 'External endpoints are configured by their own server.'
-      : 'Saved settings are used the next time this model is loaded (after a switch or EJECT).');
+      : 'Save and the model server restarts, so your next message uses these values. EJECT does the same by hand.');
   }
 }
 function openCfgMdl() {
@@ -1676,7 +1679,7 @@ if (_cfgSave) _cfgSave.onclick = function () {
       renderModels(res);
       cfgFill(res);
       const hint = document.getElementById('cfghint');
-      if (hint) hint.textContent = 'Saved. These values apply the next time this model is loaded.';
+      if (hint) hint.textContent = 'Saved. ' + (res.detail || 'These values apply the next time this model is loaded.');
     })
     .catch(function () { alert('Could not save the settings'); })
     .then(function () { _cfgSave.disabled = false; });

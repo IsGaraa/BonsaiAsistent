@@ -2093,9 +2093,31 @@ def _set_model_config(mid, raw):
         if entry.get("type", "local") != "local":
             return {"ok": False,
                     "error": "sampling settings only apply to local models"}
+        was_active = (mid == _ACTIVE_MODEL)
+        old_cfg = _entry_cfg(entry)
         entry["cfg"] = cfg
     _save_models()
-    return {"ok": True, "id": mid, "cfg": cfg, **_public_models()}
+    # The sampling values are llama-server command line flags, so they only take
+    # effect on a fresh process. The context meter has to follow the saved value
+    # immediately though, which is why this runs even if no reload happens.
+    if was_active:
+        _apply_model(entry)
+    applied = was_active and old_cfg != cfg
+    reloaded = False
+    if applied and _bonsai_ready():
+        # Reload through the normal eject path so the next message comes back on
+        # a server launched with the new --ctx-size/--temp/--top-p/--top-k/-ngl.
+        _unload_bonsai()
+        reloaded = True
+    res = {"ok": True, "id": mid, "cfg": cfg, **_public_models()}
+    if applied:
+        res["detail"] = ("saved - the model server was stopped, your next message "
+                         "reloads it with these values" if reloaded else
+                         "saved - these values apply the next time the model loads")
+        res["reloaded"] = reloaded
+    else:
+        res["detail"] = "saved - unchanged"
+    return res
 
 
 def _default_model_entry():
@@ -2159,16 +2181,21 @@ def _apply_model(entry):
     if not entry:
         return
     _ACTIVE_MODEL = entry["id"]
+    # The context size lives in entry["cfg"], which is what the gear dialog
+    # writes and what _entry_cfg() feeds to llama-server as --ctx-size. Reading
+    # entry["ctx"] here left the context meter stuck on the registry default
+    # (32768) no matter what the user had actually set.
+    ctx = _entry_cfg(entry)["ctx"]
     if entry.get("type") == "api":
         BONSAI_BASE = (entry.get("base_url") or "http://127.0.0.1:8080").rstrip("/")
         BONSAI_MODEL_ID = entry.get("model") or entry["id"]
-        BONSAI_CTX = int(entry.get("ctx") or BONSAI_CTX)
+        BONSAI_CTX = int(entry.get("ctx") or ctx)
     else:
         BONSAI_BASE = "http://127.0.0.1:%d" % int(entry.get("port") or 8080)
         BONSAI_MODEL_ID = entry["id"]
         BONSAI_MODEL = entry.get("path") or BONSAI_MODEL
         BONSAI_MMPROJ = entry.get("mmproj") or ""
-        BONSAI_CTX = int(entry.get("ctx") or 32768)
+        BONSAI_CTX = int(ctx)
 
 
 def _active_model():
@@ -2279,7 +2306,16 @@ def _select_model(mid):
     if not entry:
         return {"ok": False, "error": "unknown model '%s'" % mid}
     if mid == _ACTIVE_MODEL and _bonsai_ready():
-        return {"ok": True, "already": True, **_public_models()}
+        # Re-clicking the active model is how people try to re-apply sampling
+        # settings, so actually restart it instead of silently doing nothing.
+        _apply_model(entry)
+        _stop_local_server(int(entry.get("port") or 8080))
+        _save_models()
+        return {"ok": True, "type": "local", "ready": _bonsai_ready(),
+                "reloaded": True,
+                "detail": "model reloaded - it starts on your next message with "
+                          "its current settings",
+                **_public_models()}
     if entry.get("type") == "api":
         _apply_model(entry)
         _save_models()
@@ -7129,15 +7165,55 @@ def stream_agent(messages, on_reason=None, on_delta=None, on_tool=None,
     return {"calls": calls, "_stats": total}
 
 
+_CTX_OVERFLOW_MARKERS = (
+    "exceeds the available context",
+    "exceeds context size",
+    "exceed the context size",
+    "context size exceeded",
+    "context shift is disabled",
+    "n_ctx",
+    "kv cache is full",
+    "input is too large",
+)
+
+
+def _ctx_overflow_text(exc):
+    """llama-server reports an oversized prompt as a raw HTTP 400. Turn that into
+    something the user can actually act on instead of a wall of server text."""
+    blob = str(exc or "").lower()
+    if not any(marker in blob for marker in _CTX_OVERFLOW_MARKERS):
+        return None
+    entry = _active_model()
+    name = (entry or {}).get("label") or (entry or {}).get("id") or "this model"
+    try:
+        size = int(BONSAI_CTX)
+    except Exception:
+        size = 0
+    return ("This conversation no longer fits in the context window of '%s' "
+            "(%s tokens), so the model could not read it.\n\n"
+            "Fix it in whichever way suits you:\n"
+            "  - start a new chat (the old one is still saved, you can reopen it),\n"
+            "  - raise Context size in the model settings (gear) and save, which "
+            "restarts the model server,\n"
+            "  - or remove some long attachments or earlier messages."
+            % (name, "{:,}".format(size) if size else "unknown"))
+
+
 def handle_chat(messages, on_reason=None, on_delta=None, on_tool=None,
                 stream=False, mode=MODE_BUILD, on_stats=None, hooks=None):
     msgs = build_messages(messages, mode=mode)
-    if stream:
-        return stream_agent(msgs, on_reason=on_reason, on_delta=on_delta,
-                            on_tool=on_tool, mode=mode, on_stats=on_stats,
-                            hooks=hooks)
-    return run_agent(msgs, on_tool=on_tool, mode=mode, on_stats=on_stats,
-                     hooks=hooks)
+    try:
+        if stream:
+            return stream_agent(msgs, on_reason=on_reason, on_delta=on_delta,
+                                on_tool=on_tool, mode=mode, on_stats=on_stats,
+                                hooks=hooks)
+        return run_agent(msgs, on_tool=on_tool, mode=mode, on_stats=on_stats,
+                         hooks=hooks)
+    except Exception as exc:
+        friendly = _ctx_overflow_text(exc)
+        if friendly:
+            raise RuntimeError(friendly) from exc
+        raise
 
 
 PAGE = """<!doctype html>
@@ -7721,7 +7797,7 @@ PAGE = """<!doctype html>
 </div>
 <input type="file" id="filein" accept="image/*,.txt,.md,.py,.js,.ts,.json,.csv,.log,.ini,.cfg,.xml,.html,.css,.bat,.ps1,.sh,.yml,.yaml,.sql,.java,.cpp,.c,.h,.cs,.go,.rb,.php,.toml,.env,.gitignore" multiple>
 <script>
-const BONSAI_CTX = 32768;
+let BONSAI_CTX = 0;
 let chats = load();
 let cur = null;
 let busy = false;
@@ -8259,7 +8335,7 @@ function onStats(j) {
   statsVals.respond_ms = j.respond_ms || 0;
   statsVals.tok_s = j.tok_s || 0;
   statsVals.ctx_used = j.ctx_used || 0;
-  statsVals.ctx_left = j.ctx_left || (BONSAI_CTX - statsVals.ctx_used);
+  statsVals.ctx_left = j.ctx_left || Math.max(0, BONSAI_CTX - statsVals.ctx_used);
   statsVals.prompt_tokens = j.prompt_tokens || 0;
   statsVals.completion_tokens = j.completion_tokens || 0;
   runningStats();
@@ -8794,6 +8870,8 @@ function setModelStatus(ready, loading) {
 function renderModels(j) {
   const sel = document.getElementById('modelsel');
   if (!sel) return;
+  const _am = (j.models || []).filter(function (m) { return m.id === j.active; })[0];
+  if (_am && _am.ctx) BONSAI_CTX = _am.ctx;
   sel.innerHTML = '';
   (j.models || []).forEach(function (m) {
     const o = document.createElement('option');
@@ -8947,6 +9025,7 @@ function cfgFill(j) {
   const models = (j && j.models) || [];
   const act = models.filter(function (m) { return m.id === (j && j.active); })[0];
   const cfg = (act && act.cfg) || (j && j.defaults) || { ctx: 32768, temp: 1, top_p: 0.95, top_k: 20, ngl: 99 };
+  if (act && act.ctx) BONSAI_CTX = act.ctx;
   const set = function (id, v) { const e = document.getElementById(id); if (e) e.value = v; };
   set('cfg_ctx', cfg.ctx); set('cfg_temp', cfg.temp);
   set('cfg_top_p', cfg.top_p); set('cfg_top_k', cfg.top_k); set('cfg_ngl', cfg.ngl);
@@ -8956,7 +9035,7 @@ function cfgFill(j) {
   if (hint) {
     hint.textContent = !act ? 'No local model selected.'
       : (act.type === 'api' ? 'External endpoints are configured by their own server.'
-      : 'Saved settings are used the next time this model is loaded (after a switch or EJECT).');
+      : 'Save and the model server restarts, so your next message uses these values. EJECT does the same by hand.');
   }
 }
 function openCfgMdl() {
@@ -9000,7 +9079,7 @@ if (_cfgSave) _cfgSave.onclick = function () {
       renderModels(res);
       cfgFill(res);
       const hint = document.getElementById('cfghint');
-      if (hint) hint.textContent = 'Saved. These values apply the next time this model is loaded.';
+      if (hint) hint.textContent = 'Saved. ' + (res.detail || 'These values apply the next time this model is loaded.');
     })
     .catch(function () { alert('Could not save the settings'); })
     .then(function () { _cfgSave.disabled = false; });
@@ -9650,7 +9729,7 @@ PAGE_GPT = """<!doctype html>
 </div>
 <input type="file" id="filein" accept="image/*,.txt,.md,.py,.js,.ts,.json,.csv,.log,.ini,.cfg,.xml,.html,.css,.bat,.ps1,.sh,.yml,.yaml,.sql,.java,.cpp,.c,.h,.cs,.go,.rb,.php,.toml,.env,.gitignore" multiple>
 <script>
-const BONSAI_CTX = 32768;
+let BONSAI_CTX = 0;
 let chats = load();
 let cur = null, busy = false, pendingAtt = [], started = false, abortCtrl = null, msgQueue = [];
 let chatMode = localStorage.getItem('bonsai_gpt_mode') === 'plan' ? 'plan' : 'build';
@@ -10286,7 +10365,7 @@ function onStats(j) {
   statsVals.respond_ms = j.respond_ms || 0;
   statsVals.tok_s = j.tok_s || 0;
   statsVals.ctx_used = j.ctx_used || 0;
-  statsVals.ctx_left = j.ctx_left || (BONSAI_CTX - statsVals.ctx_used);
+  statsVals.ctx_left = j.ctx_left || Math.max(0, BONSAI_CTX - statsVals.ctx_used);
   statsVals.prompt_tokens = j.prompt_tokens || 0;
   statsVals.completion_tokens = j.completion_tokens || 0;
   runningStats();
@@ -10769,6 +10848,8 @@ function setModelStatus(ready, loading) {
 function renderModels(j) {
   const sel = document.getElementById('modelsel');
   if (!sel) return;
+  const _am = (j.models || []).filter(function (m) { return m.id === j.active; })[0];
+  if (_am && _am.ctx) BONSAI_CTX = _am.ctx;
   sel.innerHTML = '';
   (j.models || []).forEach(function (m) {
     const o = document.createElement('option');
@@ -10922,6 +11003,7 @@ function cfgFill(j) {
   const models = (j && j.models) || [];
   const act = models.filter(function (m) { return m.id === (j && j.active); })[0];
   const cfg = (act && act.cfg) || (j && j.defaults) || { ctx: 32768, temp: 1, top_p: 0.95, top_k: 20, ngl: 99 };
+  if (act && act.ctx) BONSAI_CTX = act.ctx;
   const set = function (id, v) { const e = document.getElementById(id); if (e) e.value = v; };
   set('cfg_ctx', cfg.ctx); set('cfg_temp', cfg.temp);
   set('cfg_top_p', cfg.top_p); set('cfg_top_k', cfg.top_k); set('cfg_ngl', cfg.ngl);
@@ -10931,7 +11013,7 @@ function cfgFill(j) {
   if (hint) {
     hint.textContent = !act ? 'No local model selected.'
       : (act.type === 'api' ? 'External endpoints are configured by their own server.'
-      : 'Saved settings are used the next time this model is loaded (after a switch or EJECT).');
+      : 'Save and the model server restarts, so your next message uses these values. EJECT does the same by hand.');
   }
 }
 function openCfgMdl() {
@@ -10975,7 +11057,7 @@ if (_cfgSave) _cfgSave.onclick = function () {
       renderModels(res);
       cfgFill(res);
       const hint = document.getElementById('cfghint');
-      if (hint) hint.textContent = 'Saved. These values apply the next time this model is loaded.';
+      if (hint) hint.textContent = 'Saved. ' + (res.detail || 'These values apply the next time this model is loaded.');
     })
     .catch(function () { alert('Could not save the settings'); })
     .then(function () { _cfgSave.disabled = false; });
