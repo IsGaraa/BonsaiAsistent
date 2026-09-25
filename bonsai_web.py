@@ -2672,17 +2672,76 @@ CLIPBOARD_TOOL = {
 }
 
 
+def _dl_tune_props(with_files=False):
+    """Schema knobs every download tool shares, so they cannot drift apart."""
+    props = {
+        "max_mb": {"type": "integer",
+                   "description": "Optional size cap for this file in MB "
+                                  "(default: no limit at all)."},
+        "retries": {"type": "integer",
+                    "description": "Extra attempts when the connection drops, "
+                                   "max 10."},
+        "connections": {"type": "integer",
+                        "description": "Split this one file across 1-4 parallel "
+                                       "connections (default 1). Needs a server "
+                                       "that honours range requests; a large "
+                                       "speed-up on slow single-stream hosts, "
+                                       "ignored for small files."},
+        "throttle_kbps": {"type": "integer",
+                          "description": "Cap this download at N kilobytes per "
+                                         "second (default 0 = uncapped) so it "
+                                         "leaves bandwidth for other apps."},
+        "timeout": {"type": "integer",
+                    "description": "Seconds to wait before handing the download "
+                                   "back as still running (default 180, max "
+                                   "1800). A download that outlasts it keeps "
+                                   "going in the background."},
+        "background": {"type": "boolean",
+                       "description": "Return straight away with a job id instead "
+                                      "of waiting. The transfer continues and shows "
+                                      "up in the DOWNLOADS panel."}
+    }
+    if with_files:
+        props["overwrite"] = {"type": "boolean",
+                              "description": "Replace the destination if it "
+                                             "already exists (default false: a "
+                                             "numbered copy is made)."}
+    return props
+
+
+DOWNLOAD_STATUS_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "download_status",
+        "description": "Check on downloads: pass a job id to see one transfer, or "
+                       "call it with no arguments to list everything currently "
+                       "queued, running or paused, with bytes, speed and ETA. Use "
+                       "it after a 'background: true' download.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "job": {"type": "string",
+                        "description": "Job id from a background download. Omit to "
+                                       "list the active ones."}
+            },
+            "required": []
+        }
+    }
+}
+
 DOWNLOAD_TOOL = {
     "type": "function",
     "function": {
         "name": "download_file",
         "description": "Download a file from a web URL and save it inside the "
-                       "workspace folder. Returns the saved path, the byte size "
-                       "and (for text files) the beginning of the content so "
-                       "you can see what you got.",
+                       "workspace folder. Streams straight to disk, so a 5 GB file "
+                       "costs no more memory than a small one, and it can continue "
+                       "where it stopped if the connection drops. Returns the saved "
+                       "path, the byte size and (for text files) the beginning of the "
+                       "content so you can see what you got.",
         "parameters": {
             "type": "object",
-            "properties": {
+            "properties": dict({
                 "url": {
                     "type": "string",
                     "description": "Full http(s) URL to download."
@@ -2693,7 +2752,7 @@ DOWNLOAD_TOOL = {
                                    "e.g. 'Downloads/installer.exe'. Defaults to "
                                    "the file name from the URL."
                 }
-            },
+            }, **_dl_tune_props(with_files=True)),
             "required": ["url"]
         }
     }
@@ -2712,7 +2771,7 @@ DOWNLOAD_BATCH_TOOL = {
                        "calling download_file in a loop.",
         "parameters": {
             "type": "object",
-            "properties": {
+            "properties": dict({
                 "urls": {"type": "array", "items": {"type": "string"},
                          "description": "Full http(s) URLs to download."},
                 "from_page": {"type": "string",
@@ -2728,12 +2787,8 @@ DOWNLOAD_BATCH_TOOL = {
                 "max_files": {"type": "integer",
                               "description": "Safety cap, default 25, max 200."},
                 "parallel": {"type": "integer",
-                             "description": "How many at once, default 4, max 8."},
-                "max_mb": {"type": "integer",
-                           "description": "Per-file size cap in MB."},
-                "timeout": {"type": "integer",
-                            "description": "Per-file timeout in seconds (default 120)."}
-            },
+                             "description": "How many files at once, default 4, max 8."},
+            }, **_dl_tune_props()),
             "required": []
         }
     }
@@ -2751,7 +2806,7 @@ DOWNLOAD_AUTHED_TOOL = {
                        "URLs.",
         "parameters": {
             "type": "object",
-            "properties": {
+            "properties": dict({
                 "url": {"type": "string", "description": "Full http(s) URL."},
                 "bearer": {"type": "string",
                            "description": "API token; sent as 'Authorization: "
@@ -2764,9 +2819,7 @@ DOWNLOAD_AUTHED_TOOL = {
                                            "{'X-Api-Key': '...'}."},
                 "path": {"type": "string",
                          "description": "Destination inside the workspace."},
-                "max_mb": {"type": "integer", "description": "Size cap in MB."},
-                "timeout": {"type": "integer", "description": "Timeout seconds."}
-            },
+            }, **_dl_tune_props()),
             "required": ["url"]
         }
     }
@@ -2810,7 +2863,7 @@ DOWNLOAD_VERIFY_TOOL = {
                        "datasets and model files.",
         "parameters": {
             "type": "object",
-            "properties": {
+            "properties": dict({
                 "url": {"type": "string", "description": "Full http(s) URL."},
                 "path": {"type": "string",
                          "description": "Destination inside the workspace."},
@@ -2820,10 +2873,7 @@ DOWNLOAD_VERIFY_TOOL = {
                           "description": "Expected size in bytes."},
                 "resume": {"type": "boolean",
                            "description": "Continue a partial download. Default true."},
-                "retries": {"type": "integer",
-                            "description": "Retry attempts, default 3, max 10."},
-                "max_mb": {"type": "integer", "description": "Size cap in MB."}
-            },
+            }, **_dl_tune_props()),
             "required": ["url"]
         }
     }
@@ -3374,9 +3424,9 @@ NEW_TOOLS = [WINDOW_LIST_TOOL, WINDOW_ACTION_TOOL,
              SCHEDULE_TOOL, LIST_SCHEDULES_TOOL, UNSCHEDULE_TOOL,
              TTS_VOICES_TOOL, TTS_SPEAK_TOOL, PREVIEW_HTML_TOOL]
 
-DOWNLOAD_TOOLS = [DOWNLOAD_BATCH_TOOL, DOWNLOAD_AUTHED_TOOL,
-                  DOWNLOAD_PAGE_TOOL, DOWNLOAD_VERIFY_TOOL,
-                  DOWNLOAD_MEDIA_TOOL]
+DOWNLOAD_TOOLS = [DOWNLOAD_STATUS_TOOL, DOWNLOAD_BATCH_TOOL,
+                  DOWNLOAD_AUTHED_TOOL, DOWNLOAD_PAGE_TOOL,
+                  DOWNLOAD_VERIFY_TOOL, DOWNLOAD_MEDIA_TOOL]
 
 PC_TOOLS = [SHOT_TOOL, INPUT_TOOL, CLIPBOARD_TOOL,
             DOWNLOAD_TOOL, ARCHIVE_TOOL, ASK_TOOL, TODO_TOOL] + NEW_TOOLS + DOWNLOAD_TOOLS
@@ -4256,7 +4306,18 @@ def _free_bytes(path):
 
 
 def _content_length(url, headers=None, timeout=30):
-    """Ask the server how big the file is (HEAD, falling back to a ranged GET)."""
+    """Ask the server how big the file is (None when it will not say)."""
+    return _probe_url(url, headers, timeout).get("size")
+
+
+def _probe_url(url, headers=None, timeout=30):
+    """One cheap round trip that learns size, range support and the real name.
+
+    Range support decides whether a download can be split across several
+    connections, so it is worth knowing before any bytes are written.
+    """
+    out = {"size": None, "accepts_ranges": False, "content_type": None,
+           "filename": None, "final_url": url}
     req_headers = {"User-Agent": _WEB_UA}
     for k, v in (headers or {}).items():
         if v is not None and str(k).strip():
@@ -4264,22 +4325,35 @@ def _content_length(url, headers=None, timeout=30):
     try:
         req = urllib.request.Request(url, headers=req_headers, method="HEAD")
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            n = resp.headers.get("Content-Length")
+            out["final_url"] = resp.geturl()
+            rheaders = {k.title(): v for k, v in resp.headers.items()}
+            out["content_type"] = rheaders.get("Content-Type")
+            out["filename"] = _name_from_response(url, rheaders)
+            if (rheaders.get("Accept-Ranges") or "").lower().strip() == "bytes":
+                out["accepts_ranges"] = True
+            n = rheaders.get("Content-Length")
             if n:
-                return int(n)
+                out["size"] = int(n)
+            if out["size"] is not None:
+                return out
     except Exception:
         pass
     try:
         req_headers["Range"] = "bytes=0-0"
         req = urllib.request.Request(url, headers=req_headers)
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            crange = resp.headers.get("Content-Range") or ""
+            out["final_url"] = resp.geturl()
+            code = getattr(resp, "status", 200) or 200
+            rheaders = {k.title(): v for k, v in resp.headers.items()}
+            if code == 206:
+                out["accepts_ranges"] = True
+            crange = rheaders.get("Content-Range") or ""
             m = re.search(r"/(\d+)$", crange)
             if m:
-                return int(m.group(1))
+                out["size"] = int(m.group(1))
     except Exception:
         pass
-    return None
+    return out
 
 
 def _space_guard(url, dest, headers=None, need=None):
@@ -4298,9 +4372,34 @@ def _space_guard(url, dest, headers=None, need=None):
     return None
 
 
-def _fetch_to_file(url, dest, headers=None, timeout=180, max_bytes=None,
-                   resume=False, retries=0, method="GET"):
-    """Stream an http(s) URL straight to disk. Never buffers the whole file."""
+class _DLCanceled(Exception):
+    """Raised inside a transfer when the job was canceled."""
+
+
+class _DLPaused(Exception):
+    """Raised inside a transfer when the job was paused (socket released)."""
+
+
+def _dl_throttle(start_t, moved, bps):
+    """Sleep just enough to keep the average rate at or below bps."""
+    if not bps or bps <= 0:
+        return
+    ahead = (float(moved) / float(bps)) - (time.time() - start_t)
+    if ahead > 0:
+        time.sleep(min(ahead, 2.0))
+
+
+def _stream_to_file(url, dest, headers=None, timeout=180, max_bytes=None,
+                    resume=False, retries=0, method="GET", first=None, last=None,
+                    progress=None, cancel=None, pause=None, throttle_bps=0,
+                    have_bytes=None):
+    """Stream one byte range of a URL to dest, appending at an offset.
+
+    first/last are inclusive byte offsets used by segmented downloads; with
+    first None the normal resume rules apply (continue at the current file
+    size). Pause and cancel are raised as exceptions so a stopped transfer is
+    never mistaken for a failure, and the partial file stays resumable.
+    """
     if not _url_ok(url):
         return {"error": "url must start with http:// or https://"}
     cap = int(max_bytes or MAX_DOWNLOAD_BYTES)
@@ -4308,31 +4407,52 @@ def _fetch_to_file(url, dest, headers=None, timeout=180, max_bytes=None,
     for k, v in (headers or {}).items():
         if v is not None and str(k).strip():
             req_headers[str(k)] = str(v)
+    span = (last - first + 1) if first is not None else None
     have = 0
-    if resume and os.path.isfile(dest) and os.path.getsize(dest) > 0:
+    if first is not None:
+        # a preallocated segment file is already at full length, so its size
+        # says nothing: only the ledger may claim bytes are done
+        have = max(0, min(int(have_bytes or 0), span))
+    elif resume and os.path.isfile(dest) and os.path.getsize(dest) > 0:
         have = os.path.getsize(dest)
-        req_headers["Range"] = "bytes=%d-" % have
-    last = None
+    started = time.time()
+    moved = 0
+    last_err = None
     for attempt in range(max(1, int(retries or 0) + 1)):
         try:
+            if span is not None:
+                req_headers["Range"] = "bytes=%d-%d" % (first + have, last)
+            elif have:
+                req_headers["Range"] = "bytes=%d-" % have
+            else:
+                req_headers.pop("Range", None)
             req = urllib.request.Request(url, headers=req_headers, method=method)
+            os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 code = getattr(resp, "status", 200) or 200
                 rheaders = {k.title(): v for k, v in resp.headers.items()}
-                mode = "ab"
-                if have and code != 206:
-                    have = 0
-                    mode = "wb"
-                written = have
-                os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
+                if span is not None and code != 206:
+                    return {"error": "server ignored the range request (HTTP %s), "
+                                     "cannot fetch that part" % code}
+                if span is None:
+                    mode = "ab" if have else "wb"
+                    pos = have
+                else:
+                    mode = "r+b" if os.path.isfile(dest) else "wb"
+                    pos = first + have
+                got_here = 0
                 with open(dest, mode) as fh:
+                    if mode != "ab":
+                        fh.seek(pos)
                     while True:
+                        if cancel is not None and cancel.is_set():
+                            raise _DLCanceled()
+                        if pause is not None and pause.is_set():
+                            raise _DLPaused()
                         chunk = resp.read(DOWNLOAD_CHUNK)
                         if not chunk:
                             break
-                        written += len(chunk)
-                        if cap and written > cap:
-                            fh.close()
+                        if cap and (pos + got_here + len(chunk)) > cap:
                             try:
                                 os.remove(dest)
                             except OSError:
@@ -4341,39 +4461,243 @@ def _fetch_to_file(url, dest, headers=None, timeout=180, max_bytes=None,
                                             "limit (raise it with max_mb)"
                                     % (url, cap / (1024 * 1024))}
                         fh.write(chunk)
+                        got_here += len(chunk)
+                        moved += len(chunk)
+                        if progress:
+                            progress(len(chunk))
+                        _dl_throttle(started, moved, throttle_bps)
+                written = pos + got_here
                 want = rheaders.get("Content-Length")
                 if want:
                     try:
-                        want = int(want) + (have if code == 206 else 0)
+                        want = int(want)
                     except (TypeError, ValueError):
                         want = None
-                if want and written < want:
-                    # the connection died mid-file: keep what we got and retry
-                    last = ("connection closed after %d of %d bytes"
-                            % (written, want))
-                    have = written
-                    if attempt < int(retries or 0):
-                        time.sleep(1.5 * (attempt + 1))
-                        req_headers["Range"] = "bytes=%d-" % have
-                        continue
-                    return {"error": "download incomplete: %s" % last}
-                return {"ok": True, "url": url, "status": code,
-                        "bytes": written, "resumed": bool(have),
-                        "content_type": rheaders.get("Content-Type"),
-                        "final_url": resp.geturl(), "headers": rheaders}
+                if want and got_here < want:
+                    last_err = ("connection closed after %d of %d bytes"
+                                % (written, pos + want))
+                elif span is not None and written < last + 1:
+                    last_err = "stopped at %d of %d" % (written, last + 1)
+                else:
+                    return {"ok": True, "url": url, "status": code,
+                            "bytes": written, "resumed": bool(have),
+                            "content_type": rheaders.get("Content-Type"),
+                            "final_url": resp.geturl(), "headers": rheaders}
+                have = written
         except urllib.error.HTTPError as exc:
-            last = "HTTP %s %s" % (exc.code, exc.reason)
+            last_err = "HTTP %s %s" % (exc.code, exc.reason)
             if exc.code == 416 and have:
                 return {"ok": True, "url": url, "status": 206, "bytes": have,
                         "resumed": True, "already_complete": True,
                         "content_type": None, "final_url": url, "headers": {}}
             if exc.code < 500:
                 break
+        except (_DLCanceled, _DLPaused):
+            raise
         except Exception as exc:
-            last = str(exc)
+            last_err = str(exc)
         if attempt < int(retries or 0):
             time.sleep(1.5 * (attempt + 1))
-    return {"error": "download failed: %s" % (last or "unknown error")}
+    return {"error": "download incomplete: %s" % (last_err or "unknown error")}
+
+
+def _fetch_to_file(url, dest, headers=None, timeout=180, max_bytes=None,
+                   resume=False, retries=0, method="GET", progress=None,
+                   cancel=None, throttle_bps=0, first=None, last=None):
+    """Thin wrapper kept for callers that want a plain single-stream fetch."""
+    return _stream_to_file(url, dest, headers=headers, timeout=timeout,
+                           max_bytes=max_bytes, resume=resume, retries=retries,
+                           method=method, progress=progress, cancel=cancel,
+                           throttle_bps=throttle_bps, first=first, last=last)
+
+
+_SEG_MIN_BYTES = 8 * 1024 * 1024
+_SEG_MAX_CONNECTIONS = 4
+_SEG_LEDGER_FLUSH = 4 * 1024 * 1024
+
+
+def _seg_bounds(total, count):
+    """Split [0, total-1] into count chunk-aligned, non-empty ranges."""
+    if count < 1:
+        count = 1
+    size = (total // count // DOWNLOAD_CHUNK) * DOWNLOAD_CHUNK
+    if size < DOWNLOAD_CHUNK:
+        size = DOWNLOAD_CHUNK
+    bounds = []
+    start = 0
+    for i in range(count):
+        if i == count - 1 or start + size > total:
+            end = total - 1
+        else:
+            end = start + size - 1
+        bounds.append((start, end))
+        start = end + 1
+        if start >= total:
+            break
+    return bounds
+
+
+def _seg_ledger_path(part):
+    return part + ".segments.json"
+
+
+_SEG_LEDGER_VERSION = 2
+
+
+def _seg_ledger_load(part, url, total, count):
+    """Completed byte counts from a previous run, or None to start over."""
+    try:
+        with open(_seg_ledger_path(part), "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    if int(data.get("v") or 0) != _SEG_LEDGER_VERSION:
+        return None
+    if (data.get("url") != url or int(data.get("total") or 0) != int(total)
+            or int(data.get("count") or 0) != int(count)):
+        return None
+    rows = data.get("segments") or []
+    if len(rows) != count:
+        return None
+    out = []
+    for row in rows:
+        try:
+            start, end, done = int(row[0]), int(row[1]), int(row[2])
+        except Exception:
+            return None
+        out.append([start, end, max(0, min(done, end - start + 1))])
+    return out
+
+
+def _seg_ledger_save(part, url, total, segs):
+    path = _seg_ledger_path(part)
+    tmp = path + ".tmp"
+    payload = {"v": _SEG_LEDGER_VERSION, "url": url, "total": int(total),
+               "count": len(segs), "chunk": DOWNLOAD_CHUNK,
+               "segments": [list(s) for s in segs], "saved_at": time.time()}
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh)
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+
+def _seg_ledger_clear(part):
+    for path in (_seg_ledger_path(part), _seg_ledger_path(part) + ".tmp"):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def _fetch_segments(url, dest, total, count, headers=None, timeout=180,
+                    retries=0, progress=None, cancel=None, pause=None,
+                    throttle_bps=0, ledger=None):
+    """Fetch total bytes using count parallel Range requests into one file.
+
+    The file is preallocated and each worker owns a disjoint byte range, so no
+    merge step and no second full pass over the disk is needed. A ledger of
+    finished offsets is flushed as the transfer proceeds, which is what makes
+    pause, cancel and crash-resume safe for a segmented download.
+    """
+    bounds = _seg_bounds(total, count)
+    segs = ledger if ledger else [[s, e, 0] for s, e in bounds]
+    try:
+        with open(dest, "r+b") as fh:
+            fh.truncate(total)
+    except OSError:
+        with open(dest, "wb") as fh:
+            fh.truncate(total)
+    _seg_ledger_save(dest, url, total, segs)
+    errors = [None] * len(segs)
+    lock = threading.Lock()
+    stopped = []
+
+    def worker(idx):
+        try:
+            _seg_run(idx)
+        except (_DLCanceled, _DLPaused) as exc:
+            with lock:
+                stopped.append(exc)
+        except Exception as exc:
+            with lock:
+                errors[idx] = str(exc)
+
+    def _seg_run(idx):
+        start, end, _done = segs[idx]
+        flushed = segs[idx][2]
+
+        def seg_progress(count):
+            # track the segment live so a pause or a kill still has an
+            # accurate ledger, and the job sees the bytes as they land
+            segs[idx][2] += count
+            if progress:
+                progress(count)
+
+        while start + segs[idx][2] <= end:
+            if cancel is not None and cancel.is_set():
+                raise _DLCanceled()
+            if pause is not None and pause.is_set():
+                raise _DLPaused()
+            try:
+                # first stays at the segment start: have_bytes carries the
+                # ledger progress, so the Range header is start+done, once
+                got = _stream_to_file(url, dest, headers=headers,
+                                      timeout=timeout, retries=retries,
+                                      first=start, last=end,
+                                      progress=seg_progress, cancel=cancel,
+                                      pause=pause, throttle_bps=throttle_bps,
+                                      have_bytes=segs[idx][2])
+            except (_DLCanceled, _DLPaused):
+                with lock:
+                    _seg_ledger_save(dest, url, total, segs)
+                raise
+            if got.get("error"):
+                errors[idx] = got["error"]
+                with lock:
+                    _seg_ledger_save(dest, url, total, segs)
+                return
+            segs[idx][2] = max(0, min(got["bytes"] - start, end - start + 1))
+            if (segs[idx][2] - flushed) >= _SEG_LEDGER_FLUSH:
+                flushed = segs[idx][2]
+                with lock:
+                    _seg_ledger_save(dest, url, total, segs)
+        with lock:
+            _seg_ledger_save(dest, url, total, segs)
+
+    threads = []
+    for i in range(len(segs)):
+        th = threading.Thread(target=worker, args=(i,), name="dl-seg%d" % i)
+        th.daemon = True
+        threads.append(th)
+        th.start()
+    for th in threads:
+        th.join()
+    if stopped:
+        raise stopped[0]
+    for err in errors:
+        if err:
+            return {"error": err, "segments": segs, "total": total}
+    missing = [i for i, s in enumerate(segs) if s[2] < (s[1] - s[0] + 1)]
+    if missing:
+        return {"error": "segments %s did not finish" % ",".join(str(i) for i in missing),
+                "segments": segs, "total": total}
+    try:
+        if os.path.getsize(dest) != total:
+            return {"error": "size check failed: %d of %d bytes" %
+                              (os.path.getsize(dest), total),
+                    "segments": segs, "total": total}
+    except OSError as exc:
+        return {"error": "could not stat the finished file: %s" % exc,
+                "segments": segs, "total": total}
+    _seg_ledger_clear(dest)
+    return {"ok": True, "url": url, "status": 206, "bytes": total,
+            "resumed": any(s[2] > 0 for s in segs) if ledger else False,
+            "content_type": None, "final_url": url, "headers": {},
+            "segments": len(segs), "total": total}
 
 
 def _sha256_of(path, limit=None):
@@ -4391,65 +4715,347 @@ def _sha256_of(path, limit=None):
     return h.hexdigest()
 
 
-def _download_one(url, raw_path, folder, headers=None, timeout=180,
-                  max_bytes=None, resume=False, retries=0, overwrite=False):
-    """Download one URL into the workspace, returning a per-file record.
+_DL_JOBS = {}
+_DL_LOCK = threading.RLock()
+_DL_SEQ = [0]
+_DL_KEEP = 200
+_DL_SEM = threading.Semaphore(max(1, int(os.environ.get("BONSAI_DL_JOBS") or 4)))
 
-    The bytes land in a .part file first, so a half-finished transfer is never
-    mistaken for a finished file and the real name can still come from the
-    server's Content-Disposition header.
-    """
-    if not _url_ok(url):
-        return {"url": url, "error": "url must start with http:// or https://"}
-    explicit = bool(raw_path)
+
+class _DLJob(object):
+    """One download: registry entry, control events and live progress."""
+
+    def __init__(self, spec, tool=""):
+        with _DL_LOCK:
+            _DL_SEQ[0] += 1
+            seq = _DL_SEQ[0]
+        self.id = "dl%d%d" % (int(time.time()) % 1000000, seq)
+        self.tool = tool
+        self.url = str(spec.get("url") or "")
+        self.dest = str(spec.get("dest") or "")
+        self.folder = str(spec.get("folder") or "")
+        self.group = str(spec.get("group") or "")
+        self.headers = spec.get("headers") or None
+        self.timeout = max(1, int(spec.get("timeout") or 180))
+        self.max_bytes = spec.get("max_bytes")
+        self.retries = int(spec.get("retries") or 0)
+        self.resume = bool(spec.get("resume", True))
+        self.overwrite = bool(spec.get("overwrite"))
+        self.want_conns = max(1, min(int(spec.get("connections") or 1),
+                                     _SEG_MAX_CONNECTIONS))
+        self.throttle_bps = int(spec.get("throttle_bps") or 0)
+        self.sha256 = str(spec.get("sha256") or "")
+        self.expect_size = int(spec.get("expect_size") or 0)
+        self.preview = bool(spec.get("preview", True))
+        self.sem = spec.get("sem")
+        self.total = 0
+        self.done = 0
+        self.status = "queued"
+        self.error = ""
+        self.saved = ""
+        self.name = ""
+        self.content_type = ""
+        self.record = {}
+        self.failed_check = False
+        self.resumed = False
+        self.connections = 0
+        self.started_at = 0.0
+        self.ended_at = 0.0
+        self.samples = []
+        self._last_sample = 0.0
+        self.cancel_evt = threading.Event()
+        self.pause_evt = threading.Event()
+        self.wake = threading.Event()
+        self.finished = threading.Event()
+        self.thread = None
+
+    def add_bytes(self, count):
+        self.done += count
+        now = time.time()
+        if now - self._last_sample >= 0.25:
+            self._last_sample = now
+            self.samples.append((now, self.done))
+            if len(self.samples) > 80:
+                self.samples.pop(0)
+
+    def rate(self):
+        pts = self.samples
+        if len(pts) < 2:
+            return 0.0, 0.0
+        t0, d0 = pts[0]
+        t1, d1 = pts[-1]
+        span = t1 - t0
+        if span < 0.35:
+            return 0.0, 0.0
+        speed = (d1 - d0) / span
+        if speed <= 1 or not self.total:
+            return max(0.0, speed), 0.0
+        return speed, max(0.0, (self.total - self.done) / speed)
+
+    def public(self):
+        speed, eta = self.rate()
+        pct = None
+        if self.total:
+            pct = round(min(100.0, self.done * 100.0 / self.total), 1)
+        out = {"id": self.id, "url": self.url, "name": self.name,
+               "status": self.status, "done": self.done, "total": self.total,
+               "percent": pct, "speed_bps": int(speed),
+               "eta_s": int(eta) if eta else None, "saved": self.saved,
+               "folder": self.folder, "tool": self.tool,
+               "connections": self.connections, "resumed": self.resumed,
+               "started_at": self.started_at, "ended_at": self.ended_at,
+               "part": self.dest}
+        if self.error:
+            out["error"] = self.error
+        if self.content_type:
+            out["content_type"] = self.content_type
+        return out
+
+    def set_status(self, status):
+        with _DL_LOCK:
+            if self.status in ("done", "error", "canceled"):
+                return
+            self.status = status
+
+    def finish(self, status):
+        with _DL_LOCK:
+            self.status = status
+            self.ended_at = time.time()
+        self.finished.set()
+
+
+def _dl_trim():
+    with _DL_LOCK:
+        if len(_DL_JOBS) <= _DL_KEEP:
+            return
+        done = [j for j in _DL_JOBS.values()
+                if j.status in ("done", "error", "canceled")]
+        done.sort(key=lambda j: j.ended_at)
+        for job in done[:len(_DL_JOBS) - _DL_KEEP]:
+            _DL_JOBS.pop(job.id, None)
+
+
+def _dl_register(job):
+    with _DL_LOCK:
+        _DL_JOBS[job.id] = job
+    _dl_trim()
+    return job
+
+
+def _dl_get(job_id):
+    with _DL_LOCK:
+        return _DL_JOBS.get(str(job_id or ""))
+
+
+def _dl_state():
+    with _DL_LOCK:
+        jobs = list(_DL_JOBS.values())
+    active = [j for j in jobs
+              if j.status in ("queued", "running", "paused")]
+    rest = [j for j in jobs if j not in active]
+    rest.sort(key=lambda j: j.ended_at, reverse=True)
+    return {"jobs": [j.public() for j in active + rest],
+            "max_parallel": getattr(_DL_SEM, "_initial_value", 4),
+            "connections": _SEG_MAX_CONNECTIONS}
+
+
+def _dl_pause(job_id):
+    job = _dl_get(job_id)
+    if not job:
+        return {"error": "no such download: %s" % job_id}
+    if job.status in ("done", "error", "canceled"):
+        return {"error": "download already finished"}
+    job.pause_evt.set()
+    job.set_status("paused")
+    return {"ok": True, "status": "paused"}
+
+
+def _dl_resume(job_id):
+    job = _dl_get(job_id)
+    if not job:
+        return {"error": "no such download: %s" % job_id}
+    if job.status in ("done", "error", "canceled"):
+        return {"error": "download already finished"}
+    job.pause_evt.clear()
+    job.wake.set()
+    job.set_status("running")
+    return {"ok": True, "status": "running"}
+
+
+def _dl_cancel(job_id):
+    job = _dl_get(job_id)
+    if not job:
+        return {"error": "no such download: %s" % job_id}
+    job.cancel_evt.set()
+    job.pause_evt.set()
+    job.wake.set()
+    return {"ok": True, "status": "canceled"}
+
+
+def _dl_clear(where="finished"):
+    gone = []
+    with _DL_LOCK:
+        for jid, job in list(_DL_JOBS.items()):
+            if where == "all":
+                if job.status not in ("running",):
+                    job.cancel_evt.set()
+                    job.wake.set()
+                    gone.append(jid)
+                    _DL_JOBS.pop(jid, None)
+            elif job.status in ("done", "error", "canceled"):
+                gone.append(jid)
+                _DL_JOBS.pop(jid, None)
+    return {"ok": True, "removed": len(gone)}
+
+
+def _dl_execute(job):
+    """Run one slice of a job. Returns a record, or {'paused': True} to yield."""
+    if not _url_ok(job.url):
+        return {"error": "url must start with http:// or https://"}
     try:
+        explicit = bool(job.dest)
         if explicit:
-            dest = _safe_path(raw_path)
+            dest = _safe_path(job.dest)
             part = dest + ".part"
         else:
-            guess = _name_from_response(url, None) or "download.bin"
-            if guess in (".", "..", ""):
-                guess = "download.bin"
+            probe_name = _name_from_response(job.url, None) or "download.bin"
+            if probe_name in (".", "..", ""):
+                probe_name = "download.bin"
             dest = None
-            part = _safe_path(os.path.join(folder, guess + ".part") if folder
-                              else guess + ".part")
+            part = _safe_path(os.path.join(job.folder, probe_name + ".part")
+                              if job.folder else probe_name + ".part")
         os.makedirs(os.path.dirname(part) or ".", exist_ok=True)
     except Exception as exc:
-        return {"url": url, "error": "bad destination path: %s" % exc}
-    if not resume:
-        try:
-            if os.path.isfile(part):
-                os.remove(part)
-        except OSError:
-            pass
+        return {"error": "bad destination path: %s" % exc}
+    ledger = None
+    if not job.resume:
+        for stale in (part, _seg_ledger_path(part)):
+            try:
+                os.remove(stale)
+            except OSError:
+                pass
     elif explicit and not os.path.isfile(part) and os.path.isfile(dest):
-        # an earlier run already left a partial file at the final path
         try:
             shutil.move(dest, part)
         except Exception:
             pass
+    probe = _probe_url(job.url, job.headers)
+    if probe.get("size"):
+        job.total = int(probe["size"])
     if not os.path.isfile(part):
-        blocked = _space_guard(url, part, headers)
+        blocked = _space_guard(job.url, part, job.headers, need=job.total or None)
         if blocked:
-            return {"url": url, "error": blocked["error"]}
-    got = _fetch_to_file(url, part, headers=headers, timeout=timeout,
-                         max_bytes=max_bytes, resume=resume, retries=retries)
+            return blocked
+    conns = 1
+    if (job.want_conns > 1 and job.total and not job.max_bytes
+            and probe.get("accepts_ranges")
+            and (job.total - (job.done or 0)) >= _SEG_MIN_BYTES):
+        conns = min(job.want_conns, _SEG_MAX_CONNECTIONS)
+    ledger = None
+    if conns > 1:
+        bounds = _seg_bounds(job.total, conns)
+        ledger = _seg_ledger_load(part, job.url, job.total, len(bounds))
+        if ledger is None and os.path.isfile(_seg_ledger_path(part)):
+            # a ledger from another layout means this part file is preallocated,
+            # so its length proves nothing and none of it can be trusted
+            for stale in (part, _seg_ledger_path(part)):
+                try:
+                    os.remove(stale)
+                except OSError:
+                    pass
+            ledger = [[s, e, 0] for s, e in bounds]
+            job.done = 0
+        elif ledger is None:
+            # upgrade an unfinished single-stream prefix into segment 0..n
+            ledger = [[s, e, 0] for s, e in bounds]
+            spare = job.done or 0
+            for row in ledger:
+                if spare <= 0:
+                    break
+                take = min(spare, row[1] - row[0] + 1)
+                row[2] = take
+                spare -= take
+            job.done = min(job.total, job.done or 0)
+        else:
+            job.done = sum(min(s[2], s[1] - s[0] + 1) for s in ledger)
+    elif os.path.isfile(_seg_ledger_path(part)):
+        # leftover segmented state but this run is a plain stream: the part file
+        # is preallocated and cannot be treated as a contiguous prefix
+        for stale in (part, _seg_ledger_path(part)):
+            try:
+                os.remove(stale)
+            except OSError:
+                pass
+        job.done = 0
+    job.connections = conns
+    if conns > 1:
+        try:
+            got = _fetch_segments(job.url, part, job.total, conns,
+                                  headers=job.headers, timeout=job.timeout,
+                                  retries=job.retries, progress=job.add_bytes,
+                                  cancel=job.cancel_evt, pause=job.pause_evt,
+                                  throttle_bps=job.throttle_bps, ledger=ledger)
+        except _DLPaused:
+            return {"paused": True}
+        except _DLCanceled:
+            return {"error": "canceled", "canceled": True}
+    else:
+        if job.done and job.total and job.done >= job.total:
+            got = {"ok": True, "bytes": job.done, "already_complete": True,
+                   "headers": {}, "content_type": probe.get("content_type")}
+        else:
+            try:
+                got = _stream_to_file(job.url, part, headers=job.headers,
+                                      timeout=job.timeout, max_bytes=job.max_bytes,
+                                      resume=True, retries=job.retries,
+                                      progress=job.add_bytes,
+                                      cancel=job.cancel_evt,
+                                      pause=job.pause_evt,
+                                      throttle_bps=job.throttle_bps)
+            except _DLPaused:
+                return {"paused": True}
+            except _DLCanceled:
+                return {"error": "canceled", "canceled": True}
     if got.get("error"):
-        return {"url": url, "error": got["error"]}
+        return got
     try:
         if not explicit:
-            name = _name_from_response(url, got.get("headers")) or "download.bin"
-            dest = _safe_path(os.path.join(folder, name) if folder else name)
-        if not overwrite and os.path.exists(dest):
+            name = _name_from_response(job.url, got.get("headers")) or \
+                probe.get("filename") or "download.bin"
+            dest = _safe_path(os.path.join(job.folder, name) if job.folder
+                              else name)
+        if not job.overwrite and os.path.exists(dest):
             dest = _unique_path(dest)
         os.replace(part, dest)
     except Exception as exc:
-        return {"url": url, "error": "could not finalise the download: %s" % exc}
-    record = {"url": url, "saved": dest.replace("\\", "/"),
-              "bytes": got["bytes"], "status": got.get("status"),
-              "content_type": got.get("content_type"),
-              "resumed": got.get("resumed", False)}
-    if (got.get("headers", {}).get("Content-Type") or "").startswith("text/"):
+        return {"error": "could not finalise the download: %s" % exc}
+    size = 0
+    try:
+        size = os.path.getsize(dest)
+    except OSError:
+        pass
+    record = {"url": job.url, "saved": dest.replace("\\", "/"), "bytes": size,
+              "status": got.get("status"),
+              "content_type": got.get("content_type") or probe.get("content_type"),
+              "resumed": bool(got.get("resumed") or job.done),
+              "connections": conns}
+    checks = {}
+    if job.expect_size:
+        checks["size"] = {"expected": job.expect_size, "actual": size,
+                          "ok": size == job.expect_size}
+    if job.sha256:
+        actual = _sha256_of(dest)
+        checks["sha256"] = {"expected": job.sha256, "actual": actual,
+                            "ok": actual.lower() == job.sha256.lower()}
+    if checks:
+        record["checks"] = checks
+        record["result"] = "ok" if all(c["ok"] for c in checks.values()) else "FAILED CHECK"
+        if record["result"] != "ok":
+            record["verdict"] = "; ".join(
+                "%s check failed (expected %s, got %s)" % (kind, c.get("expected"),
+                                                           c.get("actual"))
+                for kind, c in checks.items() if not c["ok"])
+    if job.preview and (record.get("content_type") or "").startswith("text/"):
         try:
             with open(dest, "r", encoding="utf-8", errors="replace") as fh:
                 record["preview"] = fh.read(1200)
@@ -4458,28 +5064,237 @@ def _download_one(url, raw_path, folder, headers=None, timeout=180,
     return record
 
 
+def _dl_worker(job):
+    guard = job.sem or _DL_SEM
+    guard.acquire()
+    try:
+        if job.cancel_evt.is_set():
+            job.finish("canceled")
+            return
+        job.started_at = time.time()
+        job.set_status("running")
+        while True:
+            try:
+                rec = _dl_execute(job)
+            except _DLPaused:
+                rec = {"paused": True}
+            except _DLCanceled:
+                rec = {"error": "canceled", "canceled": True}
+            except Exception as exc:
+                rec = {"error": "download failed: %s" % exc}
+            if not rec.get("paused"):
+                break
+            job.set_status("paused")
+            job.wake.wait()
+            job.wake.clear()
+            if job.cancel_evt.is_set():
+                break
+            job.set_status("running")
+        if rec.get("canceled"):
+            job.error = "canceled"
+            job.finish("canceled")
+        elif rec.get("error"):
+            job.error = rec["error"]
+            job.finish("error")
+        else:
+            job.record = rec or {}
+            job.saved = rec.get("saved", "")
+            job.content_type = rec.get("content_type") or ""
+            job.resumed = bool(rec.get("resumed"))
+            job.connections = rec.get("connections") or job.connections
+            job.total = rec.get("bytes") or job.total
+            job.done = rec.get("bytes") or job.done
+            job.name = os.path.basename(job.saved.replace("\\", "/")) or job.name
+            if rec.get("result") == "FAILED CHECK":
+                job.failed_check = True
+                job.error = rec.get("verdict") or "checks failed"
+                job.finish("error")
+            else:
+                job.finish("done")
+    finally:
+        guard.release()
+
+
+def _dl_add(spec, tool="", register=True, wait=0, start=True):
+    job = _DLJob(spec, tool=tool)
+    if register:
+        _dl_register(job)
+    if start:
+        job.thread = threading.Thread(target=_dl_worker, args=(job,),
+                                      name="dl-%s" % job.id)
+        job.thread.daemon = True
+        job.thread.start()
+    if wait:
+        job.finished.wait(min(3600, int(wait) + 2))
+    return job
+
+
+def _dl_result(job):
+    """Tool-shaped result for a finished (or still running) job."""
+    if job.status in ("done", "error") and job.failed_check:
+        # a file that downloaded but did not match is a verdict, not an error
+        out = {"result": "FAILED CHECK", "url": job.url, "saved": job.saved,
+               "bytes": job.done, "resumed": job.resumed,
+               "checks": (job.record or {}).get("checks") or {},
+               "verdict": job.error}
+        if job.content_type:
+            out["content_type"] = job.content_type
+        return out
+    if job.status == "done":
+        rec = {"result": "ok", "url": job.url, "saved": job.saved,
+               "bytes": job.done, "content_type": job.content_type or None,
+               "resumed": job.resumed}
+        for key in ("preview", "checks", "result", "verdict"):
+            if (job.record or {}).get(key):
+                rec[key] = job.record[key]
+        return rec
+    if job.status == "error":
+        return {"error": job.error or "download failed"}
+    if job.status == "canceled":
+        return {"error": "download canceled", "canceled": True}
+    return {"result": "running", "job": job.id, "url": job.url,
+            "status": job.status, "done": job.done, "total": job.total,
+            "part": job.dest or None}
+
+
+def _dl_retry(job_id):
+    job = _dl_get(job_id)
+    if not job:
+        return {"error": "no such download: %s" % job_id}
+    if job.status in ("queued", "running", "paused"):
+        return {"error": "download is still active"}
+    spec = {"url": job.url, "dest": job.dest, "folder": job.folder,
+            "group": job.group, "headers": job.headers, "timeout": job.timeout,
+            "max_bytes": job.max_bytes, "retries": job.retries,
+            "resume": True, "overwrite": job.overwrite,
+            "connections": job.want_conns, "throttle_bps": job.throttle_bps,
+            "sha256": job.sha256, "expect_size": job.expect_size}
+    _dl_add(spec, tool=job.tool)
+    return {"ok": True, "retried": job.id}
+
+
+def _download_one(url, raw_path, folder, headers=None, timeout=180,
+                  max_bytes=None, resume=False, retries=0, overwrite=False,
+                  connections=1, throttle_bps=0, preview=True, sha256="",
+                  expect_size=0):
+    """Download one URL into the workspace, returning a per-file record.
+
+    The bytes land in a .part file first, so a half-finished transfer is never
+    mistaken for a finished file and the real name can still come from the
+    server's Content-Disposition header.
+    """
+    if not _url_ok(url):
+        return {"url": url, "error": "url must start with http:// or https://"}
+    spec = {"url": url, "dest": raw_path, "folder": folder, "headers": headers,
+            "timeout": timeout, "max_bytes": max_bytes, "resume": resume,
+            "retries": retries, "overwrite": overwrite, "connections": connections,
+            "throttle_bps": throttle_bps, "preview": preview, "sha256": sha256,
+            "expect_size": expect_size}
+    job = _dl_add(spec, register=False, wait=timeout + 5)
+    rec = {"url": job.url}
+    if job.status in ("done", "error") and job.failed_check:
+        rec["saved"] = job.saved
+        rec["bytes"] = job.done
+        rec["status"] = 200
+        rec["content_type"] = job.content_type or None
+        rec["resumed"] = job.resumed
+        rec["result"] = "FAILED CHECK"
+        rec["verdict"] = job.error
+        rec["checks"] = (job.record or {}).get("checks") or {}
+    elif job.status == "done":
+        rec["saved"] = job.saved
+        rec["bytes"] = job.done
+        rec["status"] = 200
+        rec["content_type"] = job.content_type or None
+        rec["resumed"] = job.resumed
+        for key in ("preview", "checks", "result", "verdict"):
+            if (job.record or {}).get(key):
+                rec[key] = job.record[key]
+    elif job.status == "canceled":
+        rec["error"] = "download canceled"
+    elif job.status == "error":
+        rec["error"] = job.error or "download failed"
+    else:
+        rec["error"] = "download timed out after %ss" % timeout
+    return rec
+
+
+def _dl_args(args, default_timeout=180):
+    """Tuning knobs shared by every download tool."""
+    out = {}
+    try:
+        out["timeout"] = min(max(int(args.get("timeout") or default_timeout), 1), 1800)
+    except Exception:
+        out["timeout"] = default_timeout
+    try:
+        max_mb = float(args.get("max_mb") or 0)
+    except Exception:
+        max_mb = 0.0
+    out["max_bytes"] = int(max_mb * 1024 * 1024) if max_mb > 0 else None
+    try:
+        out["retries"] = min(max(int(args.get("retries") or 0), 0), 10)
+    except Exception:
+        out["retries"] = 0
+    try:
+        out["connections"] = min(max(int(args.get("connections") or 1), 1),
+                                 _SEG_MAX_CONNECTIONS)
+    except Exception:
+        out["connections"] = 1
+    try:
+        kbps = float(args.get("throttle_kbps") or 0)
+    except Exception:
+        kbps = 0.0
+    out["throttle_bps"] = int(kbps * 1024.0) if kbps > 0 else 0
+    out["background"] = bool(args.get("background"))
+    out["path"] = str(args.get("path") or "").strip()
+    out["overwrite"] = bool(args.get("overwrite"))
+    out["resume"] = bool(args.get("resume", True))
+    return out
+
+
+def _dl_run(spec, tool, tune):
+    """Enqueue a job for the model: wait for it, or hand back a job id."""
+    job = _dl_add(spec, tool=tool)
+    if tune.get("background"):
+        return {"result": "started", "job": job.id, "url": job.url,
+                "status": job.status,
+                "note": "running in the background - watch it in the DOWNLOADS "
+                        "panel, or call download_status with this id"}
+    job.finished.wait(min(3600, job.timeout + 5))
+    res = _dl_result(job)
+    if res.get("result") == "running":
+        res["note"] = ("still going after %ss: it keeps running in the "
+                       "background and the DOWNLOADS panel can pause, cancel or "
+                       "clear it" % job.timeout)
+    return res
+
+
+def _download_status(args):
+    job_id = str(args.get("job") or "").strip()
+    if not job_id:
+        state = _dl_state()
+        return {"result": "ok", "active": [j for j in state["jobs"]
+                                           if j["status"] in
+                                           ("queued", "running", "paused")],
+                "max_parallel": state["max_parallel"],
+                "connections_per_file": state["connections"]}
+    job = _dl_get(job_id)
+    if not job:
+        return {"error": "no such download: %s" % job_id}
+    return _dl_result(job)
+
+
 def _download_file(args):
     url = str(args.get("url") or "").strip()
     if not _url_ok(url):
         return {"error": "url must start with http:// or https://"}
-    try:
-        timeout = min(max(int(args.get("timeout") or 180), 1), 900)
-    except Exception:
-        timeout = 180
-    try:
-        max_mb = float(args.get("max_mb") or 0)
-    except Exception:
-        max_mb = 0
-    rec = _download_one(url, str(args.get("path") or "").strip(), "",
-                        timeout=timeout,
-                        max_bytes=int(max_mb * 1024 * 1024) if max_mb else None,
-                        retries=int(args.get("retries") or 0),
-                        overwrite=bool(args.get("overwrite")))
-    if rec.get("error"):
-        return {"error": rec["error"]}
-    return {"result": "ok", "url": rec["url"], "saved": rec["saved"],
-            "bytes": rec["bytes"], "content_type": rec.get("content_type"),
-            "preview": rec.get("preview")}
+    tune = _dl_args(args, 180)
+    spec = {"url": url, "dest": tune["path"], "timeout": tune["timeout"],
+            "max_bytes": tune["max_bytes"], "resume": tune["resume"],
+            "retries": tune["retries"], "overwrite": tune["overwrite"],
+            "connections": tune["connections"],
+            "throttle_bps": tune["throttle_bps"]}
+    return _dl_run(spec, "download_file", tune)
 
 
 def _download_batch(args):
@@ -4514,50 +5329,44 @@ def _download_batch(args):
     if len(urls) > max_files:
         urls = urls[:max_files]
     folder = str(args.get("path") or "downloads").strip() or "downloads"
-    try:
-        timeout = min(max(int(args.get("timeout") or 120), 1), 900)
-    except Exception:
-        timeout = 120
+    tune = _dl_args(args, 120)
     try:
         workers = min(max(int(args.get("parallel") or 4), 1), 8)
     except Exception:
         workers = 4
-    try:
-        max_mb = float(args.get("max_mb") or 0)
-    except Exception:
-        max_mb = 0
-    cap = int(max_mb * 1024 * 1024) if max_mb else None
-    results = [None] * len(urls)
-    lock = threading.Lock()
-    cursor = [0]
-
-    def worker():
-        while True:
-            with lock:
-                i = cursor[0]
-                cursor[0] += 1
-            if i >= len(urls):
-                return
-            results[i] = _download_one(urls[i], "", folder, timeout=timeout,
-                                       max_bytes=cap)
-
-    threads = [threading.Thread(target=worker, daemon=True)
-               for _ in range(min(workers, len(urls)))]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-    ok = [r for r in results if r and not r.get("error")]
-    bad = [r for r in results if not r or r.get("error")]
-    out = {"result": "ok", "requested": len(urls), "downloaded": len(ok),
+    sem = threading.Semaphore(workers)
+    group = os.path.basename(folder.replace("\\", "/")) or folder
+    jobs = []
+    for url in urls:
+        spec = {"url": url, "dest": "", "folder": folder, "group": group,
+                "timeout": tune["timeout"], "max_bytes": tune["max_bytes"],
+                "resume": True, "retries": tune["retries"],
+                "connections": tune["connections"],
+                "throttle_bps": tune["throttle_bps"], "sem": sem}
+        jobs.append(_dl_add(spec, tool="download_batch"))
+    if tune["background"]:
+        return {"result": "started", "requested": len(jobs),
+                "jobs": [j.id for j in jobs], "folder": folder.replace("\\", "/"),
+                "note": "%d downloads queued in the background - call "
+                        "download_status to check on them" % len(jobs)}
+    rounds = (len(jobs) + workers - 1) // workers
+    deadline = time.time() + tune["timeout"] * rounds + 30
+    for job in jobs:
+        job.finished.wait(max(0.5, deadline - time.time()))
+    ok = [j for j in jobs if j.status == "done"]
+    bad = [j for j in jobs if j.status in ("error", "canceled")]
+    live = [j for j in jobs if j.status in ("queued", "running", "paused")]
+    out = {"result": "ok", "requested": len(jobs), "downloaded": len(ok),
            "failed": len(bad), "folder": folder.replace("\\", "/"),
-           "files": [{"file": os.path.basename(r["saved"]), "bytes": r["bytes"],
-                      "url": r["url"]} for r in ok]}
+           "files": [{"file": os.path.basename(j.saved.replace("\\", "/")),
+                      "bytes": j.done, "url": j.url, "job": j.id} for j in ok]}
     if bad:
-        out["errors"] = [{"url": r.get("url") if r else None,
-                          "error": (r or {}).get("error", "unknown")} for r in bad][:20]
-    if not ok and bad:
-        return {"error": "all %d downloads failed: %s" % (len(bad), bad[0].get("error"))}
+        out["errors"] = [{"url": j.url, "error": j.error or j.status}
+                         for j in bad][:20]
+    if live:
+        out["still_running"] = [{"url": j.url, "job": j.id} for j in live][:20]
+    if not ok and not live and bad:
+        return {"error": "all %d downloads failed: %s" % (len(bad), bad[0].error)}
     return out
 
 
@@ -4605,23 +5414,17 @@ def _download_authed(args):
     if not headers:
         return {"error": "no credentials given - pass 'bearer', 'cookie' or "
                          "'headers' (the values are never saved or shown back)"}
-    try:
-        timeout = min(max(int(args.get("timeout") or 180), 1), 900)
-    except Exception:
-        timeout = 180
-    try:
-        max_mb = float(args.get("max_mb") or 0)
-    except Exception:
-        max_mb = 0
-    rec = _download_one(url, str(args.get("path") or "").strip(), "",
-                        headers=headers, timeout=timeout,
-                        max_bytes=int(max_mb * 1024 * 1024) if max_mb else None,
-                        retries=int(args.get("retries") or 1))
-    if rec.get("error"):
-        return {"error": rec["error"]}
-    return {"result": "ok", "url": rec["url"], "saved": rec["saved"],
-            "bytes": rec["bytes"], "content_type": rec.get("content_type"),
-            "sent_headers": sorted(headers.keys()), "preview": rec.get("preview")}
+    tune = _dl_args(args, 180)
+    if not tune["retries"]:
+        tune["retries"] = 1
+    spec = {"url": url, "dest": tune["path"], "headers": headers,
+            "timeout": tune["timeout"], "max_bytes": tune["max_bytes"],
+            "resume": tune["resume"], "retries": tune["retries"],
+            "connections": tune["connections"],
+            "throttle_bps": tune["throttle_bps"]}
+    res = _dl_run(spec, "download_authed", tune)
+    res["sent_headers"] = sorted(headers.keys())
+    return res
 
 
 _ASSET_ATTR = re.compile(
@@ -4734,39 +5537,21 @@ def _download_verify(args):
     except Exception:
         expect_size = 0
     try:
-        timeout = min(max(int(args.get("timeout") or 300), 1), 1800)
-    except Exception:
-        timeout = 300
-    try:
         retries = min(max(int(args.get("retries") or 3), 0), 10)
     except Exception:
         retries = 3
-    try:
-        max_mb = float(args.get("max_mb") or 0)
-    except Exception:
-        max_mb = 0
-    rec = _download_one(url, str(args.get("path") or "").strip(), "",
-                        timeout=timeout,
-                        max_bytes=int(max_mb * 1024 * 1024) if max_mb else None,
-                        resume=bool(args.get("resume", True)),
-                        retries=retries, overwrite=True)
-    if rec.get("error"):
-        return {"error": rec["error"]}
-    size = rec["bytes"]
-    out = {"result": "ok", "url": url, "saved": rec["saved"], "bytes": size,
-           "resumed": rec.get("resumed", False), "checks": {}}
-    if want_sha:
-        got = _sha256_of(rec["saved"].replace("/", os.sep))
-        out["checks"]["sha256"] = {"expected": want_sha, "actual": got,
-                                   "ok": got == want_sha}
-    if expect_size:
-        out["checks"]["size"] = {"expected": expect_size, "actual": size,
-                                 "ok": size == expect_size}
-    if out["checks"] and not all(c["ok"] for c in out["checks"].values()):
-        out["result"] = "FAILED CHECK"
-        out["verdict"] = ("the file downloaded but does NOT match what you asked "
-                          "for - keep it only if you know it is the right file")
-    return out
+    tune = _dl_args(args, 300)
+    tune["retries"] = retries
+    spec = {"url": url, "dest": tune["path"], "timeout": tune["timeout"],
+            "max_bytes": tune["max_bytes"], "resume": tune["resume"],
+            "retries": retries, "overwrite": True,
+            "connections": tune["connections"],
+            "throttle_bps": tune["throttle_bps"],
+            "sha256": want_sha, "expect_size": expect_size}
+    res = _dl_run(spec, "download_verify", tune)
+    if not res.get("error"):
+        res.setdefault("checks", {})
+    return res
 
 
 def _download_media(args):
@@ -4912,7 +5697,7 @@ def _archive(args):
         except Exception as exc:
             return {"error": f"create failed: {exc}"}
         return {"result": "ok", "created": dest.replace("\\", "/"),
-                "entries": len(srcs)}
+                "entries": count[0]}
     return {"error": "action must be 'extract' or 'create'"}
 
 
@@ -5960,6 +6745,8 @@ def _execute_tool_call(name, args, tc, hooks, image_uri):
         raw_result = _download_verify(args)
     elif name == "download_media":
         raw_result = _download_media(args)
+    elif name == "download_status":
+        raw_result = _download_status(args)
     elif name == "archive":
         raw_result = _archive(args)
     elif name == "ask_user":
@@ -6578,11 +7365,6 @@ PAGE = """<!doctype html>
 
   /* screenshot thumb in tool log */
   .tlitem .tthumb { max-width: 220px; border-radius: 6px; border: 1px solid var(--bd); margin-top: 6px; display: block; }
-  .shotcard { margin-top: 8px; border: 1px solid var(--bd); border-radius: 10px; overflow: hidden; background: var(--bg2); }
-  .shotcard .shothd { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 5px 8px; font-size: 11px; color: var(--mut); border-bottom: 1px solid var(--bd); }
-  .shotcard .shothd b { color: var(--txt); font-weight: 600; }
-  .shotcard .shotimg { display: block; width: 100%; height: auto; cursor: zoom-in; background: var(--bg); }
-  .shotcard .shotpath { padding: 4px 8px; font-size: 10.5px; color: var(--mut); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .shotcard { margin-top: 8px; border: 1px solid var(--bd2); border-radius: 8px; overflow: hidden; background: var(--bg2); }
   .shotcard .shothd { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 5px 8px; font-size: 11px; color: var(--mut); border-bottom: 1px solid var(--bd); font-family: Consolas, monospace; }
   .shotcard .shothd b { color: var(--txt2); font-weight: 600; }
@@ -6631,6 +7413,32 @@ PAGE = """<!doctype html>
   .toasthd { font-size: 10px; letter-spacing: 1.2px; color: var(--acc); margin-bottom: 5px; }
   .toastx { position: absolute; top: 5px; right: 6px; background: transparent; border: none; color: var(--mut); font-size: 15px; line-height: 1; cursor: pointer; }
   .toastx:hover { color: var(--err); }
+  .dllist { padding: 2px 0 4px; }
+  .dlhead { display: flex; justify-content: space-between; align-items: center; padding: 10px 14px 4px; font-size: 10px; letter-spacing: 1.5px; color: var(--mut); text-transform: uppercase; font-family: Consolas, monospace; }
+  .dlempty { padding: 8px 12px; font-size: 11px; color: var(--mut); }
+  .dlrow { padding: 8px 12px; border-bottom: 1px solid rgba(22,78,99,.4); }
+  .dlrow:last-child { border-bottom: none; }
+  .dltop { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+  .dlname { font-size: 11.5px; color: var(--bg2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .dlstat { font-size: 9px; letter-spacing: 1px; color: var(--mut); text-transform: uppercase; flex: none; }
+  .dlrow.running .dlstat, .dlrow.queued .dlstat { color: var(--acc); }
+  .dlrow.done .dlstat { color: #34d399; }
+  .dlrow.error .dlstat, .dlrow.canceled .dlstat { color: var(--err); }
+  .dlbar { height: 4px; margin: 6px 0 4px; background: rgba(255,255,255,.07); border-radius: 3px; overflow: hidden; }
+  .dlfill { height: 100%; width: 0; background: var(--acc); transition: width .25s linear; }
+  .dlrow.done .dlfill { background: #34d399; }
+  .dlrow.error .dlfill, .dlrow.canceled .dlfill { background: var(--err); }
+  .dlrow.paused .dlfill { background: var(--mut); }
+  .dlfill.indet { width: 34% !important; animation: dlslide 1.1s ease-in-out infinite; }
+  @keyframes dlslide { 0% { margin-left: 0; } 50% { margin-left: 66%; } 100% { margin-left: 0; } }
+  .dlnum { font-size: 10px; color: var(--mut); font-family: Consolas, monospace; }
+  .dlpath { font-size: 9.5px; color: var(--mut); opacity: .75; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .dlerr { font-size: 10px; color: var(--err); margin-top: 3px; word-break: break-word; }
+  .dlbtns { display: flex; gap: 5px; margin-top: 6px; }
+  .dlbtn { background: transparent; border: 1px solid var(--bd); color: var(--mut); font-size: 9px; letter-spacing: 1px; padding: 3px 7px; border-radius: 4px; cursor: pointer; font-family: Consolas, monospace; }
+  .dlbtn:hover { color: var(--acc); border-color: var(--acc); }
+  .dlclear { display: none; width: calc(100% - 24px); margin: 2px 12px 8px; background: transparent; border: 1px solid var(--bd); color: var(--mut); font-size: 9px; letter-spacing: 1px; padding: 4px 0; border-radius: 4px; cursor: pointer; font-family: Consolas, monospace; }
+  .dlclear:hover { color: var(--err); border-color: var(--err); }
   .toastcmd { font-family: Consolas, monospace; font-size: 11px; color: var(--txt2); word-break: break-all; margin-bottom: 5px; }
   .toastout { font-family: Consolas, monospace; font-size: 11px; color: var(--txt); background: var(--bg); border: 1px solid var(--bd); border-radius: 5px; padding: 5px 7px; margin: 0; max-height: 130px; overflow: auto; white-space: pre-wrap; word-break: break-word; }
   .toastwhen { font-size: 10px; color: var(--mut); margin-top: 5px; }
@@ -6724,6 +7532,9 @@ PAGE = """<!doctype html>
       <div id="chatlist"></div>
       <div class="ptitle" style="margin-top:8px; border-top:1px solid #164e63; padding-top:8px;"><span>TODO</span><span id="todocount"></span></div>
       <div id="todopanel"></div>
+      <div class="ptitle" style="margin-top:8px; border-top:1px solid #164e63; padding-top:8px;"><span>DOWNLOADS</span><span id="dlcount"></span></div>
+      <div class="dllist" id="dllist"></div>
+      <button class="dlclear" id="dlclear">CLEAR FINISHED</button>
       <div class="ptitle" style="margin-top:8px; border-top:1px solid #164e63; padding-top:8px;"><span>PATH SCOPE</span></div>
       <button class="scopebtn" id="scopebtn" title="How far Bonsai may reach outside the workspace. Click to switch: WORKSPACE (hard sandbox) / ASK (ask me every time) / SYSTEM (no prompts).">SCOPE: ...</button>
       <div class="scopelist" id="scopelist"></div>
@@ -6897,6 +7708,7 @@ function init() {
   setSendUI();
   serverLoad();
   startSchedWatch();
+  startDlWatch();
   bindScope();
   fetch('/api/todos').then(function (r) { return r.json(); }).then(function (j) {
     if (j && j.todos) renderTodo(j.todos);
@@ -7391,7 +8203,7 @@ function shotCardDom(call) {
   const box = document.createElement('div'); box.className = 'shotcard';
   const head = document.createElement('div'); head.className = 'shothd';
   const name = document.createElement('b');
-  name.textContent = '\\ud83d\\udcbe ' + (r.matched ? 'window: ' + r.matched : 'screenshot');
+  name.textContent = String.fromCodePoint(0x1F4BE) + ' ' + (r.matched ? 'window: ' + r.matched : 'screenshot');
   head.appendChild(name);
   if (r.width && r.height) {
     const d = document.createElement('span');
@@ -8127,6 +8939,161 @@ function schedToast(ev) {
   while (box.children.length > 4) box.removeChild(box.firstChild);
   setTimeout(function () { if (t.parentNode) t.parentNode.removeChild(t); }, 30000);
 }
+function dlBytes(n) {
+  if (n === null || n === undefined || n === '') return '';
+  const u = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let i = 0, v = Number(n);
+  if (!isFinite(v)) return '';
+  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+  return (i ? v.toFixed(1) : Math.round(v)) + ' ' + u[i];
+}
+function dlTime(s) {
+  if (!s && s !== 0) return '';
+  s = Math.round(Number(s));
+  if (s < 60) return s + 's';
+  if (s < 3600) return Math.round(s / 60) + 'm';
+  return Math.floor(s / 3600) + 'h ' + Math.round((s % 3600) / 60) + 'm';
+}
+function dlAct(id, what) {
+  fetch('/api/dl_' + what, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ id: id }) })
+    .then(function () { dlTick(); })
+    .catch(function () {});
+}
+function dlToast(j) {
+  let box = document.getElementById('toasts');
+  if (!box) {
+    box = document.createElement('div');
+    box.id = 'toasts';
+    document.body.appendChild(box);
+  }
+  const t = document.createElement('div');
+  t.className = 'toast';
+  const h = document.createElement('div');
+  h.className = 'toasthd';
+  h.textContent = (j.status === 'done' ? 'DOWNLOAD FINISHED: ' : 'DOWNLOAD FAILED: ') +
+                  (j.name || j.url || '');
+  const x = document.createElement('button');
+  x.className = 'toastx';
+  x.textContent = '\u00d7';
+  x.onclick = function () { if (t.parentNode) t.parentNode.removeChild(t); };
+  const p = document.createElement('div');
+  p.className = 'toastout';
+  p.textContent = (j.saved || j.url || '') + (j.error ? '  ' + j.error : '  ' + dlBytes(j.done));
+  t.appendChild(h); t.appendChild(x); t.appendChild(p);
+  box.appendChild(t);
+  while (box.children.length > 4) box.removeChild(box.firstChild);
+  setTimeout(function () { if (t.parentNode) t.parentNode.removeChild(t); }, 15000);
+}
+function dlRow(j) {
+  const row = document.createElement('div');
+  row.className = 'dlrow ' + (j.status || '');
+  const top = document.createElement('div');
+  top.className = 'dltop';
+  const nm = document.createElement('span');
+  nm.className = 'dlname';
+  nm.textContent = j.name || String(j.url || '').split('/').pop() || j.url;
+  nm.title = j.url || '';
+  const st = document.createElement('span');
+  st.className = 'dlstat';
+  st.textContent = j.status || '';
+  top.appendChild(nm); top.appendChild(st);
+  row.appendChild(top);
+  const bar = document.createElement('div');
+  bar.className = 'dlbar';
+  const fill = document.createElement('div');
+  fill.className = 'dlfill';
+  if (j.status === 'done') fill.style.width = '100%';
+  else if (j.percent !== null && j.percent !== undefined) fill.style.width = Math.max(2, j.percent) + '%';
+  else fill.classList.add('indet');
+  bar.appendChild(fill);
+  row.appendChild(bar);
+  const num = document.createElement('div');
+  num.className = 'dlnum';
+  const bits = [];
+  if (j.total) bits.push(dlBytes(j.done) + ' / ' + dlBytes(j.total));
+  else if (j.done) bits.push(dlBytes(j.done));
+  if (j.status === 'running' && j.percent !== null && j.percent !== undefined) bits.push(j.percent + '%');
+  if (j.speed_bps) bits.push(dlBytes(j.speed_bps) + '/s');
+  if (j.eta_s) bits.push('ETA ' + dlTime(j.eta_s));
+  if (j.connections > 1) bits.push(j.connections + ' conn');
+  if (j.resumed) bits.push('resumed');
+  num.textContent = bits.join('  \u00b7  ');
+  row.appendChild(num);
+  if (j.saved) {
+    const p = document.createElement('div');
+    p.className = 'dlpath';
+    p.textContent = j.saved;
+    p.title = j.saved;
+    row.appendChild(p);
+  }
+  if (j.error) {
+    const e = document.createElement('div');
+    e.className = 'dlerr';
+    e.textContent = j.error;
+    row.appendChild(e);
+  }
+  const btns = document.createElement('div');
+  btns.className = 'dlbtns';
+  const mk = function (label, what, title) {
+    const b = document.createElement('button');
+    b.className = 'dlbtn';
+    b.textContent = label;
+    b.title = title || label;
+    b.onclick = function (ev) { ev.stopPropagation(); dlAct(j.id, what); };
+    btns.appendChild(b);
+  };
+  if (j.status === 'running' || j.status === 'queued') mk('PAUSE', 'pause', 'Stop reading for a moment - the socket is released and it picks up where it left off');
+  if (j.status === 'paused') mk('RESUME', 'resume');
+  if (j.status !== 'done' && j.status !== 'error' && j.status !== 'canceled') mk('CANCEL', 'cancel', 'Give up on this one; the partial file stays on disk so you can retry later');
+  if (j.status === 'error' || j.status === 'canceled') mk('RETRY', 'retry', 'Try again - it continues from the bytes already on disk');
+  if (btns.children.length) row.appendChild(btns);
+  return row;
+}
+var DL_SEEN = {};
+function dlRender(state) {
+  const box = document.getElementById('dllist');
+  if (!box) return;
+  const jobs = state.jobs || [];
+  const live = jobs.filter(function (j) { return j.status !== 'done'; });
+  const recent = jobs.filter(function (j) { return j.status === 'done'; }).slice(0, 2);
+  const show = live.concat(recent);
+  const active = jobs.filter(function (j) {
+    return j.status === 'queued' || j.status === 'running' || j.status === 'paused';
+  }).length;
+  const cnt = document.getElementById('dlcount');
+  if (cnt) cnt.textContent = active ? active + ' active' : '';
+  const clr = document.getElementById('dlclear');
+  if (clr) clr.style.display = jobs.length ? '' : 'none';
+  while (box.firstChild) box.removeChild(box.firstChild);
+  if (!show.length) {
+    const e = document.createElement('div');
+    e.className = 'dlempty';
+    e.textContent = 'No downloads yet.';
+    box.appendChild(e);
+    return;
+  }
+  show.forEach(function (j) { box.appendChild(dlRow(j)); });
+  show.forEach(function (j) {
+    const was = DL_SEEN[j.id];
+    DL_SEEN[j.id] = j.status;
+    if (was && was !== j.status && (j.status === 'done' || j.status === 'error')) dlToast(j);
+  });
+}
+function dlTick() {
+  fetch('/api/dl_state').then(function (r) { return r.json(); })
+    .then(dlRender).catch(function () {});
+}
+function startDlWatch() {
+  const clr = document.getElementById('dlclear');
+  if (clr) clr.onclick = function () {
+    fetch('/api/dl_clear', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ where: 'finished' }) })
+      .then(function () { dlTick(); }).catch(function () {});
+  };
+  dlTick();
+  setInterval(dlTick, 900);
+}
 function startSchedWatch() {
   const tick = function () {
     fetch('/api/sched_results').then(function (r) { return r.json(); })
@@ -8368,6 +9335,32 @@ PAGE_GPT = """<!doctype html>
   .toasthd { font-size: 10px; letter-spacing: 1.2px; color: var(--acc); margin-bottom: 5px; }
   .toastx { position: absolute; top: 5px; right: 6px; background: transparent; border: none; color: var(--mut); font-size: 15px; line-height: 1; cursor: pointer; }
   .toastx:hover { color: var(--err); }
+  .dllist { padding: 2px 0 4px; }
+  .dlhead { display: flex; justify-content: space-between; align-items: center; padding: 10px 14px 4px; font-size: 10px; letter-spacing: 1.5px; color: var(--mut); text-transform: uppercase; font-family: Consolas, monospace; }
+  .dlempty { padding: 8px 12px; font-size: 11px; color: var(--mut); }
+  .dlrow { padding: 8px 12px; border-bottom: 1px solid rgba(22,78,99,.4); }
+  .dlrow:last-child { border-bottom: none; }
+  .dltop { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+  .dlname { font-size: 11.5px; color: var(--bg2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .dlstat { font-size: 9px; letter-spacing: 1px; color: var(--mut); text-transform: uppercase; flex: none; }
+  .dlrow.running .dlstat, .dlrow.queued .dlstat { color: var(--acc); }
+  .dlrow.done .dlstat { color: #34d399; }
+  .dlrow.error .dlstat, .dlrow.canceled .dlstat { color: var(--err); }
+  .dlbar { height: 4px; margin: 6px 0 4px; background: rgba(255,255,255,.07); border-radius: 3px; overflow: hidden; }
+  .dlfill { height: 100%; width: 0; background: var(--acc); transition: width .25s linear; }
+  .dlrow.done .dlfill { background: #34d399; }
+  .dlrow.error .dlfill, .dlrow.canceled .dlfill { background: var(--err); }
+  .dlrow.paused .dlfill { background: var(--mut); }
+  .dlfill.indet { width: 34% !important; animation: dlslide 1.1s ease-in-out infinite; }
+  @keyframes dlslide { 0% { margin-left: 0; } 50% { margin-left: 66%; } 100% { margin-left: 0; } }
+  .dlnum { font-size: 10px; color: var(--mut); font-family: Consolas, monospace; }
+  .dlpath { font-size: 9.5px; color: var(--mut); opacity: .75; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .dlerr { font-size: 10px; color: var(--err); margin-top: 3px; word-break: break-word; }
+  .dlbtns { display: flex; gap: 5px; margin-top: 6px; }
+  .dlbtn { background: transparent; border: 1px solid var(--bd); color: var(--mut); font-size: 9px; letter-spacing: 1px; padding: 3px 7px; border-radius: 4px; cursor: pointer; font-family: Consolas, monospace; }
+  .dlbtn:hover { color: var(--acc); border-color: var(--acc); }
+  .dlclear { display: none; width: calc(100% - 24px); margin: 2px 12px 8px; background: transparent; border: 1px solid var(--bd); color: var(--mut); font-size: 9px; letter-spacing: 1px; padding: 4px 0; border-radius: 4px; cursor: pointer; font-family: Consolas, monospace; }
+  .dlclear:hover { color: var(--err); border-color: var(--err); }
   .toastcmd { font-family: Consolas, monospace; font-size: 11px; color: var(--txt2); word-break: break-all; margin-bottom: 5px; }
   .toastout { font-family: Consolas, monospace; font-size: 11px; color: var(--txt); background: var(--bg); border: 1px solid var(--bd); border-radius: 5px; padding: 5px 7px; margin: 0; max-height: 130px; overflow: auto; white-space: pre-wrap; word-break: break-word; }
   .toastwhen { font-size: 10px; color: var(--mut); margin-top: 5px; }
@@ -8422,6 +9415,12 @@ PAGE_GPT = """<!doctype html>
   .dropov { position: fixed; inset: 0; z-index: 95; display: none; align-items: center; justify-content: center; pointer-events: none; }
   .dropov.on { display: flex; }
   .dropov .bx { border: 2px dashed var(--mut); border-radius: 20px; padding: 40px 60px; background: var(--bg); font-size: 15px; color: var(--mut); }
+  .shots { margin: 6px 0 10px; display: flex; flex-direction: column; gap: 8px; }
+  .shotcard { margin-top: 8px; border: 1px solid var(--bd); border-radius: 8px; overflow: hidden; background: var(--bg2); }
+  .shotcard .shothd { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 5px 8px; font-size: 11px; color: var(--mut); border-bottom: 1px solid var(--bd); font-family: Consolas, monospace; }
+  .shotcard .shothd b { color: var(--txt); font-weight: 600; }
+  .shotcard .shotimg { display: block; width: 100%; height: auto; cursor: zoom-in; background: var(--bg); }
+  .shotcard .shotpath { padding: 4px 8px; font-size: 10.5px; color: var(--mut); font-family: Consolas, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 </style>
 </head>
 <body>
@@ -8432,6 +9431,9 @@ PAGE_GPT = """<!doctype html>
       <button class="btn-new" id="newchat">+ New chat</button>
     </div>
     <div class="chatlist" id="chatlist"></div>
+    <div class="dlhead"><span>DOWNLOADS</span><span id="dlcount"></span></div>
+    <div class="dllist" id="dllist"></div>
+    <button class="dlclear" id="dlclear">CLEAR FINISHED</button>
     <div class="side-foot">
       <div class="blrow" id="blstatus" title="Blender MCP status"><svg class="blicon" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 1.6C7.4 1.6 3.7 3.9 3.7 6.9c0 1.6 1.1 3 2.8 3.9-2.1.9-3.5 2.4-3.5 4.2 0 3.2 4 5.8 9 5.8 2.4 0 4.6-.7 6.2-1.8l3.4 2.8 1.7-2-3.3-2.7c.6-.9.9-1.9.9-3 0-1.9-1-3.6-2.6-4.9.3-.5.4-1.1.4-1.7 0-3-3.7-5.3-8.3-5.3Z"/><ellipse cx="12" cy="6.9" rx="4.2" ry="2.5" fill="#18181b"/></svg><span class="bldot off" id="bldot"></span></div>
       <button class="btn-ghost wd" id="workbtn"></button>
@@ -8613,6 +9615,161 @@ function schedToast(ev) {
   while (box.children.length > 4) box.removeChild(box.firstChild);
   setTimeout(function () { if (t.parentNode) t.parentNode.removeChild(t); }, 30000);
 }
+function dlBytes(n) {
+  if (n === null || n === undefined || n === '') return '';
+  const u = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let i = 0, v = Number(n);
+  if (!isFinite(v)) return '';
+  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+  return (i ? v.toFixed(1) : Math.round(v)) + ' ' + u[i];
+}
+function dlTime(s) {
+  if (!s && s !== 0) return '';
+  s = Math.round(Number(s));
+  if (s < 60) return s + 's';
+  if (s < 3600) return Math.round(s / 60) + 'm';
+  return Math.floor(s / 3600) + 'h ' + Math.round((s % 3600) / 60) + 'm';
+}
+function dlAct(id, what) {
+  fetch('/api/dl_' + what, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ id: id }) })
+    .then(function () { dlTick(); })
+    .catch(function () {});
+}
+function dlToast(j) {
+  let box = document.getElementById('toasts');
+  if (!box) {
+    box = document.createElement('div');
+    box.id = 'toasts';
+    document.body.appendChild(box);
+  }
+  const t = document.createElement('div');
+  t.className = 'toast';
+  const h = document.createElement('div');
+  h.className = 'toasthd';
+  h.textContent = (j.status === 'done' ? 'DOWNLOAD FINISHED: ' : 'DOWNLOAD FAILED: ') +
+                  (j.name || j.url || '');
+  const x = document.createElement('button');
+  x.className = 'toastx';
+  x.textContent = '\u00d7';
+  x.onclick = function () { if (t.parentNode) t.parentNode.removeChild(t); };
+  const p = document.createElement('div');
+  p.className = 'toastout';
+  p.textContent = (j.saved || j.url || '') + (j.error ? '  ' + j.error : '  ' + dlBytes(j.done));
+  t.appendChild(h); t.appendChild(x); t.appendChild(p);
+  box.appendChild(t);
+  while (box.children.length > 4) box.removeChild(box.firstChild);
+  setTimeout(function () { if (t.parentNode) t.parentNode.removeChild(t); }, 15000);
+}
+function dlRow(j) {
+  const row = document.createElement('div');
+  row.className = 'dlrow ' + (j.status || '');
+  const top = document.createElement('div');
+  top.className = 'dltop';
+  const nm = document.createElement('span');
+  nm.className = 'dlname';
+  nm.textContent = j.name || String(j.url || '').split('/').pop() || j.url;
+  nm.title = j.url || '';
+  const st = document.createElement('span');
+  st.className = 'dlstat';
+  st.textContent = j.status || '';
+  top.appendChild(nm); top.appendChild(st);
+  row.appendChild(top);
+  const bar = document.createElement('div');
+  bar.className = 'dlbar';
+  const fill = document.createElement('div');
+  fill.className = 'dlfill';
+  if (j.status === 'done') fill.style.width = '100%';
+  else if (j.percent !== null && j.percent !== undefined) fill.style.width = Math.max(2, j.percent) + '%';
+  else fill.classList.add('indet');
+  bar.appendChild(fill);
+  row.appendChild(bar);
+  const num = document.createElement('div');
+  num.className = 'dlnum';
+  const bits = [];
+  if (j.total) bits.push(dlBytes(j.done) + ' / ' + dlBytes(j.total));
+  else if (j.done) bits.push(dlBytes(j.done));
+  if (j.status === 'running' && j.percent !== null && j.percent !== undefined) bits.push(j.percent + '%');
+  if (j.speed_bps) bits.push(dlBytes(j.speed_bps) + '/s');
+  if (j.eta_s) bits.push('ETA ' + dlTime(j.eta_s));
+  if (j.connections > 1) bits.push(j.connections + ' conn');
+  if (j.resumed) bits.push('resumed');
+  num.textContent = bits.join('  \u00b7  ');
+  row.appendChild(num);
+  if (j.saved) {
+    const p = document.createElement('div');
+    p.className = 'dlpath';
+    p.textContent = j.saved;
+    p.title = j.saved;
+    row.appendChild(p);
+  }
+  if (j.error) {
+    const e = document.createElement('div');
+    e.className = 'dlerr';
+    e.textContent = j.error;
+    row.appendChild(e);
+  }
+  const btns = document.createElement('div');
+  btns.className = 'dlbtns';
+  const mk = function (label, what, title) {
+    const b = document.createElement('button');
+    b.className = 'dlbtn';
+    b.textContent = label;
+    b.title = title || label;
+    b.onclick = function (ev) { ev.stopPropagation(); dlAct(j.id, what); };
+    btns.appendChild(b);
+  };
+  if (j.status === 'running' || j.status === 'queued') mk('PAUSE', 'pause', 'Stop reading for a moment - the socket is released and it picks up where it left off');
+  if (j.status === 'paused') mk('RESUME', 'resume');
+  if (j.status !== 'done' && j.status !== 'error' && j.status !== 'canceled') mk('CANCEL', 'cancel', 'Give up on this one; the partial file stays on disk so you can retry later');
+  if (j.status === 'error' || j.status === 'canceled') mk('RETRY', 'retry', 'Try again - it continues from the bytes already on disk');
+  if (btns.children.length) row.appendChild(btns);
+  return row;
+}
+var DL_SEEN = {};
+function dlRender(state) {
+  const box = document.getElementById('dllist');
+  if (!box) return;
+  const jobs = state.jobs || [];
+  const live = jobs.filter(function (j) { return j.status !== 'done'; });
+  const recent = jobs.filter(function (j) { return j.status === 'done'; }).slice(0, 2);
+  const show = live.concat(recent);
+  const active = jobs.filter(function (j) {
+    return j.status === 'queued' || j.status === 'running' || j.status === 'paused';
+  }).length;
+  const cnt = document.getElementById('dlcount');
+  if (cnt) cnt.textContent = active ? active + ' active' : '';
+  const clr = document.getElementById('dlclear');
+  if (clr) clr.style.display = jobs.length ? '' : 'none';
+  while (box.firstChild) box.removeChild(box.firstChild);
+  if (!show.length) {
+    const e = document.createElement('div');
+    e.className = 'dlempty';
+    e.textContent = 'No downloads yet.';
+    box.appendChild(e);
+    return;
+  }
+  show.forEach(function (j) { box.appendChild(dlRow(j)); });
+  show.forEach(function (j) {
+    const was = DL_SEEN[j.id];
+    DL_SEEN[j.id] = j.status;
+    if (was && was !== j.status && (j.status === 'done' || j.status === 'error')) dlToast(j);
+  });
+}
+function dlTick() {
+  fetch('/api/dl_state').then(function (r) { return r.json(); })
+    .then(dlRender).catch(function () {});
+}
+function startDlWatch() {
+  const clr = document.getElementById('dlclear');
+  if (clr) clr.onclick = function () {
+    fetch('/api/dl_clear', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ where: 'finished' }) })
+      .then(function () { dlTick(); }).catch(function () {});
+  };
+  dlTick();
+  setInterval(dlTick, 900);
+}
 function startSchedWatch() {
   const tick = function () {
     fetch('/api/sched_results').then(function (r) { return r.json(); })
@@ -8628,6 +9785,7 @@ function init() {
   if (!chats.length) newChat(); else cur = chats[chats.length - 1];
   renderAll(); setSendUI();
   startSchedWatch();
+  startDlWatch();
   bindScope();
   fetch('/api/todos').then(function (r) { return r.json(); }).then(function (j) {
     if (j && j.todos) renderTodo(j.todos);
@@ -8854,6 +10012,35 @@ function renderLivePills(container, calls) {
     chip.textContent = label;
     container.appendChild(chip);
   });
+}
+function shotCardDom(call) {
+  if (!call) return null;
+  const src = call.preview || call.image_data || '';
+  if (!src) return null;
+  const r = call.result || {};
+  const saved = r.saved || r.path || '';
+  const box = document.createElement('div'); box.className = 'shotcard';
+  const head = document.createElement('div'); head.className = 'shothd';
+  const name = document.createElement('b');
+  name.textContent = String.fromCodePoint(0x1F4BE) + ' ' + (r.matched ? 'window: ' + r.matched : 'screenshot');
+  head.appendChild(name);
+  if (r.width && r.height) {
+    const d = document.createElement('span');
+    d.textContent = r.width + '\u00d7' + r.height;
+    head.appendChild(d);
+  }
+  box.appendChild(head);
+  const im = document.createElement('img'); im.className = 'shotimg';
+  im.src = src; im.alt = 'screenshot captured by Bonsai';
+  im.title = 'Click to open full size';
+  im.onclick = function () { window.open(src, '_blank'); };
+  box.appendChild(im);
+  if (saved) {
+    const p = document.createElement('div'); p.className = 'shotpath';
+    p.textContent = saved;
+    box.appendChild(p);
+  }
+  return box;
 }
 function addToolLog(container, calls) {
   if (!calls || !calls.length) return;
@@ -9969,6 +11156,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, json.dumps(_path_state(), default=str))
         elif path == "/api/sched_results":
             self._send(200, json.dumps({"events": _sched_take_events()}, default=str))
+        elif path == "/api/dl_state":
+            self._send(200, json.dumps(_dl_state(), default=str))
         elif path == "/preview":
             self._serve_preview()
         elif path.startswith("/previewfile/"):
@@ -9984,7 +11173,9 @@ class Handler(BaseHTTPRequestHandler):
                             "/api/pick_workdir", "/api/chats",
                             "/api/answer", "/api/effort", "/api/eject",
                             "/api/tts", "/api/models", "/api/pick_model",
-                            "/api/path_policy"):
+                            "/api/path_policy", "/api/dl_pause",
+                            "/api/dl_resume", "/api/dl_cancel",
+                            "/api/dl_retry", "/api/dl_clear"):
                 self._send(404, "not found", "text/plain")
                 return
             length = int(self.headers.get("Content-Length", 0) or 0)
@@ -10011,6 +11202,23 @@ class Handler(BaseHTTPRequestHandler):
                     state = _path_forget(body.get("path")) if body.get("path") \
                         else _path_policy_set(body.get("policy"))
                 self._send(200, json.dumps(state, default=str))
+                return
+            if path.startswith("/api/dl_"):
+                job_id = str(body.get("id") or body.get("job") or "")
+                action = path[len("/api/dl_"):]
+                if action == "pause":
+                    out = _dl_pause(job_id)
+                elif action == "resume":
+                    out = _dl_resume(job_id)
+                elif action == "cancel":
+                    out = _dl_cancel(job_id)
+                elif action == "retry":
+                    out = _dl_retry(job_id)
+                elif action == "clear":
+                    out = _dl_clear(str(body.get("where") or "finished"))
+                else:
+                    out = {"error": "unknown download action: %s" % action}
+                self._send(200, json.dumps(out, default=str))
                 return
             if path == "/api/answer":
                 ask_id = str(body.get("id") or "")
@@ -10098,6 +11306,11 @@ class Handler(BaseHTTPRequestHandler):
             if body.get("effort"):
                 set_bonsai_effort(body["effort"])
             if path == "/api/stream":
+                write_lock = threading.Lock()
+
+                def emit(event, obj):
+                    with write_lock:
+                        sse(self, event, obj)
 
                 def do_ask(q):
                     ask_id = uuid.uuid4().hex[:12]
@@ -10105,12 +11318,12 @@ class Handler(BaseHTTPRequestHandler):
                     entry = {"event": event, "answer": None}
                     with _ASKS_LOCK:
                         _ASKS[ask_id] = entry
-                    sse(self, "ask", {"id": ask_id,
-                                      "kind": q.get("kind") or "question",
-                                      "question": q.get("question", ""),
-                                      "path": q.get("path") or "",
-                                      "tool": q.get("tool") or "",
-                                      "options": q.get("options") or []})
+                    emit("ask", {"id": ask_id,
+                                 "kind": q.get("kind") or "question",
+                                 "question": q.get("question", ""),
+                                 "path": q.get("path") or "",
+                                 "tool": q.get("tool") or "",
+                                 "options": q.get("options") or []})
                     _touch_activity()
                     try:
                         event.wait(BONSAI_KEEP_ALIVE)
@@ -10122,31 +11335,49 @@ class Handler(BaseHTTPRequestHandler):
                     return answer
 
                 def do_todo(items):
-                    sse(self, "todo", {"todos": items})
+                    emit("todo", {"todos": items})
 
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream; charset=utf-8")
                 self.send_header("Cache-Control", "no-cache")
                 self.end_headers()
-                sse(self, "start", {"ok": True, "workdir": WORKDIR,
-                                    "model_ready": _bonsai_ready()})
+                emit("start", {"ok": True, "workdir": WORKDIR,
+                               "model_ready": _bonsai_ready()})
                 if not _ensure_bonsai():
-                    sse(self, "error", {"text": "Bonsai 2 model server could not start."})
+                    emit("error", {"text": "Bonsai 2 model server could not start."})
                     return
+                # a long tool (a multi-GB download) must not look like a hang:
+                # trickle a comment so the connection and proxies stay alive
+                stop_beat = threading.Event()
+
+                def keepalive():
+                    while not stop_beat.wait(10):
+                        try:
+                            with write_lock:
+                                self.wfile.write(b": keepalive\n\n")
+                                self.wfile.flush()
+                        except Exception:
+                            return
+
+                beat = threading.Thread(target=keepalive, name="sse-keepalive")
+                beat.daemon = True
+                beat.start()
                 try:
                     handle_chat(messages or [], stream=True, mode=mode,
-                                on_reason=lambda t: sse(self, "reason", {"text": t}),
-                                on_delta=lambda t: sse(self, "delta", {"text": t}),
-                                on_tool=lambda c: sse(self, "tool", {"call": _strip_full(c)}),
-                                on_stats=lambda s: sse(self, "stats", s),
+                                on_reason=lambda t: emit("reason", {"text": t}),
+                                on_delta=lambda t: emit("delta", {"text": t}),
+                                on_tool=lambda c: emit("tool", {"call": _strip_full(c)}),
+                                on_stats=lambda s: emit("stats", s),
                                 hooks={"on_ask": do_ask, "on_todo": do_todo})
                 except Exception as exc:
                     traceback.print_exc()
                     try:
-                        sse(self, "error", {"text": "The model run failed: " + str(exc)})
+                        emit("error", {"text": "The model run failed: " + str(exc)})
                     except Exception:
                         pass
-                sse(self, "done", {"ok": True})
+                finally:
+                    stop_beat.set()
+                emit("done", {"ok": True})
             else:
                 if not _ensure_bonsai():
                     self._send(200, json.dumps({"reply": "Bonsai 2 model server could not start.",
@@ -10186,7 +11417,32 @@ class BonsaiServer(ThreadingHTTPServer):
         traceback.print_exc()
 
 
+def _gen_tools_json(path=None):
+    """Write the tool catalogue to tools.json so the docs cannot drift."""
+    tools = ([TOOL_SPEC] + list(FILE_TOOLS.values()) + WEB_SPECS +
+             [SHELL_TOOL, CODE_TOOL] + PC_TOOLS)
+    seen = set()
+    out = []
+    for tool in tools:
+        name = (tool.get("function") or {}).get("name")
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        out.append(tool)
+    target = path or os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  "tools.json")
+    with open(target, "w", encoding="utf-8") as fh:
+        json.dump(out, fh, ensure_ascii=False, indent=2)
+        fh.write("\n")
+    return target, [t["function"]["name"] for t in out]
+
+
 def main():
+    if "--gen-tools" in sys.argv:
+        where, names = _gen_tools_json()
+        print("wrote %d tools to %s" % (len(names), where), flush=True)
+        print(", ".join(names), flush=True)
+        return
     try:
         os.makedirs(WORKDIR, exist_ok=True)
     except Exception as exc:

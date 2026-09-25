@@ -151,6 +151,32 @@
   .toasthd { font-size: 10px; letter-spacing: 1.2px; color: var(--acc); margin-bottom: 5px; }
   .toastx { position: absolute; top: 5px; right: 6px; background: transparent; border: none; color: var(--mut); font-size: 15px; line-height: 1; cursor: pointer; }
   .toastx:hover { color: var(--err); }
+  .dllist { padding: 2px 0 4px; }
+  .dlhead { display: flex; justify-content: space-between; align-items: center; padding: 10px 14px 4px; font-size: 10px; letter-spacing: 1.5px; color: var(--mut); text-transform: uppercase; font-family: Consolas, monospace; }
+  .dlempty { padding: 8px 12px; font-size: 11px; color: var(--mut); }
+  .dlrow { padding: 8px 12px; border-bottom: 1px solid rgba(22,78,99,.4); }
+  .dlrow:last-child { border-bottom: none; }
+  .dltop { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+  .dlname { font-size: 11.5px; color: var(--bg2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .dlstat { font-size: 9px; letter-spacing: 1px; color: var(--mut); text-transform: uppercase; flex: none; }
+  .dlrow.running .dlstat, .dlrow.queued .dlstat { color: var(--acc); }
+  .dlrow.done .dlstat { color: #34d399; }
+  .dlrow.error .dlstat, .dlrow.canceled .dlstat { color: var(--err); }
+  .dlbar { height: 4px; margin: 6px 0 4px; background: rgba(255,255,255,.07); border-radius: 3px; overflow: hidden; }
+  .dlfill { height: 100%; width: 0; background: var(--acc); transition: width .25s linear; }
+  .dlrow.done .dlfill { background: #34d399; }
+  .dlrow.error .dlfill, .dlrow.canceled .dlfill { background: var(--err); }
+  .dlrow.paused .dlfill { background: var(--mut); }
+  .dlfill.indet { width: 34% !important; animation: dlslide 1.1s ease-in-out infinite; }
+  @keyframes dlslide { 0% { margin-left: 0; } 50% { margin-left: 66%; } 100% { margin-left: 0; } }
+  .dlnum { font-size: 10px; color: var(--mut); font-family: Consolas, monospace; }
+  .dlpath { font-size: 9.5px; color: var(--mut); opacity: .75; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .dlerr { font-size: 10px; color: var(--err); margin-top: 3px; word-break: break-word; }
+  .dlbtns { display: flex; gap: 5px; margin-top: 6px; }
+  .dlbtn { background: transparent; border: 1px solid var(--bd); color: var(--mut); font-size: 9px; letter-spacing: 1px; padding: 3px 7px; border-radius: 4px; cursor: pointer; font-family: Consolas, monospace; }
+  .dlbtn:hover { color: var(--acc); border-color: var(--acc); }
+  .dlclear { display: none; width: calc(100% - 24px); margin: 2px 12px 8px; background: transparent; border: 1px solid var(--bd); color: var(--mut); font-size: 9px; letter-spacing: 1px; padding: 4px 0; border-radius: 4px; cursor: pointer; font-family: Consolas, monospace; }
+  .dlclear:hover { color: var(--err); border-color: var(--err); }
   .toastcmd { font-family: Consolas, monospace; font-size: 11px; color: var(--txt2); word-break: break-all; margin-bottom: 5px; }
   .toastout { font-family: Consolas, monospace; font-size: 11px; color: var(--txt); background: var(--bg); border: 1px solid var(--bd); border-radius: 5px; padding: 5px 7px; margin: 0; max-height: 130px; overflow: auto; white-space: pre-wrap; word-break: break-word; }
   .toastwhen { font-size: 10px; color: var(--mut); margin-top: 5px; }
@@ -205,6 +231,12 @@
   .dropov { position: fixed; inset: 0; z-index: 95; display: none; align-items: center; justify-content: center; pointer-events: none; }
   .dropov.on { display: flex; }
   .dropov .bx { border: 2px dashed var(--mut); border-radius: 20px; padding: 40px 60px; background: var(--bg); font-size: 15px; color: var(--mut); }
+  .shots { margin: 6px 0 10px; display: flex; flex-direction: column; gap: 8px; }
+  .shotcard { margin-top: 8px; border: 1px solid var(--bd); border-radius: 8px; overflow: hidden; background: var(--bg2); }
+  .shotcard .shothd { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 5px 8px; font-size: 11px; color: var(--mut); border-bottom: 1px solid var(--bd); font-family: Consolas, monospace; }
+  .shotcard .shothd b { color: var(--txt); font-weight: 600; }
+  .shotcard .shotimg { display: block; width: 100%; height: auto; cursor: zoom-in; background: var(--bg); }
+  .shotcard .shotpath { padding: 4px 8px; font-size: 10.5px; color: var(--mut); font-family: Consolas, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 </style>
 </head>
 <body>
@@ -215,6 +247,9 @@
       <button class="btn-new" id="newchat">+ New chat</button>
     </div>
     <div class="chatlist" id="chatlist"></div>
+    <div class="dlhead"><span>DOWNLOADS</span><span id="dlcount"></span></div>
+    <div class="dllist" id="dllist"></div>
+    <button class="dlclear" id="dlclear">CLEAR FINISHED</button>
     <div class="side-foot">
       <div class="blrow" id="blstatus" title="Blender MCP status"><svg class="blicon" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 1.6C7.4 1.6 3.7 3.9 3.7 6.9c0 1.6 1.1 3 2.8 3.9-2.1.9-3.5 2.4-3.5 4.2 0 3.2 4 5.8 9 5.8 2.4 0 4.6-.7 6.2-1.8l3.4 2.8 1.7-2-3.3-2.7c.6-.9.9-1.9.9-3 0-1.9-1-3.6-2.6-4.9.3-.5.4-1.1.4-1.7 0-3-3.7-5.3-8.3-5.3Z"/><ellipse cx="12" cy="6.9" rx="4.2" ry="2.5" fill="#18181b"/></svg><span class="bldot off" id="bldot"></span></div>
       <button class="btn-ghost wd" id="workbtn"></button>
@@ -396,6 +431,161 @@ function schedToast(ev) {
   while (box.children.length > 4) box.removeChild(box.firstChild);
   setTimeout(function () { if (t.parentNode) t.parentNode.removeChild(t); }, 30000);
 }
+function dlBytes(n) {
+  if (n === null || n === undefined || n === '') return '';
+  const u = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let i = 0, v = Number(n);
+  if (!isFinite(v)) return '';
+  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+  return (i ? v.toFixed(1) : Math.round(v)) + ' ' + u[i];
+}
+function dlTime(s) {
+  if (!s && s !== 0) return '';
+  s = Math.round(Number(s));
+  if (s < 60) return s + 's';
+  if (s < 3600) return Math.round(s / 60) + 'm';
+  return Math.floor(s / 3600) + 'h ' + Math.round((s % 3600) / 60) + 'm';
+}
+function dlAct(id, what) {
+  fetch('/api/dl_' + what, { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ id: id }) })
+    .then(function () { dlTick(); })
+    .catch(function () {});
+}
+function dlToast(j) {
+  let box = document.getElementById('toasts');
+  if (!box) {
+    box = document.createElement('div');
+    box.id = 'toasts';
+    document.body.appendChild(box);
+  }
+  const t = document.createElement('div');
+  t.className = 'toast';
+  const h = document.createElement('div');
+  h.className = 'toasthd';
+  h.textContent = (j.status === 'done' ? 'DOWNLOAD FINISHED: ' : 'DOWNLOAD FAILED: ') +
+                  (j.name || j.url || '');
+  const x = document.createElement('button');
+  x.className = 'toastx';
+  x.textContent = '×';
+  x.onclick = function () { if (t.parentNode) t.parentNode.removeChild(t); };
+  const p = document.createElement('div');
+  p.className = 'toastout';
+  p.textContent = (j.saved || j.url || '') + (j.error ? '  ' + j.error : '  ' + dlBytes(j.done));
+  t.appendChild(h); t.appendChild(x); t.appendChild(p);
+  box.appendChild(t);
+  while (box.children.length > 4) box.removeChild(box.firstChild);
+  setTimeout(function () { if (t.parentNode) t.parentNode.removeChild(t); }, 15000);
+}
+function dlRow(j) {
+  const row = document.createElement('div');
+  row.className = 'dlrow ' + (j.status || '');
+  const top = document.createElement('div');
+  top.className = 'dltop';
+  const nm = document.createElement('span');
+  nm.className = 'dlname';
+  nm.textContent = j.name || String(j.url || '').split('/').pop() || j.url;
+  nm.title = j.url || '';
+  const st = document.createElement('span');
+  st.className = 'dlstat';
+  st.textContent = j.status || '';
+  top.appendChild(nm); top.appendChild(st);
+  row.appendChild(top);
+  const bar = document.createElement('div');
+  bar.className = 'dlbar';
+  const fill = document.createElement('div');
+  fill.className = 'dlfill';
+  if (j.status === 'done') fill.style.width = '100%';
+  else if (j.percent !== null && j.percent !== undefined) fill.style.width = Math.max(2, j.percent) + '%';
+  else fill.classList.add('indet');
+  bar.appendChild(fill);
+  row.appendChild(bar);
+  const num = document.createElement('div');
+  num.className = 'dlnum';
+  const bits = [];
+  if (j.total) bits.push(dlBytes(j.done) + ' / ' + dlBytes(j.total));
+  else if (j.done) bits.push(dlBytes(j.done));
+  if (j.status === 'running' && j.percent !== null && j.percent !== undefined) bits.push(j.percent + '%');
+  if (j.speed_bps) bits.push(dlBytes(j.speed_bps) + '/s');
+  if (j.eta_s) bits.push('ETA ' + dlTime(j.eta_s));
+  if (j.connections > 1) bits.push(j.connections + ' conn');
+  if (j.resumed) bits.push('resumed');
+  num.textContent = bits.join('  ·  ');
+  row.appendChild(num);
+  if (j.saved) {
+    const p = document.createElement('div');
+    p.className = 'dlpath';
+    p.textContent = j.saved;
+    p.title = j.saved;
+    row.appendChild(p);
+  }
+  if (j.error) {
+    const e = document.createElement('div');
+    e.className = 'dlerr';
+    e.textContent = j.error;
+    row.appendChild(e);
+  }
+  const btns = document.createElement('div');
+  btns.className = 'dlbtns';
+  const mk = function (label, what, title) {
+    const b = document.createElement('button');
+    b.className = 'dlbtn';
+    b.textContent = label;
+    b.title = title || label;
+    b.onclick = function (ev) { ev.stopPropagation(); dlAct(j.id, what); };
+    btns.appendChild(b);
+  };
+  if (j.status === 'running' || j.status === 'queued') mk('PAUSE', 'pause', 'Stop reading for a moment - the socket is released and it picks up where it left off');
+  if (j.status === 'paused') mk('RESUME', 'resume');
+  if (j.status !== 'done' && j.status !== 'error' && j.status !== 'canceled') mk('CANCEL', 'cancel', 'Give up on this one; the partial file stays on disk so you can retry later');
+  if (j.status === 'error' || j.status === 'canceled') mk('RETRY', 'retry', 'Try again - it continues from the bytes already on disk');
+  if (btns.children.length) row.appendChild(btns);
+  return row;
+}
+var DL_SEEN = {};
+function dlRender(state) {
+  const box = document.getElementById('dllist');
+  if (!box) return;
+  const jobs = state.jobs || [];
+  const live = jobs.filter(function (j) { return j.status !== 'done'; });
+  const recent = jobs.filter(function (j) { return j.status === 'done'; }).slice(0, 2);
+  const show = live.concat(recent);
+  const active = jobs.filter(function (j) {
+    return j.status === 'queued' || j.status === 'running' || j.status === 'paused';
+  }).length;
+  const cnt = document.getElementById('dlcount');
+  if (cnt) cnt.textContent = active ? active + ' active' : '';
+  const clr = document.getElementById('dlclear');
+  if (clr) clr.style.display = jobs.length ? '' : 'none';
+  while (box.firstChild) box.removeChild(box.firstChild);
+  if (!show.length) {
+    const e = document.createElement('div');
+    e.className = 'dlempty';
+    e.textContent = 'No downloads yet.';
+    box.appendChild(e);
+    return;
+  }
+  show.forEach(function (j) { box.appendChild(dlRow(j)); });
+  show.forEach(function (j) {
+    const was = DL_SEEN[j.id];
+    DL_SEEN[j.id] = j.status;
+    if (was && was !== j.status && (j.status === 'done' || j.status === 'error')) dlToast(j);
+  });
+}
+function dlTick() {
+  fetch('/api/dl_state').then(function (r) { return r.json(); })
+    .then(dlRender).catch(function () {});
+}
+function startDlWatch() {
+  const clr = document.getElementById('dlclear');
+  if (clr) clr.onclick = function () {
+    fetch('/api/dl_clear', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ where: 'finished' }) })
+      .then(function () { dlTick(); }).catch(function () {});
+  };
+  dlTick();
+  setInterval(dlTick, 900);
+}
 function startSchedWatch() {
   const tick = function () {
     fetch('/api/sched_results').then(function (r) { return r.json(); })
@@ -411,6 +601,7 @@ function init() {
   if (!chats.length) newChat(); else cur = chats[chats.length - 1];
   renderAll(); setSendUI();
   startSchedWatch();
+  startDlWatch();
   bindScope();
   fetch('/api/todos').then(function (r) { return r.json(); }).then(function (j) {
     if (j && j.todos) renderTodo(j.todos);
@@ -637,6 +828,35 @@ function renderLivePills(container, calls) {
     chip.textContent = label;
     container.appendChild(chip);
   });
+}
+function shotCardDom(call) {
+  if (!call) return null;
+  const src = call.preview || call.image_data || '';
+  if (!src) return null;
+  const r = call.result || {};
+  const saved = r.saved || r.path || '';
+  const box = document.createElement('div'); box.className = 'shotcard';
+  const head = document.createElement('div'); head.className = 'shothd';
+  const name = document.createElement('b');
+  name.textContent = String.fromCodePoint(0x1F4BE) + ' ' + (r.matched ? 'window: ' + r.matched : 'screenshot');
+  head.appendChild(name);
+  if (r.width && r.height) {
+    const d = document.createElement('span');
+    d.textContent = r.width + '×' + r.height;
+    head.appendChild(d);
+  }
+  box.appendChild(head);
+  const im = document.createElement('img'); im.className = 'shotimg';
+  im.src = src; im.alt = 'screenshot captured by Bonsai';
+  im.title = 'Click to open full size';
+  im.onclick = function () { window.open(src, '_blank'); };
+  box.appendChild(im);
+  if (saved) {
+    const p = document.createElement('div'); p.className = 'shotpath';
+    p.textContent = saved;
+    box.appendChild(p);
+  }
+  return box;
 }
 function addToolLog(container, calls) {
   if (!calls || !calls.length) return;

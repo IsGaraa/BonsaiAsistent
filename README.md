@@ -130,7 +130,7 @@ clears it, and a queued message survives a page reload.
 | **PC control** | `control_input` moves the mouse, clicks, drags, scrolls and types like a human; `click_text` clicks a control by its visible label (no pixel guessing) |
 | **Waits instead of polling** | `wait_for` blocks until a file/download, port, URL, process, window or on-screen text is ready - so no more screenshot loops |
 | **Clipboard as a channel** | `copy_to_clipboard` / `paste_from_clipboard` with type hints, including pasting an image from another app straight into the conversation |
-| **Downloads that finish** | `download_file` streams to disk with a size cap, retries and resume; `download_batch` grabs many files (or every link on a page) at once; `download_authed` fetches what needs a token or cookie (secrets redacted); `download_page` saves a page to work offline; `download_verify` checks sha256/size and reports `FAILED CHECK`; `download_media` pulls video/audio/subs via yt-dlp |
+| **Downloads that finish** | every download runs in the background with a live **DOWNLOADS** panel (bytes, %, speed, ETA, pause / resume / cancel / retry) - a 5 GB file no longer freezes the chat. One file can be split across up to 4 connections, throttled, or left running after the reply ends. `download_file` streams to disk with retries and resume; `download_batch` grabs many files (or every link on a page) at once; `download_authed` fetches what needs a token or cookie (secrets redacted); `download_page` saves a page to work offline; `download_verify` checks sha256/size and reports `FAILED CHECK`; `download_media` pulls video/audio/subs via yt-dlp |
 | **Shell + sandbox** | `run_command` executes real shell commands - PowerShell/cmd on Windows, `sh` on Linux (configurable timeout, up to 600s); `run_code` runs snippets in an isolated temp folder (auto-detects what's installed on the PC: Python + Node by default, plus Go/Lua/PHP/Ruby/Perl/Bash when present; timeouts up to 600s) |
 | **Asks you questions** | `ask_user` pauses and asks you a question (with optional clickable options) exactly like a human would - just like opencode |
 | **Todo list** | `todo_write` shows a live, visible checklist on the left panel as it works through longer tasks |
@@ -175,11 +175,13 @@ always produced at the end.
 | `clipboard` | Reads (`get`) or writes (`set`) the system clipboard | |
 | `copy_to_clipboard` / `paste_from_clipboard` | First-class clipboard channel with type hints | `copy` validates `format=json` before copying; `paste` with `format=auto` also picks up a copied **picture** and returns it as an image Bonsai can see (`text`/`json`/`image`) |
 | `download_file` | One public http(s) URL → a file in the workspace | streamed straight to disk (never buffers the whole file), `max_mb` cap, `retries`, resumes a `.part` file, keeps the server's `Content-Disposition` filename, and shows a preview for text |
+| `download_status` | Asks what the downloads are doing | pass a job id, or call it bare to list everything queued / running / paused with bytes, speed and ETA; the panel is the same data, live |
 | `download_batch` | **Many** files in one call | give `urls`, or point `from_page` at a page and let it collect the links (`match` filters them); 4 at a time by default, one folder, per-file ok/failed report |
 | `download_authed` | A file behind a login / token | `bearer`, `cookie` or full `headers`; the secret values are **redacted everywhere** - not in the result, not in the chat history, not in the tool log |
 | `download_page` | Save a web page **offline** | downloads the HTML plus its images/CSS/JS/fonts, rewrites the links to the local copies and writes an `index.html` that works with no internet |
 | `download_verify` | A file that must be **provably** correct | big downloads continue with HTTP resume, broken connections retry, then it checks `sha256` and/or the exact byte size and says `FAILED CHECK` instead of pretending |
 | `download_media` | Video / audio / subtitles | via `yt-dlp` (`pip install yt-dlp`): audio-only as mp3, subtitles, thumbnail, playlist, or cookies from your browser for private videos |
+| `connections` / `throttle_kbps` / `background` (on every download tool) | Speed and control knobs | `connections: 1-4` splits one big file across parallel range requests (a large speed-up on slow single-stream hosts; ignored for small files and when the server refuses ranges). `throttle_kbps` caps one transfer so it leaves bandwidth free. `background: true` returns a job id at once and the transfer keeps going |
 | `archive` | Creates / extracts zip, tar, tar.gz, tgz archives | unpack or pack inside the workspace |
 | `ask_user` | Asks you a question and **waits for your answer** (options or free text) | pauses its work like opencode's question skill |
 | `todo_write` | Replaces the visible TODO checklist (pending / in_progress / completed) | shown live on the left panel |
@@ -242,6 +244,34 @@ GPT UI: above the footer links) has three modes. Click it to cycle:
 - `run_command` / `run_code` run a shell and can already reach the whole disk, so
   they are not path-gated - that is the same trust level as giving Bonsai the
   **SYSTEM** scope.
+
+### 4.2 The DOWNLOADS panel
+
+Every download runs as a background job, so a big file no longer freezes the
+chat. The **DOWNLOADS** panel (classic UI: under the TODO list; GPT UI: in the
+sidebar) refreshes about once a second and shows, per transfer:
+
+- a progress bar with **bytes / total**, **%**, current **speed** and **ETA**,
+  plus `4 conn` when the file is split across parallel connections and
+  `resumed` when it continued an earlier attempt;
+- **PAUSE** (releases the socket and keeps the bytes), **RESUME**,
+  **CANCEL** (the `.part` file stays on disk) and **RETRY** after a failure;
+- **CLEAR FINISHED** to tidy the list, and a toast when something completes.
+
+A few things worth knowing:
+
+- A paused, cancelled or crashed download leaves a `.part` file (plus a small
+  `.segments.json` ledger for split downloads). Nothing is ever half-renamed
+  into its final name, and the next attempt continues from those bytes.
+- `connections: 1-4` splits one file into parallel range requests. It is
+  **skipped automatically** when the server does not support ranges or the file
+  is small, so it can never make things worse.
+- If a download outlasts the tool's `timeout`, the reply says it is still going
+  and hands back a job id - the transfer is not killed. `download_status` (or
+  the panel) picks it up from there.
+- The panel is shared state, so it survives a page refresh; only in-flight
+  transfers live in the server's memory and are gone if the server restarts
+  (the `.part` files remain, so a retry continues).
 
 ## 5. The console - controls & HUD
 
@@ -358,6 +388,7 @@ project's local folders).
 | `PC_WORKDIR` | The workspace folder the file tools use | to point file access at a specific folder by default |
 | `PC_PATH_POLICY` | Default path scope: `workspace`, `ask` (default) or `system` | to start in a fixed mode instead of `ASK` (§4.1) |
 | `PC_MAX_DOWNLOAD_MB` | Optional ceiling for one downloaded file (default: **no limit**) | set it only if you want a hard stop; per-call `max_mb` overrides it |
+| `BONSAI_DL_JOBS` | How many downloads may run at the same time, default 4 | lower it on a slow connection or a laptop that must stay responsive |
 | `PC_LLAMA_SERVER` | Path to the `llama-server` binary used for local models | only if it isn't on `PATH` (Linux) or in the default PrismML location (Windows) |
 | `PC_PIPER_DIR` | Folder holding the Piper voice models | only if the voices live outside the project's `piper\` |
 

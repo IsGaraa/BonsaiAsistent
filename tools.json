@@ -353,7 +353,7 @@
     "type": "function",
     "function": {
       "name": "download_file",
-      "description": "Download a file from a web URL and save it inside the workspace folder. Returns the saved path, the byte size and (for text files) the beginning of the content so you can see what you got.",
+      "description": "Download a file from a web URL and save it inside the workspace folder. Streams straight to disk, so a 5 GB file costs no more memory than a small one, and it can continue where it stopped if the connection drops. Returns the saved path, the byte size and (for text files) the beginning of the content so you can see what you got.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -364,6 +364,34 @@
           "path": {
             "type": "string",
             "description": "Relative destination inside the workspace, e.g. 'Downloads/installer.exe'. Defaults to the file name from the URL."
+          },
+          "max_mb": {
+            "type": "integer",
+            "description": "Optional size cap for this file in MB (default: no limit at all)."
+          },
+          "retries": {
+            "type": "integer",
+            "description": "Extra attempts when the connection drops, max 10."
+          },
+          "connections": {
+            "type": "integer",
+            "description": "Split this one file across 1-4 parallel connections (default 1). Needs a server that honours range requests; a large speed-up on slow single-stream hosts, ignored for small files."
+          },
+          "throttle_kbps": {
+            "type": "integer",
+            "description": "Cap this download at N kilobytes per second (default 0 = uncapped) so it leaves bandwidth for other apps."
+          },
+          "timeout": {
+            "type": "integer",
+            "description": "Seconds to wait before handing the download back as still running (default 180, max 1800). A download that outlasts it keeps going in the background."
+          },
+          "background": {
+            "type": "boolean",
+            "description": "Return straight away with a job id instead of waiting. The transfer continues and shows up in the DOWNLOADS panel."
+          },
+          "overwrite": {
+            "type": "boolean",
+            "description": "Replace the destination if it already exists (default false: a numbered copy is made)."
           }
         },
         "required": [
@@ -1072,6 +1100,23 @@
   {
     "type": "function",
     "function": {
+      "name": "download_status",
+      "description": "Check on downloads: pass a job id to see one transfer, or call it with no arguments to list everything currently queued, running or paused, with bytes, speed and ETA. Use it after a 'background: true' download.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "job": {
+            "type": "string",
+            "description": "Job id from a background download. Omit to list the active ones."
+          }
+        },
+        "required": []
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
       "name": "download_batch",
       "description": "Download MANY files in one call: pass a list of URLs, or point 'from_page' at a web page and let it collect the links (optionally filtered by 'match'). Files land in one folder, several at a time, and you get a per-file report of what succeeded and what failed. Use this instead of calling download_file in a loop.",
       "parameters": {
@@ -1102,15 +1147,31 @@
           },
           "parallel": {
             "type": "integer",
-            "description": "How many at once, default 4, max 8."
+            "description": "How many files at once, default 4, max 8."
           },
           "max_mb": {
             "type": "integer",
-            "description": "Per-file size cap in MB."
+            "description": "Optional size cap for this file in MB (default: no limit at all)."
+          },
+          "retries": {
+            "type": "integer",
+            "description": "Extra attempts when the connection drops, max 10."
+          },
+          "connections": {
+            "type": "integer",
+            "description": "Split this one file across 1-4 parallel connections (default 1). Needs a server that honours range requests; a large speed-up on slow single-stream hosts, ignored for small files."
+          },
+          "throttle_kbps": {
+            "type": "integer",
+            "description": "Cap this download at N kilobytes per second (default 0 = uncapped) so it leaves bandwidth for other apps."
           },
           "timeout": {
             "type": "integer",
-            "description": "Per-file timeout in seconds (default 120)."
+            "description": "Seconds to wait before handing the download back as still running (default 180, max 1800). A download that outlasts it keeps going in the background."
+          },
+          "background": {
+            "type": "boolean",
+            "description": "Return straight away with a job id instead of waiting. The transfer continues and shows up in the DOWNLOADS panel."
           }
         },
         "required": []
@@ -1147,11 +1208,27 @@
           },
           "max_mb": {
             "type": "integer",
-            "description": "Size cap in MB."
+            "description": "Optional size cap for this file in MB (default: no limit at all)."
+          },
+          "retries": {
+            "type": "integer",
+            "description": "Extra attempts when the connection drops, max 10."
+          },
+          "connections": {
+            "type": "integer",
+            "description": "Split this one file across 1-4 parallel connections (default 1). Needs a server that honours range requests; a large speed-up on slow single-stream hosts, ignored for small files."
+          },
+          "throttle_kbps": {
+            "type": "integer",
+            "description": "Cap this download at N kilobytes per second (default 0 = uncapped) so it leaves bandwidth for other apps."
           },
           "timeout": {
             "type": "integer",
-            "description": "Timeout seconds."
+            "description": "Seconds to wait before handing the download back as still running (default 180, max 1800). A download that outlasts it keeps going in the background."
+          },
+          "background": {
+            "type": "boolean",
+            "description": "Return straight away with a job id instead of waiting. The transfer continues and shows up in the DOWNLOADS panel."
           }
         },
         "required": [
@@ -1223,13 +1300,29 @@
             "type": "boolean",
             "description": "Continue a partial download. Default true."
           },
-          "retries": {
-            "type": "integer",
-            "description": "Retry attempts, default 3, max 10."
-          },
           "max_mb": {
             "type": "integer",
-            "description": "Size cap in MB."
+            "description": "Optional size cap for this file in MB (default: no limit at all)."
+          },
+          "retries": {
+            "type": "integer",
+            "description": "Extra attempts when the connection drops, max 10."
+          },
+          "connections": {
+            "type": "integer",
+            "description": "Split this one file across 1-4 parallel connections (default 1). Needs a server that honours range requests; a large speed-up on slow single-stream hosts, ignored for small files."
+          },
+          "throttle_kbps": {
+            "type": "integer",
+            "description": "Cap this download at N kilobytes per second (default 0 = uncapped) so it leaves bandwidth for other apps."
+          },
+          "timeout": {
+            "type": "integer",
+            "description": "Seconds to wait before handing the download back as still running (default 180, max 1800). A download that outlasts it keeps going in the background."
+          },
+          "background": {
+            "type": "boolean",
+            "description": "Return straight away with a job id instead of waiting. The transfer continues and shows up in the DOWNLOADS panel."
           }
         },
         "required": [
