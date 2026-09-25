@@ -449,7 +449,7 @@ model shows up without touching `models.json`.
 
 | Setting | Default | Notes |
 |---|---|---|
-| **Context size (ctx)** | **32768** | tokens the model can see. Bigger = longer conversations/files, but more VRAM and slower prompt processing |
+| **Context size (ctx)** | **32768** | tokens the model can see. Bigger = longer conversations/files, but more VRAM and slower prompt processing. Capped at **102400 (100k)** - the KV cache grows with the window and is paid for in VRAM |
 | **Temperature** | 1.0 | lower = more focused/deterministic, higher = more varied |
 | **Top-p** | 0.95 | nucleus sampling cut-off |
 | **Top-k** | 20 | candidate limit; 0 disables it |

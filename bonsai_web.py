@@ -2058,6 +2058,11 @@ def _stop_local_server(port=8080):
 
 _MODEL_DEFAULTS = {"ctx": 32768, "temp": 1.0, "top_p": 0.95,
                    "top_k": 20, "ngl": 99}
+# The KV cache grows linearly with the context window and is paid for in VRAM
+# (and in prompt-processing time), so the useful ceiling is hardware, not
+# theoretical. 100k is the cap for this machine; the dialog enforces the same
+# number so a context this large cannot be re-entered by accident.
+MAX_CTX_TOKENS = 102400
 
 
 def _model_sanitise_cfg(raw):
@@ -2070,7 +2075,7 @@ def _model_sanitise_cfg(raw):
             return default
         return max(lo, min(hi, val))
 
-    return {"ctx": num("ctx", 512, 1048576, int, _MODEL_DEFAULTS["ctx"]),
+    return {"ctx": num("ctx", 512, MAX_CTX_TOKENS, int, _MODEL_DEFAULTS["ctx"]),
             "temp": num("temp", 0.0, 2.0, float, _MODEL_DEFAULTS["temp"]),
             "top_p": num("top_p", 0.01, 1.0, float, _MODEL_DEFAULTS["top_p"]),
             "top_k": num("top_k", 0, 1000, int, _MODEL_DEFAULTS["top_k"]),
@@ -7723,7 +7728,7 @@ PAGE = """<!doctype html>
     <div class="mdlbox">
       <h4>MODEL SETTINGS <span id="cfgwho"></span></h4>
       <div class="cfgrid">
-        <label>Context size (ctx)<input id="cfg_ctx" type="number" min="512" max="1048576" step="512"></label>
+        <label>Context size (ctx)<input id="cfg_ctx" type="number" min="512" max="102400" step="512"></label>
         <label>Temperature<input id="cfg_temp" type="number" min="0" max="2" step="0.05"></label>
         <label>Top-p<input id="cfg_top_p" type="number" min="0.01" max="1" step="0.01"></label>
         <label>Top-k<input id="cfg_top_k" type="number" min="0" max="1000" step="1"></label>
@@ -9707,7 +9712,7 @@ PAGE_GPT = """<!doctype html>
       <div class="mdlbox">
         <h4>MODEL SETTINGS <span id="cfgwho"></span></h4>
         <div class="cfgrid">
-          <label>Context size (ctx)<input id="cfg_ctx" type="number" min="512" max="1048576" step="512"></label>
+          <label>Context size (ctx)<input id="cfg_ctx" type="number" min="512" max="102400" step="512"></label>
           <label>Temperature<input id="cfg_temp" type="number" min="0" max="2" step="0.05"></label>
           <label>Top-p<input id="cfg_top_p" type="number" min="0.01" max="1" step="0.01"></label>
           <label>Top-k<input id="cfg_top_k" type="number" min="0" max="1000" step="1"></label>
