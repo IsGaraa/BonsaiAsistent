@@ -36,6 +36,7 @@ piper/*.wav
 
 # Model selector config (per-machine model list + active choice)
 models.json
+models.json.bak
 
 # Scheduled shell tasks (per-machine state written by schedule_task)
 schedules.json
