@@ -5768,6 +5768,9 @@ PAGE = """<!doctype html>
   .pvboxx { background: transparent; border: 1px solid var(--bd); color: var(--txt); border-radius: 6px; cursor: pointer; font-size: 16px; line-height: 1; padding: 2px 10px; }
   .pvboxx:hover { border-color: var(--err); color: var(--err); }
   .pvboxframe { flex: 1; width: 100%; border: none; background: var(--bg); }
+  .msgrow.user.queued .bubble { border-color: var(--warn); opacity: .92; }
+  .qbadge { display: inline-block; font-size: 9.5px; letter-spacing: 1.1px; color: var(--warn); border: 1px dashed var(--warn); border-radius: 999px; padding: 2px 9px; margin-bottom: 6px; animation: qpulse 1.6s ease-in-out infinite; }
+  @keyframes qpulse { 0%, 100% { opacity: .55; } 50% { opacity: 1; } }
   .scopebtn { width: 100%; text-align: left; font-family: Consolas, monospace; font-size: 11px; letter-spacing: 1px; color: var(--acc); background: var(--bg3); border: 1px solid var(--bd2); border-radius: 6px; padding: 6px 8px; cursor: pointer; }
   .scopebtn:hover { border-color: var(--acc); }
   .scopebtn.sc-system { color: var(--err); border-color: var(--err); }
@@ -5938,7 +5941,6 @@ PAGE = """<!doctype html>
             <button type="button" class="iconbtn" id="attach" title="Attach images / files">&#128206;</button>
             <button type="button" class="iconbtn" id="mic-btn" title="Microphone">&#127908;</button>
             <button type="button" class="modebtn" id="modebtn" title="Switch Plan / Build mode - Plan is read-only (no tools run)">BUILD</button>
-            <button type="button" id="queue" title="Queue this message - I will answer it after the current reply">QUEUE</button>
             <select id="effort-sel" title="Thinking effort - how deeply BONSAI reasons (this can change the response quality)">
               <option value="off">THINK: OFF</option>
               <option value="low">THINK: LOW</option>
@@ -6061,7 +6063,6 @@ function init() {
   else cur = chats[chats.length - 1];
   renderAll();
   setSendUI();
-  setQueueUI();
   serverLoad();
   startSchedWatch();
   bindScope();
@@ -6131,11 +6132,12 @@ function renderConv() {
   conv.innerHTML = '';
   if (cur) {
     cur.messages.forEach(function (m) {
-      if (m.role === 'user') addUser(m.content);
+      if (m.role === 'user') addUser(m.content, !!m.queued);
       else if (m.role === 'assistant') addAsst(m.content, m.calls || [], m.reason, m.stats);
     });
   }
   busy = false;
+  requeuePending();
 }
 function esc(s) { return (s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
 function fmt(s) {
@@ -6153,11 +6155,18 @@ function fileChipDom(name) {
   c.textContent = '\\ud83d\\udcc4 ' + name;
   return c;
 }
-function addUser(content) {
+function addUser(content, queued) {
   const conv = convEl();
-  const row = document.createElement('div'); row.className = 'msgrow user';
+  const row = document.createElement('div'); row.className = 'msgrow user' + (queued ? ' queued' : '');
   const av = document.createElement('div'); av.className = 'av me'; av.textContent = 'U';
   const b = document.createElement('div'); b.className = 'bubble';
+  if (queued) {
+    const qb = document.createElement('div'); qb.className = 'qbadge';
+    qb.setAttribute('data-state', 'queued');
+    qb.textContent = 'QUEUED \u00b7 waiting for the current reply';
+    qb.title = 'This message is in line - it will be sent automatically.';
+    b.appendChild(qb);
+  }
   const parts = typeof content === 'string' ? [{ type: 'text', text: content }] : content;
   const arr = parts || [];
   (arr.filter(function (p) { return p.type === 'image_url'; })).forEach(function (p) {
@@ -6340,19 +6349,57 @@ function buildUserMsg() {
 
 function handleSubmit(e) {
   e.preventDefault();
-  if (busy) { stopRun(); return; }
+  if (busy) { queueNow(); return; }
   go();
 }
-
 function setSendUI() {
   const b = document.getElementById('send');
-  if (busy) { b.textContent = 'STOP'; b.disabled = false; b.classList.add('stop'); }
+  if (busy) { b.textContent = msgQueue.length ? ('STOP \u00b7 ' + msgQueue.length + ' queued') : 'STOP'; b.disabled = false; b.classList.add('stop'); }
   else { b.textContent = 'SEND'; b.classList.remove('stop'); }
 }
-function setQueueUI() {
-  const q = document.getElementById('queue');
-  q.textContent = msgQueue.length ? ('QUEUE (' + msgQueue.length + ')') : 'QUEUE';
-  q.classList.toggle('hasq', msgQueue.length > 0);
+function refreshQueueUI() {
+  setSendUI();
+}
+function clearQueuedBadge(chat, msg) {
+  if (!chat || !msg) return;
+  if (cur && chat.id !== cur.id) return;
+  const all = chat.messages || [];
+  const at = all.indexOf(msg);
+  if (at < 0) return;
+  let k = -1;
+  for (let i = 0; i <= at; i++) if (all[i].role === 'user') k++;
+  const row = document.querySelectorAll('.msgrow.user')[k];
+  if (!row) return;
+  row.classList.remove('queued');
+  const b = row.querySelector('.qbadge');
+  if (b) b.remove();
+}
+function queueNow() {
+  const parts = buildUserMsg();
+  if (!parts) return;
+  const chat = cur || newChat();
+  const raw = parts.length === 1 && parts[0].type === 'text' ? parts[0].text : parts;
+  const msg = { role: 'user', content: raw, queued: true };
+  chat.messages.push(msg);
+  msgQueue.push({ parts: parts, chat: chat, msg: msg });
+  addUser(parts, true);
+  pendingAtt = [];
+  renderPreview();
+  document.getElementById('user-input').value = '';
+  save();
+  refreshQueueUI();
+  scrollBottom();
+}
+function requeuePending() {
+  msgQueue = msgQueue.filter(function (q) { return q.chat && q.msg && q.msg.queued; });
+  if (!cur) return;
+  (cur.messages || []).forEach(function (m) {
+    if (m.role !== 'user' || !m.queued) return;
+    if (msgQueue.some(function (q) { return q.msg === m; })) return;
+    const parts = typeof m.content === 'string' ? [{ type: 'text', text: m.content }] : (m.content || []);
+    if (parts.length) msgQueue.push({ parts: parts, chat: cur, msg: m });
+  });
+  refreshQueueUI();
 }
 function stopRun() {
   if (abortCtrl) { const a = abortCtrl; abortCtrl = null; try { a.abort(); } catch (e) {} }
@@ -6363,11 +6410,14 @@ function drainQueue() {
   if (busy) return;
   if (!msgQueue.length) return;
   const next = msgQueue.shift();
-  setQueueUI();
-  go(next.parts, next.chat);
+  if (next.msg) delete next.msg.queued;
+  clearQueuedBadge(next.chat, next.msg);
+  refreshQueueUI();
+  go(next.parts, next.chat, true);
 }
 
-async function go(forcedParts, chat) {
+
+async function go(forcedParts, chat, alreadyAdded) {
   if (busy) return;
   if (!cur) newChat();
   if (chat && chat !== cur && chats.indexOf(chat) !== -1) { cur = chat; renderAll(); }
@@ -6390,15 +6440,14 @@ async function go(forcedParts, chat) {
   }
 
   const raw = parts.length === 1 && parts[0].type === 'text' ? parts[0].text : parts;
-  target.messages.push({ role: 'user', content: raw });
-  addUser(parts);
+  if (!alreadyAdded) { target.messages.push({ role: 'user', content: raw }); addUser(parts); }
 
   addThinking();
   setBonsaiState('thinking');
   pendingAtt = [];
   renderPreview();
   document.getElementById('user-input').value = '';
-  try { await streamRun(target.messages.slice(), target); }
+  try { await streamRun(target.messages.filter(function (m) { return !m.queued; }).slice(), target); }
   catch (err) { doneThinking('Error: ' + err.message); setBonsaiState('idle'); }
   busy = false;
   setSendUI();
@@ -6858,21 +6907,10 @@ document.getElementById('filein').onchange = function () { addFiles(this.files);
 })();
 
 document.getElementById('newchat2').onclick = function () { newChat(); setBonsaiState('idle'); };
-document.getElementById('queue').onclick = function () {
-  const parts = buildUserMsg();
-  if (!parts) return;
-  if (busy) {
-    msgQueue.push({ parts: parts, chat: cur });
-    pendingAtt = [];
-    renderPreview();
-    document.getElementById('user-input').value = '';
-    setQueueUI();
-  } else {
-    document.getElementById('user-input').value = '';
-    pendingAtt = [];
-    renderPreview();
-    go(parts);
-  }
+const _sendBtn = document.getElementById('send');
+if (_sendBtn) _sendBtn.onclick = function () {
+  if (busy) { stopRun(); return false; }
+  return true;
 };
 function setWorkdirInUI(wd) {
   workdir = wd;
@@ -7461,6 +7499,9 @@ PAGE_GPT = """<!doctype html>
   .tlprev a { font-size: 11px; color: var(--acc); }
   .tlprev .tlframe { width: 100%; height: 280px; border: 1px dashed var(--bd); border-radius: 8px; background: var(--bg2); margin-top: 6px; }
   .toolsline { margin: 2px 0 8px; display: flex; flex-wrap: wrap; gap: 6px; }
+  .msgrow.user.queued .bubble { border-color: var(--warn); opacity: .92; }
+  .qbadge { display: inline-block; font-size: 9.5px; letter-spacing: 1.1px; color: var(--warn); border: 1px dashed var(--warn); border-radius: 999px; padding: 2px 9px; margin-bottom: 6px; animation: qpulse 1.6s ease-in-out infinite; }
+  @keyframes qpulse { 0%, 100% { opacity: .55; } 50% { opacity: 1; } }
   .scopebtn { width: 100%; text-align: left; font-size: 11px; letter-spacing: 1px; color: var(--acc); background: transparent; border: 1px solid var(--bd); border-radius: 8px; padding: 7px 10px; cursor: pointer; }
   .scopebtn:hover { border-color: var(--acc); }
   .scopebtn.sc-system { color: var(--err); border-color: var(--err); }
@@ -7642,7 +7683,6 @@ PAGE_GPT = """<!doctype html>
           <div style="display:flex;align-items:center;gap:2px">
             <button class="ic" id="attach" title="Attach images / files">&#128206;</button>
             <button class="ic" id="mic-btn" title="Microphone">&#127908;</button>
-            <button class="ic" id="queue" title="Queue this message - I will answer after the current reply">&#9201;</button>
             <button class="send" id="send" title="Send"></button>
           </div>
         </div>
@@ -7747,7 +7787,7 @@ function init() {
   bindModeBtn(); bindTheme(); loadWorkdir();
   dedupeChats();
   if (!chats.length) newChat(); else cur = chats[chats.length - 1];
-  renderAll(); setSendUI(); setQueueUI();
+  renderAll(); setSendUI();
   startSchedWatch();
   bindScope();
   fetch('/api/todos').then(function (r) { return r.json(); }).then(function (j) {
@@ -8310,18 +8350,61 @@ function buildUserMsg() {
 }
 function handleSubmit(e) {
   e.preventDefault();
-  if (busy) { stopRun(); return; }
+  if (busy) { queueNow(); return; }
   go();
 }
 function setSendUI() {
   const b = document.getElementById('send');
-  if (busy) { b.innerHTML = STOP_SVG; b.className = 'send busy'; b.title = 'Stop'; }
-  else { b.innerHTML = SEND_SVG; b.className = 'send'; b.title = 'Send'; }
+  if (busy) {
+    b.innerHTML = STOP_SVG;
+    b.className = 'send busy';
+    b.title = msgQueue.length ? ('Stop - ' + msgQueue.length + ' message(s) queued') : 'Stop';
+  } else { b.innerHTML = SEND_SVG; b.className = 'send'; b.title = 'Send'; }
 }
-function setQueueUI() {
-  const q = document.getElementById('queue');
-  q.textContent = msgQueue.length ? '\u9201' + msgQueue.length : '\u9201';
-  q.title = msgQueue.length ? 'Queued: ' + msgQueue.length + ' message(s)' : 'Queue this message';
+function refreshQueueUI() {
+  setSendUI();
+}
+function clearQueuedBadge(chat, msg) {
+  if (!chat || !msg) return;
+  if (cur && chat.id !== cur.id) return;
+  const all = chat.messages || [];
+  const at = all.indexOf(msg);
+  if (at < 0) return;
+  let k = -1;
+  for (let i = 0; i <= at; i++) if (all[i].role === 'user') k++;
+  const row = document.querySelectorAll('.msgrow.user')[k];
+  if (!row) return;
+  row.classList.remove('queued');
+  const b = row.querySelector('.qbadge');
+  if (b) b.remove();
+}
+function queueNow() {
+  const parts = buildUserMsg();
+  if (!parts) return;
+  if (!cur) newChat();
+  const chat = cur;
+  const raw = parts.length === 1 && parts[0].type === 'text' ? parts[0].text : parts;
+  const msg = { role: 'user', content: raw, queued: true };
+  chat.messages.push(msg);
+  msgQueue.push({ parts: parts, chat: chat, msg: msg });
+  addUser(parts, true);
+  pendingAtt = [];
+  renderPreview();
+  document.getElementById('user-input').value = '';
+  save();
+  refreshQueueUI();
+  scrollBottom();
+}
+function requeuePending() {
+  msgQueue = msgQueue.filter(function (q) { return q.chat && q.msg && q.msg.queued; });
+  if (!cur) return;
+  (cur.messages || []).forEach(function (m) {
+    if (m.role !== 'user' || !m.queued) return;
+    if (msgQueue.some(function (q) { return q.msg === m; })) return;
+    const parts = typeof m.content === 'string' ? [{ type: 'text', text: m.content }] : (m.content || []);
+    if (parts.length) msgQueue.push({ parts: parts, chat: cur, msg: m });
+  });
+  refreshQueueUI();
 }
 function stopRun() {
   if (abortCtrl) { const a = abortCtrl; abortCtrl = null; try { a.abort(); } catch (e) {} }
@@ -8332,10 +8415,12 @@ function drainQueue() {
   if (busy) return;
   if (!msgQueue.length) return;
   const next = msgQueue.shift();
-  setQueueUI();
-  go(next.parts, next.chat);
+  if (next.msg) delete next.msg.queued;
+  clearQueuedBadge(next.chat, next.msg);
+  refreshQueueUI();
+  go(next.parts, next.chat, true);
 }
-async function go(forcedParts, chat) {
+async function go(forcedParts, chat, alreadyAdded) {
   if (busy) return;
   if (!cur) newChat();
   if (chat && chat !== cur && chats.indexOf(chat) !== -1) { cur = chat; renderAll(); }
@@ -8357,15 +8442,14 @@ async function go(forcedParts, chat) {
   }
 
   const raw = parts.length === 1 && parts[0].type === 'text' ? parts[0].text : parts;
-  target.messages.push({ role: 'user', content: raw });
-  addUser(parts);
+  if (!alreadyAdded) { target.messages.push({ role: 'user', content: raw }); addUser(parts); }
 
   addThinking();
   setState('thinking');
   pendingAtt = [];
   renderPreview();
   document.getElementById('user-input').value = '';
-  try { await streamRun(target.messages.slice(), target); }
+  try { await streamRun(target.messages.filter(function (m) { return !m.queued; }).slice(), target); }
   catch (err) { doneThinking('Error: ' + err.message); setState('idle'); }
   busy = false;
   setSendUI();
@@ -8443,19 +8527,10 @@ document.getElementById('filein').onchange = function () { addFiles(this.files);
   });
 })();
 document.getElementById('newchat').onclick = function () { newChat(); setState('idle'); };
-document.getElementById('queue').onclick = function () {
-  const parts = buildUserMsg();
-  if (!parts) return;
-  if (busy) {
-    msgQueue.push({ parts: parts, chat: cur });
-    pendingAtt = []; renderPreview();
-    document.getElementById('user-input').value = '';
-    setQueueUI();
-  } else {
-    document.getElementById('user-input').value = '';
-    pendingAtt = []; renderPreview();
-    go(parts);
-  }
+const _gSend = document.getElementById('send');
+if (_gSend) _gSend.onclick = function () {
+  if (busy) { stopRun(); return; }
+  handleSubmit({ preventDefault: function () {} });
 };
 document.getElementById('workbtn').onclick = async function () {
   try {

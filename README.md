@@ -95,10 +95,13 @@ Check the latest news about Nvidia and pick three highlights
 List the .py files in this folder with their sizes
 ```
 
-The SEND button becomes **STOP** while Bonsai is replying, so you can cut it
-off. There's also a **QUEUE** button: type a follow-up while it's busy and hit
-QUEUE - it gets answered right after the current reply (QUEUE keeps a backlog
-in order).
+While Bonsai is replying you can keep typing: **press Enter and the message is
+queued** - it appears in the conversation straight away with a pulsing
+**QUEUED · waiting for the current reply** badge, and is sent automatically as
+soon as the current reply ends (order is kept, and you can queue several). The
+button turns into **STOP · 2 queued**, so you always see the backlog; clicking
+it aborts the current reply, after which the queue starts. Starting a new chat
+clears it, and a queued message survives a page reload.
 
 ## 2. Requirements
 
@@ -141,7 +144,7 @@ in order).
 | **Scheduled tasks** | `schedule_task` (once / every N seconds / 5-field cron), `list_schedules`, `unschedule_task` - run shell commands in the background while the PC is on. Tasks are **saved to `schedules.json`** in the BONSAI folder, so they survive a restart, a one-shot that came due while Bonsai was closed runs as soon as it starts again, and every finished run pops up as a **toast in the corner** with its output. Completed one-shots stay in `list_schedules` (status `completed`) until you remove them |
 | **Speaks out loud** | `tts_speak` reads text aloud with the local neural Piper engine (English + Romanian voices) and saves the WAV in the workspace; no cloud, no Windows voices, no media player - streams straight to the speakers with `sounddevice`. **Off by default** - flip the **TTS** header button to let Bonsai speak |
 | **Thinking effort** | **THINK: OFF / LOW / MED / HIGH** selector in the composer controls how deep Bonsai reasons (maps to `enable_thinking` / `reasoning_effort`) |
-| **STOP / QUEUE** | abort a reply mid-stream, or queue a follow-up to be answered immediately after |
+| **STOP / Enter-to-queue** | the button aborts a reply mid-stream (and shows how many messages are waiting); pressing Enter while Bonsai is busy queues your message instead of cancelling - it shows up as **QUEUED** and is sent automatically next |
 | **Live token stats** | real-time think vs. speak time, tokens/second and context usage under the input (see §6) |
 | **Always-in-memory** | the model stays loaded (resident) for the whole session - no idle timer ever unloads it, so a reply never stalls because of a pause (see §6) |
 | **Persistent history** | conversations saved in the browser and on disk; survive server restarts (see §7) |
@@ -240,7 +243,7 @@ GPT UI: above the footer links) has three modes. Click it to cycle:
 | Control | What it does |
 |---|---|
 | **SEND / STOP** | Submits your message; while Bonsai is replying it becomes **STOP** to abort the run |
-| **QUEUE** | Holds your typed message so it's answered right after the current reply (ordered backlog) |
+| **Enter while busy** | Queues the message: it appears in the chat with a **QUEUED** badge and is sent automatically when the current reply finishes (FIFO, several at a time, survives a reload). The **STOP** button shows the backlog (`STOP · 2 queued`) and clicking it still aborts the current reply |
 | **THINK: OFF / LOW / MED / HIGH** | Selects how deeply Bonsai reasons (`enable_thinking` / `reasoning_effort`); higher = deeper reasoning, slower replies. Default MED |
 | **TODO panel** | Live checklist on the left panel, updated by `todo_write` as longer tasks progress |
 | **Workspace (folder icon)** | Choose/open the working folder for the file tools |
