@@ -888,7 +888,7 @@ function renderTodo(items) {
     d.appendChild(st); d.appendChild(tx); el.appendChild(d);
   });
 }
-async function streamRun(messages, chat) {
+async function streamRun(messages, chat, anchorMsg) {
   chat = chat || cur;
   abortCtrl = new AbortController();
   startStats();
@@ -1040,9 +1040,9 @@ function drainQueue() {
   if (next.msg) delete next.msg.queued;
   clearQueuedBadge(next.chat, next.msg);
   refreshQueueUI();
-  go(next.parts, next.chat, true);
+  go(next.parts, next.chat, true, next.msg);
 }
-async function go(forcedParts, chat, alreadyAdded) {
+async function go(forcedParts, chat, alreadyAdded, askedMsg) {
   if (busy) return;
   if (!cur) newChat();
   if (chat && chat !== cur && chats.indexOf(chat) !== -1) { cur = chat; renderAll(); }
@@ -1064,14 +1064,15 @@ async function go(forcedParts, chat, alreadyAdded) {
   }
 
   const raw = parts.length === 1 && parts[0].type === 'text' ? parts[0].text : parts;
-  if (!alreadyAdded) { target.messages.push({ role: 'user', content: raw }); addUser(parts); }
+  let asked = alreadyAdded ? (askedMsg || null) : null;
+  if (!asked) { asked = { role: 'user', content: raw }; target.messages.push(asked); addUser(parts); }
 
   addThinking();
   setState('thinking');
   pendingAtt = [];
   renderPreview();
   document.getElementById('user-input').value = '';
-  try { await streamRun(target.messages.filter(function (m) { return !m.queued; }).slice(), target); }
+  try { await streamRun(target.messages.filter(function (m) { return !m.queued; }).slice(), target, asked); }
   catch (err) { doneThinking('Error: ' + err.message); setState('idle'); }
   busy = false;
   setSendUI();

@@ -136,15 +136,15 @@ clears it, and a queued message survives a page reload.
 | **Todo list** | `todo_write` shows a live, visible checklist on the left panel as it works through longer tasks |
 | **Live HTML preview** | any `.html` page Bonsai writes (or `preview_html` explicitly) takes over the **center stage** - the arc reactor slides away and the page is shown full-panel, with a name and an **X** to bring the reactor back. Served from this PC, so JavaScript and local assets (CSS/JS/images next to the page) work. In the GPT-style chat (`/chat`) the same page opens as a full-screen lightbox |
 | **Screenshots appear in the chat** | every `take_screenshot` / `screenshot_window` / `click_text` result is drawn as a labelled card (dimensions + saved path, click to open full size) **above** the collapsed tool log - no need to expand anything |
-| **Not locked to one folder** | **PATH SCOPE** in the sidebar decides how far Bonsai may reach: `WORKSPACE` (hard sandbox), `ASK` (the default - anything outside the workspace pops a **PERMISSION NEEDED** dialog with **ALLOW FOR THIS CONV** / **ALLOW ONCE** / **DENY**) or `SYSTEM` (no prompts). So "find my tax PDF" can mean a search across `C:\`, not just the workspace |
+| **Not locked to one folder** | with the default `ASK` scope Bonsai can read, write and **search the whole PC** (`C:\`, `/home/...`), and you approve each new folder - so "find my tax PDF" works outside the workspace too. The **PATH SCOPE** control in the sidebar switches between `WORKSPACE` / `ASK` / `SYSTEM` (§4.1) |
 | **Real system meters** | live CPU / RAM / GPU usage under the reactor, read from `psutil` + `nvidia-smi` instead of placeholder numbers |
 | **Window management** | `window_list` lists every open window (title, process, PID) and `window_action` brings one to the front, maximizes, minimizes or restores it - so Bonsai can switch apps before acting |
-| **Docker / containers** | `docker_ps`, `docker_images`, `docker_start`, `docker_stop`, `docker_restart`, `docker_logs` and `docker_exec` drive the Docker CLI (works with Docker Desktop) |
+| **Docker / containers** | drives the Docker CLI from chat (list images/containers, start, stop, restart, tail logs, run a command inside) - works with Docker Desktop |
 | **API client** | `api_call` speaks REST/GraphQL (any HTTP method, JSON or raw bodies, custom headers) and `ws_test` connects to WebSocket endpoints, sends and collects replies |
-| **Scheduled tasks** | `schedule_task` (once / every N seconds / 5-field cron), `list_schedules`, `unschedule_task` - run shell commands in the background while the PC is on. Tasks are **saved to `schedules.json`** in the BONSAI folder, so they survive a restart, a one-shot that came due while Bonsai was closed runs as soon as it starts again, and every finished run pops up as a **toast in the corner** with its output. Completed one-shots stay in `list_schedules` (status `completed`) until you remove them |
+| **Scheduled tasks** | `schedule_task` (once / every N seconds / 5-field cron) runs shell commands in the background while the PC is on; they survive a restart and report back as toasts (§7) |
 | **Speaks out loud** | `tts_speak` reads text aloud with the local neural Piper engine (English + Romanian voices) and saves the WAV in the workspace; no cloud, no Windows voices, no media player - streams straight to the speakers with `sounddevice`. **Off by default** - flip the **TTS** header button to let Bonsai speak |
 | **Thinking effort** | **THINK: OFF / LOW / MED / HIGH** selector in the composer controls how deep Bonsai reasons (maps to `enable_thinking` / `reasoning_effort`) |
-| **STOP / Enter-to-queue** | the button aborts a reply mid-stream (and shows how many messages are waiting); pressing Enter while Bonsai is busy queues your message instead of cancelling - it shows up as **QUEUED** and is sent automatically next |
+| **Never waits idle** | Enter while a reply is streaming and your message is queued with a **QUEUED** badge, then sent automatically - no cancelling, no waiting for the UI (§1) |
 | **Live token stats** | real-time think vs. speak time, tokens/second and context usage under the input (see §6) |
 | **Always-in-memory** | the model stays loaded (resident) for the whole session - no idle timer ever unloads it, so a reply never stalls because of a pause (see §6) |
 | **Persistent history** | conversations saved in the browser and on disk; survive server restarts (see §7) |
@@ -167,7 +167,7 @@ always produced at the end.
 |---|---|---|
 | `launch_or_open` | Opens apps, websites, files and settings by name | Notepad, Steam, Chrome, Spotify, YouTube, workspace files, system settings... |
 | `list_dir` / `read_file` / `search_files` / `write_file` / `edit_file` | Work on your files | the **workspace folder** by default; with `PATH SCOPE: ASK` Bonsai may also use an absolute path anywhere on the PC and you approve it per folder (§4.1). `search_files` can sweep the whole disk |
-| `take_screenshot` | Captures the screen (or a region) and **feeds the image to Bonsai's eyes** | also saves a PNG in the workspace; shown as a thumbnail in the tool log |
+| `take_screenshot` | Captures the screen (or a region) and **feeds the image to Bonsai's eyes** | also saves a PNG in the workspace; you see it as a card in the chat |
 | `screenshot_window` | Captures **one named window** (title substring / process / PID) and feeds it to Bonsai's eyes | no more guesswork between `window_list` and a full-screen grab; a minimized window is restored first, and the list of open windows is suggested if nothing matches |
 | `wait_for` | Waits until something is true instead of polling screenshots | `kind`: `file` (appears, or reaches `min_bytes` - a download finishing), `port` (starts listening), `url` (HTTP 2xx/3xx), `process` (app launched), `window` (title appears), `text` (string in a file), `screen_text` (visible on screen, needs OCR); `must_disappear` waits for the opposite; reports `timed_out` + what it last saw instead of erroring |
 | `control_input` | Moves the mouse, clicks, double/right-clicks, drags, scrolls, types text, presses keys/hotkeys | screen-pixel coordinates; pair with `take_screenshot` to see the result |
@@ -182,11 +182,11 @@ always produced at the end.
 | `docker_ps` / `docker_images` / `docker_start` / `docker_stop` / `docker_restart` / `docker_logs` / `docker_exec` | Manage Docker containers and images | shells out to the `docker` CLI (Docker Desktop); clean error if not installed |
 | `api_call` | Any HTTP method to REST or GraphQL APIs, JSON or raw body, custom headers | needs `requests`; returns status, headers, elapsed ms and body |
 | `ws_test` | Connects to a `ws://`/`wss://` endpoint, optionally sends a message, collects replies | needs `websocket-client` |
-| `schedule_task` / `list_schedules` / `unschedule_task` | Run a shell command later: once, every N seconds, or by 5-field cron | in-process scheduler thread, persisted to `schedules.json` in the BONSAI folder (survives restarts, missed one-shots run on the next start); each finished run appears as a corner toast with its output; `list_schedules` keeps completed one-shots until removed |
+| `schedule_task` / `list_schedules` / `unschedule_task` | Run a shell command later: once, every N seconds, or by 5-field cron | see §7 for persistence, the run toasts and completed one-shots |
 | `tts_voices` / `tts_speak` | Lists local Piper voices; speaks text aloud and saves the WAV (`out\tts\`) | needs `piper-tts` + `onnxruntime` + `sounddevice`; voice models live in the project's `piper\` - run `python piper\download_voices.py` once; `tts_speak` only works after the **TTS** header button is turned on |
 | `web_search` / `web_fetch` | Look up current information online when it's not sure | `web_search` returns **structured** results (title, url, domain, snippet, source) plus `did_you_mean` and `related_searches`, so a typo like `serach` recovers in one call; `action="suggest"` is the cheap autocomplete-only check. `web_fetch` reads a page |
 | `run_command` | Runs a real shell command (cmd/PowerShell on Windows, `sh` on Linux) | timeout default 45s, configurable up to 600s, output capped to ~8 KB |
-| `run_code` | Runs snippets in many languages (auto-detected: Python + Node by default; Go/Lua/PHP/Ruby/Perl/Bash when installed) | isolated temp folder, deleted afterwards; timeout default 30s, up to 600s; ~8 KB output cap |
+| `run_code` | Runs a snippet in any installed language (see §2) | isolated temp folder, deleted afterwards; timeout default 30s, up to 600s; ~8 KB output cap |
 | `preview_html` | Live-preview an `.html` page from the workspace: it takes over the center stage (reactor hidden, **X** restores it), or opens as a lightbox in `/chat` | also auto-suggested when `write_file` targets an `.html`/`.htm` file (returns a `preview_url`) |
 | `get_scene_info` | Lists the open Blender scene: objects, types, locations (Mesh, Camera, Light, ...) | requires Blender running with the *MCP for Blender* addon enabled |
 | `get_object_info` | Details on one object (location, rotation, scale, ...) | |
@@ -243,7 +243,7 @@ GPT UI: above the footer links) has three modes. Click it to cycle:
 | Control | What it does |
 |---|---|
 | **SEND / STOP** | Submits your message; while Bonsai is replying it becomes **STOP** to abort the run |
-| **Enter while busy** | Queues the message: it appears in the chat with a **QUEUED** badge and is sent automatically when the current reply finishes (FIFO, several at a time, survives a reload). The **STOP** button shows the backlog (`STOP · 2 queued`) and clicking it still aborts the current reply |
+| **Enter while busy** | queues the message instead of cancelling it (see §1); the backlog is shown on the button, e.g. `STOP · 2 queued` |
 | **THINK: OFF / LOW / MED / HIGH** | Selects how deeply Bonsai reasons (`enable_thinking` / `reasoning_effort`); higher = deeper reasoning, slower replies. Default MED |
 | **TODO panel** | Live checklist on the left panel, updated by `todo_write` as longer tasks progress |
 | **Workspace (folder icon)** | Choose/open the working folder for the file tools |
@@ -435,16 +435,15 @@ at near-parity quality (~5.9-7.2 GB instead of ~54 GB).
 | File | What it is | Download |
 |---|---|---|
 | `Ternary-Bonsai-2-27B-PQ2_0.gguf` | Language model (7.21 GB, ternary g128) | [Hugging Face](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf) |
-| `Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf` | Vision projector (0.63 GB) - required for image input | [Hugging Face](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf) |
+| `Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf` | Vision projector (0.63 GB) - required for image input | same Hugging Face repo (row above) |
 
 Server profile: 32k context, `-ngl 99`, flash-attention, temp 1.0, top-p 0.95,
 top-k 20.
 
-Useful links:
+Useful links (the model files themselves are in the table above):
 
-- 📄 Model card & weights: **https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf**
 - 📚 PrismML model downloads & docs: **https://docs.prismml.com/download/models**
-- 🔧 Runtime engine (`llama-server`): the **PrismML llama.cpp fork** - https://github.com/PrismML-Eng/llama.cpp (stock llama.cpp won't load PQ2_0/PTQ1_0 tensors)
+- 🔧 Runtime engine (`llama-server`): **https://github.com/PrismML-Eng/llama.cpp** (stock llama.cpp won't load PQ2_0/PTQ1_0 tensors)
 - 🧪 Official demos: https://github.com/PrismML-Eng/Bonsai-demo
 
 ## 10. Security & privacy
@@ -478,7 +477,7 @@ Useful links:
 |---|---|
 | First reply after a pause is slow | normal only if `llama-server` was stopped/restarted meanwhile - otherwise the model stays resident for the whole session |
 | Model won't start / blank UI | make sure `prism-llama`'s `llama-server` is installed (Windows exe or a binary on `PATH` / `PC_LLAMA_SERVER` on Linux) and `BONSAI_DIR` points at the `.gguf` files |
-| Vision doesn't work | the active model needs a vision projector: put a `*mmproj*.gguf` with a matching filename prefix next to the model, or attach one from the **+** dialog; the header shows `VISION: mmproj ON/OFF` |
+| Vision doesn't work | the active model needs a vision projector: put a `*mmproj*.gguf` with a matching filename prefix next to the model, or attach one from the **+** dialog |
 | "Bonsai 2 model server could not start" | run `run.bat` again; check port 8080 isn't taken and the GPU/driver support CUDA |
 | Model answers but sees no files | pick the workspace folder (📁 button) - file tools are confined to it |
 | `take_screenshot` / `control_input` / `clipboard` error ("not installed") | install Pillow, pyautogui and pyperclip (`pip install pillow pyautogui pyperclip`) |
