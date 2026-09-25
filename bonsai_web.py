@@ -2656,6 +2656,12 @@ def _http_json(url, payload, timeout=300):
         return json.loads(resp.read().decode("utf-8"))
 
 
+def _http_json_get(url, timeout=30):
+    req = urllib.request.Request(url, method="GET")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
 WEB_SPECS = [WEB_TOOLS["web_search"], WEB_TOOLS["web_fetch"]]
 
 SHELL_TOOL = {
@@ -3753,6 +3759,119 @@ def build_messages(raw_messages, mode=MODE_BUILD):
     if not any(m.get("role") == "user" for m in msgs):
         msgs.append({"role": "user", "content": "..."})
     return msgs
+
+
+# ---------------------------------------------------------------- context
+# A "new" conversation is never really empty: every request carries the
+# system prompt plus the whole tool catalogue, and llama.cpp renders that
+# through the model's chat template before it sees a single word. The
+# baseline is cached per (mode, model) because it only changes when the
+# prompt or the tool list does.
+_CTX_BASE = {}
+_CTX_LOCK = threading.Lock()
+# A vision projector spends a fixed slice of the window per image, and the
+# exact size depends on the projector. This is a sane average; the meter
+# reports images separately instead of pretending to know.
+_CTX_IMG_TOKENS = 1024
+
+
+def _ctx_strip_images(msgs):
+    """Return (text-only messages, image count). Base64 image payloads must
+    never reach /tokenize - they are megabytes of noise that would count as
+    hundreds of thousands of tokens."""
+    out = []
+    images = 0
+    for m in msgs:
+        content = m.get("content")
+        if not isinstance(content, list):
+            out.append(m)
+            continue
+        texts = []
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") == "image_url":
+                images += 1
+            elif part.get("type") == "text" and part.get("text"):
+                texts.append(str(part["text"]))
+        out.append({"role": m.get("role"), "content": "\n".join(texts)})
+    return out, images
+
+
+def _ctx_estimate(msgs, tools):
+    """Rough token count for models we cannot ask. JSON is token-dense, so
+    3.6 chars/token sits much closer to the truth than the usual 4."""
+    blob = json.dumps({"messages": msgs, "tools": tools}, default=str)
+    return int(len(blob) / 3.6) + 24
+
+
+def _ctx_exact(msgs, tools, timeout=25):
+    """Ask the running llama-server for the real number: render the prompt
+    through the model's own chat template, then tokenize it. Returns None if
+    the server cannot answer."""
+    try:
+        prompt = _http_json(BONSAI_BASE + "/apply-template",
+                            {"messages": msgs, "tools": tools}, timeout)["prompt"]
+        toks = _http_json(BONSAI_BASE + "/tokenize",
+                          {"content": prompt, "add_special": True}, timeout)["tokens"]
+        return len(toks)
+    except Exception:
+        return None
+
+
+def _ctx_server_total():
+    """The window the server is actually running with - it rounds up, so this
+    is not always the number the user typed."""
+    try:
+        props = _http_json_get(BONSAI_BASE + "/props", timeout=5)
+        return int((props.get("default_generation_settings") or {}).get("n_ctx") or 0)
+    except Exception:
+        return 0
+
+
+def _ctx_usage(raw_messages, mode=MODE_BUILD):
+    """How much of the window this conversation is using right now.
+
+    Returns fixed (the system prompt + tools cost every turn carries), own
+    (what the conversation itself has added) and total (the real window)."""
+    mode = MODE_PLAN if str(mode) == MODE_PLAN else MODE_BUILD
+    msgs = build_messages(raw_messages, mode)
+    tools = _tools_for(mode)
+    msgs, images = _ctx_strip_images(msgs)
+    entry = _active_model()
+    local = bool(entry) and entry.get("type") != "api" and _bonsai_ready()
+
+    used = None
+    exact = False
+    if local:
+        used = _ctx_exact(msgs, tools)
+        exact = used is not None
+    if used is None:
+        used = _ctx_estimate(msgs, tools)
+    if images:
+        used += images * _CTX_IMG_TOKENS
+
+    # The baseline: what an empty conversation in this mode costs.
+    key = (mode, (entry or {}).get("id"))
+    with _CTX_LOCK:
+        fixed = _CTX_BASE.get(key)
+    if fixed is None:
+        empty = build_messages([], mode)
+        if local and exact:
+            fixed = _ctx_exact(empty, tools)
+        if fixed is None:
+            fixed = _ctx_estimate(empty, tools)
+        with _CTX_LOCK:
+            _CTX_BASE[key] = fixed
+
+    total = _ctx_server_total() or int(_entry_cfg(entry).get("ctx") or 0)
+    own = max(0, used - fixed)
+    base = {"used": used, "fixed": fixed, "own": own, "total": total,
+            "exact": exact, "mode": mode, "images": images}
+    if total and used > total:
+        return dict(base, ok=False, error="this conversation no longer fits in "
+                     "the context window - start a new chat or raise ctx")
+    return dict(base, ok=True, pct=round(used * 100.0 / total, 1) if total else None)
 
 
 def parse_arguments(raw):
@@ -7559,6 +7678,35 @@ PAGE = """<!doctype html>
   #effort-sel option { background: #16161b; color: var(--txt2); }
   #effort-sel:hover { border-color: var(--acc); }
 
+  /* context window meter - always visible, so you can see the cost of the
+     system prompt + tools before you even type, and how it grows. */
+  .ctxmeter {
+    display: flex; align-items: center; gap: 6px; align-self: center;
+    background: var(--bg3); border: 1px solid var(--bd2); border-radius: 12px;
+    padding: 0 10px; height: 34px; cursor: default; white-space: nowrap;
+    font-size: 11px; font-family: Consolas, monospace; user-select: none;
+    transition: border-color .15s;
+  }
+  .ctxmeter:hover { border-color: var(--acc); }
+  .ctxmeter .ctxtag { color: var(--mut); font-weight: 700; letter-spacing: .5px; }
+  .ctxmeter .ctxbar {
+    width: 54px; height: 6px; border-radius: 3px; background: var(--bg4);
+    overflow: hidden; flex: 0 0 auto;
+  }
+  .ctxmeter .ctxfill { height: 100%; width: 0%; background: var(--acc); transition: width .25s, background .25s; border-radius: 3px; }
+  .ctxmeter.warn .ctxfill { background: #fbbf24; }
+  .ctxmeter.over .ctxfill { background: var(--err); }
+  .ctxmeter .ctxnum { color: var(--txt2); }
+  .ctxmeter .ctxown { color: var(--mut); }
+  .ctxmeter .ctxhint {
+    display: none; position: absolute; z-index: 40; margin-top: 46px;
+    background: var(--bg2); border: 1px solid var(--bd2); border-radius: 10px;
+    padding: 8px 10px; font-size: 11px; color: var(--txt2); white-space: normal;
+    width: 260px; box-shadow: 0 8px 24px rgba(0,0,0,.5); line-height: 1.5;
+  }
+  .ctxmeter:hover .ctxhint { display: block; }
+  .ctxmeter .ctxhint b { color: var(--acc); }
+
   /* todo panel */
   #todopanel { display: none; padding: 4px 8px; }
   #todopanel.on { display: block; }
@@ -7801,6 +7949,12 @@ PAGE = """<!doctype html>
             <textarea id="user-input" rows="1" placeholder="Type a command..."></textarea>
             <button type="button" class="iconbtn" id="attach" title="Attach images / files">&#128206;</button>
             <button type="button" class="iconbtn" id="mic-btn" title="Microphone">&#127908;</button>
+            <div class="ctxmeter" id="ctxmeter" title="Context window in use - the system prompt and all tools are already counted, before you type">
+              <span class="ctxtag">CTX</span>
+              <span class="ctxbar"><span class="ctxfill" id="ctxfill"></span></span>
+              <span class="ctxnum" id="ctxnum">--</span>
+              <span class="ctxhint" id="ctxhint"></span>
+            </div>
             <button type="button" class="modebtn" id="modebtn" title="Switch Plan / Build mode - Plan is read-only (no tools run)">BUILD</button>
             <select id="effort-sel" title="Thinking effort - how deeply BONSAI reasons (this can change the response quality)">
               <option value="off">THINK: OFF</option>
@@ -7943,6 +8097,7 @@ function bindModeBtn() {
     chatMode = chatMode === 'plan' ? 'build' : 'plan';
     localStorage.setItem('jarvis_mode', chatMode);
     update();
+    scheduleCtx();
     if (typeof setBonsaiState === 'function') setBonsaiState(bonsaiState || 'idle');
   };
 }
@@ -7953,7 +8108,7 @@ async function loadWorkdir() {
     if (j.workdir) setWorkdirInUI(j.workdir);
   } catch (e) { /* offline */ }
 }
-function renderAll() { renderList(); renderConv(); }
+function renderAll() { renderList(); renderConv(); scheduleCtx(); }
 function dedupeChats() {
   const byId = {};
   const out = [];
@@ -8235,6 +8390,66 @@ function clearQueuedBadge(chat, msg) {
   row.classList.remove('queued');
   const b = row.querySelector('.qbadge');
   if (b) b.remove();
+}
+
+/* ---- context window meter ----------------------------------------------
+   A new chat is not empty: the system prompt and the whole tool catalogue go
+   out with every request, so the meter shows that fixed cost before you type
+   and grows as the conversation does. Hover for the breakdown. */
+let ctxLast = null;
+let ctxTimer = null;
+function fmtK(n) {
+  n = Number(n) || 0;
+  if (n < 1000) return String(n);
+  return (n / 1000).toFixed(n >= 10000 ? 0 : 1).replace(/[.]0$/, '') + 'k';
+}
+function ctxPaint() {
+  const meter = document.getElementById('ctxmeter');
+  if (!meter) return;
+  const num = document.getElementById('ctxnum');
+  const fill = document.getElementById('ctxfill');
+  const hint = document.getElementById('ctxhint');
+  const j = ctxLast;
+  if (!j) { num.textContent = '--'; if (hint) hint.textContent = 'measuring...'; return; }
+  if (!j.ok) {
+    meter.classList.remove('warn'); meter.classList.add('over');
+    if (fill) fill.style.width = '100%';
+    num.textContent = 'FULL';
+  } else {
+    const pct = j.total ? Math.min(100, j.used * 100 / j.total) : 0;
+    meter.classList.toggle('warn', pct >= 50 && pct < 80);
+    meter.classList.toggle('over', pct >= 80);
+    if (fill) fill.style.width = pct.toFixed(1) + '%';
+    num.textContent = fmtK(j.used) + '/' + fmtK(j.total);
+  }
+  if (hint) {
+    if (!j.ok) {
+      hint.innerHTML = '<b>Context full.</b><br>This conversation no longer fits the '
+        + 'window.<br>Start a new chat, or raise ctx in model settings.';
+    } else {
+      let extra = '';
+      if (j.images) extra += '<br>images: ' + j.images + ' (about ' + fmtK(j.images * 1024) + ')';
+      if (!j.exact) extra += '<br>estimated - model not loaded';
+      hint.innerHTML = '<b>' + (j.exact ? '' : '~') + Number(j.used).toLocaleString() + '</b>'
+        + ' of <b>' + Number(j.total || 0).toLocaleString() + '</b> tokens'
+        + '<br>system prompt + tools: ' + Number(j.fixed || 0).toLocaleString()
+        + '<br>this conversation: ' + Number(j.own || 0).toLocaleString() + extra;
+    }
+  }
+}
+async function refreshCtx() {
+  const msgs = (cur && cur.messages) ? cur.messages : [];
+  try {
+    const r = await fetch('/api/ctx', { method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ messages: msgs, mode: chatMode }) });
+    ctxLast = await r.json();
+  } catch (e) { ctxLast = { ok: false }; }
+  ctxPaint();
+}
+function scheduleCtx() {
+  if (ctxTimer) clearTimeout(ctxTimer);
+  ctxTimer = setTimeout(refreshCtx, 400);
 }
 function queueNow() {
   const parts = buildUserMsg();
@@ -8702,6 +8917,7 @@ async function streamRun(messages, chat, anchorMsg) {
     last.reason = reason.trim() ? reason : undefined;
     last.stats = savedStats;
   }
+  scheduleCtx();
 }
 
 function renderPreview() {
@@ -8899,6 +9115,7 @@ function renderModels(j) {
   if (!sel) return;
   const _am = (j.models || []).filter(function (m) { return m.id === j.active; })[0];
   if (_am && _am.ctx) BONSAI_CTX = _am.ctx;
+  scheduleCtx();
   sel.innerHTML = '';
   (j.models || []).forEach(function (m) {
     const o = document.createElement('option');
@@ -9642,6 +9859,31 @@ PAGE_GPT = """<!doctype html>
   .shotcard .shothd b { color: var(--txt); font-weight: 600; }
   .shotcard .shotimg { display: block; width: 100%; height: auto; cursor: zoom-in; background: var(--bg); }
   .shotcard .shotpath { padding: 4px 8px; font-size: 10.5px; color: var(--mut); font-family: Consolas, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  /* context window meter - always visible, so you can see the cost of the
+     system prompt + tools before you even type, and how it grows. */
+  .ctxmeter {
+    display: flex; align-items: center; gap: 6px;
+    background: var(--bg2); border: 1px solid var(--bd); border-radius: 12px;
+    padding: 0 10px; height: 34px; cursor: default; white-space: nowrap;
+    font-size: 11px; font-family: Consolas, monospace; user-select: none;
+    position: relative; transition: border-color .15s;
+  }
+  .ctxmeter:hover { border-color: var(--acc); }
+  .ctxmeter .ctxtag { color: var(--mut); font-weight: 700; letter-spacing: .5px; }
+  .ctxmeter .ctxbar { width: 54px; height: 6px; border-radius: 3px; background: var(--bg); overflow: hidden; flex: 0 0 auto; }
+  .ctxmeter .ctxfill { display: block; height: 100%; width: 0%; background: var(--acc); transition: width .25s, background .25s; border-radius: 3px; }
+  .ctxmeter.warn .ctxfill { background: #fbbf24; }
+  .ctxmeter.over .ctxfill { background: var(--err); }
+  .ctxmeter .ctxnum { color: var(--txt2); }
+  .ctxmeter .ctxhint {
+    display: none; position: absolute; bottom: 42px; right: 0; z-index: 40;
+    background: var(--bg2); border: 1px solid var(--bd); border-radius: 10px;
+    padding: 8px 10px; font-size: 11px; color: var(--txt2); white-space: normal;
+    width: 268px; box-shadow: 0 8px 24px rgba(0,0,0,.5); line-height: 1.5; text-align: left;
+  }
+  .ctxmeter:hover .ctxhint { display: block; }
+  .ctxmeter .ctxhint b { color: var(--acc); }
 </style>
 </head>
 <body>
@@ -9745,6 +9987,12 @@ PAGE_GPT = """<!doctype html>
           <div style="display:flex;align-items:center;gap:2px">
             <button class="ic" id="attach" title="Attach images / files">&#128206;</button>
             <button class="ic" id="mic-btn" title="Microphone">&#127908;</button>
+            <div class="ctxmeter" id="ctxmeter" title="Context window in use - the system prompt and all tools are already counted, before you type">
+              <span class="ctxtag">CTX</span>
+              <span class="ctxbar"><span class="ctxfill" id="ctxfill"></span></span>
+              <span class="ctxnum" id="ctxnum">--</span>
+              <span class="ctxhint" id="ctxhint"></span>
+            </div>
             <button class="send" id="send" title="Send"></button>
           </div>
         </div>
@@ -10018,7 +10266,7 @@ function bindModeBtn() {
   const btn = document.getElementById('modebtn');
   const update = function () { btn.textContent = chatMode === 'plan' ? 'PLAN' : 'BUILD'; btn.classList.toggle('plan', chatMode === 'plan'); };
   update();
-  btn.onclick = function () { chatMode = chatMode === 'plan' ? 'build' : 'plan'; localStorage.setItem('bonsai_gpt_mode', chatMode); update(); };
+  btn.onclick = function () { chatMode = chatMode === 'plan' ? 'build' : 'plan'; localStorage.setItem('bonsai_gpt_mode', chatMode); update(); scheduleCtx(); };
 }
 function bindTheme() {
   const b = document.getElementById('themebtn');
@@ -10044,7 +10292,7 @@ function setWorkdirInUI(wd) {
   w.textContent = '\\ud83d\\udcc1 ' + workdir;
   w.title = 'Working folder: ' + workdir;
 }
-function renderAll() { renderList(); renderConv(); }
+function renderAll() { renderList(); renderConv(); scheduleCtx(); }
 function dedupeChats() {
   const byId = {};
   const out = [];
@@ -10578,6 +10826,7 @@ async function streamRun(messages, chat, anchorMsg) {
     last.reason = reason.trim() ? reason : undefined;
     last.stats = savedStats;
   }
+  scheduleCtx();
 }
 function setState(s) {
   const el = document.getElementById('state-label');
@@ -10624,6 +10873,66 @@ function clearQueuedBadge(chat, msg) {
   row.classList.remove('queued');
   const b = row.querySelector('.qbadge');
   if (b) b.remove();
+}
+
+/* ---- context window meter ----------------------------------------------
+   A new chat is not empty: the system prompt and the whole tool catalogue go
+   out with every request, so the meter shows that fixed cost before you type
+   and grows as the conversation does. Hover for the breakdown. */
+let ctxLast = null;
+let ctxTimer = null;
+function fmtK(n) {
+  n = Number(n) || 0;
+  if (n < 1000) return String(n);
+  return (n / 1000).toFixed(n >= 10000 ? 0 : 1).replace(/[.]0$/, '') + 'k';
+}
+function ctxPaint() {
+  const meter = document.getElementById('ctxmeter');
+  if (!meter) return;
+  const num = document.getElementById('ctxnum');
+  const fill = document.getElementById('ctxfill');
+  const hint = document.getElementById('ctxhint');
+  const j = ctxLast;
+  if (!j) { num.textContent = '--'; if (hint) hint.textContent = 'measuring...'; return; }
+  if (!j.ok) {
+    meter.classList.remove('warn'); meter.classList.add('over');
+    if (fill) fill.style.width = '100%';
+    num.textContent = 'FULL';
+  } else {
+    const pct = j.total ? Math.min(100, j.used * 100 / j.total) : 0;
+    meter.classList.toggle('warn', pct >= 50 && pct < 80);
+    meter.classList.toggle('over', pct >= 80);
+    if (fill) fill.style.width = pct.toFixed(1) + '%';
+    num.textContent = fmtK(j.used) + '/' + fmtK(j.total);
+  }
+  if (hint) {
+    if (!j.ok) {
+      hint.innerHTML = '<b>Context full.</b><br>This conversation no longer fits the '
+        + 'window.<br>Start a new chat, or raise ctx in model settings.';
+    } else {
+      let extra = '';
+      if (j.images) extra += '<br>images: ' + j.images + ' (about ' + fmtK(j.images * 1024) + ')';
+      if (!j.exact) extra += '<br>estimated - model not loaded';
+      hint.innerHTML = '<b>' + (j.exact ? '' : '~') + Number(j.used).toLocaleString() + '</b>'
+        + ' of <b>' + Number(j.total || 0).toLocaleString() + '</b> tokens'
+        + '<br>system prompt + tools: ' + Number(j.fixed || 0).toLocaleString()
+        + '<br>this conversation: ' + Number(j.own || 0).toLocaleString() + extra;
+    }
+  }
+}
+async function refreshCtx() {
+  const msgs = (cur && cur.messages) ? cur.messages : [];
+  try {
+    const r = await fetch('/api/ctx', { method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ messages: msgs, mode: chatMode }) });
+    ctxLast = await r.json();
+  } catch (e) { ctxLast = { ok: false }; }
+  ctxPaint();
+}
+function scheduleCtx() {
+  if (ctxTimer) clearTimeout(ctxTimer);
+  ctxTimer = setTimeout(refreshCtx, 400);
 }
 function queueNow() {
   const parts = buildUserMsg();
@@ -10877,6 +11186,7 @@ function renderModels(j) {
   if (!sel) return;
   const _am = (j.models || []).filter(function (m) { return m.id === j.active; })[0];
   if (_am && _am.ctx) BONSAI_CTX = _am.ctx;
+  scheduleCtx();
   sel.innerHTML = '';
   (j.models || []).forEach(function (m) {
     const o = document.createElement('option');
@@ -11397,6 +11707,7 @@ class Handler(BaseHTTPRequestHandler):
                             "/api/pick_workdir", "/api/chats",
                             "/api/answer", "/api/effort", "/api/eject",
                             "/api/tts", "/api/models", "/api/pick_model",
+                            "/api/ctx",
                             "/api/path_policy", "/api/dl_pause",
                             "/api/dl_resume", "/api/dl_cancel",
                             "/api/dl_retry", "/api/dl_clear"):
@@ -11480,6 +11791,11 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     res = _select_model(str(body.get("id") or ""))
                 self._send(200, json.dumps(res, default=str))
+                return
+            if path == "/api/ctx":
+                self._send(200, json.dumps(
+                    _ctx_usage(body.get("messages") or [],
+                               body.get("mode") or MODE_BUILD), default=str))
                 return
             if path == "/api/pick_model":
                 what = str(body.get("what") or "file").strip().lower()
