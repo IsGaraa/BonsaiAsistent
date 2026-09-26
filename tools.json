@@ -1005,7 +1005,7 @@
     "type": "function",
     "function": {
       "name": "download_batch",
-      "description": "Download MANY files in one call: pass a list of URLs, or point 'from_page' at a web page and let it collect the links (optionally filtered by 'match'). Files land in one folder, several at a time, and you get a per-file report of what succeeded and what failed. Use this instead of calling download_file in a loop.",
+      "description": "Download MANY files in one call: pass a list of URLs, or point 'from_page' at a page and it resolves the files actually behind it (following hops, ignoring nav links), optionally filtered by 'match'. Files land in one folder, several at a time, and you get a per-file report of what succeeded and what failed. Use this instead of calling download_file in a loop.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -1018,11 +1018,23 @@
           },
           "from_page": {
             "type": "string",
-            "description": "Read this page and download the links found on it (e.g. an index of files)."
+            "description": "A page to take links from. By default it downloads every link the page's markup carries, filtered by 'match'."
+          },
+          "resolve": {
+            "type": "boolean",
+            "description": "Resolve the page first and download the files actually behind it, following hops (index -> file host -> file) instead of grabbing the page's own links. This skips nav and login links that a plain scrape would try to download. Default false, so 'from_page' keeps its original meaning."
           },
           "match": {
             "type": "string",
             "description": "Only keep links matching this regular expression, e.g. '\\\\.pdf$'."
+          },
+          "render": {
+            "type": "boolean",
+            "description": "With 'resolve', read the page in a real browser so JavaScript-built links and bot checks resolve too. Slower; default false."
+          },
+          "max_hops": {
+            "type": "integer",
+            "description": "With 'resolve', how many page-to-page hops to follow. Default 3, max 5."
           },
           "path": {
             "type": "string",

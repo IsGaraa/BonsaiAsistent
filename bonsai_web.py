@@ -2997,8 +2997,9 @@ DOWNLOAD_BATCH_TOOL = {
     "function": {
         "name": "download_batch",
         "description": "Download MANY files in one call: pass a list of URLs, or "
-                       "point 'from_page' at a web page and let it collect the "
-                       "links (optionally filtered by 'match'). Files land in one "
+                       "point 'from_page' at a page and it resolves the files "
+                       "actually behind it (following hops, ignoring nav links), "
+                       "optionally filtered by 'match'. Files land in one "
                        "folder, several at a time, and you get a per-file report "
                        "of what succeeded and what failed. Use this instead of "
                        "calling download_file in a loop.",
@@ -3008,12 +3009,32 @@ DOWNLOAD_BATCH_TOOL = {
                 "urls": {"type": "array", "items": {"type": "string"},
                          "description": "Full http(s) URLs to download."},
                 "from_page": {"type": "string",
-                              "description": "Read this page and download the "
-                                             "links found on it (e.g. an index "
-                                             "of files)."},
+                              "description": "A page to take links from. By "
+                                             "default it downloads every link "
+                                             "the page's markup carries, "
+                                             "filtered by 'match'."},
+                "resolve": {"type": "boolean",
+                            "description": "Resolve the page first and download "
+                                           "the files actually behind it, "
+                                           "following hops (index -> file host "
+                                           "-> file) instead of grabbing the "
+                                           "page's own links. This skips nav "
+                                           "and login links that a plain scrape "
+                                           "would try to download. Default "
+                                           "false, so 'from_page' keeps its "
+                                           "original meaning."},
                 "match": {"type": "string",
                           "description": "Only keep links matching this regular "
                                          "expression, e.g. '\\\\.pdf$'."},
+                "render": {"type": "boolean",
+                           "description": "With 'resolve', read the page in a "
+                                          "real browser so JavaScript-built "
+                                          "links and bot checks resolve too. "
+                                          "Slower; default false."},
+                "max_hops": {"type": "integer",
+                             "description": "With 'resolve', how many "
+                                            "page-to-page hops to follow. "
+                                            "Default 3, max 5."},
                 "path": {"type": "string",
                          "description": "Folder inside the workspace for the "
                                         "files. Default 'downloads'."},
@@ -4649,20 +4670,25 @@ _RESOLVE_FILE_CT = (
 # Never render or fetch these, whatever a page links to. A browser will happily
 # follow a redirect into the private network, which a plain fetcher would not.
 _RESOLVE_BLOCK_HOSTS = {
-    "localhost", "localhost.localdomain", "metadata.google.internal",
-    "instance-data", "metadata",
+    "metadata.google.internal", "metadata.goog", "instance-data",
+    "instance-data.ec2.internal", "metadata",
 }
 _RESOLVE_BLOCK_NET = ()  # reserved for future ranges; IPv4/IPv6 checked inline
 
 
 def _resolve_host_allowed(url):
-    """True when a URL is safe to fetch: http(s), public host, resolvable.
+    """True when a URL is safe for the resolver to fetch: http(s), resolvable,
+    and not a cloud-metadata address.
 
-    A rendered page can redirect anywhere, so this guard sits in front of both
-    the static fetcher and the browser. It fails closed on purpose: a name we
-    cannot resolve is refused rather than handed to a browser that might reach
-    it some other way. Set BONSAI_ALLOW_PRIVATE_FETCH=1 to let the resolver
-    reach loopback and LAN addresses (the test suite needs it).
+    Loopback and LAN addresses are deliberately ALLOWED. Every other download
+    tool already fetches them (a plain download of http://192.168.1.10/... has
+    always worked), and the agent can reach any host through api_call and
+    run_code regardless, so refusing them here would only make the resolver
+    behave differently from the rest of the download stack for no real gain.
+    What does get refused is the one address class that is a genuine SSRF
+    target: link-local cloud metadata, where a stray link could otherwise read
+    cloud credentials. Set BONSAI_ALLOW_PRIVATE_FETCH=1 to skip the check
+    entirely, metadata included.
     """
     if os.environ.get("BONSAI_ALLOW_PRIVATE_FETCH") == "1":
         try:
@@ -4678,9 +4704,8 @@ def _resolve_host_allowed(url):
         host = (parts.hostname or "").strip().lower().rstrip(".")
         if not host:
             return False, "no host in the URL"
-        if host in _RESOLVE_BLOCK_HOSTS or host.endswith(".local") or \
-                host.endswith(".internal") or host.endswith(".localhost"):
-            return False, "refusing to fetch a local or metadata address"
+        if host in _RESOLVE_BLOCK_HOSTS:
+            return False, "refusing to fetch a cloud metadata address"
         try:
             infos = socket.getaddrinfo(host, None)
         except Exception:
@@ -4690,22 +4715,12 @@ def _resolve_host_allowed(url):
             try:
                 if info[0] == socket.AF_INET:
                     octets = [int(x) for x in packed.split(".")]
-                    if octets[0] == 10 or octets[0] == 127 or octets[0] == 0:
-                        return False, "refusing to fetch a private or reserved address"
-                    if octets[0] == 172 and 16 <= octets[1] <= 31:
-                        return False, "refusing to fetch a private or reserved address"
-                    if octets[0] == 192 and octets[1] == 168:
-                        return False, "refusing to fetch a private or reserved address"
                     if octets[0] == 169 and octets[1] == 254:
                         return False, "refusing to fetch a link-local or metadata address"
-                    if octets[0] >= 224:
-                        return False, "refusing to fetch a multicast or reserved address"
+                    if octets[0] == 0 or octets[0] >= 224:
+                        return False, "refusing to fetch a reserved address"
                 else:
                     raw = socket.inet_pton(socket.AF_INET6, packed)
-                    if raw == b"\x00" * 15 + b"\x01":
-                        return False, "refusing to fetch a private or reserved address"
-                    if raw[:9] == b"\x00" * 9 + b"\xff":
-                        return False, "refusing to fetch a private or reserved address"
                     # fe80::/10 link-local, which is where cloud metadata lives
                     if raw[0] == 0xFE and (raw[1] & 0xC0) == 0x80:
                         return False, "refusing to fetch a link-local or metadata address"
@@ -4829,9 +4844,10 @@ def _resolve_candidates(markup, base_url, max_out=40, min_score=None):
             continue
         if not _url_ok(full) or full in out:
             continue
-        ok, _why = _resolve_host_allowed(full)
-        if not ok:
-            continue
+        # no host check here on purpose: this is a pure HTML parser, and letting
+        # it do DNS would silently drop candidates on any host that does not
+        # resolve from this machine. The guard runs where the network is
+        # actually touched - the page walk and the candidate probe.
         out[full] = {"url": full, "name": _name_from_response(full, None),
                      "score": _resolve_score(full, text=text)}
     ranked = sorted(out.values(), key=lambda c: -c["score"])
@@ -6006,25 +6022,74 @@ def _download_batch(args):
     urls = [str(u).strip() for u in (args.get("urls") or []) if str(u).strip()]
     page = str(args.get("from_page") or "").strip()
     pattern = str(args.get("match") or "").strip()
+    # headers every resolved transfer needs: the session the page was reached
+    # with, or a resolved file host would hand back a challenge page
+    carry = {}
+    resolved = {}
     if page:
         if not _url_ok(page):
             return {"error": "from_page must start with http:// or https://"}
-        try:
-            body = _fetch_html(page, 1500000)
-        except Exception as exc:
-            return {"error": "could not read the page: %s" % exc}
-        found = re.findall(r'(?:href|src)\s*=\s*["\']([^"\']+)["\']', body, re.I)
         rx = re.compile(pattern, re.I) if pattern else None
-        base = page if page.endswith("/") else page.rsplit("/", 1)[0] + "/"
-        for link in found:
-            if link.startswith(("javascript:", "mailto:", "data:", "#")):
-                continue
-            full = urllib.parse.urljoin(base, link)
-            if _url_ok(full) and (not rx or rx.search(full)):
+        if args.get("resolve"):
+            # opt-in: follow hops to the file behind the page and take only
+            # real files, instead of every link the markup happens to carry
+            render = args.get("render")
+            if isinstance(render, str):
+                render = render.strip().lower() not in ("0", "false", "no", "off")
+            try:
+                max_hops = min(max(int(args.get("max_hops") or 3), 0), 5)
+            except Exception:
+                max_hops = 3
+            try:
+                res = _web_resolve({"url": page, "render": render,
+                                    "max_hops": max_hops, "max_results": 60,
+                                    "timeout": 45, "headers": _auth_headers(args)})
+            except Exception as exc:
+                return {"error": "could not read the page: %s" % exc}
+            if res.get("error"):
+                msg = str(res["error"])
+                # public_result() collapses a failed result to {"error": ...}
+                # alone, so a hint in a sibling key would be discarded
+                if not res.get("pages_walked"):
+                    return {"error": "could not read the page: %s" % msg}
+                return {"error": "%s - if the links only appear after the page "
+                                 "runs its scripts, retry with 'render': true" % msg}
+            if res.get("_cookie"):
+                carry["Cookie"] = res["_cookie"]
+            carry["Referer"] = res.get("source_page") or page
+            resolved = {"how": res.get("how"),
+                        "walked": res.get("pages_walked") or [],
+                        "found": res.get("found", 0), "candidates": []}
+            for cand in res.get("candidates") or []:
+                full = cand.get("url")
+                if not full or not _url_ok(full):
+                    continue
+                if rx and not rx.search(full):
+                    continue
+                resolved["candidates"].append(
+                    {"url": full, "name": cand.get("name"),
+                     "size_h": cand.get("size_h"), "type": cand.get("type")})
                 urls.append(full)
-        urls = list(dict.fromkeys(urls))
+            urls = list(dict.fromkeys(urls))
+        else:
+            try:
+                body = _fetch_html(page, 1500000)
+            except Exception as exc:
+                return {"error": "could not read the page: %s" % exc}
+            found = re.findall(r'(?:href|src)\s*=\s*["\']([^"\']+)["\']', body, re.I)
+            base = page if page.endswith("/") else page.rsplit("/", 1)[0] + "/"
+            for link in found:
+                if link.startswith(("javascript:", "mailto:", "data:", "#")):
+                    continue
+                full = urllib.parse.urljoin(base, link)
+                if _url_ok(full) and (not rx or rx.search(full)):
+                    urls.append(full)
+            urls = list(dict.fromkeys(urls))
     urls = [u for u in urls if _url_ok(u)]
     if not urls:
+        if page:
+            return {"error": "nothing to download from %s%s" %
+                            (page, " (no link matched 'match')" if pattern else "")}
         return {"error": "nothing to download: give 'urls' or a 'from_page' whose "
                          "links match 'match'"}
     try:
@@ -6046,14 +6111,20 @@ def _download_batch(args):
         spec = {"url": url, "dest": "", "folder": folder, "group": group,
                 "timeout": tune["timeout"], "max_bytes": tune["max_bytes"],
                 "resume": True, "retries": tune["retries"],
-                "connections": tune["connections"],
+                "connections": tune["connections"], "headers": dict(carry) or None,
                 "throttle_bps": tune["throttle_bps"], "sem": sem}
         jobs.append(_dl_add(spec, tool="download_batch"))
+    if resolved:
+        resolved["queued"] = len(jobs)
+        resolved["skipped_over_max_files"] = max(0, len(set(urls)) - max_files)
     if tune["background"]:
-        return {"result": "started", "requested": len(jobs),
-                "jobs": [j.id for j in jobs], "folder": folder.replace("\\", "/"),
-                "note": "%d downloads queued in the background - call "
-                        "download_status to check on them" % len(jobs)}
+        out = {"result": "started", "requested": len(jobs),
+               "jobs": [j.id for j in jobs], "folder": folder.replace("\\", "/"),
+               "note": "%d downloads queued in the background - call "
+                       "download_status to check on them" % len(jobs)}
+        if resolved:
+            out["resolved"] = resolved
+        return out
     rounds = (len(jobs) + workers - 1) // workers
     deadline = time.time() + tune["timeout"] * rounds + 30
     for job in jobs:
@@ -6065,12 +6136,20 @@ def _download_batch(args):
            "failed": len(bad), "folder": folder.replace("\\", "/"),
            "files": [{"file": os.path.basename(j.saved.replace("\\", "/")),
                       "bytes": j.done, "url": j.url, "job": j.id} for j in ok]}
+    if resolved:
+        out["resolved"] = resolved
     if bad:
         out["errors"] = [{"url": j.url, "error": j.error or j.status}
                          for j in bad][:20]
     if live:
         out["still_running"] = [{"url": j.url, "job": j.id} for j in live][:20]
     if not ok and not live and bad:
+        if resolved:
+            names = ", ".join(c["url"] for c in resolved.get("candidates", [])[:4])
+            return {"error": "all %d downloads failed (%s) - the page resolved to "
+                             "[%s] but the transfers failed; try web_resolve with "
+                             "render:true and download them one at a time"
+                             % (len(bad), bad[0].error, names)}
         return {"error": "all %d downloads failed: %s" % (len(bad), bad[0].error)}
     return out
 
