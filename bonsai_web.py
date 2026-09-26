@@ -2924,78 +2924,8 @@ def _http_json_get(url, timeout=30):
 
 WEB_SPECS = [WEB_TOOLS["web_search"], WEB_TOOLS["web_fetch"]]
 
-SHELL_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "run_command",
-        "description": "Run a shell command on this PC and return its "
-                       "output. Use it to build, test, install, debug or check "
-                       "system info: python, pip, git, npm, node, ls, dir, "
-                       "ps, ping, etc. Runs in the workspace "
-                       "folder by default. Max 45 seconds by default - raise "
-                       "'timeout' for long-running commands (up to 600s). "
-                       "Output truncated to ~8 KB. In PLAN mode this tool is "
-                       "disabled.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "command": {
-                    "type": "string",
-                    "description": "The command to run, e.g. 'python tools/screenshot.py'."
-                },
-                "workdir": {
-                    "type": "string",
-                    "description": "Optional folder to run in: absolute path or "
-                                   "relative to the workspace. Default = workspace root."
-                },
-                "timeout": {
-                    "type": "integer",
-                    "description": "Optional timeout in seconds (1-600). Use a "
-                                   "higher value for long downloads, builds or "
-                                   "tests. Default 45."
-                }
-            },
-            "required": ["command"]
-        }
-    }
-}
 
 
-CODE_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "run_code",
-        "description": "Run a snippet in a sandboxed environment and return its "
-                       "output. Languages available on this PC are auto-detected - "
-                       "typically: python, node (JavaScript). Also supported when "
-                       "installed: go, lua, php, ruby, perl, bash. Use it to test "
-                       "functions, verify logic, parse data or prototype before "
-                       "touching real files. Runs in an isolated temp folder that "
-                       "is deleted afterwards. Default timeout 30s, up to 600s.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "language": {
-                    "type": "string",
-                    "description": "Language to run: 'python', 'node' (or 'js'), "
-                                   "'go', 'lua', 'php', 'ruby', 'perl', 'bash'. "
-                                   "If the runtime is missing this returns the "
-                                   "list actually available."
-                },
-                "code": {
-                    "type": "string",
-                    "description": "The source code to run."
-                },
-                "timeout": {
-                    "type": "integer",
-                    "description": "Max seconds to run (1-600). Default 30. "
-                                   "Raise it for slow work, e.g. simulations."
-                }
-            },
-            "required": ["language", "code"]
-        }
-    }
-}
 
 
 PREVIEW_HTML_TOOL = {
@@ -3778,34 +3708,6 @@ ARCHIVE_TOOL = {
 }
 
 
-ASK_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "ask_user",
-        "description": "Ask the user a question and wait for their answer, like "
-                       "a human would. Use it when you need a choice, extra "
-                       "information, a password, or confirmation before doing "
-                       "something important. The user can pick one of the given "
-                       "options or type a free answer. The rest of your work is "
-                       "paused until they reply.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "question": {
-                    "type": "string",
-                    "description": "The question to ask, phrased clearly."
-                },
-                "options": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Optional short answer options the user can "
-                                   "pick with one click."
-                }
-            },
-            "required": ["question"]
-        }
-    }
-}
 
 
 TODO_TOOL = {
@@ -4190,7 +4092,7 @@ DOWNLOAD_TOOLS = [DOWNLOAD_STATUS_TOOL, DOWNLOAD_BATCH_TOOL,
 RESOLVE_TOOLS = [WEB_RESOLVE_TOOL]
 
 PC_TOOLS = [SHOT_TOOL, INPUT_TOOL, CLIPBOARD_TOOL,
-            DOWNLOAD_TOOL, ARCHIVE_TOOL, ASK_TOOL, TODO_TOOL] + NEW_TOOLS + DOWNLOAD_TOOLS \
+            DOWNLOAD_TOOL, ARCHIVE_TOOL, TODO_TOOL] + NEW_TOOLS + DOWNLOAD_TOOLS \
     + RESOLVE_TOOLS + OPENCODE_TOOLS
 
 
@@ -13352,7 +13254,7 @@ class BonsaiServer(ThreadingHTTPServer):
 def _gen_tools_json(path=None):
     """Write the tool catalogue to tools.json so the docs cannot drift."""
     tools = ([TOOL_SPEC] + list(FILE_TOOLS.values()) + WEB_SPECS +
-             [SHELL_TOOL, CODE_TOOL] + PC_TOOLS)
+             PC_TOOLS)
     seen = set()
     out = []
     for tool in tools:
