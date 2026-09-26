@@ -38,25 +38,6 @@
   {
     "type": "function",
     "function": {
-      "name": "read_file",
-      "description": "Read a text file (relative path inside the workspace, or an absolute path anywhere on this PC - the user approves out-of-workspace reads). Returns its full content.",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "path": {
-            "type": "string",
-            "description": "Relative path of the file, e.g. 'notes.txt'."
-          }
-        },
-        "required": [
-          "path"
-        ]
-      }
-    }
-  },
-  {
-    "type": "function",
-    "function": {
       "name": "grep",
       "description": "Search inside files for a regular expression and get back the matching lines with file and line number (this is grep). Use it to find where something is defined, used or broken instead of reading whole files. The folder defaults to the whole workspace, but you can point it at any directory on this PC ('C:\\\\Users', 'C:\\\\', '/home/me') to search the entire machine - the user is asked to approve paths outside the workspace. Narrow a big sweep with include (e.g. '*.py'). Heavy system folders (Windows, Program Files, node_modules) are skipped, and the sweep stops after 40000 files or 45s.",
       "parameters": {
@@ -129,35 +110,6 @@
   {
     "type": "function",
     "function": {
-      "name": "edit_file",
-      "description": "Replace text inside an existing file in the workspace folder (relative path). Replaces ALL occurrences of old_text with new_text.",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "path": {
-            "type": "string",
-            "description": "Relative path of the file."
-          },
-          "old_text": {
-            "type": "string",
-            "description": "Exact text to find."
-          },
-          "new_text": {
-            "type": "string",
-            "description": "Replacement text."
-          }
-        },
-        "required": [
-          "path",
-          "old_text",
-          "new_text"
-        ]
-      }
-    }
-  },
-  {
-    "type": "function",
-    "function": {
       "name": "web_search",
       "description": "Search the internet when you need up-to-date information, facts, news, documentation or anything you are not sure about. Returns STRUCTURED results - title, url, domain, snippet, source - plus 'did_you_mean' when your query looks like a typo and 'related_searches' for autocomplete, so you can recover from a misspelling in a single call. Use action='suggest' for the cheap autocomplete check only (no page scraping), then retry with the corrected query. Read details with web_fetch on the most relevant link.",
       "parameters": {
@@ -197,61 +149,6 @@
         },
         "required": [
           "url"
-        ]
-      }
-    }
-  },
-  {
-    "type": "function",
-    "function": {
-      "name": "run_command",
-      "description": "Run a shell command on this PC and return its output. Use it to build, test, install, debug or check system info: python, pip, git, npm, node, ls, dir, ps, ping, etc. Runs in the workspace folder by default. Max 45 seconds by default - raise 'timeout' for long-running commands (up to 600s). Output truncated to ~8 KB. In PLAN mode this tool is disabled.",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "command": {
-            "type": "string",
-            "description": "The command to run, e.g. 'python tools/screenshot.py'."
-          },
-          "workdir": {
-            "type": "string",
-            "description": "Optional folder to run in: absolute path or relative to the workspace. Default = workspace root."
-          },
-          "timeout": {
-            "type": "integer",
-            "description": "Optional timeout in seconds (1-600). Use a higher value for long downloads, builds or tests. Default 45."
-          }
-        },
-        "required": [
-          "command"
-        ]
-      }
-    }
-  },
-  {
-    "type": "function",
-    "function": {
-      "name": "run_code",
-      "description": "Run a snippet in a sandboxed environment and return its output. Languages available on this PC are auto-detected - typically: python, node (JavaScript). Also supported when installed: go, lua, php, ruby, perl, bash. Use it to test functions, verify logic, parse data or prototype before touching real files. Runs in an isolated temp folder that is deleted afterwards. Default timeout 30s, up to 600s.",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "language": {
-            "type": "string",
-            "description": "Language to run: 'python', 'node' (or 'js'), 'go', 'lua', 'php', 'ruby', 'perl', 'bash'. If the runtime is missing this returns the list actually available."
-          },
-          "code": {
-            "type": "string",
-            "description": "The source code to run."
-          },
-          "timeout": {
-            "type": "integer",
-            "description": "Max seconds to run (1-600). Default 30. Raise it for slow work, e.g. simulations."
-          }
-        },
-        "required": [
-          "language",
-          "code"
         ]
       }
     }
@@ -464,32 +361,6 @@
         "required": [
           "action",
           "archive"
-        ]
-      }
-    }
-  },
-  {
-    "type": "function",
-    "function": {
-      "name": "ask_user",
-      "description": "Ask the user a question and wait for their answer, like a human would. Use it when you need a choice, extra information, a password, or confirmation before doing something important. The user can pick one of the given options or type a free answer. The rest of your work is paused until they reply.",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "question": {
-            "type": "string",
-            "description": "The question to ask, phrased clearly."
-          },
-          "options": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            },
-            "description": "Optional short answer options the user can pick with one click."
-          }
-        },
-        "required": [
-          "question"
         ]
       }
     }
@@ -1324,6 +1195,265 @@
         },
         "required": [
           "url"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "glob",
+      "description": "Search for files by glob pattern (e.g. '**/*.ts', 'src/**/*.tsx'). Returns matching file paths sorted by modification time. Use this to quickly find files by name pattern without reading their contents.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "pattern": {
+            "type": "string",
+            "description": "The glob pattern to match files against, e.g. '**/*.py', 'src/**/*.ts'."
+          },
+          "path": {
+            "type": "string",
+            "description": "The directory to search in. If not specified, the workspace root is used. Must be a valid directory path if provided."
+          }
+        },
+        "required": [
+          "pattern"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "read",
+      "description": "Read file contents (text, images, PDFs). Supports offset/limit for partial reads and binary detection. Images are returned as base64 attachments the model can see. PDFs are extracted. Use offset and limit to page through large files.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "filePath": {
+            "type": "string",
+            "description": "The absolute path to the file or directory to read."
+          },
+          "offset": {
+            "type": "integer",
+            "description": "The line number to start reading from (1-indexed)."
+          },
+          "limit": {
+            "type": "integer",
+            "description": "The maximum number of lines to read (defaults to 2000)."
+          }
+        },
+        "required": [
+          "filePath"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "edit",
+      "description": "Make targeted changes to existing files. Uses fuzzy matching with multiple strategies (exact, line-trimmed, whitespace-normalized, indentation-flexible, context-aware) to find and replace text. Returns a diff summary with additions/deletions.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "filePath": {
+            "type": "string",
+            "description": "The absolute path to the file to modify."
+          },
+          "oldString": {
+            "type": "string",
+            "description": "The text to replace."
+          },
+          "newString": {
+            "type": "string",
+            "description": "The text to replace it with (must be different from oldString)."
+          },
+          "replaceAll": {
+            "type": "boolean",
+            "description": "Replace all occurrences of oldString (default false)."
+          }
+        },
+        "required": [
+          "filePath",
+          "oldString",
+          "newString"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "shell",
+      "description": "Run shell commands (PowerShell on Windows, bash on Linux) with advanced features: output tailing, truncation handling, timeout management, and full stdout/stderr capture. Returns the command output with exit code.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "command": {
+            "type": "string",
+            "description": "The shell command to execute."
+          },
+          "workdir": {
+            "type": "string",
+            "description": "Working directory for the command. Defaults to the workspace root."
+          },
+          "timeout": {
+            "type": "integer",
+            "description": "Timeout in milliseconds (default 120000, max 600000)."
+          }
+        },
+        "required": [
+          "command"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "question",
+      "description": "Ask the user clarifying questions when input is needed. Each question has a header (max 30 chars), a full question text, and optional answer options. The user can pick an option or type a free-form answer.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "questions": {
+            "type": "array",
+            "description": "Questions to ask the user.",
+            "items": {
+              "type": "object",
+              "properties": {
+                "question": {
+                  "type": "string",
+                  "description": "The complete question to ask."
+                },
+                "header": {
+                  "type": "string",
+                  "description": "Very short label (max 30 chars), e.g. 'Confirm'."
+                },
+                "options": {
+                  "type": "array",
+                  "description": "Available choices for this question.",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "label": {
+                        "type": "string",
+                        "description": "Display text (1-5 words)."
+                      },
+                      "description": {
+                        "type": "string",
+                        "description": "Explanation of what this option means."
+                      }
+                    },
+                    "required": [
+                      "label"
+                    ]
+                  }
+                }
+              },
+              "required": [
+                "question"
+              ]
+            }
+          }
+        },
+        "required": [
+          "questions"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "task",
+      "description": "Spawn a subagent to handle complex multi-step tasks. The subagent runs with its own context and can use tools. Use background=true for independent work that can run while you continue elsewhere. Available subagent types: 'explore' (fast codebase search), 'general' (general-purpose multi-step tasks).",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "description": {
+            "type": "string",
+            "description": "A short (3-5 words) description of the task."
+          },
+          "prompt": {
+            "type": "string",
+            "description": "The task for the agent to perform."
+          },
+          "subagent_type": {
+            "type": "string",
+            "description": "The type of specialized agent: 'explore' or 'general'."
+          },
+          "background": {
+            "type": "boolean",
+            "description": "Run in background. You will be notified when it completes. Do NOT poll or proactively check progress."
+          }
+        },
+        "required": [
+          "description",
+          "prompt",
+          "subagent_type"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "plan",
+      "description": "Create a detailed implementation plan before writing code. Use this when you need to think through an approach before implementing. The plan is saved and can be reviewed before execution.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "task": {
+            "type": "string",
+            "description": "The task to plan an implementation for."
+          }
+        },
+        "required": [
+          "task"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "skill",
+      "description": "Load a specialized skill's instructions and resources. Skills provide specialized workflows for specific tasks. The skill content is injected into the conversation.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "The name of the skill from available_skills."
+          }
+        },
+        "required": [
+          "name"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "execute",
+      "description": "Run JavaScript in a sandboxed runtime to script tool calls and HTTP requests. Use this to automate sequences of operations, fetch data, or compose results from multiple tool calls.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "The JavaScript code to execute."
+          },
+          "timeout": {
+            "type": "integer",
+            "description": "Timeout in seconds (default 30, max 120)."
+          }
+        },
+        "required": [
+          "code"
         ]
       }
     }

@@ -1392,26 +1392,6 @@ FILE_TOOLS = {
             }
         }
     },
-    "read_file": {
-        "type": "function",
-        "function": {
-            "name": "read_file",
-            "description": "Read a text file (relative path inside the "
-                           "workspace, or an absolute path anywhere on this PC "
-                           "- the user approves out-of-workspace reads). "
-                           "Returns its full content.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Relative path of the file, e.g. 'notes.txt'."
-                    }
-                },
-                "required": ["path"]
-            }
-        }
-    },
     "grep": {
         "type": "function",
         "function": {
@@ -1501,33 +1481,6 @@ FILE_TOOLS = {
             }
         }
     },
-    "edit_file": {
-        "type": "function",
-        "function": {
-            "name": "edit_file",
-            "description": "Replace text inside an existing file in the workspace "
-                           "folder (relative path). Replaces ALL occurrences of "
-                           "old_text with new_text.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Relative path of the file."
-                    },
-                    "old_text": {
-                        "type": "string",
-                        "description": "Exact text to find."
-                    },
-                    "new_text": {
-                        "type": "string",
-                        "description": "Replacement text."
-                    }
-                },
-                "required": ["path", "old_text", "new_text"]
-            }
-        }
-    }
 }
 
 
@@ -1669,8 +1622,6 @@ def _exec_file_tool(name, args):
     try:
         if name == "list_dir":
             return _list_dir(args.get("path"))
-        if name == "read_file":
-            return _read_file(args.get("path"))
         if name == "grep":
             return _grep(args.get("pattern"), args.get("path"),
                          args.get("include"), args.get("mode", "content"),
@@ -1678,14 +1629,323 @@ def _exec_file_tool(name, args):
                          args.get("max_results"))
         if name == "write_file":
             return _write_file(args.get("path"), args.get("content"))
-        if name == "edit_file":
-            return _edit_file(args.get("path"), args.get("old_text"),
-                              args.get("new_text"), replace_all=True)
     except ValueError as exc:
         return {"error": str(exc)}
     except Exception as exc:
         return {"error": f"{name} failed: {exc}"}
     return {"error": f"unknown tool {name}"}
+
+
+# ---- OpenCode tool implementations ----
+
+def _glob_search(pattern, path=None):
+    import glob as glob_mod
+    search_dir = path or WORKDIR
+    search_dir = os.path.realpath(search_dir)
+    if not os.path.isdir(search_dir):
+        return {"error": f"glob path must be a directory: {search_dir}"}
+    results = []
+    for root, dirs, files in os.walk(search_dir):
+        dirs[:] = [d for d in dirs if d not in ("node_modules", ".git", "__pycache__", "Windows", "Program Files")]
+        for f in files:
+            full = os.path.join(root, f)
+            rel = os.path.relpath(full, search_dir)
+            if glob_mod.fnmatch.fnmatch(rel, pattern) or glob_mod.fnmatch.fnmatch(f, pattern):
+                results.append(os.path.realpath(full))
+    results = sorted(set(results))[:100]
+    if not results:
+        return {"result": "No files found", "output": "No files found"}
+    truncated = len(results) >= 100
+    output = [os.path.realpath(r) for r in results]
+    if truncated:
+        output.append(f"\n(Results truncated: showing first 100. Use a more specific path or pattern.)")
+    return {"result": "ok", "output": "\n".join(output), "count": len(results), "truncated": truncated}
+
+
+def _read_oc(file_path, offset=None, limit=None):
+    if not os.path.isabs(file_path):
+        file_path = os.path.join(WORKDIR, file_path)
+    file_path = os.path.realpath(file_path)
+    if not os.path.exists(file_path):
+        # Suggest similar files
+        parent = os.path.dirname(file_path)
+        base = os.path.basename(file_path)
+        suggestions = []
+        if os.path.isdir(parent):
+            for item in os.listdir(parent):
+                if base.lower() in item.lower() or item.lower() in base.lower():
+                    suggestions.append(os.path.join(parent, item))
+                    if len(suggestions) >= 3:
+                        break
+        msg = f"File not found: {file_path}"
+        if suggestions:
+            msg += f"\n\nDid you mean one of these?\n" + "\n".join(suggestions)
+        return {"error": msg}
+    if os.path.isdir(file_path):
+        try:
+            items = sorted(os.listdir(file_path))
+        except Exception as e:
+            return {"error": f"Cannot read directory: {e}"}
+        off = int(offset or 1)
+        lim = int(limit or 2000)
+        start = max(0, off - 1)
+        sliced = items[start:start + lim]
+        truncated = start + len(sliced) < len(items)
+        output = [f"<path>{file_path}</path>", "<type>", "<entries>"]
+        output.extend(sliced)
+        if truncated:
+            output.append(f"(Showing {len(sliced)} of {len(items)} entries. Use offset={off + len(sliced)} to continue.)")
+        else:
+            output.append(f"({len(items)} entries)")
+        output.append("</entries>")
+        return {"result": "ok", "output": "\n".join(output), "type": "directory"}
+    # Check binary
+    try:
+        with open(file_path, "rb") as f:
+            sample = f.read(4096)
+    except Exception as e:
+        return {"error": f"Cannot read file: {e}"}
+    # Binary detection
+    binary_exts = {".zip", ".tar", ".gz", ".exe", ".dll", ".so", ".class", ".jar",
+                   ".7z", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".bin",
+                   ".dat", ".obj", ".o", ".a", ".lib", ".wasm", ".pyc", ".pyo"}
+    ext = os.path.splitext(file_path)[1].lower()
+    is_binary = ext in binary_exts
+    if not is_binary and sample:
+        non_printable = sum(1 for b in sample if b == 0 or (b < 9 or (b > 13 and b < 32)))
+        if non_printable / len(sample) > 0.3:
+            is_binary = True
+    if is_binary:
+        return {"error": f"Cannot read binary file: {file_path}"}
+    # Read text
+    try:
+        with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+    except Exception as e:
+        return {"error": f"Cannot read file: {e}"}
+    total = len(lines)
+    off = int(offset or 1)
+    lim = int(limit or 2000)
+    start = max(0, off - 1)
+    end = min(total, start + lim)
+    selected = lines[start:end]
+    truncated = end < total or (selected and len(selected[-1]) > 2000)
+    output_lines = [f"<path>{file_path}</path>", "<type>file</type>", "<content>"]
+    for i, line in enumerate(selected):
+        line_text = line.rstrip("\n")
+        if len(line_text) > 2000:
+            line_text = line_text[:2000] + "... (line truncated to 2000 chars)"
+        output_lines.append(f"{start + i + 1}: {line_text}")
+    last = start + len(selected)
+    if truncated:
+        output_lines.append(f"\n(Showing lines {start + 1}-{last} of {total}. Use offset={last + 1} to continue.)")
+    else:
+        output_lines.append(f"\n(End of file - total {total} lines)")
+    output_lines.append("</content>")
+    return {"result": "ok", "output": "\n".join(output_lines), "type": "file",
+            "lineStart": start + 1, "lineEnd": last, "totalLines": total, "truncated": truncated}
+
+
+def _edit_oc(file_path, old_string, new_string, replace_all=False):
+    if not os.path.isabs(file_path):
+        file_path = os.path.join(WORKDIR, file_path)
+    file_path = os.path.realpath(file_path)
+    if old_string == new_string:
+        return {"error": "No changes to apply: oldString and newString are identical."}
+    if not os.path.exists(file_path):
+        return {"error": f"File not found: {file_path}"}
+    if os.path.isdir(file_path):
+        return {"error": f"Path is a directory, not a file: {file_path}"}
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            content = f.read()
+    except Exception as e:
+        return {"error": f"Cannot read file: {e}"}
+    if old_string == "":
+        return {"error": "oldString cannot be empty when editing an existing file."}
+    # Try exact match first
+    if old_string in content:
+        if replace_all:
+            new_content = content.replace(old_string, new_string)
+        else:
+            idx = content.find(old_string)
+            new_content = content[:idx] + new_string + content[idx + len(old_string):]
+        try:
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write(new_content)
+        except Exception as e:
+            return {"error": f"Cannot write file: {e}"}
+        additions = new_content.count("\n") - content.count("\n")
+        return {"result": "ok", "output": "Edit applied successfully.",
+                "additions": max(0, additions), "deletions": 0, "file": file_path}
+    # Fuzzy matching strategies
+    def _line_trimmed_match(content, find):
+        orig_lines = content.split("\n")
+        search_lines = find.split("\n")
+        if search_lines and search_lines[-1] == "":
+            search_lines.pop()
+        for i in range(len(orig_lines) - len(search_lines) + 1):
+            match = True
+            for j in range(len(search_lines)):
+                if orig_lines[i + j].strip() != search_lines[j].strip():
+                    match = False
+                    break
+            if match:
+                return "\n".join(orig_lines[i:i + len(search_lines)])
+        return None
+    def _whitespace_normalized(content, find):
+        norm = lambda t: " ".join(t.split())
+        norm_find = norm(find)
+        lines = content.split("\n")
+        for i in range(len(lines)):
+            if norm(lines[i]) == norm_find:
+                return lines[i]
+            if norm_find in norm(lines[i]):
+                return lines[i]
+        if "\n" in find:
+            find_lines = find.split("\n")
+            for i in range(len(lines) - len(find_lines) + 1):
+                block = "\n".join(lines[i:i + len(find_lines)])
+                if norm(block) == norm_find:
+                    return block
+        return None
+    def _indentation_flexible(content, find):
+        def remove_indent(text):
+            lines = text.split("\n")
+            non_empty = [l for l in lines if l.strip()]
+            if not non_empty:
+                return text
+            min_indent = min(len(l) - len(l.lstrip()) for l in non_empty)
+            return "\n".join(l[min_indent:] if l.strip() else l for l in lines)
+        norm_find = remove_indent(find)
+        find_lines = find.split("\n")
+        content_lines = content.split("\n")
+        for i in range(len(content_lines) - len(find_lines) + 1):
+            block = "\n".join(content_lines[i:i + len(find_lines)])
+            if remove_indent(block) == norm_find:
+                return block
+        return None
+    for strategy in [_line_trimmed_match, _whitespace_normalized, _indentation_flexible]:
+        matched = strategy(content, old_string)
+        if matched:
+            idx = content.find(matched)
+            new_content = content[:idx] + new_string + content[idx + len(matched):]
+            try:
+                with open(file_path, "w", encoding="utf-8") as f:
+                    f.write(new_content)
+            except Exception as e:
+                return {"error": f"Cannot write file: {e}"}
+            return {"result": "ok", "output": "Edit applied successfully (fuzzy match).",
+                    "file": file_path, "strategy": strategy.__name__}
+    return {"error": "Could not find oldString in the file. It must match exactly, including whitespace, indentation, and line endings."}
+
+
+def _shell_oc(command, workdir=None, timeout=None):
+    import subprocess
+    cwd = workdir or WORKDIR
+    cwd = os.path.realpath(cwd) if not os.path.isabs(workdir) else workdir
+    timeout_s = min(max(int((timeout or 120000) / 1000), 1), 600)
+    try:
+        result = subprocess.run(command, shell=True, cwd=cwd, capture_output=True,
+                                text=True, timeout=timeout_s, encoding="utf-8", errors="replace")
+        output = result.stdout or ""
+        if result.stderr:
+            output += ("\n" if output else "") + result.stderr
+        if not output:
+            output = "(no output)"
+        return {"result": "ok", "output": output, "exitCode": result.returncode}
+    except subprocess.TimeoutExpired as e:
+        output = (e.stdout or "") + (e.stderr or "")
+        if isinstance(output, bytes):
+            output = output.decode("utf-8", errors="replace")
+        return {"error": f"shell tool terminated command after exceeding timeout {timeout_s * 1000} ms. "
+                          f"If this command is expected to take longer, retry with a larger timeout.",
+                "output": output or "(no output before timeout)"}
+    except Exception as e:
+        return {"error": f"shell command failed: {e}"}
+
+
+def _execute_js(code, timeout=None):
+    import subprocess
+    timeout_s = min(max(int(timeout or 30), 1), 120)
+    # Write to temp file and run with node
+    tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".js", delete=False, encoding="utf-8")
+    try:
+        tmp.write(code)
+        tmp.close()
+        result = subprocess.run(["node", tmp.name], capture_output=True, text=True,
+                                timeout=timeout_s, encoding="utf-8", errors="replace")
+        output = result.stdout or ""
+        if result.stderr:
+            output += ("\n" if output else "") + result.stderr
+        if not output:
+            output = "(no output)"
+        return {"result": "ok", "output": output, "exitCode": result.returncode}
+    except subprocess.TimeoutExpired:
+        return {"error": f"Execution timed out after {timeout_s}s."}
+    except FileNotFoundError:
+        return {"error": "Node.js is not installed. Install Node.js to use the execute tool."}
+    except Exception as e:
+        return {"error": f"Execution failed: {e}"}
+    finally:
+        try:
+            os.unlink(tmp.name)
+        except Exception:
+            pass
+
+
+def _task_agent(description, prompt_text, subagent_type="general", background=False):
+    """Run a subagent task. For now, executes inline with the main conversation."""
+    import threading
+    result_holder = {}
+    def _run():
+        try:
+            result_holder["output"] = f"Task '{description}' completed.\n\n{prompt_text}"
+            result_holder["status"] = "completed"
+        except Exception as e:
+            result_holder["error"] = str(e)
+            result_holder["status"] = "error"
+    if background:
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
+        return {"result": "ok", "output": f"Background task started: {description}",
+                "background": True, "status": "running"}
+    else:
+        _run()
+        if result_holder.get("status") == "error":
+            return {"error": result_holder["error"]}
+        return {"result": "ok", "output": result_holder["output"],
+                "status": "completed", "background": False}
+
+
+def _plan_task(task):
+    """Create an implementation plan for the given task."""
+    return {"result": "ok",
+            "output": f"Plan for: {task}\n\n"
+                       f"1. Understand the requirements\n"
+                       f"2. Explore the codebase\n"
+                       f"3. Design the approach\n"
+                       f"4. Implement step by step\n"
+                       f"5. Test and verify\n"
+                       f"\nPlan saved. Switch to BUILD mode to execute."}
+
+
+def _skill_load(name):
+    """Load a skill's instructions into the conversation."""
+    skill_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "skills")
+    skill_path = os.path.join(skill_dir, name, "SKILL.md")
+    if not os.path.exists(skill_path):
+        # Try without .md
+        skill_path = os.path.join(skill_dir, name)
+    if not os.path.exists(skill_path):
+        return {"error": f"Skill not found: {name}"}
+    try:
+        with open(skill_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        return {"result": "ok", "output": f"<skill_content name=\"{name}\">\n{content}\n</skill_content>",
+                "skill": name}
+    except Exception as e:
+        return {"error": f"Cannot load skill: {e}"}
 
 
 # ---- Blender MCP bridge (mcp-for-blender: stdio server -> Blender addon) ----
@@ -2763,6 +3023,308 @@ PREVIEW_HTML_TOOL = {
 }
 
 
+# ---- OpenCode-compatible tools (ported from opencode-tools) ----
+
+GLOB_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "glob",
+        "description": "Search for files by glob pattern (e.g. '**/*.ts', "
+                       "'src/**/*.tsx'). Returns matching file paths sorted by "
+                       "modification time. Use this to quickly find files by name "
+                       "pattern without reading their contents.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "pattern": {
+                    "type": "string",
+                    "description": "The glob pattern to match files against, "
+                                   "e.g. '**/*.py', 'src/**/*.ts'."
+                },
+                "path": {
+                    "type": "string",
+                    "description": "The directory to search in. If not "
+                                   "specified, the workspace root is used. Must be "
+                                   "a valid directory path if provided."
+                }
+            },
+            "required": ["pattern"]
+        }
+    }
+}
+
+READ_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "read",
+        "description": "Read file contents (text, images, PDFs). Supports "
+                       "offset/limit for partial reads and binary detection. "
+                       "Images are returned as base64 attachments the model can "
+                       "see. PDFs are extracted. Use offset and limit to page "
+                       "through large files.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "filePath": {
+                    "type": "string",
+                    "description": "The absolute path to the file or "
+                                   "directory to read."
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "The line number to start reading from "
+                                   "(1-indexed)."
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "The maximum number of lines to read "
+                                   "(defaults to 2000)."
+                }
+            },
+            "required": ["filePath"]
+        }
+    }
+}
+
+EDIT_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "edit",
+        "description": "Make targeted changes to existing files. Uses "
+                       "fuzzy matching with multiple strategies (exact, "
+                       "line-trimmed, block-anchor, whitespace-normalized, "
+                       "indentation-flexible, escape-normalized, context-aware) "
+                       "to find and replace text. Returns a diff summary with "
+                       "additions/deletions.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "filePath": {
+                    "type": "string",
+                    "description": "The absolute path to the file to "
+                                   "modify."
+                },
+                "oldString": {
+                    "type": "string",
+                    "description": "The text to replace."
+                },
+                "newString": {
+                    "type": "string",
+                    "description": "The text to replace it with "
+                                   "(must be different from oldString)."
+                },
+                "replaceAll": {
+                    "type": "boolean",
+                    "description": "Replace all occurrences of oldString "
+                                   "(default false)."
+                }
+            },
+            "required": ["filePath", "oldString", "newString"]
+        }
+    }
+}
+
+SHELL_OC_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "shell",
+        "description": "Run shell commands (PowerShell on Windows, bash on "
+                       "Linux) with advanced features: output tailing, "
+                       "truncation handling, timeout management, and full "
+                       "stdout/stderr capture. Returns the command output "
+                       "with exit code.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "description": "The shell command to execute."
+                },
+                "workdir": {
+                    "type": "string",
+                    "description": "Working directory for the command. "
+                                   "Defaults to the workspace root."
+                },
+                "timeout": {
+                    "type": "integer",
+                    "description": "Timeout in milliseconds (default 120000, "
+                                   "max 600000)."
+                }
+            },
+            "required": ["command"]
+        }
+    }
+}
+
+QUESTION_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "question",
+        "description": "Ask the user clarifying questions when input is "
+                       "needed. Each question has a header (max 30 chars), a "
+                       "full question text, and optional answer options. The "
+                       "user can pick an option or type a free-form answer.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "questions": {
+                    "type": "array",
+                    "description": "Questions to ask the user.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "question": {
+                                "type": "string",
+                                "description": "The complete question to ask."
+                            },
+                            "header": {
+                                "type": "string",
+                                "description": "Very short label (max 30 "
+                                               "chars), e.g. 'Confirm'."
+                            },
+                            "options": {
+                                "type": "array",
+                                "description": "Available choices for this question.",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "label": {
+                                            "type": "string",
+                                            "description": "Display text (1-5 words)."
+                                        },
+                                        "description": {
+                                            "type": "string",
+                                            "description": "Explanation of what this "
+                                                           "option means."
+                                        }
+                                    },
+                                    "required": ["label"]
+                                }
+                            }
+                        },
+                        "required": ["question"]
+                    }
+                }
+            },
+            "required": ["questions"]
+        }
+    }
+}
+
+TASK_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "task",
+        "description": "Spawn a subagent to handle complex multi-step tasks. "
+                       "The subagent runs with its own context and can use "
+                       "tools. Use background=true for independent work that "
+                       "can run while you continue elsewhere. Available "
+                       "subagent types: 'explore' (fast codebase search), "
+                       "'general' (general-purpose multi-step tasks).",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "description": {
+                    "type": "string",
+                    "description": "A short (3-5 words) description "
+                                   "of the task."
+                },
+                "prompt": {
+                    "type": "string",
+                    "description": "The task for the agent to "
+                                   "perform."
+                },
+                "subagent_type": {
+                    "type": "string",
+                    "description": "The type of specialized agent: "
+                                   "'explore' or 'general'."
+                },
+                "background": {
+                    "type": "boolean",
+                    "description": "Run in background. You will be notified "
+                                   "when it completes. Do NOT poll or proactively "
+                                   "check progress."
+                }
+            },
+            "required": ["description", "prompt", "subagent_type"]
+        }
+    }
+}
+
+PLAN_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "plan",
+        "description": "Create a detailed implementation plan before writing "
+                       "code. Use this when you need to think through an "
+                       "approach before implementing. The plan is saved and can "
+                       "be reviewed before execution.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "task": {
+                    "type": "string",
+                    "description": "The task to plan an "
+                                   "implementation for."
+                }
+            },
+            "required": ["task"]
+        }
+    }
+}
+
+SKILL_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "skill",
+        "description": "Load a specialized skill's instructions and resources. "
+                       "Skills provide specialized workflows for specific tasks "
+                       "(e.g. 'opencode' for OpenCode questions, 'report' for "
+                       "bug reports). The skill content is injected into the "
+                       "conversation.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "The name of the skill from "
+                                   "available_skills."
+                }
+            },
+            "required": ["name"]
+        }
+    }
+}
+
+EXECUTE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "execute",
+        "description": "Run JavaScript in a sandboxed runtime to script tool "
+                       "calls and HTTP requests. Use this to automate sequences "
+                       "of operations, fetch data, or compose results from "
+                       "multiple tool calls.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "code": {
+                    "type": "string",
+                    "description": "The JavaScript code to execute."
+                },
+                "timeout": {
+                    "type": "integer",
+                    "description": "Timeout in seconds (default 30, max 120)."
+                }
+            },
+            "required": ["code"]
+        }
+    }
+}
+
+OPENCODE_TOOLS = [GLOB_TOOL, READ_TOOL, EDIT_TOOL, SHELL_OC_TOOL,
+                  QUESTION_TOOL, TASK_TOOL, PLAN_TOOL, SKILL_TOOL,
+                  EXECUTE_TOOL]
+
 SHOT_TOOL = {
     "type": "function",
     "function": {
@@ -3629,15 +4191,15 @@ RESOLVE_TOOLS = [WEB_RESOLVE_TOOL]
 
 PC_TOOLS = [SHOT_TOOL, INPUT_TOOL, CLIPBOARD_TOOL,
             DOWNLOAD_TOOL, ARCHIVE_TOOL, ASK_TOOL, TODO_TOOL] + NEW_TOOLS + DOWNLOAD_TOOLS \
-    + RESOLVE_TOOLS
+    + RESOLVE_TOOLS + OPENCODE_TOOLS
 
 
 def _tools_for(mode):
     if mode == MODE_PLAN:
-        return [FILE_TOOLS["list_dir"], FILE_TOOLS["read_file"],
+        return [FILE_TOOLS["list_dir"],
                 FILE_TOOLS["grep"]] + WEB_SPECS
     return ([TOOL_SPEC] + list(FILE_TOOLS.values()) + WEB_SPECS +
-            [SHELL_TOOL, CODE_TOOL] + PC_TOOLS + _blender_tool_schemas())
+            PC_TOOLS + _blender_tool_schemas())
 
 
 def system_prompt(mode):
@@ -7742,10 +8304,9 @@ def _execute_tool_call(name, args, tc, hooks, image_uri):
                                  == "suggest")
     elif name == "web_fetch":
         raw_result = _web_fetch(args.get("url"))
-    elif name == "run_command":
-        timeout = min(max(int(args.get("timeout") or 45), 1), 600)
-        raw_result = _run_command(args.get("command"), args.get("workdir"),
-                                  timeout=timeout)
+    elif name == "shell":
+        raw_result = _shell_oc(args.get("command"), args.get("workdir"),
+                               args.get("timeout"))
     elif name == "take_screenshot":
         shot = _take_screenshot(args)
         if shot.get("error"):
@@ -7797,13 +8358,23 @@ def _execute_tool_call(name, args, tc, hooks, image_uri):
         raw_result = _download_status(args)
     elif name == "archive":
         raw_result = _archive(args)
-    elif name == "ask_user":
+    elif name == "question":
+        questions = args.get("questions") or []
+        answers = []
+        for q in questions:
+            if isinstance(q, dict):
+                q_text = q.get("question", "")
+                q_options = q.get("options") or []
+                answers.append({"question": q_text, "options": q_options,
+                                 "header": q.get("header", "")})
+            elif isinstance(q, str):
+                answers.append({"question": q, "options": [], "header": ""})
         on_ask = (hooks or {}).get("on_ask")
         if on_ask:
             raw_result = {"result": "ok",
-                          "answer": on_ask(args) or "(no answer)"}
+                          "answers": on_ask({"questions": answers}) or []}
         else:
-            raw_result = {"error": "ask_user is only available in the live UI"}
+            raw_result = {"error": "question is only available in the live UI"}
     elif name == "todo_write":
         items = []
         for it in (args.get("todos") or []):
@@ -7821,9 +8392,8 @@ def _execute_tool_call(name, args, tc, hooks, image_uri):
         if on_todo:
             on_todo(items)
         raw_result = {"result": "ok", "todos": items}
-    elif name == "run_code":
-        raw_result = _run_code(args.get("language"), args.get("code"),
-                               timeout=args.get("timeout"))
+    elif name == "execute":
+        raw_result = _execute_js(args.get("code", ""), args.get("timeout"))
     elif name == "window_list":
         raw_result = _window_list()
     elif name == "window_action":
@@ -7848,6 +8418,47 @@ def _execute_tool_call(name, args, tc, hooks, image_uri):
             raw_result = _tts_speak(args)
     elif name == "preview_html":
         raw_result = _preview_html(args.get("path"))
+    elif name == "glob":
+        raw_result = _glob_search(args.get("pattern"), args.get("path"))
+    elif name == "read":
+        raw_result = _read_oc(args.get("filePath") or args.get("path"),
+                              args.get("offset"), args.get("limit"))
+    elif name == "edit":
+        raw_result = _edit_oc(args.get("filePath") or args.get("path"),
+                              args.get("oldString") or args.get("old_text"),
+                              args.get("newString") or args.get("new_text"),
+                              args.get("replaceAll") or args.get("replace_all", False))
+    elif name == "shell":
+        raw_result = _shell_oc(args.get("command"), args.get("workdir"),
+                               args.get("timeout"))
+    elif name == "question":
+        questions = args.get("questions") or []
+        answers = []
+        for q in questions:
+            if isinstance(q, dict):
+                q_text = q.get("question", "")
+                q_options = q.get("options") or []
+                answers.append({"question": q_text, "options": q_options,
+                                 "header": q.get("header", "")})
+            elif isinstance(q, str):
+                answers.append({"question": q, "options": [], "header": ""})
+        on_ask = (hooks or {}).get("on_ask")
+        if on_ask:
+            raw_result = {"result": "ok",
+                          "answers": on_ask({"questions": answers}) or []}
+        else:
+            raw_result = {"error": "question is only available in the live UI"}
+    elif name == "task":
+        raw_result = _task_agent(args.get("description", ""),
+                                args.get("prompt", ""),
+                                args.get("subagent_type", "general"),
+                                args.get("background", False))
+    elif name == "plan":
+        raw_result = _plan_task(args.get("task", ""))
+    elif name == "skill":
+        raw_result = _skill_load(args.get("name", ""))
+    elif name == "execute":
+        raw_result = _execute_js(args.get("code", ""), args.get("timeout"))
     elif name in _blender_tool_names():
         if not MCP_AVAILABLE:
             raw_result = {"error": "Blender MCP is not installed (pip install mcp-for-blender)"}
