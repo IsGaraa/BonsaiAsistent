@@ -4805,9 +4805,15 @@ def _resolve_candidates(markup, base_url, max_out=40, min_score=None):
         for attr in ("src", "data-href", "data-src", "data-url", "data-download",
                      "data-file", "href"):
             for m in re.finditer(
-                    r'(?is)\b%s\s*=\s*(["\'])(?P<u>.+?)\1' % re.escape(attr),
+                    r'(?is)(?<![\w-])%s\s*=\s*(["\'])(?P<u>.+?)\1' % re.escape(attr),
                     markup or ""):
-                pairs.append((m.group("u"), ""))
+                raw_val = html.unescape(str(m.group("u") or "")).strip()
+                # a marker attribute like data-href="yes" is not a url; only
+                # keep values that actually look like one
+                if attr != "href" and not _url_ok(raw_val) and \
+                        not raw_val.lower().startswith("/"):
+                    continue
+                pairs.append((raw_val, ""))
         for m in re.finditer(r'(?is)"(?:url|href|src|downloadUrl|fileUrl)"\s*:\s*"([^"]+)"',
                               markup or ""):
             pairs.append((m.group(1), ""))
@@ -6434,6 +6440,8 @@ def _web_resolve(args):
         if cand.get("size"):
             item["bytes"] = cand["size"]
             item["size_h"] = _human_bytes(cand["size"])
+        else:
+            item["size"] = None
         if cand.get("final_url") and cand["final_url"] != cand["url"]:
             item["redirects_to"] = cand["final_url"]
         if cand.get("accepts_ranges"):

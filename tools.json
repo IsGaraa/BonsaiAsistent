@@ -390,6 +390,10 @@
             "type": "string",
             "description": "Relative destination inside the workspace, e.g. 'Downloads/installer.exe'. Defaults to the file name from the URL."
           },
+          "follow": {
+            "type": "boolean",
+            "description": "The URL is a page, not a file. Resolve it first (index -> file host -> file) in a real browser and download the file behind it, carrying the session cookies over. Default false. Use web_resolve first if you want to see what is behind the page before anything is written to disk."
+          },
           "max_mb": {
             "type": "integer",
             "description": "Optional size cap for this file in MB (default: no limit at all)."
@@ -761,148 +765,6 @@
         },
         "required": [
           "text"
-        ]
-      }
-    }
-  },
-  {
-    "type": "function",
-    "function": {
-      "name": "docker_ps",
-      "description": "List Docker containers. Include stopped ones with 'all'. Returns id, name, image and status per container. Use docker_logs/docker_exec/docker_start/docker_stop with the returned names.",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "all": {
-            "type": "boolean",
-            "description": "Include stopped containers."
-          }
-        },
-        "required": []
-      }
-    }
-  },
-  {
-    "type": "function",
-    "function": {
-      "name": "docker_images",
-      "description": "List Docker images available locally (repository, tag, id, size).",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "filter": {
-            "type": "string",
-            "description": "Optional name filter (repository substring)."
-          }
-        },
-        "required": []
-      }
-    }
-  },
-  {
-    "type": "function",
-    "function": {
-      "name": "docker_start",
-      "description": "Start a Docker container by name or id.",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "name": {
-            "type": "string",
-            "description": "Container name or id."
-          }
-        },
-        "required": [
-          "name"
-        ]
-      }
-    }
-  },
-  {
-    "type": "function",
-    "function": {
-      "name": "docker_stop",
-      "description": "Stop a running Docker container by name or id.",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "name": {
-            "type": "string",
-            "description": "Container name or id."
-          },
-          "timeout": {
-            "type": "integer",
-            "description": "Seconds to wait before killing (default 10)."
-          }
-        },
-        "required": [
-          "name"
-        ]
-      }
-    }
-  },
-  {
-    "type": "function",
-    "function": {
-      "name": "docker_restart",
-      "description": "Restart a Docker container by name or id.",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "name": {
-            "type": "string",
-            "description": "Container name or id."
-          }
-        },
-        "required": [
-          "name"
-        ]
-      }
-    }
-  },
-  {
-    "type": "function",
-    "function": {
-      "name": "docker_logs",
-      "description": "Read the logs of a Docker container by name or id.",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "name": {
-            "type": "string",
-            "description": "Container name or id."
-          },
-          "tail": {
-            "type": "integer",
-            "description": "Number of lines from the end (default 100)."
-          }
-        },
-        "required": [
-          "name"
-        ]
-      }
-    }
-  },
-  {
-    "type": "function",
-    "function": {
-      "name": "docker_exec",
-      "description": "Run a command inside a running Docker container (docker exec with sh -c). Returns the command output.",
-      "parameters": {
-        "type": "object",
-        "properties": {
-          "name": {
-            "type": "string",
-            "description": "Container name or id."
-          },
-          "command": {
-            "type": "string",
-            "description": "The shell command to run inside the container, e.g. 'ls -la /app'."
-          }
-        },
-        "required": [
-          "name",
-          "command"
         ]
       }
     }
@@ -1407,6 +1269,45 @@
           "timeout": {
             "type": "integer",
             "description": "Timeout seconds."
+          }
+        },
+        "required": [
+          "url"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "web_resolve",
+      "description": "Find the real file behind a download PAGE. Some sites do not give you a file URL: they show an index that links elsewhere, a file host behind a 'your download starts in N seconds' page, links built by JavaScript, or a bot check. This reads the page, follows those hops, and returns a ranked list of candidate files with names and sizes. It downloads nothing. Use it when a URL is a page rather than a file, then pass the chosen url to download_file (with 'follow': true to carry the session over).",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "url": {
+            "type": "string",
+            "description": "The page URL to resolve."
+          },
+          "render": {
+            "type": "boolean",
+            "description": "Load the page in a real browser so JavaScript runs and bot checks are handled. Slower, but needed when the links only exist after the page runs. Default false."
+          },
+          "max_hops": {
+            "type": "integer",
+            "description": "How many page-to-page hops to follow. Default 3, max 5."
+          },
+          "max_results": {
+            "type": "integer",
+            "description": "How many candidates to return. Default 10, max 25."
+          },
+          "timeout": {
+            "type": "integer",
+            "description": "Seconds to allow, default 30."
+          },
+          "headers": {
+            "type": "object",
+            "description": "Extra request headers, e.g. a cookie, for a page that needs a session."
           }
         },
         "required": [
