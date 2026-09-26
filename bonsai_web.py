@@ -2935,8 +2935,57 @@ DOWNLOAD_TOOL = {
                     "description": "Relative destination inside the workspace, "
                                    "e.g. 'Downloads/installer.exe'. Defaults to "
                                    "the file name from the URL."
+                },
+                "follow": {
+                    "type": "boolean",
+                    "description": "The URL is a page, not a file. Resolve it "
+                                   "first (index -> file host -> file) in a real "
+                                   "browser and download the file behind it, "
+                                   "carrying the session cookies over. Default "
+                                   "false. Use web_resolve first if you want to "
+                                   "see what is behind the page before anything "
+                                   "is written to disk."
                 }
             }, **_dl_tune_props(with_files=True)),
+            "required": ["url"]
+        }
+    }
+}
+
+
+WEB_RESOLVE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "web_resolve",
+        "description": "Find the real file behind a download PAGE. Some sites do not "
+                       "give you a file URL: they show an index that links elsewhere, "
+                       "a file host behind a 'your download starts in N seconds' page, "
+                       "links built by JavaScript, or a bot check. This reads the page, "
+                       "follows those hops, and returns a ranked list of candidate "
+                       "files with names and sizes. It downloads nothing. Use it when a "
+                       "URL is a page rather than a file, then pass the chosen url to "
+                       "download_file (with 'follow': true to carry the session over).",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "The page URL to resolve."},
+                "render": {"type": "boolean",
+                           "description": "Load the page in a real browser so "
+                                          "JavaScript runs and bot checks are handled. "
+                                          "Slower, but needed when the links only exist "
+                                          "after the page runs. Default false."},
+                "max_hops": {"type": "integer",
+                             "description": "How many page-to-page hops to follow. "
+                                            "Default 3, max 5."},
+                "max_results": {"type": "integer",
+                                "description": "How many candidates to return. "
+                                               "Default 10, max 25."},
+                "timeout": {"type": "integer",
+                            "description": "Seconds to allow, default 30."},
+                "headers": {"type": "object",
+                            "description": "Extra request headers, e.g. a cookie, for a "
+                                           "page that needs a session."},
+            },
             "required": ["url"]
         }
     }
@@ -3276,61 +3325,6 @@ def _pc_tool(name, description, properties, required):
     }
 
 
-DOCKER_PS_TOOL = _pc_tool(
-    "docker_ps",
-    "List Docker containers. Include stopped ones with 'all'. Returns id, name, "
-    "image and status per container. Use docker_logs/docker_exec/docker_start/"
-    "docker_stop with the returned names.",
-    {"all": {"type": "boolean", "description": "Include stopped containers."}},
-    []
-)
-
-DOCKER_IMAGES_TOOL = _pc_tool(
-    "docker_images",
-    "List Docker images available locally (repository, tag, id, size).",
-    {"filter": {"type": "string", "description": "Optional name filter (repository substring)."}},
-    []
-)
-
-DOCKER_START_TOOL = _pc_tool(
-    "docker_start",
-    "Start a Docker container by name or id.",
-    {"name": {"type": "string", "description": "Container name or id."}},
-    ["name"]
-)
-
-DOCKER_STOP_TOOL = _pc_tool(
-    "docker_stop",
-    "Stop a running Docker container by name or id.",
-    {"name": {"type": "string", "description": "Container name or id."},
-     "timeout": {"type": "integer", "description": "Seconds to wait before killing (default 10)."}},
-    ["name"]
-)
-
-DOCKER_RESTART_TOOL = _pc_tool(
-    "docker_restart",
-    "Restart a Docker container by name or id.",
-    {"name": {"type": "string", "description": "Container name or id."}},
-    ["name"]
-)
-
-DOCKER_LOGS_TOOL = _pc_tool(
-    "docker_logs",
-    "Read the logs of a Docker container by name or id.",
-    {"name": {"type": "string", "description": "Container name or id."},
-     "tail": {"type": "integer", "description": "Number of lines from the end (default 100)."}},
-    ["name"]
-)
-
-DOCKER_EXEC_TOOL = _pc_tool(
-    "docker_exec",
-    "Run a command inside a running Docker container (docker exec with sh -c). "
-    "Returns the command output.",
-    {"name": {"type": "string", "description": "Container name or id."},
-     "command": {"type": "string", "description": "The shell command to run inside the container, e.g. 'ls -la /app'."}},
-    ["name", "command"]
-)
-
 API_CALL_TOOL = {
     "type": "function",
     "function": {
@@ -3602,9 +3596,7 @@ CLICK_TEXT_TOOL = {
 NEW_TOOLS = [WINDOW_LIST_TOOL, WINDOW_ACTION_TOOL,
              SCREENSHOT_WINDOW_TOOL, WAIT_FOR_TOOL,
              COPY_CLIPBOARD_TOOL, PASTE_CLIPBOARD_TOOL, CLICK_TEXT_TOOL,
-             DOCKER_PS_TOOL, DOCKER_IMAGES_TOOL, DOCKER_START_TOOL,
-             DOCKER_STOP_TOOL, DOCKER_RESTART_TOOL, DOCKER_LOGS_TOOL,
-             DOCKER_EXEC_TOOL, API_CALL_TOOL, WS_TEST_TOOL,
+             API_CALL_TOOL, WS_TEST_TOOL,
              SCHEDULE_TOOL, LIST_SCHEDULES_TOOL, UNSCHEDULE_TOOL,
              TTS_VOICES_TOOL, TTS_SPEAK_TOOL, PREVIEW_HTML_TOOL]
 
@@ -3612,8 +3604,11 @@ DOWNLOAD_TOOLS = [DOWNLOAD_STATUS_TOOL, DOWNLOAD_BATCH_TOOL,
                   DOWNLOAD_AUTHED_TOOL, DOWNLOAD_PAGE_TOOL,
                   DOWNLOAD_VERIFY_TOOL, DOWNLOAD_MEDIA_TOOL]
 
+RESOLVE_TOOLS = [WEB_RESOLVE_TOOL]
+
 PC_TOOLS = [SHOT_TOOL, INPUT_TOOL, CLIPBOARD_TOOL,
-            DOWNLOAD_TOOL, ARCHIVE_TOOL, ASK_TOOL, TODO_TOOL] + NEW_TOOLS + DOWNLOAD_TOOLS
+            DOWNLOAD_TOOL, ARCHIVE_TOOL, ASK_TOOL, TODO_TOOL] + NEW_TOOLS + DOWNLOAD_TOOLS \
+    + RESOLVE_TOOLS
 
 
 def _tools_for(mode):
@@ -4576,6 +4571,364 @@ def _name_from_response(url, headers):
     name = os.path.basename(urllib.parse.unquote(path)).strip()
     name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name)
     return name or "download.bin"
+
+
+# ---------------- link resolution ----------------
+#
+# A "download page" is a page whose real payload is somewhere else: an index
+# that links out, a file host behind a "your download starts in N seconds"
+# interstitial, a link built by JavaScript, or a bot check in front of both.
+# The resolver turns such a page into a ranked list of candidate file URLs.
+#
+# It is deliberately split from the downloader. Resolving is cheap and safe -
+# it fetches a page and reports what it found. Downloading writes to disk and
+# can be gigabytes, so that stays an explicit, separate call the caller
+# approves after seeing the candidates.
+
+# Extensions that are a file a user means to download. Everything else on a
+# page (nav links, login pages, css, trackers) is noise to be ranked away.
+_RESOLVE_FILE_EXT = {
+    # archives
+    ".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz", ".tgz", ".tbz2", ".iso",
+    ".img", ".dmg", ".pkg", ".cab", ".z01",
+    # installers and binaries
+    ".exe", ".msi", ".msix", ".appx", ".deb", ".rpm", ".apk", ".appimage", ".snap",
+    ".bat", ".cmd", ".ps1", ".vbs", ".jar", ".class", ".bin", ".run", ".sh",
+    # documents
+    ".pdf", ".epub", ".mobi", ".azw3", ".djvu", ".cbz", ".cbr", ".chm",
+    ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".odt", ".ods", ".odp",
+    ".rtf", ".txt", ".md", ".csv", ".log", ".json", ".xml", ".yaml", ".yml",
+    # images, audio, video
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tif", ".tiff", ".svg",
+    ".heic", ".raw", ".psd", ".ai", ".eps",
+    ".mp3", ".flac", ".wav", ".aac", ".ogg", ".m4a", ".wma", ".opus",
+    ".mp4", ".mkv", ".avi", ".mov", ".webm", ".m4v", ".flv", ".wmv", ".ts", ".m2ts",
+    # subtitles and misc
+    ".srt", ".sub", ".ass", ".ssa", ".vtt", ".ttf", ".otf", ".woff", ".woff2",
+}
+
+# A path ending in a digit run right before the extension is almost always an
+# auto-numbered file (/file_01.zip) rather than a route.
+_RESOLVE_INDEX_EXT = {".html", ".htm", ".php", ".asp", ".aspx", ".jsp", ".cgi",
+                      ".do", ".action", ".shtml", ".phtml", ".cfm"}
+
+# Pages that are never the file. Following these just burns a hop.
+_RESOLVE_SKIP_TEXT = (
+    "login", "signin", "sign-in", "register", "signup", "sign-up", "logout",
+    "account", "profile", "settings", "preferences", "contact", "about",
+    "privacy", "terms", "tos", "legal", "cookie", "faq", "help", "support",
+    "search", "forum", "community", "comment", "reply", "newsletter",
+    "subscribe", "advertise", "careers", "jobs", "sitemap", "rss", "feed",
+    "donate", "premium", "membership", "subscribe", "upgrade", "billing",
+    "cart", "checkout", "wishlist", "compare", "review", "rating", "vote",
+    "facebook", "twitter", "instagram", "youtube", "telegram", "discord",
+    "reddit", "tiktok", "pinterest", "linkedin", "whatsapp", "github",
+    "twitter", "mastodon", "xkcd", "imgur", "flickr", "patreon", "paypal",
+)
+
+# Content types that mean "this really is a file, stream it".
+_RESOLVE_FILE_CT = (
+    "application/zip", "application/x-zip-compressed", "application/x-rar",
+    "application/vnd.rar", "application/x-7z-compressed", "application/x-tar",
+    "application/gzip", "application/x-gzip", "application/x-bzip2",
+    "application/x-xz", "application/octet-stream", "application/x-msdownload",
+    "application/vnd.microsoft.portable-executable", "application/x-msi",
+    "application/vnd.ms-cab-compressed", "application/vnd.android.package-archive",
+    "application/pdf", "application/epub+zip", "application/x-cbz",
+    "application/x-cbr", "application/vnd.comicbook+zip",
+    "application/msword", "application/vnd.openxmlformats-officedocument",
+    "application/vnd.ms-excel", "application/vnd.ms-powerpoint",
+    "application/vnd.oasis.opendocument",
+    "audio/", "video/", "image/",
+    "application/x-debian-package", "application/x-rpm",
+    "application/vnd.apple.installer+xml", "application/x-apple-diskimage",
+    "application/x-apple-diskimage", "application/java-archive",
+    "application/x-ms-shortcut", "application/x-sh",
+)
+
+# Never render or fetch these, whatever a page links to. A browser will happily
+# follow a redirect into the private network, which a plain fetcher would not.
+_RESOLVE_BLOCK_HOSTS = {
+    "localhost", "localhost.localdomain", "metadata.google.internal",
+    "instance-data", "metadata",
+}
+_RESOLVE_BLOCK_NET = ()  # reserved for future ranges; IPv4/IPv6 checked inline
+
+
+def _resolve_host_allowed(url):
+    """True when a URL is safe to fetch: http(s), public host, resolvable.
+
+    A rendered page can redirect anywhere, so this guard sits in front of both
+    the static fetcher and the browser. It fails closed on purpose: a name we
+    cannot resolve is refused rather than handed to a browser that might reach
+    it some other way. Set BONSAI_ALLOW_PRIVATE_FETCH=1 to let the resolver
+    reach loopback and LAN addresses (the test suite needs it).
+    """
+    if os.environ.get("BONSAI_ALLOW_PRIVATE_FETCH") == "1":
+        try:
+            parts = urllib.parse.urlsplit(url)
+            if parts.scheme.lower() in ("http", "https") and (parts.hostname or ""):
+                return True, ""
+        except Exception:
+            pass
+    try:
+        parts = urllib.parse.urlsplit(url)
+        if parts.scheme.lower() not in ("http", "https"):
+            return False, "only http and https are supported"
+        host = (parts.hostname or "").strip().lower().rstrip(".")
+        if not host:
+            return False, "no host in the URL"
+        if host in _RESOLVE_BLOCK_HOSTS or host.endswith(".local") or \
+                host.endswith(".internal") or host.endswith(".localhost"):
+            return False, "refusing to fetch a local or metadata address"
+        try:
+            infos = socket.getaddrinfo(host, None)
+        except Exception:
+            return False, "cannot resolve the host name"
+        for info in infos:
+            packed = info[4][0]
+            try:
+                if info[0] == socket.AF_INET:
+                    octets = [int(x) for x in packed.split(".")]
+                    if octets[0] == 10 or octets[0] == 127 or octets[0] == 0:
+                        return False, "refusing to fetch a private or reserved address"
+                    if octets[0] == 172 and 16 <= octets[1] <= 31:
+                        return False, "refusing to fetch a private or reserved address"
+                    if octets[0] == 192 and octets[1] == 168:
+                        return False, "refusing to fetch a private or reserved address"
+                    if octets[0] == 169 and octets[1] == 254:
+                        return False, "refusing to fetch a link-local or metadata address"
+                    if octets[0] >= 224:
+                        return False, "refusing to fetch a multicast or reserved address"
+                else:
+                    raw = socket.inet_pton(socket.AF_INET6, packed)
+                    if raw == b"\x00" * 15 + b"\x01":
+                        return False, "refusing to fetch a private or reserved address"
+                    if raw[:9] == b"\x00" * 9 + b"\xff":
+                        return False, "refusing to fetch a private or reserved address"
+                    # fe80::/10 link-local, which is where cloud metadata lives
+                    if raw[0] == 0xFE and (raw[1] & 0xC0) == 0x80:
+                        return False, "refusing to fetch a link-local or metadata address"
+            except Exception:
+                # a family we cannot parse is not a reason to allow the url
+                return False, "could not check the address for this host"
+        return True, ""
+    except Exception as exc:
+        return False, str(exc)
+
+
+def _resolve_ct_is_file(content_type):
+    ct = str(content_type or "").split(";")[0].strip().lower()
+    if not ct:
+        return False
+    if ct.startswith(("text/", "application/xhtml")):
+        return False
+    return any(ct.startswith(prefix) for prefix in _RESOLVE_FILE_CT)
+
+
+def _resolve_score(url, content_type=None, size=None, text=None, depth=0):
+    """Rank a candidate. Higher is more likely to be the wanted file."""
+    try:
+        parts = urllib.parse.urlsplit(url)
+        path = parts.path or ""
+        ext = os.path.splitext(path)[1].lower()
+        name = os.path.basename(urllib.parse.unquote(path))
+        query = (parts.query or "").lower()
+        blob = ("%s %s %s" % (url, name, query)).lower()
+    except Exception:
+        return -1
+    score = 0
+    is_file_ext = ext in _RESOLVE_FILE_EXT
+    if is_file_ext:
+        score += 60
+    if _resolve_ct_is_file(content_type):
+        score += 50
+    if ext in _RESOLVE_INDEX_EXT:
+        score -= 45
+    if not ext and not _resolve_ct_is_file(content_type):
+        score -= 20
+    low = blob
+    for word in ("download", "mirror", "file", "get", "dl", "fetch", "source"):
+        if word in low:
+            score += 12
+            break
+    if "/download" in low or "download=" in low or "?d=" in low:
+        score += 18
+    # Skip-words only demote things that are not already a real file, so a
+    # genuine 'download-portal.zip' is not punished for a noisy name.
+    if not (is_file_ext or _resolve_ct_is_file(content_type)):
+        for bad in _RESOLVE_SKIP_TEXT:
+            if bad in low:
+                score -= 30
+                break
+        if re.search(r"/\d{3,}(?:[._-]|$)", path) and not is_file_ext:
+            score -= 15
+    if text:
+        hint = str(text).strip().lower()
+        if re.search(r"\b(size|mb|gb|mib|gib|bytes)\b", hint):
+            score += 6
+        if re.search(r"\b(download|mirror|file|part)\b", hint):
+            score += 6
+        if re.search(r"\b(advert|login|sign|home|menu|privacy)\b", hint):
+            score -= 8
+    if size:
+        try:
+            mb = int(size) / (1024 * 1024)
+            if mb >= 1:
+                score += min(18, int(mb / 50) + 6)
+            elif mb < 0.05:
+                score -= 12
+        except Exception:
+            pass
+    if parts.scheme.lower() == "https":
+        score += 4
+    score -= depth * 2
+    return score
+
+
+def _resolve_candidates(markup, base_url, max_out=40, min_score=None):
+    """Pull every plausible link out of a page, best first.
+
+    By default this keeps even links that look like pages, because the
+    hop-follower has to be able to walk *into* an interstitial. Pass
+    min_score to drop the unpromising ones, which is what you want when the
+    output is going straight to the user as a list of files.
+    """
+    out = {}
+    try:
+        pairs = []
+        for m in re.finditer(
+                r'(?is)<a\b[^>]*?href\s*=\s*(["\'])(?P<u>.+?)\1(?P<rest>[^>]*)>(?P<t>.*?)</a>',
+                markup or ""):
+            text = re.sub(r"(?is)<[^>]+>", " ", m.group("t") or "")
+            pairs.append((m.group("u"), text))
+        for attr in ("src", "data-href", "data-src", "data-url", "data-download",
+                     "data-file", "href"):
+            for m in re.finditer(
+                    r'(?is)\b%s\s*=\s*(["\'])(?P<u>.+?)\1' % re.escape(attr),
+                    markup or ""):
+                pairs.append((m.group("u"), ""))
+        for m in re.finditer(r'(?is)"(?:url|href|src|downloadUrl|fileUrl)"\s*:\s*"([^"]+)"',
+                              markup or ""):
+            pairs.append((m.group(1), ""))
+    except Exception:
+        return []
+    for raw, text in pairs:
+        raw = str(raw or "").strip()
+        if not raw or raw.lower().startswith(_SKIP_PREFIX):
+            continue
+        try:
+            full = urllib.parse.urljoin(base_url, html.unescape(raw))
+        except Exception:
+            continue
+        if not _url_ok(full) or full in out:
+            continue
+        ok, _why = _resolve_host_allowed(full)
+        if not ok:
+            continue
+        out[full] = {"url": full, "name": _name_from_response(full, None),
+                     "score": _resolve_score(full, text=text)}
+    ranked = sorted(out.values(), key=lambda c: -c["score"])
+    if min_score is None:
+        return ranked[:max_out]
+    return [c for c in ranked[:max_out] if c["score"] > min_score]
+
+
+def _resolve_probe_candidate(cand, timeout=20, headers=None):
+    """Learn a candidate's real size/type and re-rank it with that knowledge."""
+    url = cand["url"]
+    ok, why = _resolve_host_allowed(url)
+    if not ok:
+        cand["skipped"] = why
+        return cand
+    try:
+        req_headers = {"User-Agent": _WEB_UA, "Accept": "*/*"}
+        for k, v in (headers or {}).items():
+            if v is not None and str(k).strip():
+                req_headers[str(k)] = str(v)
+        req = urllib.request.Request(url, headers=req_headers, method="HEAD")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            rh = {k.title(): v for k, v in resp.headers.items()}
+            cand["final_url"] = resp.geturl()
+            cand["content_type"] = rh.get("Content-Type")
+            cand["filename"] = _name_from_response(resp.geturl(), rh) or cand["name"]
+            if rh.get("Content-Length"):
+                try:
+                    cand["size"] = int(rh["Content-Length"])
+                except Exception:
+                    pass
+            cand["accepts_ranges"] = (rh.get("Accept-Ranges") or "").lower().strip() == "bytes"
+    except Exception as exc:
+        cand.setdefault("skipped", str(exc)[:120])
+    cand["score"] = _resolve_score(cand.get("final_url") or url,
+                                   content_type=cand.get("content_type"),
+                                   size=cand.get("size"),
+                                   text=cand.get("text"))
+    return cand
+
+
+def _resolve_static(url, depth=0, max_depth=3, headers=None, timeout=20,
+                    probe=True, max_hops_per_level=6):
+    """Walk a page chain and return ranked file candidates.
+
+    Pure HTTP, no new dependencies. Follows same-host and cross-host links up
+    to max_depth levels, but only descends into pages that look like a host
+    page rather than a whole site.
+    """
+    seen = set()
+    found = {}
+    frontier = [(url, 0)]
+    pages = []
+    while frontier:
+        page, level = frontier.pop(0)
+        if page in seen or level > max_depth:
+            continue
+        seen.add(page)
+        ok, why = _resolve_host_allowed(page)
+        if not ok:
+            pages.append({"url": page, "error": why})
+            continue
+        try:
+            markup = _fetch_html(page, 1500000, timeout=timeout)
+        except Exception as exc:
+            pages.append({"url": page, "error": str(exc)[:200]})
+            continue
+        pages.append({"url": page, "candidates": len(found)})
+        # keep everything here: the pages that score worst are often exactly
+        # the interstitials we need to walk into.
+        cands = _resolve_candidates(markup, page)
+        descend = 0
+        for cand in cands:
+            ext = os.path.splitext(urllib.parse.urlsplit(cand["url"]).path)[1].lower()
+            looks_page = ext in _RESOLVE_INDEX_EXT or not ext
+            if looks_page and level < max_depth and descend < max_hops_per_level:
+                frontier.append((cand["url"], level + 1))
+                descend += 1
+            elif not looks_page or _resolve_ct_is_file(cand.get("content_type")):
+                found[cand["url"]] = cand
+    ranked = list(found.values())
+    if probe:
+        for cand in ranked[:25]:
+            _resolve_probe_candidate(cand, timeout=timeout, headers=headers)
+        ranked = sorted(ranked, key=lambda c: -c["score"])
+    # only report things that actually look like a downloadable file
+    files = []
+    for cand in ranked:
+        ext = os.path.splitext(urllib.parse.urlsplit(cand["url"]).path)[1].lower()
+        if ext in _RESOLVE_FILE_EXT or _resolve_ct_is_file(cand.get("content_type")):
+            files.append(cand)
+    return files, pages
+
+
+def _resolve_best(ranked):
+    """The single most file-like candidate, if any is convincing enough."""
+    for cand in ranked:
+        if cand.get("score", 0) >= 60 and (
+                cand.get("content_type") and _resolve_ct_is_file(cand["content_type"])
+                or os.path.splitext(urllib.parse.urlsplit(cand["url"]).path)[1].lower()
+                in _RESOLVE_FILE_EXT):
+            return cand
+    return ranked[0] if ranked else None
 
 
 def _unique_path(path):
@@ -5581,17 +5934,66 @@ def _download_status(args):
     return _dl_result(job)
 
 
+def _resolve_for_download(url, headers, follow, render, timeout=30):
+    """Resolve a page to a real file, carrying the session across the hop.
+
+    Returns (url, headers, note). The cookies the browser earned are put into
+    the headers, because a download sent without them gets challenged again and
+    fails even though the browser just passed.
+    """
+    if not follow:
+        return url, headers, ""
+    try:
+        res = _web_resolve({"url": url, "render": True, "max_hops": 3,
+                            "max_results": 10, "timeout": timeout,
+                            "headers": headers or {}})
+    except Exception as exc:
+        return url, headers, "could not resolve the page: %s" % str(exc)[:120]
+    if res.get("error"):
+        return url, headers, str(res.get("error"))[:160]
+    cands = res.get("candidates") or []
+    if not cands:
+        return url, headers, "no file found behind that page"
+    best = cands[0]
+    merged = dict(headers or {})
+    # The clearance cookie is the whole point: a transfer sent without it gets
+    # challenged again and fails even though the browser just passed.
+    cookie = res.get("_cookie") or ""
+    if cookie and not any(str(k).lower() == "cookie" for k in merged):
+        merged["Cookie"] = cookie
+    note = "resolved via %s: %s" % (res.get("how", "?"), best.get("name") or best["url"])
+    if res.get("source_page"):
+        merged["Referer"] = res["source_page"]
+    return best["url"], merged, note
+
+
 def _download_file(args):
     url = str(args.get("url") or "").strip()
     if not _url_ok(url):
         return {"error": "url must start with http:// or https://"}
     tune = _dl_args(args, 180)
+    follow = args.get("follow")
+    if isinstance(follow, str):
+        follow = follow.strip().lower() not in ("0", "false", "no", "off")
+    headers = _auth_headers(args)
+    if follow:
+        url, headers, note = _resolve_for_download(url, headers, True, True,
+                                                  timeout=min(60, tune["timeout"]))
+        if note:
+            tune["resolve_note"] = note
     spec = {"url": url, "dest": tune["path"], "timeout": tune["timeout"],
             "max_bytes": tune["max_bytes"], "resume": tune["resume"],
             "retries": tune["retries"], "overwrite": tune["overwrite"],
             "connections": tune["connections"],
-            "throttle_bps": tune["throttle_bps"]}
-    return _dl_run(spec, "download_file", tune)
+            "throttle_bps": tune["throttle_bps"], "headers": headers}
+    res = _dl_run(spec, "download_file", tune)
+    if tune.get("resolve_note"):
+        res["resolved"] = tune["resolve_note"]
+        if res.get("error"):
+            res["note"] = ("the page resolved to %s but the transfer still failed; "
+                           "try web_resolve with render:true and download the "
+                           "candidate url directly" % url)
+    return res
 
 
 def _download_batch(args):
@@ -5701,6 +6103,356 @@ def _auth_headers(args):
     if cookie:
         headers["Cookie"] = cookie
     return headers
+
+
+def _human_bytes(n):
+    """A byte count as a short human string, for reporting sizes to the model."""
+    try:
+        n = float(n)
+    except Exception:
+        return ""
+    if n < 1024:
+        return "%d B" % int(n)
+    for unit, step in (("KB", 1024), ("MB", 1024 ** 2), ("GB", 1024 ** 3),
+                       ("TB", 1024 ** 4)):
+        if n < step * 1024 or unit == "TB":
+            return "%.1f %s" % (n / float(step), unit)
+    return "%.1f TB" % (n / float(1024 ** 4))
+
+
+_RESOLVE_PW_LOCK = threading.Lock()
+_RESOLVE_PW = {"playwright": None, "browser": None, "procs": set(), "dead": False}
+# One page at a time. A second Chromium is hundreds of MB and these calls are
+# interactive, so queueing is cheaper than a second browser.
+_RESOLVE_PW_SEM = threading.BoundedSemaphore(1)
+_RESOLVE_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+               "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+
+
+def _resolve_pw_stop():
+    """Tear the browser down and reap anything it left running.
+
+    Called from the normal exit path and from the server shutdown hook, because
+    a leaked Chromium holds a profile lock and a few hundred MB.
+    """
+    with _RESOLVE_PW_LOCK:
+        browser = _RESOLVE_PW.get("browser")
+        pw = _RESOLVE_PW.get("playwright")
+        _RESOLVE_PW["browser"] = None
+        _RESOLVE_PW["playwright"] = None
+        _RESOLVE_PW["dead"] = True
+        procs = list(_RESOLVE_PW.get("procs") or ())
+        _RESOLVE_PW["procs"] = set()
+    if browser is not None:
+        try:
+            browser.close()
+        except Exception:
+            pass
+    if pw is not None:
+        try:
+            pw.stop()
+        except Exception:
+            pass
+    for proc in procs:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+    for proc in procs:
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+
+def _resolve_pw_browser():
+    """A long-lived headless Chromium, started on first use.
+
+    Returns (playwright, browser) or raises. The caller must hold the
+    semaphore. On any failure the half-built objects are dropped so the next
+    call starts clean rather than reusing a dead browser.
+    """
+    with _RESOLVE_PW_LOCK:
+        if _RESOLVE_PW.get("dead"):
+            raise RuntimeError("the browser resolver was shut down")
+        if _RESOLVE_PW.get("browser") is not None:
+            if _RESOLVE_PW["browser"].is_connected():
+                return _RESOLVE_PW["playwright"], _RESOLVE_PW["browser"]
+            _RESOLVE_PW["browser"] = None
+            _RESOLVE_PW["playwright"] = None
+    from playwright.sync_api import sync_playwright
+    pw = sync_playwright().start()
+    browser = None
+    try:
+        browser = pw.chromium.launch(headless=True, args=[
+            "--disable-blink-features=AutomationControlled",
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+        ])
+    except Exception:
+        try:
+            pw.stop()
+        except Exception:
+            pass
+        raise
+    with _RESOLVE_PW_LOCK:
+        _RESOLVE_PW["playwright"] = pw
+        _RESOLVE_PW["browser"] = browser
+    return pw, browser
+
+
+def _resolve_render(url, timeout=30, headers=None, max_depth=1, wait_ms=2500):
+    """Load a page in a real browser and harvest the links it produces.
+
+    Returns (candidates, pages, cookies_header, note). A note explains why the
+    browser path did not work, so the caller can say something useful instead
+    of "no files found".
+    """
+    acquired = _RESOLVE_PW_SEM.acquire(timeout=min(30, int(timeout) + 5))
+    if not acquired:
+        return [], [], "", "the browser resolver is busy"
+    browser = None
+    context = None
+    try:
+        ok, _why = _resolve_host_allowed(url)
+        if not ok:
+            return [], [], "", "refused: " + _why
+        try:
+            _pw, browser = _resolve_pw_browser()
+        except Exception as exc:
+            return [], [], "", "no browser available (%s)" % str(exc)[:120]
+        try:
+            context = browser.new_context(
+                user_agent=_RESOLVE_UA, ignore_https_errors=True,
+                accept_downloads=False, java_script_enabled=True)
+        except Exception as exc:
+            return [], [], "", "could not open a page (%s)" % str(exc)[:120]
+        if headers:
+            try:
+                context.set_extra_http_headers({str(k): str(v)
+                                               for k, v in headers.items()
+                                               if v is not None})
+            except Exception:
+                pass
+        page = None
+        network_downloads = []
+        try:
+            page = context.new_page()
+
+            def _on_response(resp):
+                # a response that is a file, not a document, is the prize
+                try:
+                    if resp.request.resource_type not in ("document", "xhr", "fetch"):
+                        if _resolve_ct_is_file(resp.headers.get("content-type")) or \
+                                "attachment" in (resp.headers.get("content-disposition") or ""):
+                            if _url_ok(resp.url):
+                                network_downloads.append(resp.url)
+                except Exception:
+                    pass
+
+            page.on("response", _on_response)
+            page.set_default_timeout(max(3000, int(timeout) * 1000))
+            page.goto(url, wait_until="domcontentloaded",
+                      timeout=int(timeout) * 1000)
+        except Exception as exc:
+            return [], [], "", "could not load the page (%s)" % str(exc)[:140]
+        # Links built by script appear after the DOM settles, and a bot check
+        # usually swaps the body and navigates, so give both a moment.
+        try:
+            page.wait_for_load_state("networkidle", timeout=min(8000, wait_ms + 4000))
+        except Exception:
+            pass
+        try:
+            page.wait_for_timeout(wait_ms)
+        except Exception:
+            pass
+        final_url = url
+        try:
+            final_url = page.url or url
+        except Exception:
+            pass
+        try:
+            markup = page.content()
+        except Exception:
+            markup = ""
+        # Also harvest anything the page actually fetched: a file served by
+        # fetch/XHR never appears in the HTML but shows up as a response.
+        seen = {}
+        for cand in (_resolve_candidates(markup, final_url) if markup else []):
+            seen[cand["url"]] = cand
+        for hint in network_downloads + _resolve_render_downloads(page):
+            if hint not in seen:
+                seen[hint] = {"url": hint,
+                              "name": _name_from_response(hint, None),
+                              "score": _resolve_score(hint) + 25,
+                              "from": "network"}
+        # walk one more hop if the page only led to another page
+        pages = [{"url": final_url, "how": "browser"}]
+        files = []
+        for cand in sorted(seen.values(), key=lambda c: -c["score"]):
+            ext = os.path.splitext(urllib.parse.urlsplit(cand["url"]).path)[1].lower()
+            if ext in _RESOLVE_FILE_EXT or _resolve_ct_is_file(
+                    cand.get("content_type")):
+                files.append(cand)
+            elif max_depth > 0 and (ext in _RESOLVE_INDEX_EXT or not ext):
+                more, _p, _h, _n = _resolve_render(cand["url"], timeout=timeout,
+                                                   max_depth=max_depth - 1)
+                files.extend(more)
+        files = sorted(files, key=lambda c: -c["score"])[:40]
+        # Collect the cookies BEFORE probing. A probe sent without them gets a
+        # soft 404 or a challenge page instead of the file, which is exactly
+        # the failure this whole path exists to avoid.
+        cookie_header = ""
+        try:
+            pairs = ["%s=%s" % (c.get("name"), c.get("value"))
+                     for c in (context.cookies() or [])
+                     if c.get("name") and c.get("value")]
+            if pairs:
+                cookie_header = "; ".join(pairs)
+        except Exception:
+            pass
+        probe_headers = dict(headers or {})
+        if cookie_header and not any(str(k).lower() == "cookie" for k in probe_headers):
+            probe_headers["Cookie"] = cookie_header
+        # the browser tells us a link exists; only a real request tells us what
+        # it actually is
+        for cand in files[:25]:
+            _resolve_probe_candidate(cand, timeout=timeout, headers=probe_headers)
+        files = sorted([c for c in files
+                        if os.path.splitext(urllib.parse.urlsplit(c["url"]).path)[1].lower()
+                        in _RESOLVE_FILE_EXT
+                        or _resolve_ct_is_file(c.get("content_type"))
+                        or c.get("from") == "network"],
+                       key=lambda c: -c["score"])[:40]
+        return files, pages, cookie_header, ""
+    except Exception as exc:
+        return [], [], "", "browser render failed (%s)" % str(exc)[:140]
+    finally:
+        # close in the reverse order, and never let teardown raise
+        for closer in (lambda: page and page.close(),
+                       lambda: context and context.close()):
+            try:
+                closer()
+            except Exception:
+                pass
+        try:
+            _RESOLVE_PW_SEM.release()
+        except Exception:
+            pass
+
+
+def _resolve_render_downloads(page):
+    """Content-disposition / attachment responses the browser observed.
+
+    Playwright only keeps these if they were recorded while the page was open,
+    so the caller passes a page whose responses are already tracked.
+    """
+    try:
+        hint = page.evaluate(
+            """() => {
+                const out = [];
+                document.querySelectorAll('a[href]').forEach(a => {
+                    const h = a.href;
+                    if (!h) return;
+                    if (a.hasAttribute('download') ||
+                        /\\.(zip|rar|7z|iso|exe|msi|pdf|dmg|deb|rpm|apk|img|bin)$/i.test(h)) {
+                        out.push(h);
+                    }
+                });
+                return out;
+            }""")
+        return [h for h in (hint or []) if _url_ok(h)]
+    except Exception:
+        return []
+
+
+def _web_resolve(args):
+    """Report the files behind a download page. Downloads nothing."""
+    url = str(args.get("url") or "").strip()
+    if not _url_ok(url):
+        return {"error": "url must start with http:// or https://"}
+    try:
+        max_hops = min(max(int(args.get("max_hops") or 3), 0), 5)
+    except Exception:
+        max_hops = 3
+    try:
+        max_results = min(max(int(args.get("max_results") or 10), 1), 25)
+    except Exception:
+        max_results = 10
+    try:
+        timeout = min(max(int(args.get("timeout") or 30), 3), 300)
+    except Exception:
+        timeout = 30
+    render = args.get("render")
+    if isinstance(render, str):
+        render = render.strip().lower() not in ("0", "false", "no", "off")
+    headers = _auth_headers(args)
+    started = time.time()
+    ranked, pages = [], []
+    how = "static"
+    cookie_header = ""
+    try:
+        ranked, pages = _resolve_static(url, max_depth=max_hops, headers=headers,
+                                        timeout=timeout)
+    except Exception as exc:
+        return {"error": "could not resolve %s: %s" % (url, exc)}
+    # A page that gave us nothing is exactly the case a browser is for.
+    if render or not ranked:
+        rendered, rpages, rcookies, note = _resolve_render(url, timeout=timeout,
+                                                           headers=headers)
+        if rendered:
+            ranked, pages, how = rendered, pages + rpages, "browser"
+            cookie_header = rcookies
+            if note:
+                how += " (%s)" % note
+            else:
+                how += " (javascript rendered)"
+        elif not ranked:
+            return {"error": "no downloadable file found on %s%s" %
+                            (url, (" after following %d page(s)" % len(pages))
+                             if len(pages) > 1 else ""),
+                    "pages_walked": [p.get("url") for p in pages],
+                    "why": note or "the page had no file links",
+                    "note": "if the links only appear after the page runs, retry "
+                            "with 'render': true"}
+    if not ranked:
+        return {"error": "no downloadable file found on %s%s" %
+                        (url, (" after following %d page(s)" % len(pages))
+                         if len(pages) > 1 else ""),
+                "pages_walked": [p.get("url") for p in pages],
+                "note": "if the links only appear after the page runs, retry with "
+                        "'render': true"}
+    out = []
+    for cand in ranked[:max_results]:
+        item = {"url": cand["url"], "name": cand.get("filename") or cand.get("name"),
+                "score": cand.get("score")}
+        if cand.get("content_type"):
+            item["type"] = cand["content_type"].split(";")[0]
+        if cand.get("size"):
+            item["bytes"] = cand["size"]
+            item["size_h"] = _human_bytes(cand["size"])
+        if cand.get("final_url") and cand["final_url"] != cand["url"]:
+            item["redirects_to"] = cand["final_url"]
+        if cand.get("accepts_ranges"):
+            item["resumable"] = True
+        if cand.get("skipped"):
+            item["note"] = cand["skipped"]
+        out.append(item)
+    res = {"result": "ok", "page": url, "how": how, "found": len(out),
+           "candidates": out, "pages_walked": [p.get("url") for p in pages],
+           "elapsed": round(time.time() - started, 1)}
+    # private, for download_file(follow=True) only - never shown to the model
+    res["_cookie"] = cookie_header
+    res["source_page"] = url
+    best = _resolve_best(ranked)
+    if best and best["url"] in [c["url"] for c in out[:1]]:
+        res["suggestion"] = ("call download_file with url=%r%s to fetch it"
+                             % (best["url"],
+                                " and follow=true" if how.startswith("browser") else ""))
+    return res
 
 
 def _download_authed(args):
@@ -6477,96 +7229,6 @@ def _window_action(args):
     return {"result": "ok", "action": action, "window": title[:160]}
 
 
-# ---------------- Docker tools ----------------
-
-def _docker_run(args_list, timeout=120):
-    cmd = ["docker"] + list(args_list)
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True,
-                              timeout=timeout, creationflags=CREATE_NO_WINDOW)
-    except FileNotFoundError:
-        return {"error": "docker CLI not found - is Docker Desktop installed, running and on PATH?"}
-    except subprocess.TimeoutExpired:
-        return {"error": f"docker command timed out after {timeout}s"}
-    out = (proc.stdout or "").strip()
-    err = (proc.stderr or "").strip()
-    if proc.returncode != 0:
-        return {"error": (err or out)[:1500]}
-    return {"result": "ok", "output": out[:12000]}
-
-
-def _docker_ps(args):
-    fmt = r"{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Status}}"
-    cmd = ["ps", "--format", fmt]
-    if args.get("all"):
-        cmd.append("-a")
-    res = _docker_run(cmd)
-    if res.get("error"):
-        return res
-    rows = []
-    for line in res["output"].splitlines():
-        parts = line.split("\t")
-        if len(parts) >= 4:
-            rows.append({"id": parts[0], "name": parts[1],
-                         "image": parts[2], "status": parts[3]})
-    return {"result": "ok", "containers": rows, "count": len(rows)}
-
-
-def _docker_images(args):
-    fmt = r"{{.Repository}}\t{{.Tag}}\t{{.ID}}\t{{.Size}}"
-    res = _docker_run(["images", "--format", fmt])
-    if res.get("error"):
-        return res
-    filt = str(args.get("filter") or "").strip().lower()
-    rows = []
-    for line in res["output"].splitlines():
-        parts = line.split("\t")
-        if len(parts) >= 4:
-            repo, tag, iid, size = parts[0], parts[1], parts[2], parts[3]
-            if filt and filt not in repo.lower():
-                continue
-            rows.append({"repository": repo, "tag": tag, "id": iid, "size": size})
-    return {"result": "ok", "images": rows, "count": len(rows)}
-
-
-def _docker_action(action, args):
-    name = str(args.get("name") or "").strip()
-    if not name:
-        return {"error": "container name is required"}
-    if action == "stop" and args.get("timeout"):
-        secs = max(1, min(int(args.get("timeout")), 120))
-        res = _docker_run(["stop", "-t", str(secs), name])
-    else:
-        res = _docker_run([action, name])
-    if res.get("error"):
-        return res
-    return {"result": "ok", "action": action, "container": res["output"] or name}
-
-
-def _docker_logs(args):
-    name = str(args.get("name") or "").strip()
-    if not name:
-        return {"error": "container name is required"}
-    tail = max(1, min(int(args.get("tail") or 100), 5000))
-    res = _docker_run(["logs", "--tail", str(tail), name], timeout=120)
-    if res.get("error"):
-        return res
-    return {"result": "ok", "container": name, "logs": res["output"]}
-
-
-def _docker_exec(args):
-    name = str(args.get("name") or "").strip()
-    command = str(args.get("command") or "").strip()
-    if not name:
-        return {"error": "container name is required"}
-    if not command:
-        return {"error": "command is required"}
-    res = _docker_run(["exec", name, "sh", "-c", command], timeout=180)
-    if res.get("error"):
-        return res
-    return {"result": "ok", "container": name, "output": res["output"]}
-
-
 # ---------------- API client ----------------
 
 def _api_call(args):
@@ -7032,6 +7694,8 @@ def _execute_tool_call(name, args, tc, hooks, image_uri):
         raw_result = _clipboard(args)
     elif name == "download_file":
         raw_result = _download_file(args)
+    elif name == "web_resolve":
+        raw_result = _web_resolve(args)
     elif name == "download_batch":
         raw_result = _download_batch(args)
     elif name == "download_authed":
@@ -7077,16 +7741,6 @@ def _execute_tool_call(name, args, tc, hooks, image_uri):
         raw_result = _window_list()
     elif name == "window_action":
         raw_result = _window_action(args)
-    elif name == "docker_ps":
-        raw_result = _docker_ps(args)
-    elif name == "docker_images":
-        raw_result = _docker_images(args)
-    elif name in ("docker_start", "docker_stop", "docker_restart"):
-        raw_result = _docker_action(name[len("docker_"):], args)
-    elif name == "docker_logs":
-        raw_result = _docker_logs(args)
-    elif name == "docker_exec":
-        raw_result = _docker_exec(args)
     elif name == "api_call":
         raw_result = _api_call(args)
     elif name == "ws_test":
@@ -12037,7 +12691,16 @@ def main():
     _sched_load()
     print("BONSAI is READY on http://127.0.0.1:8081", flush=True)
     webbrowser.open(f"http://{HOST}:{PORT}")
-    BonsaiServer((HOST, PORT), Handler).serve_forever()
+    # a resolver browser that outlives the app would hold a profile lock and
+    # a few hundred MB, so it is reaped on the way out
+    import atexit
+    atexit.register(_resolve_pw_stop)
+    try:
+        BonsaiServer((HOST, PORT), Handler).serve_forever()
+    except KeyboardInterrupt:
+        print("shutting down", flush=True)
+    finally:
+        _resolve_pw_stop()
 
 
 if __name__ == "__main__":

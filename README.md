@@ -139,7 +139,6 @@ clears it, and a queued message survives a page reload.
 | **Not locked to one folder** | with the default `ASK` scope Bonsai can read, write and **search the whole PC** (`C:\`, `/home/...`), and you approve each new folder - so "find my tax PDF" works outside the workspace too. The **PATH SCOPE** control in the sidebar switches between `WORKSPACE` / `ASK` / `SYSTEM` (§4.1) |
 | **Real system meters** | live CPU / RAM / GPU usage under the reactor, read from `psutil` + `nvidia-smi` instead of placeholder numbers |
 | **Window management** | `window_list` lists every open window (title, process, PID) and `window_action` brings one to the front, maximizes, minimizes or restores it - so Bonsai can switch apps before acting |
-| **Docker / containers** | drives the Docker CLI from chat (list images/containers, start, stop, restart, tail logs, run a command inside) - works with Docker Desktop |
 | **API client** | `api_call` speaks REST/GraphQL (any HTTP method, JSON or raw bodies, custom headers) and `ws_test` connects to WebSocket endpoints, sends and collects replies |
 | **Scheduled tasks** | `schedule_task` (once / every N seconds / 5-field cron) runs shell commands in the background while the PC is on; they survive a restart and report back as toasts (§7) |
 | **Speaks out loud** | `tts_speak` reads text aloud with the local neural Piper engine (English + Romanian voices) and saves the WAV in the workspace; no cloud, no Windows voices, no media player - streams straight to the speakers with `sounddevice`. **Off by default** - flip the **TTS** header button to let Bonsai speak |
@@ -186,7 +185,6 @@ always produced at the end.
 | `ask_user` | Asks you a question and **waits for your answer** (options or free text) | pauses its work like opencode's question skill |
 | `todo_write` | Replaces the visible TODO checklist (pending / in_progress / completed) | shown live on the left panel |
 | `window_list` / `window_action` | Lists open windows (title, process, PID); brings one to front / maximizes / minimizes / restores | needs `pywin32` + `psutil` (both installed here) |
-| `docker_ps` / `docker_images` / `docker_start` / `docker_stop` / `docker_restart` / `docker_logs` / `docker_exec` | Manage Docker containers and images | shells out to the `docker` CLI (Docker Desktop); clean error if not installed |
 | `api_call` | Any HTTP method to REST or GraphQL APIs, JSON or raw body, custom headers | needs `requests`; returns status, headers, elapsed ms and body |
 | `ws_test` | Connects to a `ws://`/`wss://` endpoint, optionally sends a message, collects replies | needs `websocket-client` |
 | `schedule_task` / `list_schedules` / `unschedule_task` | Run a shell command later: once, every N seconds, or by 5-field cron | see §7 for persistence, the run toasts and completed one-shots |

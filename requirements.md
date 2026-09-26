@@ -61,7 +61,6 @@ Install everything with: `pip install -r requirements.txt -r tools\requirements.
 
 | Item | Powers | Install |
 |---|---|---|
-| **Docker Desktop + WSL2 + Virtual Machine Platform** | the `docker_ps` / `docker_images` / `docker_start` / `docker_stop` / `docker_restart` / `docker_logs` / `docker_exec` tools | `winget install --id Docker.DockerDesktop`, then `wsl --install --no-distribution` and enable the Virtual Machine Platform feature; **reboot required**. `OPTIONALS.cmd` drives all of it |
 | **"MCP for Blender" addon** (in Blender) | enables the Blender tool family | Blender > Edit > Preferences > Add-ons, enable it after installing `mcp-for-blender` |
 | **Tesseract OCR engine** | powers `tools/ocr.py` | `winget install --id UB-Mannheim.TesseractOCR` |
 | **Node.js / Go / Lua / PHP / Ruby / Perl / bash runtime** | extra languages for the `run_code` sandbox - installed ones are auto-detected (Python always works) | Windows: `winget install --id OpenJS.NodeJS` (Go: `winget install GoLang.Go`); Linux: your distro packages (`sudo apt install nodejs golang lua5.4 php ruby perl`) |
