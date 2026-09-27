@@ -73,7 +73,18 @@ BONSAI_KEEP_ALIVE = 120
 # result, not a failure. Nothing in the app should cut such a turn short - the
 # user decides when to stop, with the stop button.
 BONSAI_SOCKET_TIMEOUT = 86400
-if IS_WINDOWS:
+# The chat file normally lives in the per-user config dir, but an explicit
+# BONSAI_DIR has to win over it. It did not: this read %APPDATA% and nothing
+# else, so a second copy of the app - a test harness, a portable folder, a
+# second install - wrote its conversations straight into the real history and
+# overwrote it on the way out. Everything else in the app already follows
+# BONSAI_DIR, and this makes the chat file agree with the rest.
+if os.environ.get("BONSAI_CHATS_FILE"):
+    CHATS_FILE = os.path.abspath(os.environ["BONSAI_CHATS_FILE"])
+elif os.environ.get("BONSAI_DIR") and \
+        os.path.abspath(BONSAI_DIR) != os.path.dirname(os.path.abspath(__file__)):
+    CHATS_FILE = os.path.join(BONSAI_DIR, "chats.json")
+elif IS_WINDOWS:
     CHATS_FILE = os.path.join(os.path.expandvars(r"%APPDATA%"),
                               "BonsaiAsistent", "chats.json")
 else:
@@ -5196,6 +5207,28 @@ def _model_error_text(exc, entry=None):
             who, detail if detail else
             "Free models throttle hard; wait a moment, or use a model you "
             "have credit for."))
+    elif code == 403:
+        # "invalid_request_error: invalid request" names no field and no
+        # reason, so repeating it helps nobody, and a Cloudflare 1010 is not a
+        # permissions problem at all. Say which one this is.
+        low = (detail or "").lower()
+        if "1010" in low or "cloudflare" in low:
+            msg = ("%s was blocked by the host's firewall before it reached the "
+                   "model (403, Cloudflare 1010). The request did not identify "
+                   "itself as a real client, so it was turned away without ever "
+                   "reaching the account." % who)
+        elif "free tier" in low or "within opencode" in low:
+            msg = ("%s is not open to outside clients (403). OpenCode keeps its "
+                   "free models for its own app - they only answer requests made "
+                   "from inside OpenCode, so a valid key cannot reach them from "
+                   "here. Nothing is wrong with the key. Pick a model that "
+                   "serves third-party clients." % who)
+        elif detail:
+            msg = "%s refused the request (403): %s" % (who, detail)
+        else:
+            msg = ("%s refused the request (403). The key was accepted, but this "
+                   "model is not available to this account. Pick another model."
+                   % who)
     elif code == 400 and detail:
         low = detail.lower()
         if any(m in low for m in _INVALID_REQUEST_MARKERS):
@@ -10924,6 +10957,8 @@ PAGE = """<!doctype html>
   /* right: chat console */
   .right .chat-wrap { flex: 1; min-height: 0; display: flex; flex-direction: column; padding: 10px; }
   #chat-container { flex: 1; overflow-y: auto; overflow-x: hidden; padding: 4px 6px; }
+  .endednote { margin-top: 6px; font-size: 12px; color: var(--mut);
+               font-style: italic; font-family: Consolas, monospace; }
   .msgrow { display: flex; gap: 10px; padding: 12px 0; }
   .msgrow.user { flex-direction: row-reverse; }
   .av { width: 30px; height: 30px; border-radius: 8px; flex-shrink: 0; display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: 700; font-family: Consolas, monospace; }
@@ -11219,6 +11254,7 @@ PAGE = """<!doctype html>
       <button class="hbtn add" id="addmodelbtn" title="Add a model (local .gguf file or an external API endpoint)">+</button>
       <button class="hbtn add" id="cfgbtn" title="Model settings - context size, temperature, GPU layers">&#9881;</button>
       <button class="hbtn" id="ttsbtn" title="Text-to-speech (Piper) - speak replies aloud. Off by default.">TTS: OFF</button>
+      <button class="hbtn" id="detailbtn" title="Show each step in the chat as one collapsed line, or fully expanded">DETAIL: BRIEF</button>
       <button class="hbtn" id="ejectbtn" title="Stop the model server now and free its RAM/VRAM (it restarts automatically on the next message)">EJECT</button>
       <span class="blstatus off" id="blstatus" title="Blender MCP status" aria-label="Blender MCP status"><svg class="blicon" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 1.6C7.4 1.6 3.7 3.9 3.7 6.9c0 1.6 1.1 3 2.8 3.9-2.1.9-3.5 2.4-3.5 4.2 0 3.2 4 5.8 9 5.8 2.4 0 4.6-.7 6.2-1.8l3.4 2.8 1.7-2-3.3-2.7c.6-.9.9-1.9.9-3 0-1.9-1-3.6-2.6-4.9.3-.5.4-1.1.4-1.7 0-3-3.7-5.3-8.3-5.3Z"/><ellipse cx="12" cy="6.9" rx="4.2" ry="2.5" fill="#0a0a0c"/></svg><span class="bldot off" id="bldot"></span></span>
     </div>
@@ -11532,7 +11568,7 @@ function renderConv() {
     cur.messages.forEach(function (m, i) {
       if (i === at) addFold(cur);
       if (m.role === 'user') addUser(m.content, !!m.queued);
-      else if (m.role === 'assistant') addAsst(m.content, m.calls || [], m.reason, m.stats, m.parts);
+      else if (m.role === 'assistant') addAsst(m.content, m.calls || [], m.reason, m.stats, m.parts, m);
     });
     if (at > cur.messages.length) addFold(cur);
   }
@@ -11675,7 +11711,7 @@ function addUser(content, queued) {
   conv.appendChild(row);
   scrollBottom();
 }
-function addAsst(text, calls, reason, stats) {
+function addAsst(text, calls, reason, stats, entry) {
   const row = document.createElement('div'); row.className = 'msgrow bonsai';
   const av = document.createElement('div'); av.className = 'av bonsai'; av.textContent = 'B';
   const b = document.createElement('div'); b.className = 'bubble';
@@ -11684,6 +11720,13 @@ function addAsst(text, calls, reason, stats) {
   if (calls && calls.length) addToolLog(b, calls);
   const inner = document.createElement('div'); inner.className = 'abody'; inner.innerHTML = fmt(text);
   b.appendChild(inner);
+  if (entry && entry.ended) {
+    const e = document.createElement('div'); e.className = 'endednote';
+    e.textContent = entry.ended === 'stopped'
+      ? '(stopped by you - the work above was kept)'
+      : '(this reply was cut off - the work above was kept)';
+    b.appendChild(e);
+  }
   if (stats) addStatsChip(b, stats);
   row.appendChild(av); row.appendChild(b);
   convEl().appendChild(row);
@@ -12310,6 +12353,11 @@ function onAsk(j) {
     w.textContent = 'tool: ' + (j.tool || 'file tool') + '  -  outside the workspace';
     box.appendChild(p); box.appendChild(w);
   } else {
+    if (j.header) {
+      const hh = document.createElement('div'); hh.className = 'aqhead';
+      hh.textContent = j.header;
+      box.appendChild(hh);
+    }
     const q = document.createElement('div'); q.className = 'aq';
     q.textContent = j.question || 'What should I do?';
     box.appendChild(q);
@@ -12372,6 +12420,43 @@ function renderTodo(items) {
   });
 }
 
+
+
+/* Keep a turn that did not finish, so the work in it is not lost. */
+function keepTurn(chat, anchorMsg, reply, calls, reason, stats, ended) {
+  chat = chat || cur;
+  if (!chat) return null;
+  const entry = { role: 'assistant', content: reply, calls: calls,
+                  reason: reason && reason.trim() ? reason : undefined,
+                  stats: stats || undefined, ended: ended };
+  if (anchorMsg) {
+    const at = chat.messages.indexOf(anchorMsg);
+    if (at >= 0) chat.messages.splice(at + 1, 0, entry);
+    else chat.messages.push(entry);
+  } else {
+    chat.messages.push(entry);
+  }
+  return entry;
+}
+
+/* save() only ran when a turn ended, so a job that ran for minutes and then
+   hit a crash, a closed tab or a dead laptop lost everything since the last
+   save. These keep the transcript written down while the work is in progress. */
+let autosaveTimer = null;
+function startAutosave() {
+  stopAutosave();
+  autosaveTimer = setInterval(function () {
+    try { if (busy || (cur && cur.messages && cur.messages.length)) save(); } catch (e) {}
+  }, 5000);
+}
+function stopAutosave() {
+  if (autosaveTimer) { clearInterval(autosaveTimer); autosaveTimer = null; }
+}
+document.addEventListener('visibilitychange', function () {
+  if (document.visibilityState === 'hidden') { try { save(); } catch (e) {} }
+});
+window.addEventListener('pagehide', function () { try { save(); } catch (e) {} });
+window.addEventListener('beforeunload', function () { try { save(); } catch (e) {} });
 async function streamRun(messages, chat, anchorMsg) {
   chat = chat || cur;
   abortCtrl = new AbortController();
@@ -12421,6 +12506,20 @@ async function streamRun(messages, chat, anchorMsg) {
   } finally {
     abortCtrl = null;
     stopStats();
+  }
+  /* Whatever happened, the work that got done is kept. A turn that was
+     stopped, or that failed, used to throw before the entry was ever built:
+     the tool calls it had already run, its thinking and its half-written
+     answer were all dropped, and only the user's message survived. */
+  const partial = reply.trim() || calls.length || liveCalls.length;
+  if (aborted || (!gotEnd && partial)) {
+    if (partial) {
+      const st = statsVals && (statsVals.think_ms || statsVals.respond_ms || statsVals.completion_tokens)
+        ? JSON.parse(JSON.stringify(statsVals)) : null;
+      keepTurn(chat, anchorMsg, reply, calls, reason, st, aborted ? 'stopped' : 'cut off');
+      try { save(); } catch (e) {}
+    }
+    throw new Error(aborted ? 'stopped' : 'The reply was cut off unexpectedly - please try again.');
   }
   if (aborted) throw new Error('stopped');
   if (!gotEnd) throw new Error('The reply was cut off unexpectedly - please try again.');
@@ -13459,6 +13558,8 @@ PAGE_GPT = """<!doctype html>
   .empty .logo { width: 52px; height: 52px; border-radius: 16px; font-size: 26px; margin-bottom: 16px; }
   .empty h1 { margin: 0 0 8px; color: var(--txt); font-size: 22px; letter-spacing: .5px; }
   .empty p { font-size: 13px; line-height: 1.6; max-width: 390px; margin: 0; }
+  .endednote { margin-top: 6px; font-size: 12px; color: var(--mut);
+               font-style: italic; font-family: Consolas, monospace; }
   .msgrow { display: flex; flex-direction: column; }
   .msgrow.user { align-items: flex-end; }
   .ubub { background: var(--bg3); border-radius: 16px 16px 4px 16px; padding: 10px 14px; max-width: 80%; font-size: 14px; white-space: pre-wrap; word-break: break-word; line-height: 1.5; }
@@ -13665,6 +13766,7 @@ PAGE_GPT = """<!doctype html>
       <div class="foot-row">
         <a href="/" title="Classic UI">Classic UI</a>
         <button class="btn-ghost" id="ttsbtn" title="Text-to-speech (Piper) - speak replies aloud. Off by default.">TTS: OFF</button>
+        <button class="btn-ghost" id="detailbtn" title="Show each step in the chat as one collapsed line, or fully expanded">DETAIL: BRIEF</button>
         <button class="btn-ghost" id="themebtn" title="Toggle theme"></button>
         <button class="btn-ghost" id="ejectbtn" title="Stop the model server now and free its RAM/VRAM (it restarts automatically on the next message)">EJECT</button>
       </div>
@@ -14121,7 +14223,7 @@ function renderConv() {
     cur.messages.forEach(function (m, i) {
       if (i === at) addFold(cur);
       if (m.role === 'user') addUser(m.content);
-      else if (m.role === 'assistant') addAsst(m.content, m.calls || [], m.reason, m.stats, m.parts);
+      else if (m.role === 'assistant') addAsst(m.content, m.calls || [], m.reason, m.stats, m.parts, m);
     });
     if (at > cur.messages.length) addFold(cur);
   }
@@ -14425,7 +14527,7 @@ function addStatsChip(container, s) {
   c.textContent = txt;
   container.appendChild(c);
 }
-function addAsst(text, calls, reason, stats) {
+function addAsst(text, calls, reason, stats, entry) {
   const row = document.createElement('div'); row.className = 'msgrow';
   const b = document.createElement('div');
   if (reason) addReasonBox(b, reason, false);
@@ -14436,6 +14538,13 @@ function addAsst(text, calls, reason, stats) {
   }
   const inner = document.createElement('div'); inner.className = 'abody'; inner.innerHTML = fmt(text) || '';
   b.appendChild(inner);
+  if (entry && entry.ended) {
+    const e = document.createElement('div'); e.className = 'endednote';
+    e.textContent = entry.ended === 'stopped'
+      ? '(stopped by you - the work above was kept)'
+      : '(this reply was cut off - the work above was kept)';
+    b.appendChild(e);
+  }
   if (stats) addStatsChip(b, stats);
   row.appendChild(b); convInner().appendChild(row); scrollBottom();
   return inner;
@@ -14644,6 +14753,43 @@ function renderTodo(items) {
     d.appendChild(st); d.appendChild(tx); el.appendChild(d);
   });
 }
+
+
+/* Keep a turn that did not finish, so the work in it is not lost. */
+function keepTurn(chat, anchorMsg, reply, calls, reason, stats, ended) {
+  chat = chat || cur;
+  if (!chat) return null;
+  const entry = { role: 'assistant', content: reply, calls: calls,
+                  reason: reason && reason.trim() ? reason : undefined,
+                  stats: stats || undefined, ended: ended };
+  if (anchorMsg) {
+    const at = chat.messages.indexOf(anchorMsg);
+    if (at >= 0) chat.messages.splice(at + 1, 0, entry);
+    else chat.messages.push(entry);
+  } else {
+    chat.messages.push(entry);
+  }
+  return entry;
+}
+
+/* save() only ran when a turn ended, so a job that ran for minutes and then
+   hit a crash, a closed tab or a dead laptop lost everything since the last
+   save. These keep the transcript written down while the work is in progress. */
+let autosaveTimer = null;
+function startAutosave() {
+  stopAutosave();
+  autosaveTimer = setInterval(function () {
+    try { if (busy || (cur && cur.messages && cur.messages.length)) save(); } catch (e) {}
+  }, 5000);
+}
+function stopAutosave() {
+  if (autosaveTimer) { clearInterval(autosaveTimer); autosaveTimer = null; }
+}
+document.addEventListener('visibilitychange', function () {
+  if (document.visibilityState === 'hidden') { try { save(); } catch (e) {} }
+});
+window.addEventListener('pagehide', function () { try { save(); } catch (e) {} });
+window.addEventListener('beforeunload', function () { try { save(); } catch (e) {} });
 async function streamRun(messages, chat, anchorMsg) {
   chat = chat || cur;
   abortCtrl = new AbortController();
@@ -14694,6 +14840,16 @@ async function streamRun(messages, chat, anchorMsg) {
   } finally {
     abortCtrl = null;
     stopStats();
+  }
+  const partial = reply.trim() || calls.length || liveCalls.length;
+  if (aborted || (!gotEnd && partial)) {
+    if (partial) {
+      const st = statsVals && (statsVals.think_ms || statsVals.respond_ms || statsVals.completion_tokens)
+        ? JSON.parse(JSON.stringify(statsVals)) : null;
+      keepTurn(chat, anchorMsg, reply, calls, reason, st, aborted ? 'stopped' : 'cut off');
+      try { save(); } catch (e) {}
+    }
+    throw new Error(aborted ? 'stopped' : 'The reply was cut off unexpectedly - please try again.');
   }
   if (aborted) throw new Error('stopped');
   if (!gotEnd) throw new Error('The reply was cut off unexpectedly - please try again.');
@@ -15564,6 +15720,10 @@ _OC_CSS = (
     '  /* ---- OpenCode-style tool steps + code differencing ---------------- */\n'
     '  .ocsteps { margin: 6px 0 2px; font-family: Consolas, "Courier New", monospace; font-size: 12.5px; }\n'
     '  .ocsteps:empty { display: none; }\n'
+    '  /* the steps are chat entries in their own right now, not part of a\n'
+    '     bubble, so they need their own spacing and indent */\n'
+    '  .ocsteps { margin: 4px 0 8px 30px; }\n'
+    '  .msgrow.bonsai + .ocsteps, .msgrow + .ocsteps { clear: both; }\n'
     "  /* the model's own words sit between the steps: prose, not code */\n"
     '  .ocpara { margin: 4px 0 8px; font-family: inherit; font-size: inherit;\n'
     '            line-height: inherit; color: var(--txt); }\n'
@@ -15693,6 +15853,58 @@ _OC_JS = (
     '  };\n'
     '\n'
     '  /* ---------- formatting helpers ---------- */\n'
+    '  /* How much of a step the chat shows. A step is a collapsed <details> by\n'
+    '     default, which is right: a dozen tool calls expanded is unreadable.\n'
+    '     "Full" opens them all. A display choice, so it lives in localStorage. */\n'
+    '  function ocFull() {\n'
+    "    try { return localStorage.getItem('bonsai_stepdetail') === 'full'; } catch (e) { return false; }\n"
+    '  }\n'
+    '  function renderStepBtn() {\n'
+    "    var b = document.getElementById('detailbtn');\n"
+    "    if (b) b.textContent = 'DETAIL: ' + (ocFull() ? 'FULL' : 'BRIEF');\n"
+    '  }\n'
+    '  function applyDetail() {\n'
+    '    var on = ocFull();\n'
+    "    var all = document.querySelectorAll('.ocstep');\n"
+    '    for (var i = 0; i < all.length; i++) all[i].open = on;\n'
+    '  }\n'
+    "  document.addEventListener('DOMContentLoaded', function () {\n"
+    '    renderStepBtn();\n'
+    "    var b = document.getElementById('detailbtn');\n"
+    "    if (b) b.onclick = function () {\n"
+    "      try { localStorage.setItem('bonsai_stepdetail', ocFull() ? 'brief' : 'full'); } catch (e) {}\n"
+    '      renderStepBtn(); applyDetail();\n'
+    '    };\n'
+    '  });\n'
+    '  /* The model saying something is a response, not a step, so it gets a\n'
+    '     message bubble of its own rather than a line inside the step block.\n'
+    '     The order is kept: it is placed after the steps that came before it\n'
+    '     and before the ones that follow. */\n'
+    '  function textRow() {\n'
+    '    var bub = el(\'div\', \'bubble ocpara-bubble\');\n'
+    '    var av = el(\'div\', \'av bonsai\'); av.textContent = \'B\';\n'
+    '    var row = el(\'div\', \'msgrow bonsai\');\n'
+    '    var p = el(\'div\', \'ocpara\'); p.textContent = \'\';\n'
+    '    bub.appendChild(p);\n'
+    '    row.appendChild(av); row.appendChild(bub);\n'
+    '    var host = OCS.bubble && OCS.bubble.parentNode\n'
+    '             ? OCS.bubble.parentNode.parentNode : null;\n'
+    '    var answerRow = OCS.bubble ? OCS.bubble.parentNode : null;\n'
+    '    if (host && answerRow) {\n'
+    '      /* Straight after the steps that came before this line of prose, and\n'
+    '         not simply at the end: "think, say, do, think, say" has to read that\n'
+    '         way round. The steps block is therefore closed here, so the steps\n'
+    '         that follow start a new one and the order survives. */\n'
+    '      var ref = (OCS.steps && OCS.steps.parentNode === host) ? OCS.steps : answerRow;\n'
+    '      host.insertBefore(row, ref.nextSibling);\n'
+    '      OCS.steps = null;\n'
+    '    } else if (answerRow) {\n'
+    '      answerRow.parentNode.appendChild(row);\n'
+    '    }\n'
+    '    OCS.textRow = row;\n'
+    '    return p;\n'
+    '  }\n'
+    '\n'
     '  function el(tag, cls, text) {\n'
     '    var n = document.createElement(tag);\n'
     '    if (cls) n.className = cls;\n'
@@ -15957,6 +16169,7 @@ _OC_JS = (
     '    var chg = call.change || null;\n'
     '    var bad = !!(res && res.error);\n'
     "    var d = el('details', 'ocstep' + (bad ? ' err' : ''));\n"
+    '    if (ocFull()) d.open = true;\n'
     "    var s = el('summary');\n"
     "    s.appendChild(el('span', 'occaret', '›'));\n"
     "    s.appendChild(el('span', 'ocg', kind.spec.g));\n"
@@ -15999,6 +16212,7 @@ _OC_JS = (
     '\n'
     '  function thoughtStep(ms, text) {\n'
     "    var d = el('details', 'ocstep thought');\n"
+    '    if (ocFull()) d.open = true;\n'
     "    var s = el('summary');\n"
     "    s.appendChild(el('span', 'occaret', '›'));\n"
     "    s.appendChild(el('span', 'ocg', '+'));\n"
@@ -16026,6 +16240,9 @@ _OC_JS = (
     '    var box = orderedBox();\n'
     '    if (!box) return null;\n'
     '    if (!OCS.thinkShown) OCS.thinkShown = true;\n'
+     '    /* a tool call ends the block of reasoning before it, so whatever comes\n'
+     '       after it is a new thought and not a continuation of this one */\n'
+     '    if (OCS.thoughtNode) { showThought(true); OCS.thoughtNode.__ocOpen = false; OCS.roundText = \'\'; }\n'
     '    /* anything said before this tool call belongs above it */\n'
     '    textClose();\n'
     '    var d = stepFor(call);\n'
@@ -16096,9 +16313,36 @@ _OC_JS = (
     '    if (!OCS.bubble) return null;\n'
     '    if (!OCS.steps) {\n'
     "      OCS.steps = el('div', 'ocsteps');\n"
-    '      OCS.bubble.appendChild(OCS.steps);\n'
+    '      placeSteps(OCS.steps, OCS.bubble);\n'
     '    }\n'
     '    return OCS.steps;\n'
+    '  }\n'
+    '  /* The ordered steps go into the conversation as their own entries,\n'
+    '     immediately above the answer, instead of inside its bubble. One long\n'
+    '     turn used to arrive as a single bubble holding the thinking, every\n'
+    '     tool call and the reply, which is unreadable past a dozen steps. */\n'
+    '  function placeSteps(box, bubble) {\n'
+    '    var row = bubble && bubble.parentNode;\n'
+    '    if (row && row.parentNode) { row.parentNode.insertBefore(box, row); return; }\n'
+    '    if (bubble) bubble.appendChild(box);\n'
+    '  }\n'
+    '\n'
+    '  /* The last thing the model said is the answer, and it belongs in the\n'
+    '     answer bubble rather than up with the steps. textClose() also runs at\n'
+    '     every tool boundary, but a step follows there, so the paragraph is only\n'
+    '     moved when nothing comes after it: the end of the turn. */\n'
+    '  function adoptFinalAnswer() {\n'
+    '    var n = OCS.textNode;\n'
+    '    if (!n) return;\n'
+    "    if (String(OCS.textRaw || '').trim()) {\n"
+    "      if (typeof fmt === 'function') {\n"
+    '        try { n.innerHTML = fmt(OCS.textRaw); } catch (e) {}\n'
+    '      }\n'
+    "      n.classList.add('ocfinal');\n"
+    '    }\n'
+    '    OCS.textNode = null;\n'
+    "    OCS.textRaw = '';\n"
+    '    OCS.textPart = null;\n'
     '  }\n'
     '\n'
     '  function textClose() {\n'
@@ -16118,11 +16362,12 @@ _OC_JS = (
     '    var box = orderedBox();\n'
     '    if (!box) return;\n'
     '    if (!OCS.textNode) {\n'
-    '      /* a new block: only when something else was emitted in between, so a\n'
-    '         run of streamed tokens stays one paragraph */\n'
-    "      var n = el('div', 'ocpara');\n"
-    "      n.textContent = '';\n"
-    '      box.appendChild(n);\n'
+    '      /* a new block only when something else was emitted in between,\n'
+    '         so a run of streamed tokens stays one paragraph - and it is\n'
+    '         its own message, because it is the model talking */\n'
+    '      var n = textRow();\n'
+    "      if (!n) { n = el('div', 'ocpara'); box.appendChild(n); }\n"
+
     '      OCS.textNode = n;\n'
     "      OCS.textRaw = '';\n"
     '      OCS.last = n;\n'
@@ -16148,28 +16393,49 @@ _OC_JS = (
     '  }\n'
     '\n'
     '  function showThought(force) {\n'
-    '    if (OCS.thinkShown || !OCS.since) return;\n'
+    '    if (!OCS.since) return;\n'
+    '    /* One "+ Thought" entry per block of reasoning, not one per turn.\n'
+    '       This was a one-shot guarded by thinkShown, so the second and\n'
+    '       third thoughts of a turn were dropped - and because P.onDelta\n'
+    '       calls this on the first streamed token too, the very first\n'
+    '       thought could be consumed by an empty placeholder before it had\n'
+    '       any text in it, and a turn that opened with thinking showed no\n'
+    '       thought at all. The guard is now "do I have text for this block". */\n'
     '    OCS.thinkShown = true;\n'
-    '    OCS.thinkMs = Date.now() - OCS.since;\n'
+    '    OCS.thinkMs = OCS.thinkMs || (Date.now() - OCS.since);\n'
     '    /* the answer itself is not a thought: only show a line when the model\n'
-    '       actually reasoned, or when a tool call proves it spent real time */\n'
-    "    if (!String(OCS.roundText || '').trim() && !force) return;\n"
-    '    var box = orderedBox();\n'
+     '       actually reasoned, or when a tool call proves it spent real time */\n'
+     "    if (!String(OCS.roundText || '').trim() && !force) return;\n"
+     '    /* Nothing to show, and a tool call asks for a flush whether or not there\n'
+     '       is anything to flush. Without this, every tool call added an empty\n'
+     '       second entry beside the real thought. */\n'
+     "    if (!String(OCS.roundText || '').trim()) return;\n"
+     '    /* Idempotent for the same block of text: a tool call flushes the open\n'
+     '       thought by calling this with force, and without this guard the same\n'
+     '       reasoning was entered twice. */\n'
+     '    if (OCS.thoughtNode && OCS.thoughtNode.__ocText === OCS.roundText) return;\n'
+     '    var box = orderedBox();\n'
     '    if (!box) return;\n'
     '    /* text before this thought is finished */\n'
     '    textClose();\n'
     '    var node = thoughtStep(OCS.thinkMs, OCS.roundText);\n'
+    '    node.__ocText = OCS.roundText;\n'
+    '    node.__ocOpen = true;\n'
     '    box.appendChild(node);\n'
     '    OCS.thoughtNode = node;\n'
     '    OCS.last = node;\n'
     '    /* the reasoning is recorded where it happened, not hung off the next tool\n'
     '       call: text can come between the two and it must keep its own slot */\n'
-    '    pushThought(OCS.thinkMs, OCS.roundText);\n'
-    '    /* the legacy live box is replaced by this step */\n'
-    "    if (OCS.bubble.querySelector('.reasonbox')) clearChips();\n"
-    '    scrollSafe();\n'
-    '  }\n'
-    '\n'
+     '    pushThought(OCS.thinkMs, OCS.roundText);\n'
+     '    /* The block is on screen, but its text is NOT cleared: reasoning arrives\n'
+     '       in pieces, and a continuation a moment later is still the same\n'
+     '       thought. It is closed explicitly - by a tool call, or the end of the\n'
+     '       turn - and that is what starts the next entry. */\n'
+     '    /* the legacy live box is replaced by this step */\n'
+     "    if (OCS.bubble.querySelector('.reasonbox')) clearChips();\n"
+     '    scrollSafe();\n'
+     '  }\n'
+     '\n'
     '  /* ---------- override the page renderers ---------- */\n'
     '  var P = window;\n'
     '  var oldToolLog = P.addToolLog;\n'
@@ -16223,7 +16489,23 @@ _OC_JS = (
     '\n'
     '  /* rebuild one assistant message from its recorded block order */\n'
     '  function renderOrdered(bubble, calls, parts) {\n'
-    "    var box = el('div', 'ocsteps');\n"
+    '    var box = null;\n'
+    '    var anchor = bubble;\n'
+    '    /* Steps are grouped only for as long as they run together. A piece of\n'
+    '       prose in the middle closes the group, so the conversation reads\n'
+    '       think / say / do / think / say rather than all the steps and then\n'
+    '       all the prose - which is what it looked like before. */\n'
+    '    function steps() {\n'
+    "      if (!box) box = el('div', 'ocsteps');\n"
+    '      return box;\n'
+    '    }\n'
+    '    function flush() {\n'
+    '      if (box && box.childNodes.length) {\n'
+    '        placeSteps(box, bubble, anchor);\n'
+    '        anchor = box;\n'
+    '      }\n'
+    '      box = null;\n'
+    '    }\n'
     '    parts.forEach(function (p) {\n'
     '      if (!p) return;\n'
     "      if (p.k === 'c') {\n"
@@ -16231,27 +16513,35 @@ _OC_JS = (
     '        if (!c) return;\n'
     '        /* the reasoning already has its own slot in `parts`, so the copy hung\n'
     '           off the call is only used for chats saved before blocks existed */\n'
-    '        box.appendChild(stepFor(c));\n'
+    '        steps().appendChild(stepFor(c));\n'
     "      } else if (p.k === 't') {\n"
     "        if (!String(p.v || '').trim()) return;\n"
-    "        var n = el('div', 'ocpara');\n"
+    '        flush();\n'
+    '        var n = el(\'div\', \'ocpara\');\n'
     "        n.innerHTML = (typeof fmt === 'function') ? fmt(p.v) : String(p.v);\n"
-    '        box.appendChild(n);\n'
+    "        var rb = el('div', 'bubble ocpara-bubble');\n"
+    "        var ra = el('div', 'av bonsai'); ra.textContent = 'B';\n"
+    "        var rr = el('div', 'msgrow bonsai');\n"
+    '        rb.appendChild(n); rr.appendChild(ra); rr.appendChild(rb);\n'
+    '        if (anchor && anchor.parentNode) {\n'
+    '          anchor.parentNode.insertBefore(rr, anchor.nextSibling);\n'
+    '          anchor = rr;\n'
+    '        }\n'
     "      } else if (p.k === 'r') {\n"
     "        if (!String(p.v || '').trim() && !p.ms) return;\n"
-    '        box.appendChild(thoughtStep(p.ms || 0, p.v));\n'
+    '        steps().appendChild(thoughtStep(p.ms || 0, p.v));\n'
     '      }\n'
     '    });\n'
-    '    bubble.insertBefore(box, bubble.firstChild);\n'
-    "    var shots = el('div', 'shots');\n"
-    '    var n = 0;\n'
+    '    flush();\n'
+    '    var shots = el(\'div\', \'shots\');\n'
+    '    var nshot = 0;\n'
     '    (calls || []).forEach(function (c) {\n'
     '      if (!c || !(c.preview || c.image_data)) return;\n'
     '      var sc = shotOf(c);\n'
-    '      if (sc) { shots.appendChild(sc); n++; }\n'
+    '      if (sc) { shots.appendChild(sc); nshot++; }\n'
     '    });\n'
-    '    if (n) bubble.insertBefore(shots, box);\n'
-    '  }\n'
+    '    if (nshot) bubble.insertBefore(shots, bubble.firstChild);\n'
+    '  }'
     '  function stripLegacy(root) {\n'
     '    if (!root || !root.querySelectorAll) return;\n'
     '    var junk = root.querySelectorAll(\n'
@@ -16307,8 +16597,14 @@ _OC_JS = (
     '    /* keep the round\'s reasoning so the "+ Thought" line can show it */\n'
     "    OCS.roundText += (txt == null ? '' : String(txt));\n"
     "    OCS.tailReason += (txt == null ? '' : String(txt));\n"
-    '    if (!OCS.thoughtNode) showThought();\n'
-    '    else thoughtFill(OCS.thoughtNode, OCS.roundText);\n'
+'    /* Each stretch of reasoning is its own entry: the step on screen\n'
+'       keeps growing only while the model is in the same block, so a\n'
+'       thought after a tool call starts a new one instead of\n'
+'       stretching the previous - and the first is never swallowed. */\n'
+    '    if (OCS.thoughtNode && OCS.thoughtNode.__ocOpen) {\n'
+    '      thoughtFill(OCS.thoughtNode, OCS.roundText);\n'
+    '      OCS.thoughtNode.__ocText = OCS.roundText;\n'
+    '    } else showThought();\n'
     '    if (oldOnReason) oldOnReason(txt);\n'
     '    /* the page has just (re)built its own "Thinking (BONSAI)" box: drop it\n'
     '       right away, otherwise it survives runs that make no tool calls */\n'
@@ -17071,17 +17367,41 @@ class Handler(BaseHTTPRequestHandler):
                         sse(self, event, obj)
 
                 def do_ask(q):
+                    # The model asks in batches:
+                    #   {"questions": [{"question", "header", "options": [...]}]}
+                    # but a permission prompt is a single
+                    #   {"kind": "path_approval", "path", "tool", "options": [...]}
+                    # Reading the outer object as if it were one of the
+                    # questions found no "question" and no "options" in it, so
+                    # every batch question arrived as a bare "What should I do?"
+                    # with an empty text box and no way to pick from the choices
+                    # the model had carefully written out.
+                    if isinstance(q, dict) and isinstance(q.get("questions"), list) \
+                            and q["questions"]:
+                        q = dict(q["questions"][0])
                     ask_id = uuid.uuid4().hex[:12]
                     event = threading.Event()
                     entry = {"event": event, "answer": None}
                     with _ASKS_LOCK:
                         _ASKS[ask_id] = entry
+                    opts = []
+                    for o in (q.get("options") or []):
+                        if isinstance(o, dict):
+                            label = str(o.get("label") or o.get("text")
+                                        or o.get("value") or "").strip()
+                            desc = str(o.get("description") or "").strip()
+                            if label:
+                                opts.append(label + (" - " + desc if desc else ""))
+                        elif str(o).strip():
+                            opts.append(str(o).strip())
                     emit("ask", {"id": ask_id,
                                  "kind": q.get("kind") or "question",
-                                 "question": q.get("question", ""),
+                                 "question": q.get("question")
+                                 or q.get("header") or "",
+                                 "header": q.get("header") or "",
                                  "path": q.get("path") or "",
                                  "tool": q.get("tool") or "",
-                                 "options": q.get("options") or []})
+                                 "options": opts})
                     _touch_activity()
                     try:
                         event.wait(BONSAI_KEEP_ALIVE)
@@ -17242,7 +17562,11 @@ def main():
     # The model server is deliberately NOT started here: it loads on the first
     # message you send, so starting the UI costs no VRAM until you actually
     # use it (see _ensure_bonsai, which the chat endpoints call).
-    threading.Thread(target=_blender_kickoff, daemon=True).start()
+    # The Blender bridge is a daemon thread, but it spawns a Python process of
+    # its own and that work lands in the same interpreter as startup. A second
+    # copy of the app, or a test harness, has no use for it.
+    if not os.environ.get("BONSAI_NO_BLENDER"):
+        threading.Thread(target=_blender_kickoff, daemon=True).start()
     threading.Thread(target=_sysinfo_loop, daemon=True,
                      name="bonsai-sysinfo").start()
     _sched_load()
