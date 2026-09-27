@@ -2589,7 +2589,11 @@ _EMBEDDED_SECRET_RE = re.compile(
 # provider wording that carries no information, so our own message is better
 _GENERIC_PROVIDER_TEXT = ("", "provider returned error", "internal server error",
                           "error", "unknown error", "bad gateway",
-                          "service unavailable", "request failed")
+                          "service unavailable", "request failed",
+                          # bare status words: they name the code back at us and
+                          # say nothing about what to do instead
+                          "forbidden", "unauthorized", "access denied",
+                          "bad request", "not found", "not allowed")
 
 
 def _redact_embedded_secrets(text):
@@ -3535,8 +3539,15 @@ def _effort_params():
 
 def _model_headers(extra=None):
     """Headers for a call to the active model server: JSON plus, when the
-    active model is a keyed API endpoint, its Authorization header."""
-    headers = {"Content-Type": "application/json"}
+    active model is a keyed API endpoint, its Authorization header.
+
+    The User-Agent is not optional. urllib otherwise sends "Python-urllib/3.x",
+    which the firewall in front of OpenCode Zen rejects with "error code: 1010"
+    before the request reaches any model - so every Zen model answered 403 and
+    the 403 looked like a permissions problem when the real cause was that the
+    app had not said what it was. Naming itself is how the rest of the app
+    talks to the web too."""
+    headers = {"Content-Type": "application/json", "User-Agent": _WEB_UA}
     try:
         headers.update(_model_auth_headers())
     except Exception:
@@ -4865,12 +4876,28 @@ def _model_error_text(exc, entry=None):
                "expired: check the key name on the '%s' model, then put a valid "
                "key in API KEYS.txt." % (who, who))
     elif code == 403:
-        # a 401 is "we do not know you"; a 403 is "we know you, but not this
-        # model" - telling someone to fix the key sends them down the wrong path
-        msg = ("%s refused the request (403). The key was accepted, but this "
-               "account is not allowed to use this model - it is usually gated, "
-               "region-locked, or a private preview. Pick another model, or "
-               "enable this one in your account." % who)
+        # A 403 is "we know you, but not this model", and there are two very
+        # different reasons for it here, so the provider's own sentence decides
+        # which one to say. Guessing "gated or region-locked" sent us looking
+        # for an account setting that does not exist.
+        low = (detail or "").lower()
+        if "1010" in low or "cloudflare" in low:
+            msg = ("%s was blocked by the host's firewall before it reached "
+                   "the model (403, Cloudflare 1010). The request did not "
+                   "identify itself as a real client, so it was turned away "
+                   "without ever reaching the account." % who)
+        elif "free tier" in low or "within opencode" in low:
+            msg = ("%s is not open to outside clients (403). OpenCode keeps its "
+                   "free models for its own app - they only answer requests made "
+                   "from inside OpenCode, so a valid key cannot reach them from "
+                   "here. Nothing is wrong with the key. Pick a model that "
+                   "serves third-party clients." % who)
+        elif detail:
+            msg = "%s refused the request (403): %s" % (who, detail)
+        else:
+            msg = ("%s refused the request (403). The key was accepted, but this "
+                   "model is not available to this account. Pick another model."
+                   % who)
     elif code == 402:
         msg = ("%s is out of credit. Top up the account, or pick another model."
                % who)
