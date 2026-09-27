@@ -2545,7 +2545,7 @@ _MODEL_DEFAULTS = {"ctx": 32768, "temp": 1.0, "top_p": 0.95,
 # (and in prompt-processing time), so the useful ceiling is hardware, not
 # theoretical. 100k is the cap for this machine; the dialog enforces the same
 # number so a context this large cannot be re-entered by accident.
-MAX_CTX_TOKENS = 102400
+MAX_CTX_TOKENS = 4194304
 
 
 def _model_sanitise_cfg(raw):
@@ -2644,11 +2644,16 @@ def _set_model_config(mid, raw):
         if not entry:
             return {"ok": False, "error": "unknown model '%s'" % mid}
         if entry.get("type", "local") != "local":
-            # A hosted model has no llama.cpp flags to reconfigure - the only
-            # thing worth changing once it exists is the key name, and that
-            # used to be impossible without deleting the model and adding it
-            # again. A payload with no api_key at all (an older page, still open
-            # across an update) leaves the name alone rather than clearing it.
+            # A hosted model has no llama.cpp flags to reconfigure, so the
+            # sampling numbers mean nothing for it. Its context window does: the
+            # app decides a conversation is full by comparing against it, and
+            # there was nowhere to record the real size - every hosted model was
+            # stuck on the 32768 default, and a 1M model was metered as 32k.
+            want = int(cfg.get("ctx") or 0)
+            have = int(_entry_cfg(entry).get("ctx") or 0)
+            if "ctx" in (raw or {}) and want and want != have:
+                entry.setdefault("cfg", {})["ctx"] = want
+                _save_models()
             if "api_key" in (raw or {}):
                 if key_ref:
                     entry["api_key"] = key_ref
@@ -3118,10 +3123,13 @@ def _public_models():
         mtype = m.get("type") or "local"
         item = {"id": m["id"], "label": m.get("label") or m["id"],
                 "type": mtype}
+        # Every model, hosted ones included: the picker draws the window beside
+        # the name, and a hosted entry that reported none was drawn as a blank,
+        # which read as "unknown" when in fact the number was simply never sent.
+        item["ctx"] = _entry_cfg(m)["ctx"]
         if mtype == "local":
             item["path"] = m.get("path")
             item["available"] = bool(m.get("path") and os.path.exists(m["path"]))
-            item["ctx"] = _entry_cfg(m)["ctx"]
             item["cfg"] = _entry_cfg(m)
             item["mmproj"] = m.get("mmproj") or ""
             item["vision"] = bool(item["mmproj"]
@@ -10698,7 +10706,7 @@ PAGE = """<!doctype html>
     <div class="mdlbox">
       <h4>MODEL SETTINGS <span id="cfgwho"></span></h4>
       <div class="cfgrid">
-        <label>Context size (ctx)<input id="cfg_ctx" type="number" min="512" max="102400" step="512"></label>
+          <label>Context size (ctx)<input id="cfg_ctx" type="number" min="512" max="4194304" step="512"></label>
         <label>Temperature<input id="cfg_temp" type="number" min="0" max="2" step="0.05"></label>
         <label>Top-p<input id="cfg_top_p" type="number" min="0.01" max="1" step="0.01"></label>
         <label>Top-k<input id="cfg_top_k" type="number" min="0" max="1000" step="1"></label>
@@ -12072,6 +12080,15 @@ refreshTts();
 function modelLabel(m) {
   return (m.type === 'api' ? '\u2601 ' : '\u25C9 ') + (m.label || m.id);
 }
+function fmtCtx(c) {
+  c = Number(c) || 0;
+  if (c >= 1000000) { const t = c / 1000000; return (t >= 10 ? Math.round(t) : Math.round(t * 10) / 10) + 'M'; }
+  if (c >= 1000) return Math.floor(c / 1000) + 'k';
+  return String(c);
+}
+function modelCtxLabel(m) {
+  return m.ctx ? ' \u00b7 ' + fmtCtx(m.ctx) + ' ctx' : '';
+}
 function setModelStatus(ready, loading) {
   const t = document.getElementById('system-status-text');
   const dot = document.getElementById('sdot');
@@ -12091,7 +12108,7 @@ function renderModels(j) {
   (j.models || []).forEach(function (m) {
     const o = document.createElement('option');
     o.value = m.id;
-    o.textContent = modelLabel(m) + (m.type === 'local' && m.vision ? ' · vision' : '') +
+    o.textContent = modelLabel(m) + modelCtxLabel(m) + (m.type === 'local' && m.vision ? ' · vision' : '') +
       (m.type === 'local' && m.available === false ? ' (missing)' : '') +
       (m.type === 'api' ? ' · ' + (m.needs_key ? 'NO KEY' : (m.api_key_set ? 'key ok' : 'no key needed')) : '');
     if (m.id === j.active) o.selected = true;
@@ -13135,7 +13152,7 @@ PAGE_GPT = """<!doctype html>
       <div class="mdlbox">
         <h4>MODEL SETTINGS <span id="cfgwho"></span></h4>
         <div class="cfgrid">
-          <label>Context size (ctx)<input id="cfg_ctx" type="number" min="512" max="102400" step="512"></label>
+        <label>Context size (ctx)<input id="cfg_ctx" type="number" min="512" max="4194304" step="512"></label>
           <label>Temperature<input id="cfg_temp" type="number" min="0" max="2" step="0.05"></label>
           <label>Top-p<input id="cfg_top_p" type="number" min="0.01" max="1" step="0.01"></label>
           <label>Top-k<input id="cfg_top_k" type="number" min="0" max="1000" step="1"></label>
@@ -14501,6 +14518,15 @@ refreshTts();
 function modelLabel(m) {
   return (m.type === 'api' ? '\u2601 ' : '\u25C9 ') + (m.label || m.id);
 }
+function fmtCtx(c) {
+  c = Number(c) || 0;
+  if (c >= 1000000) { const t = c / 1000000; return (t >= 10 ? Math.round(t) : Math.round(t * 10) / 10) + 'M'; }
+  if (c >= 1000) return Math.floor(c / 1000) + 'k';
+  return String(c);
+}
+function modelCtxLabel(m) {
+  return m.ctx ? ' \u00b7 ' + fmtCtx(m.ctx) + ' ctx' : '';
+}
 function setModelStatus(ready, loading) {
   const t = document.getElementById('system-status-text');
   const dot = document.getElementById('sdot');
@@ -14520,7 +14546,7 @@ function renderModels(j) {
   (j.models || []).forEach(function (m) {
     const o = document.createElement('option');
     o.value = m.id;
-    o.textContent = modelLabel(m) + (m.type === 'local' && m.vision ? ' · vision' : '') +
+    o.textContent = modelLabel(m) + modelCtxLabel(m) + (m.type === 'local' && m.vision ? ' · vision' : '') +
       (m.type === 'local' && m.available === false ? ' (missing)' : '') +
       (m.type === 'api' ? ' · ' + (m.needs_key ? 'NO KEY' : (m.api_key_set ? 'key ok' : 'no key needed')) : '');
     if (m.id === j.active) o.selected = true;
