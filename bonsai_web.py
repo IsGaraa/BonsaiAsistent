@@ -67,6 +67,12 @@ BONSAI_BASE = "http://127.0.0.1:8080"
 BONSAI_MODEL_ID = "bonsai2"
 BONSAI_CTX = 32768
 BONSAI_KEEP_ALIVE = 120
+# How long the model socket may stay completely silent before we call it dead.
+# Effectively unlimited on purpose: a large model can think for a very long
+# time on a big plan before it emits a single token, and that is a normal
+# result, not a failure. Nothing in the app should cut such a turn short - the
+# user decides when to stop, with the stop button.
+BONSAI_SOCKET_TIMEOUT = 86400
 if IS_WINDOWS:
     CHATS_FILE = os.path.join(os.path.expandvars(r"%APPDATA%"),
                               "BonsaiAsistent", "chats.json")
@@ -4867,7 +4873,7 @@ def _bonsai_stream(messages, tools):
                                  data=json.dumps(payload).encode("utf-8"),
                                  headers=_model_headers(),
                                  method="POST")
-    with urllib.request.urlopen(req, timeout=600) as resp:
+    with urllib.request.urlopen(req, timeout=BONSAI_SOCKET_TIMEOUT) as resp:
         calls = {}
         finish = None
         usage = {}
@@ -10613,7 +10619,6 @@ function requeuePending() {
   refreshQueueUI();
 }
 function stopRun() {
-  waitTimedOut = false;
   if (abortCtrl) { const a = abortCtrl; abortCtrl = null; try { a.abort(); } catch (e) {} }
   if (thinkingRow) doneThinking('(stopped by user)');
   setBonsaiState('idle');
@@ -10723,36 +10728,25 @@ function onStats(j) {
   statsVals.completion_tokens = j.completion_tokens || 0;
   runningStats();
 }
-// A stuck "processing..." is worse than a slow one: it never says whether the
-// model is loading, throttled, or gone. Count how long the first real output
-// has been overdue, say which of those it looks like, and then give up on
-// purpose rather than hang forever.
-var WAIT_HARD = 300;
-var waitTimer = null, waitNote = '', waitStart = 0, waitTimedOut = false;
+// A long silence is normal, not a fault. A big model can spend many minutes on
+// its opening thoughts before the first token arrives, and a tool run can be
+// quiet just as long. So never cut a turn short on a timer: if it is going to
+// answer, let it. All this does is replace a bare "processing..." with a plain
+// note once it is clear the wait is real.
+var waitTimer = null;
 function clearWaitWatch() { if (waitTimer) { clearInterval(waitTimer); waitTimer = null; } }
-function setWaitNote(txt) { if (thinkingRow && thinkingRow.think) waitNote = txt || ''; }
+function showLoading() {
+  const row = thinkingRow;
+  if (!row || !row.think || !row.think.isConnected) { clearWaitWatch(); return; }
+  row.think.innerHTML = '<span class="dots"><i></i><i></i><i></i></span> The model is loading';
+}
 function startWaitWatch() {
   clearWaitWatch();
-  waitStart = Date.now();
-  waitNote = '';
   waitTimer = setInterval(function () {
-    const row = thinkingRow;
-    if (!row || !row.think || !row.think.isConnected) { clearWaitWatch(); return; }
-    const s = Math.floor((Date.now() - waitStart) / 1000);
-    if (s < 6) return;
-    const dots = '<span class="dots"><i></i><i></i><i></i></span> ';
-    const note = waitNote ? waitNote + ' - ' : '';
-    let label;
-    if (s < 30) label = note + 'still working (' + s + 's)';
-    else if (s < 120) label = note + 'no output yet (' + s + 's) - the model is loading or throttled';
-    else label = note + 'still nothing after ' + Math.floor(s / 60) + 'm';
-    row.think.innerHTML = dots + label;
-    if (s >= WAIT_HARD) {
-      clearWaitWatch();
-      waitTimedOut = true;
-      if (abortCtrl) { try { abortCtrl.abort(); } catch (e) {} }
-    }
-  }, 1000);
+    if (!thinkingRow || !thinkingRow.think || !thinkingRow.think.isConnected) { clearWaitWatch(); return; }
+    clearWaitWatch();
+    showLoading();
+  }, 6000);
 }
 function addThinking() {
   liveCalls = [];
@@ -10876,7 +10870,7 @@ function doneThinking(errMsg) {
   clearWaitWatch();
   if (!thinkingRow) return;
   // a turn can end without a single token (nothing streamed, or the request
-  // was cut off). Leaving the "still working (Ns)" spinner behind would have
+  // was cut off). Leaving the "The model is loading" note behind would have
   // the finished bubble still claiming it is waiting
   if (thinkingRow.think) thinkingRow.think.remove();
   if (thinkingRow.reasonD) {
@@ -11031,7 +11025,6 @@ function renderTodo(items) {
 async function streamRun(messages, chat, anchorMsg) {
   chat = chat || cur;
   abortCtrl = new AbortController();
-  waitTimedOut = false;
   startStats();
   let resp;
   try {
@@ -11061,7 +11054,7 @@ async function streamRun(messages, chat, anchorMsg) {
         if (!data) continue;
         let j; try { j = JSON.parse(data); } catch (e) { continue; }
         if (ev === 'start') { setModelStatus(!!j.model_ready, !j.model_ready); }
-        else if (ev === 'waiting') { setWaitNote(j.text || ''); }
+        else if (ev === 'waiting') { showLoading(); }
         else if (ev === 'delta') { if (!modelUp) { modelUp = true; setModelStatus(true, false); } reply += j.text; onDelta(j.text); statsVals.respond_ms = Date.now() - startedAt; }
         else if (ev === 'reason') { if (!modelUp) { modelUp = true; setModelStatus(true, false); } reason += j.text; onReason(j.text); setBonsaiState('thinking'); statsVals.think_ms = Date.now() - startedAt; }
         else if (ev === 'tool') { if (!modelUp) { modelUp = true; setModelStatus(true, false); } calls.push(j.call); onTool(j.call); setBonsaiState('tools'); }
@@ -11079,11 +11072,7 @@ async function streamRun(messages, chat, anchorMsg) {
     abortCtrl = null;
     stopStats();
   }
-  if (aborted) {
-    throw new Error(waitTimedOut
-      ? 'No output at all after ' + WAIT_HARD + 's, so I stopped waiting. The model may be throttled, still loading, or gone - try another model, or restart the model server.'
-      : 'stopped');
-  }
+  if (aborted) throw new Error('stopped');
   if (!gotEnd) throw new Error('The reply was cut off unexpectedly - please try again.');
   const last = chat.messages[chat.messages.length - 1];
   const savedStats = statsVals && (statsVals.think_ms || statsVals.respond_ms || statsVals.completion_tokens)
@@ -12935,33 +12924,21 @@ function addToolLog(container, calls) {
   if (shotCount) container.insertBefore(shots, d);
 }
 // see the note on the other console's copy: a silent "thinking..." stub is
-// the same lie, and the fix is the same
-var WAIT_HARD = 300;
-var waitTimer = null, waitNote = '', waitStart = 0, waitTimedOut = false;
+// the same lie, and the fix is the same - never abandon a turn on a timer
+var waitTimer = null;
 function clearWaitWatch() { if (waitTimer) { clearInterval(waitTimer); waitTimer = null; } }
-function setWaitNote(txt) { if (thinkingRow && thinkingRow.think) waitNote = txt || ''; }
+function showLoading() {
+  const row = thinkingRow;
+  if (!row || !row.think || !row.think.isConnected) { clearWaitWatch(); return; }
+  row.think.innerHTML = '<span class="dots"><i></i><i></i><i></i></span> The model is loading';
+}
 function startWaitWatch() {
   clearWaitWatch();
-  waitStart = Date.now();
-  waitNote = '';
   waitTimer = setInterval(function () {
-    const row = thinkingRow;
-    if (!row || !row.think || !row.think.isConnected) { clearWaitWatch(); return; }
-    const s = Math.floor((Date.now() - waitStart) / 1000);
-    if (s < 6) return;
-    const dots = '<span class="dots"><i></i><i></i><i></i></span> ';
-    const note = waitNote ? waitNote + ' - ' : '';
-    let label;
-    if (s < 30) label = note + 'still working (' + s + 's)';
-    else if (s < 120) label = note + 'no output yet (' + s + 's) - the model is loading or throttled';
-    else label = note + 'still nothing after ' + Math.floor(s / 60) + 'm';
-    row.think.innerHTML = dots + label;
-    if (s >= WAIT_HARD) {
-      clearWaitWatch();
-      waitTimedOut = true;
-      if (abortCtrl) { try { abortCtrl.abort(); } catch (e) {} }
-    }
-  }, 1000);
+    if (!thinkingRow || !thinkingRow.think || !thinkingRow.think.isConnected) { clearWaitWatch(); return; }
+    clearWaitWatch();
+    showLoading();
+  }, 6000);
 }
 function addReasonBox(container, text, live) {
   const d = document.createElement('details'); d.className = 'reasonbox';
@@ -13203,7 +13180,6 @@ function renderTodo(items) {
 async function streamRun(messages, chat, anchorMsg) {
   chat = chat || cur;
   abortCtrl = new AbortController();
-  waitTimedOut = false;
   startStats();
   let resp;
   try {
@@ -13234,7 +13210,7 @@ async function streamRun(messages, chat, anchorMsg) {
         if (!data) continue;
         let j; try { j = JSON.parse(data); } catch (e) { continue; }
         if (ev === 'start') { if (j.workdir) setWorkdirInUI(j.workdir); setState('idle'); }
-        else if (ev === 'waiting') { setWaitNote(j.text || ''); }
+        else if (ev === 'waiting') { showLoading(); }
         else if (ev === 'delta') { reply += j.text; onDelta(j.text); statsVals.respond_ms = Date.now() - startedAt; }
         else if (ev === 'reason') { reason += j.text; onReason(j.text); setState('thinking'); statsVals.think_ms = Date.now() - startedAt; }
         else if (ev === 'tool') { calls.push(j.call); onTool(j.call); setState('tools'); }
@@ -13252,11 +13228,7 @@ async function streamRun(messages, chat, anchorMsg) {
     abortCtrl = null;
     stopStats();
   }
-  if (aborted) {
-    throw new Error(waitTimedOut
-      ? 'No output at all after ' + WAIT_HARD + 's, so I stopped waiting. The model may be throttled, still loading, or gone - try another model, or restart the model server.'
-      : 'stopped');
-  }
+  if (aborted) throw new Error('stopped');
   if (!gotEnd) throw new Error('The reply was cut off unexpectedly - please try again.');
   if (thinkingRow && thinkingRow.body) thinkingRow.body.innerHTML = fmt(reply);
   doneThinking();
@@ -13423,7 +13395,6 @@ function requeuePending() {
   refreshQueueUI();
 }
 function stopRun() {
-  waitTimedOut = false;
   if (abortCtrl) { const a = abortCtrl; abortCtrl = null; try { a.abort(); } catch (e) {} }
   if (thinkingRow) doneThinking('(stopped by user)');
   setState('idle');
