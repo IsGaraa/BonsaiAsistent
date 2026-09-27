@@ -2570,6 +2570,33 @@ _KEY_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]*$")
 # how the big providers spell a credential, for telling a name from a secret
 _SECRETISH_RE = re.compile(r"^(sk[-_]|sk-or[-_]|hf_|gsk_|xai[-_]|api[-_]?key|"
                            r"AIza|bearer\s)", re.I)
+# a credential quoted back inside free text. A provider that rejects a key
+# likes to repeat it in the body ("invalid api key: sk-or-v1-..."), and that
+# body is about to be rendered into the chat, so scrub it on the way through.
+# The second arm insists on a name=value shape so ordinary sentences that
+# merely mention an api key are left alone.
+_EMBEDDED_SECRET_RE = re.compile(
+    r"(?:sk[-_]?or[-_]?v1[-_]|sk[-_]proj[-_]|sk[-_]|hf_|gsk_|xai[-_]|AIza|"
+    r"ghp_|glpat-)[A-Za-z0-9_\-]{16,}"
+    r"|(?:api[-_]?key|authorization|bearer)\b\s*[:=]\s*"
+    r"(?:bearer\s+)?[\"']?[A-Za-z0-9_\-\.]{16,}", re.I)
+# provider wording that carries no information, so our own message is better
+_GENERIC_PROVIDER_TEXT = ("", "provider returned error", "internal server error",
+                          "error", "unknown error", "bad gateway",
+                          "service unavailable", "request failed")
+
+
+def _redact_embedded_secrets(text):
+    """Blank out any credential-looking run inside text from a provider."""
+    if not text:
+        return ""
+    return _EMBEDDED_SECRET_RE.sub("<redacted>", str(text))
+
+
+def _generic_provider_text(text):
+    """True when the provider's own wording says nothing worth repeating."""
+    t = re.sub(r"\s+", " ", str(text or "")).strip().lower().rstrip(".")
+    return t in _GENERIC_PROVIDER_TEXT
 
 
 def _sanitise_key_ref(raw):
@@ -4721,7 +4748,13 @@ def _bonsai_chat(messages, tools):
 
 def _provider_message(exc):
     """The human-readable part of a provider's error body, when it sent one.
-    OpenRouter and friends answer {"error": {"message": "..."}}."""
+
+    OpenRouter keeps the text worth reading in error.metadata.raw and leaves
+    error.message as a flat "Provider returned error", so the metadata is
+    checked first and the flat message is only a fallback. Whatever comes
+    back is scrubbed, because a provider that rejects a credential often
+    quotes it back in the body.
+    """
     try:
         body = exc.read()
     except Exception:
@@ -4736,12 +4769,20 @@ def _provider_message(exc):
     try:
         data = json.loads(body)
     except Exception:
-        return body.strip()[:300]
+        return _redact_embedded_secrets(body.strip())[:300]
     err = data.get("error") if isinstance(data, dict) else None
     if isinstance(err, dict):
-        return str(err.get("message") or err.get("code") or "")[:300]
+        meta = err.get("metadata")
+        meta = meta if isinstance(meta, dict) else {}
+        for part in (meta.get("raw"), meta.get("reason"),
+                     err.get("message"), err.get("code")):
+            text = str(part).strip() if part else ""
+            if text and not _generic_provider_text(text):
+                return _redact_embedded_secrets(text)[:300]
+        # only boilerplate was on offer: our own wording beats it
+        return ""
     if isinstance(err, str):
-        return err[:300]
+        return _redact_embedded_secrets(err.strip())[:300]
     return ""
 
 
@@ -4758,10 +4799,17 @@ def _model_error_text(exc, entry=None):
     detail = _provider_message(exc) if isinstance(
         exc, urllib.error.HTTPError) else ""
     code = getattr(exc, "code", None)
-    if code in (401, 403):
-        msg = ("%s rejected the request (%s). The API key is missing or wrong: "
-               "put it in API KEYS.txt and check the key name on the '%s' model."
-               % (who, code, who))
+    if code == 401:
+        msg = ("%s rejected the API key (401). It is missing, wrong, or "
+               "expired: check the key name on the '%s' model, then put a valid "
+               "key in API KEYS.txt." % (who, who))
+    elif code == 403:
+        # a 401 is "we do not know you"; a 403 is "we know you, but not this
+        # model" - telling someone to fix the key sends them down the wrong path
+        msg = ("%s refused the request (403). The key was accepted, but this "
+               "account is not allowed to use this model - it is usually gated, "
+               "region-locked, or a private preview. Pick another model, or "
+               "enable this one in your account." % who)
     elif code == 402:
         msg = ("%s is out of credit. Top up the account, or pick another model."
                % who)
@@ -4770,8 +4818,12 @@ def _model_error_text(exc, entry=None):
                "the model id - the model id is not the web page address."
                % (who, code))
     elif code == 429:
-        msg = ("%s is rate limiting us (%s). Free models throttle hard; wait a "
-               "moment, or use a model you have credit for." % (who, code))
+        # the provider usually says whether this is upstream throttling or the
+        # account's own limit, and that is the useful part
+        msg = ("%s is rate limiting us (429). %s" % (
+            who, detail if detail else
+            "Free models throttle hard; wait a moment, or use a model you "
+            "have credit for."))
     elif code == 400 and detail:
         msg = "%s rejected the request: %s" % (who, detail)
     elif code and code >= 500:
@@ -10561,6 +10613,7 @@ function requeuePending() {
   refreshQueueUI();
 }
 function stopRun() {
+  waitTimedOut = false;
   if (abortCtrl) { const a = abortCtrl; abortCtrl = null; try { a.abort(); } catch (e) {} }
   if (thinkingRow) doneThinking('(stopped by user)');
   setBonsaiState('idle');
@@ -10670,6 +10723,37 @@ function onStats(j) {
   statsVals.completion_tokens = j.completion_tokens || 0;
   runningStats();
 }
+// A stuck "processing..." is worse than a slow one: it never says whether the
+// model is loading, throttled, or gone. Count how long the first real output
+// has been overdue, say which of those it looks like, and then give up on
+// purpose rather than hang forever.
+var WAIT_HARD = 300;
+var waitTimer = null, waitNote = '', waitStart = 0, waitTimedOut = false;
+function clearWaitWatch() { if (waitTimer) { clearInterval(waitTimer); waitTimer = null; } }
+function setWaitNote(txt) { if (thinkingRow && thinkingRow.think) waitNote = txt || ''; }
+function startWaitWatch() {
+  clearWaitWatch();
+  waitStart = Date.now();
+  waitNote = '';
+  waitTimer = setInterval(function () {
+    const row = thinkingRow;
+    if (!row || !row.think || !row.think.isConnected) { clearWaitWatch(); return; }
+    const s = Math.floor((Date.now() - waitStart) / 1000);
+    if (s < 6) return;
+    const dots = '<span class="dots"><i></i><i></i><i></i></span> ';
+    const note = waitNote ? waitNote + ' - ' : '';
+    let label;
+    if (s < 30) label = note + 'still working (' + s + 's)';
+    else if (s < 120) label = note + 'no output yet (' + s + 's) - the model is loading or throttled';
+    else label = note + 'still nothing after ' + Math.floor(s / 60) + 'm';
+    row.think.innerHTML = dots + label;
+    if (s >= WAIT_HARD) {
+      clearWaitWatch();
+      waitTimedOut = true;
+      if (abortCtrl) { try { abortCtrl.abort(); } catch (e) {} }
+    }
+  }, 1000);
+}
 function addThinking() {
   liveCalls = [];
   const row = document.createElement('div'); row.className = 'msgrow bonsai';
@@ -10681,7 +10765,8 @@ function addThinking() {
   row.appendChild(av); row.appendChild(b);
   convEl().appendChild(row);
   scrollBottom();
-  thinkingRow = { row: row, b: b, body: null, reasonD: null, reasonC: null, toolEl: null };
+  thinkingRow = { row: row, b: b, body: null, reasonD: null, reasonC: null, toolEl: null, think: t };
+  startWaitWatch();
 }
 function onDelta(txt) {
   if (!thinkingRow) return;
@@ -10788,7 +10873,12 @@ function onTool(call) {
   scrollBottom();
 }
 function doneThinking(errMsg) {
+  clearWaitWatch();
   if (!thinkingRow) return;
+  // a turn can end without a single token (nothing streamed, or the request
+  // was cut off). Leaving the "still working (Ns)" spinner behind would have
+  // the finished bubble still claiming it is waiting
+  if (thinkingRow.think) thinkingRow.think.remove();
   if (thinkingRow.reasonD) {
     thinkingRow.reasonD.classList.remove('live');
     const s = thinkingRow.reasonD.querySelector('summary');
@@ -10941,6 +11031,7 @@ function renderTodo(items) {
 async function streamRun(messages, chat, anchorMsg) {
   chat = chat || cur;
   abortCtrl = new AbortController();
+  waitTimedOut = false;
   startStats();
   let resp;
   try {
@@ -10970,6 +11061,7 @@ async function streamRun(messages, chat, anchorMsg) {
         if (!data) continue;
         let j; try { j = JSON.parse(data); } catch (e) { continue; }
         if (ev === 'start') { setModelStatus(!!j.model_ready, !j.model_ready); }
+        else if (ev === 'waiting') { setWaitNote(j.text || ''); }
         else if (ev === 'delta') { if (!modelUp) { modelUp = true; setModelStatus(true, false); } reply += j.text; onDelta(j.text); statsVals.respond_ms = Date.now() - startedAt; }
         else if (ev === 'reason') { if (!modelUp) { modelUp = true; setModelStatus(true, false); } reason += j.text; onReason(j.text); setBonsaiState('thinking'); statsVals.think_ms = Date.now() - startedAt; }
         else if (ev === 'tool') { if (!modelUp) { modelUp = true; setModelStatus(true, false); } calls.push(j.call); onTool(j.call); setBonsaiState('tools'); }
@@ -10987,7 +11079,11 @@ async function streamRun(messages, chat, anchorMsg) {
     abortCtrl = null;
     stopStats();
   }
-  if (aborted) throw new Error('stopped');
+  if (aborted) {
+    throw new Error(waitTimedOut
+      ? 'No output at all after ' + WAIT_HARD + 's, so I stopped waiting. The model may be throttled, still loading, or gone - try another model, or restart the model server.'
+      : 'stopped');
+  }
   if (!gotEnd) throw new Error('The reply was cut off unexpectedly - please try again.');
   const last = chat.messages[chat.messages.length - 1];
   const savedStats = statsVals && (statsVals.think_ms || statsVals.respond_ms || statsVals.completion_tokens)
@@ -12833,10 +12929,39 @@ function addToolLog(container, calls) {
   let shotCount = 0;
   (calls).forEach(function (c) {
     if (!(c.preview || c.image_data)) return;
-    const sc = shotCardDom(c);
-    if (sc) { shots.appendChild(sc); shotCount++; }
+    shots.appendChild(shotCardDom(c));
+    shotCount++;
   });
   if (shotCount) container.insertBefore(shots, d);
+}
+// see the note on the other console's copy: a silent "thinking..." stub is
+// the same lie, and the fix is the same
+var WAIT_HARD = 300;
+var waitTimer = null, waitNote = '', waitStart = 0, waitTimedOut = false;
+function clearWaitWatch() { if (waitTimer) { clearInterval(waitTimer); waitTimer = null; } }
+function setWaitNote(txt) { if (thinkingRow && thinkingRow.think) waitNote = txt || ''; }
+function startWaitWatch() {
+  clearWaitWatch();
+  waitStart = Date.now();
+  waitNote = '';
+  waitTimer = setInterval(function () {
+    const row = thinkingRow;
+    if (!row || !row.think || !row.think.isConnected) { clearWaitWatch(); return; }
+    const s = Math.floor((Date.now() - waitStart) / 1000);
+    if (s < 6) return;
+    const dots = '<span class="dots"><i></i><i></i><i></i></span> ';
+    const note = waitNote ? waitNote + ' - ' : '';
+    let label;
+    if (s < 30) label = note + 'still working (' + s + 's)';
+    else if (s < 120) label = note + 'no output yet (' + s + 's) - the model is loading or throttled';
+    else label = note + 'still nothing after ' + Math.floor(s / 60) + 'm';
+    row.think.innerHTML = dots + label;
+    if (s >= WAIT_HARD) {
+      clearWaitWatch();
+      waitTimedOut = true;
+      if (abortCtrl) { try { abortCtrl.abort(); } catch (e) {} }
+    }
+  }, 1000);
 }
 function addReasonBox(container, text, live) {
   const d = document.createElement('details'); d.className = 'reasonbox';
@@ -12879,7 +13004,8 @@ function addThinking() {
   t.innerHTML = '<span class="dots"><i></i><i></i><i></i></span> thinking...';
   b.appendChild(t);
   row.appendChild(b); convInner().appendChild(row); scrollBottom();
-  thinkingRow = { row: row, b: b, body: null, pills: null, tlog: null, reasonD: null };
+  thinkingRow = { row: row, b: b, body: null, pills: null, tlog: null, reasonD: null, think: t };
+  startWaitWatch();
 }
 function onDelta(txt) {
   if (!thinkingRow) return;
@@ -12919,7 +13045,9 @@ function onTool(call) {
   scrollBottom();
 }
 function doneThinking(errMsg) {
+  clearWaitWatch();
   if (!thinkingRow) return;
+  if (thinkingRow.think) thinkingRow.think.remove();
   if (thinkingRow.reasonD) {
     const txt = (thinkingRow.reasonD.c.textContent || '').trim();
     thinkingRow.reasonD.s.textContent = 'Thinking \u00b7 ' + (txt ? txt.length + ' chars' : 'empty');
@@ -13075,6 +13203,7 @@ function renderTodo(items) {
 async function streamRun(messages, chat, anchorMsg) {
   chat = chat || cur;
   abortCtrl = new AbortController();
+  waitTimedOut = false;
   startStats();
   let resp;
   try {
@@ -13105,6 +13234,7 @@ async function streamRun(messages, chat, anchorMsg) {
         if (!data) continue;
         let j; try { j = JSON.parse(data); } catch (e) { continue; }
         if (ev === 'start') { if (j.workdir) setWorkdirInUI(j.workdir); setState('idle'); }
+        else if (ev === 'waiting') { setWaitNote(j.text || ''); }
         else if (ev === 'delta') { reply += j.text; onDelta(j.text); statsVals.respond_ms = Date.now() - startedAt; }
         else if (ev === 'reason') { reason += j.text; onReason(j.text); setState('thinking'); statsVals.think_ms = Date.now() - startedAt; }
         else if (ev === 'tool') { calls.push(j.call); onTool(j.call); setState('tools'); }
@@ -13122,7 +13252,11 @@ async function streamRun(messages, chat, anchorMsg) {
     abortCtrl = null;
     stopStats();
   }
-  if (aborted) throw new Error('stopped');
+  if (aborted) {
+    throw new Error(waitTimedOut
+      ? 'No output at all after ' + WAIT_HARD + 's, so I stopped waiting. The model may be throttled, still loading, or gone - try another model, or restart the model server.'
+      : 'stopped');
+  }
   if (!gotEnd) throw new Error('The reply was cut off unexpectedly - please try again.');
   if (thinkingRow && thinkingRow.body) thinkingRow.body.innerHTML = fmt(reply);
   doneThinking();
@@ -13289,6 +13423,7 @@ function requeuePending() {
   refreshQueueUI();
 }
 function stopRun() {
+  waitTimedOut = false;
   if (abortCtrl) { const a = abortCtrl; abortCtrl = null; try { a.abort(); } catch (e) {} }
   if (thinkingRow) doneThinking('(stopped by user)');
   setState('idle');
@@ -15468,13 +15603,9 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Content-Type", "text/event-stream; charset=utf-8")
                 self.send_header("Cache-Control", "no-cache")
                 self.end_headers()
-                emit("start", {"ok": True, "workdir": WORKDIR,
-                               "model_ready": _bonsai_ready()})
-                if not _ensure_bonsai():
-                    emit("error", {"text": "Bonsai 2 model server could not start."})
-                    return
-                # a long tool (a multi-GB download) must not look like a hang:
-                # trickle a comment so the connection and proxies stay alive
+                # A long tool (a multi-GB download) must not look like a hang,
+                # and neither must a model load - so the beat starts before
+                # anything slow is attempted, not after the model is up.
                 stop_beat = threading.Event()
 
                 def keepalive():
@@ -15489,27 +15620,42 @@ class Handler(BaseHTTPRequestHandler):
                 beat = threading.Thread(target=keepalive, name="sse-keepalive")
                 beat.daemon = True
                 beat.start()
-                client_gone = False
                 try:
-                    handle_chat(messages or [], stream=True, mode=mode,
-                                on_reason=lambda t: emit("reason", {"text": t}),
-                                on_delta=lambda t: emit("delta", {"text": t}),
-                                on_tool=lambda c: emit("tool", {"call": _strip_full(c)}),
-                                on_stats=lambda s: emit("stats", s),
-                                hooks={"on_ask": do_ask, "on_todo": do_todo})
-                except CLIENT_GONE:
-                    # browser closed the tab mid-response: normal, not an error
-                    client_gone = True
-                except Exception as exc:
-                    traceback.print_exc()
+                    was_ready = _bonsai_ready()
+                    emit("start", {"ok": True, "workdir": WORKDIR,
+                                   "model_ready": was_ready})
+                    if not was_ready:
+                        # say *why* the answer is slow, instead of leaving the
+                        # browser on "processing..." with nothing to go on
+                        emit("waiting", {"reason": "loading_model",
+                                         "text": "Loading the model server"})
+                    if not _ensure_bonsai():
+                        emit("error", {"text": "Bonsai 2 model server could not start."})
+                        return
+                    if not was_ready:
+                        emit("waiting", {"reason": "model_ready",
+                                         "text": "Model loaded, waiting for the first token"})
+                    client_gone = False
                     try:
-                        emit("error", {"text": _model_error_text(exc)})
-                    except Exception:
-                        pass
+                        handle_chat(messages or [], stream=True, mode=mode,
+                                    on_reason=lambda t: emit("reason", {"text": t}),
+                                    on_delta=lambda t: emit("delta", {"text": t}),
+                                    on_tool=lambda c: emit("tool", {"call": _strip_full(c)}),
+                                    on_stats=lambda s: emit("stats", s),
+                                    hooks={"on_ask": do_ask, "on_todo": do_todo})
+                    except CLIENT_GONE:
+                        # browser closed the tab mid-response: normal, not an error
+                        client_gone = True
+                    except Exception as exc:
+                        traceback.print_exc()
+                        try:
+                            emit("error", {"text": _model_error_text(exc)})
+                        except Exception:
+                            pass
+                    if not client_gone:
+                        emit("done", {"ok": True})
                 finally:
                     stop_beat.set()
-                if not client_gone:
-                    emit("done", {"ok": True})
             else:
                 if not _ensure_bonsai():
                     self._send(200, json.dumps({"reply": "Bonsai 2 model server could not start.",
