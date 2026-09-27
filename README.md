@@ -570,15 +570,49 @@ download from §9) nor the Piper voice models (fetch with
 - `launch_or_open` opens apps either via the Windows shell (`os.startfile`,
   URIs, Start-menu AppIDs) or on Linux via `xdg-open`/`gio` and binaries found
   on `PATH`; workspace files open with the system default handler either way.
+  A name in the built-in app table that is a Windows path still falls back to
+  the `PATH` lookup on Linux, so "open gimp" works if gimp is installed.
 - `window_list` / `window_action` use win32 on Windows and `wmctrl` on Linux
   (X11 sessions); install `wmctrl` for them.
-- `take_screenshot` needs a real X11 desktop on Linux (PIL/ImageGrab or
-  scrot/ImageMagick fallback).
+- `take_screenshot` tries PIL/ImageGrab, then the command-line grabbers in
+  order: `scrot` and ImageMagick `import` (X11), `grim` (Wayland), then
+  `gnome-screenshot`. On a Wayland session - the default on current GNOME and
+  KDE - only `grim` can see the screen; `AUTO-SETUP.sh` installs it when it
+  detects a Wayland session.
+- `control_input` (mouse and keyboard) goes through `pyautogui`, which drives
+  the pointer over **X11**. On a Wayland-only session it cannot work; the tool
+  says so rather than reporting a missing package. Log in to an X11 session
+  (or install `python3-xlib`) if you need it.
+- Reading an **image** off the clipboard uses `xclip`, then `xsel`, then
+  `wl-paste` - the last is the one that works on Wayland. Copying and pasting
+  **text** uses `pyperclip`, which finds all three on its own.
+- The folder/file pickers open a native Tk dialog, so they need `python3-tk`
+  and a display. With neither, the app says so and offers to take the path as
+  typed text instead of silently doing nothing. `AUTO-SETUP.sh` installs
+  `python3-tk` and `tesseract-ocr`.
+- `tts_speak` plays through `sounddevice`, then `paplay`/`aplay`/`ffplay`. If
+  none of them can play, the result now says the audio was written but not
+  played instead of claiming success.
 - `run_code` picks up whatever runtimes are installed (python, node, go, lua,
   php, ruby, perl, bash).
 - Paths are portable: `BONSAI_DIR` / `PC_WORKDIR` / `PC_LLAMA_SERVER` env vars
   override the per-platform defaults (chat history lives under `%APPDATA%` on
   Windows and `$XDG_CONFIG_HOME`/`~/.config` on Linux).
+- A `models.json` that travelled from another machine keeps its old absolute
+  paths. On startup the app drops local models whose file is not here, repairs
+  the ones whose file is here under a different path, and never selects a
+  local model whose weights are missing - so an unzipped copy is usable
+  immediately.
+- `.gitattributes` pins `*.sh` to LF and `*.cmd`/`.bat`/`bonsai_web.py` to
+  CRLF, so a folder copied to Linux has working shell scripts.
+
+**A note on the local model on Linux:** `_default_llama_exe` picks up any
+`llama-server` on `PATH`, but Bonsai 2 is a ternary model and **stock
+llama.cpp cannot read these `.gguf` files** - you need the PrismML build with
+ternary kernels (the Windows install puts it in
+`%LOCALAPPDATA%\Programs\prism-llama\`). If the server starts and then
+refuses to load the weights, that is why. `AUTO-SETUP.sh` checks for it and
+says so. The hosted models in the dropdown need none of this.
 
 ## 13. License
 

@@ -550,7 +550,14 @@ def _open_one(name):
         result = _launch(key)
         if result.get("result") == "ok":
             return result
-        return {"error": result.get("error", "could not launch")}
+        # Every entry in _APPS is a Windows path, a Windows .cmd or a Windows
+        # URI, so on Linux _launch cannot possibly have worked - and returning
+        # its error here made the PATH lookup below unreachable for the whole
+        # table. That is why "open gimp", "open blender", "open vlc" and every
+        # other name in it failed on Linux even when the program was installed
+        # and sitting in PATH. Fall through and try it properly.
+        if IS_WINDOWS:
+            return {"error": result.get("error", "could not launch")}
     store = _store_appid(key)
     if store:
         try:
@@ -559,13 +566,23 @@ def _open_one(name):
             return {"error": f"could not open '{name}': {exc}"}
         return {"launched": store.get("Name", key), "result": "ok", "method": "start menu app"}
     if not IS_WINDOWS:
-        exe = shutil.which(key)
-        if exe:
+        # Try the canonical name first, then what the user actually typed:
+        # the alias table is written for Windows ("ie" means Internet Explorer),
+        # so on Linux the name the model or the user gave is often the one that
+        # is actually installed - and a name with a space in it is a command,
+        # not a path, so it gets the same treatment _launch gives it.
+        for cand in (key, str(name or "").strip()):
+            cand = str(cand or "").strip()
+            if not cand or os.sep in cand or "/" in cand:
+                continue
+            exe = shutil.which(cand)
+            if not exe:
+                continue
             try:
                 subprocess.Popen([exe], creationflags=CREATE_NO_WINDOW)
             except Exception as exc:
                 return {"error": f"could not open '{name}': {exc}"}
-            return {"launched": key, "result": "ok", "method": "linux-bin"}
+            return {"launched": cand, "result": "ok", "method": "linux-bin"}
     local = _local_file_target(name)
     if local:
         if not os.path.isfile(local):
@@ -1166,12 +1183,21 @@ def _grep(pattern, path=None, include=None, mode="content", context=0,
     counts = []
     scanned = 0
     truncated = False
+    # Linux system trees that must never be walked. Matched on the full path,
+    # not the folder name: a bare "dev" or "sys" in the skip list would throw
+    # away a project's own dev/ folder, and a grep rooted at / that reads
+    # /proc and /sys spends the whole 45s budget producing I/O errors.
+    skip_prefixes = ("/proc", "/sys", "/dev", "/run", "/snap/") \
+        if IS_LINUX else ()
     for root, dirs, files in os.walk(target):
         dirs[:] = [d for d in dirs
                    if not d.startswith(".")
                    and d != "__pycache__"
                    and os.path.join(d.lower(), "").rstrip("\\/") not in _SEARCH_SKIP_DIRS
-                   and not d.lower() in _SEARCH_SKIP_DIRS]
+                   and not d.lower() in _SEARCH_SKIP_DIRS
+                   and not (root == os.sep
+                            and any(os.path.join(root, d).startswith(p)
+                                    for p in skip_prefixes))]
         for name in sorted(files):
             if name.startswith("."):
                 continue
@@ -1600,12 +1626,16 @@ FILE_TOOLS = {
                            "grep). Use it to find where something is defined, used or "
                            "broken instead of reading whole files. The folder defaults "
                            "to the whole workspace, but you can point it at any "
-                           "directory on this PC ('C:\\\\Users', 'C:\\\\', "
-                           "'/home/me') to search the entire machine - the user is "
+                           "directory on this PC ("
+                           + ("'C:\\\\Users', 'C:\\\\'" if IS_WINDOWS
+                              else "'/home', '/', '/etc'")
+                           + ") to search the entire machine - the user is "
                            "asked to approve paths outside the workspace. Narrow a big "
                            "sweep with include (e.g. '*.py'). Heavy system folders "
-                           "(Windows, Program Files, node_modules) are skipped, and the "
-                           "sweep stops after 40000 files or 45s.",
+                           + ("(Windows, Program Files, node_modules) are skipped, and the "
+                              if IS_WINDOWS else
+                              "(/proc, /sys, /snap, node_modules) are skipped, and the ")
+                           + "sweep stops after 40000 files or 45s.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2386,14 +2416,20 @@ SYSTEM = ("You are the friendly assistant living on the user's "
           "edit_file and the user will be asked to approve it (ALLOW FOR THIS "
           "CONV, ALLOW ONCE or DENY). So do not refuse or guess - just try the "
           "real path, and if the access is denied, respect it and ask the user "
-          "what to do instead. Prefer grep with a path such as "
-          "'C:\\\\Users' or 'C:\\\\' to look across the whole PC instead of "
-          "guessing where a file might be. When "
+          "what to do instead. "
+          + ("Prefer grep with a path such as 'C:\\\\Users' or 'C:\\\\' to look "
+             "across the whole PC instead of guessing where a file might be. "
+             if IS_WINDOWS else
+             "Prefer grep with a path such as '/home' or '/' to look across the "
+             "whole machine instead of guessing where a file might be. Note "
+             "that every path on this machine is POSIX: a backslash is an "
+             "ordinary character in a file name, not a separator. ")
+          + "When "
           "you are not sure about something, are asked for recent/current "
           "information, or want to double-check a fact, you may search the web "
           "(web_search) and read pages (web_fetch) to document yourself. When "
           "the user asks you to build, test, install or inspect something on "
-          "the PC, you can run shell commands (run_command) and read their "
+          "the PC, you can run shell commands (shell) and read their "
           "output to actually do it instead of only describing it. If you need "
           "a choice, a password or a confirmation from the user, ask them "
           "politely with ask_user instead of assuming. For longer tasks use "
@@ -3059,6 +3095,92 @@ def _test_model_key(entry=None, base=None, model=None, key_ref=None):
     return out
 
 
+def _dedupe_by_id(models):
+    """One entry per id, keeping the one that can actually answer.
+
+    Two rows sharing an id is not a cosmetic problem: everything that looks a
+    model up by id - the selector, the settings dialog, the ctx meter - takes
+    the first match, so a dead duplicate silently wins over a working one. It
+    happens whenever a default or discovered entry lands on an id the file
+    already had, which is exactly what a folder copied from another machine
+    produces. Settings the dead copy was missing are carried over, so
+    repairing an entry does not quietly reset what the user configured.
+    """
+    order, byid = [], {}
+    for m in models:
+        mid = m.get("id")
+        if not mid:
+            continue
+        if mid not in byid:
+            order.append(mid)
+            byid[mid] = m
+            continue
+        keep, drop = byid[mid], m
+        if _model_can_answer(drop, [drop]) and not _model_can_answer(keep, [keep]):
+            keep, drop = drop, keep
+        for k, v in drop.items():
+            if v not in (None, "") and k not in keep:
+                keep[k] = v
+        byid[mid] = keep
+    return [byid[mid] for mid in order]
+
+
+def _model_can_answer(mid, models):
+    """True when this entry could actually serve a message.
+
+    A hosted model always can - it is a URL and a key. A local one is a file
+    on this disk, and a path that does not exist here means the model is
+    gone, not slow."""
+    entry = next((m for m in models if m.get("id") == mid), None)
+    if not entry:
+        return False
+    if entry.get("type", "local") != "local":
+        return True
+    path = str(entry.get("path") or "")
+    return bool(path) and os.path.exists(path)
+
+
+def _drop_foreign_local_models(models):
+    """Forget local models whose file is gone, and cannot come back.
+
+    models.json is written by the app, so a folder that travels - copied,
+    unzipped, moved to another machine or another operating system - carries
+    absolute paths from the machine it left. "C:\\Users\\someone\\model.gguf"
+    is not a missing file on Linux, it is a path to somewhere that does not
+    exist and never will here, and keeping it only produces a permanently
+    "(missing)" row that shadows the real model. An entry whose *filename* is
+    still sitting in BONSAI_DIR is kept: that one can be pointed back at the
+    file it names, and the user may well have moved the weights rather than
+    lost them.
+    """
+    here = {n.lower() for n in os.listdir(BONSAI_DIR)} \
+        if os.path.isdir(BONSAI_DIR) else set()
+    for folder in (MODELS_DIR,):
+        if os.path.isdir(folder):
+            here |= {n.lower() for n in os.listdir(folder)}
+    kept = []
+    for m in models:
+        if m.get("type", "local") != "local" or not m.get("path"):
+            kept.append(m)
+            continue
+        path = str(m.get("path") or "")
+        if os.path.exists(path):
+            kept.append(m)
+            continue
+        if os.path.basename(path).lower() in here:
+            kept.append(m)  # the file is here, the recorded path just is not
+            continue
+        if m.get("id") == "bonsai2" and os.path.basename(
+                _default_model_entry()["path"]).lower() in here:
+            m["path"] = _default_model_entry()["path"]
+            m["mmproj"] = _default_model_entry()["mmproj"]
+            kept.append(m)
+            continue
+        print("dropping local model '%s' - %s does not exist on this machine"
+              % (m.get("id"), path), flush=True)
+    return kept
+
+
 def _load_models():
     global _MODELS, _ACTIVE_MODEL
     data = None
@@ -3079,6 +3201,7 @@ def _load_models():
         models = [m for m in (data.get("models") or [])
                   if isinstance(m, dict) and m.get("id")]
         active = data.get("active")
+    models = _drop_foreign_local_models(models)
     default = _default_model_entry()
     if not any(m.get("type", "local") == "local"
                and os.path.normcase(m.get("path") or "") == os.path.normcase(default["path"])
@@ -3087,10 +3210,23 @@ def _load_models():
     models.extend(_discover_models(models))
     for m in models:
         _pair_mmproj(m)
+    models = _dedupe_by_id(models)
     ids = [m["id"] for m in models]
     with _MODELS_LOCK:
         _MODELS = models
-        _ACTIVE_MODEL = active if active in ids else models[0]["id"]
+        # A local model whose file is not there cannot answer a single message,
+        # so it must not be the one selected at startup. This used to pick it
+        # anyway: a folder copied from another machine keeps its models.json
+        # paths, the copy on this machine does not exist, and the id was still
+        # in the list - so a Linux user who unzipped the project got a
+        # permanently "(missing)" model chosen for them and a duplicate of the
+        # real one sitting next to it.
+        if active in ids and _model_can_answer(active, models):
+            _ACTIVE_MODEL = active
+        else:
+            _ACTIVE_MODEL = next(
+                (m["id"] for m in models if _model_can_answer(m["id"], models)),
+                models[0]["id"] if models else None)
     _apply_model(_active_model())
 
 
@@ -3283,6 +3419,29 @@ def _add_model_folder(folder):
     _save_models()
     return {"ok": True, "added": added, "skipped": skipped,
             "folder": folder, **_public_models()}
+
+
+def _tk_picker_problem():
+    """Why the file browser cannot open, or None when it can.
+
+    Every picker here runs Tk in a child process, and that child dies quietly:
+    no display, or no tkinter in the interpreter, and it prints nothing at all
+    back. The caller saw an empty string, returned None, and the UI reported
+    "cancelled" - so a Linux user with no python3-tk, or on a headless box,
+    clicked browse and nothing whatsoever happened. Saying so lets the UI fall
+    back to typing the path."""
+    if not IS_LINUX:
+        return None
+    if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        return ("this machine has no graphical display, so a file browser "
+                "cannot open - type the path instead")
+    probe = subprocess.run(
+        [sys.executable, "-c", "import tkinter"],
+        capture_output=True, text=True, timeout=30)
+    if probe.returncode != 0:
+        return ("this Python has no tkinter, so a file browser cannot open - "
+                "install it (sudo apt install python3-tk) or type the path")
+    return None
 
 
 def _run_tk_picker(code):
@@ -4443,7 +4602,9 @@ WINDOW_ACTION_TOOL = {
                 },
                 "process": {
                     "type": "string",
-                    "description": "Process name (e.g. 'notepad.exe') to match."
+                    "description": "Process name to match (e.g. "
+                                   + ("'notepad.exe'" if IS_WINDOWS else "'firefox'")
+                                   + ")."
                 },
                 "pid": {
                     "type": "integer",
@@ -4581,9 +4742,10 @@ TTS_SPEAK_TOOL = {
     "function": {
         "name": "tts_speak",
         "description": "Speak text aloud using the local neural Piper TTS "
-                       "engine (no cloud, no Windows voices). Also saves the "
-                       "speech as a WAV file in the workspace. Use this to give "
-                       "the user spoken feedback, alerts or TTS output.",
+                       "engine (no cloud, no built-in system voices). Also "
+                       "saves the speech as a WAV file in the workspace. Use "
+                       "this to give the user spoken feedback, alerts or TTS "
+                       "output.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -5749,31 +5911,50 @@ def public_result(result):
 
 
 def _linux_capture_png(bbox=None):
-    """Capture the full screen on Linux via scrot / ImageMagick (X11)."""
+    """Capture the full screen on Linux via a command-line grabber.
+
+    Tries each tool that can do it rather than assuming X11. scrot and
+    ImageMagick's import both need a real X display and are simply blind on a
+    Wayland session, which is the default on current GNOME and KDE; grim is
+    the Wayland one. Trying them in order means a Wayland user with grim
+    installed gets screenshots instead of an error that says "X11 session
+    required", and a user with neither still gets told what to install."""
     from PIL import Image
-    exe = shutil.which("scrot") or shutil.which("import")
-    if not exe:
-        raise RuntimeError("screenshot capture failed on Linux: install scrot "
-                           "or imagemagick (import) - sudo apt install scrot "
-                           "(X11 session required)")
     import tempfile
-    tmp = tempfile.mktemp(suffix=".png")
-    try:
-        if os.path.basename(exe) == "scrot":
-            subprocess.run([exe, "-z", tmp], check=True, timeout=30,
-                           creationflags=CREATE_NO_WINDOW)
-        else:
-            subprocess.run([exe, "-window", "root", tmp], check=True,
-                           timeout=30, creationflags=CREATE_NO_WINDOW)
-        img = Image.open(tmp)
-        if bbox:
-            img = img.crop(bbox)
-        return img
-    finally:
-        try:
-            os.remove(tmp)
-        except Exception:
-            pass
+    wanted = (("scrot", [lambda p: ["-z", p]]),
+              ("grim", [lambda p: [p]]),
+              ("import", [lambda p: ["-window", "root", p]]),
+              ("gnome-screenshot", [lambda p: ["-f", p]]))
+    tried = []
+    for name, forms in wanted:
+        exe = shutil.which(name)
+        if not exe:
+            continue
+        tried.append(name)
+        for build in forms:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                tmp = os.path.join(tmpdir, "shot.png")
+                try:
+                    subprocess.run([exe] + build(tmp), check=True, timeout=30,
+                                   stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL,
+                                   creationflags=CREATE_NO_WINDOW)
+                except Exception:
+                    continue
+                if not os.path.exists(tmp):
+                    continue
+                try:
+                    img = Image.open(tmp).convert("RGB")
+                except Exception:
+                    continue
+                if bbox:
+                    img = img.crop(bbox)
+                return img
+    raise RuntimeError(
+        "screenshot capture failed on Linux: none of the screen-capture tools "
+        "worked (tried: %s). Install one - sudo apt install scrot for an X11 "
+        "session, or sudo apt install grim for Wayland"
+        % (", ".join(tried) if tried else "none of them are installed"))
 
 
 def _take_screenshot(args):
@@ -5833,11 +6014,35 @@ def _take_screenshot(args):
     return info
 
 
+def _pyautogui_error(exc):
+    """Why mouse/keyboard control is unavailable, in words that help.
+
+    "pyautogui is not installed" was the whole message even when it was
+    installed and simply could not work: on Linux pyautogui drives the
+    pointer through Xlib, and importing it opens the display, so on a Wayland
+    session (or with no DISPLAY at all) the import raises and the tool blamed
+    a package the user had in fact installed."""
+    detail = str(exc).strip() or exc.__class__.__name__
+    if IS_LINUX:
+        if "display" in detail.lower() or "Xlib" in detail \
+                or "connection" in detail.lower():
+            return ("mouse and keyboard control needs a display: pyautogui "
+                    "drives the pointer over X11 and cannot work on a bare "
+                    "Wayland session (%s). On X11 install python3-xlib; on "
+                    "Wayland log in to an X11 session, or use ydotool - a "
+                    "screen reader or the keyboard tool may work better"
+                    % detail)
+        return ("mouse and keyboard control is unavailable (%s). On Linux "
+                "pyautogui also needs python3-xlib and a running X11 display"
+                % detail)
+    return "pyautogui is not installed: %s" % detail
+
+
 def _control_input(args):
     try:
         import pyautogui
     except Exception as exc:
-        return {"error": f"pyautogui is not installed: {exc}"}
+        return {"error": _pyautogui_error(exc)}
     action = str(args.get("action") or "click").strip()
     try:
         if action == "move":
@@ -5900,12 +6105,33 @@ def _proc_running(name):
                              capture_output=True, text=True, timeout=15,
                              creationflags=CREATE_NO_WINDOW).stdout
         return any(name in line.lower() for line in out.splitlines())
-    try:
-        out = subprocess.run(["pgrep", "-if", name], capture_output=True,
-                             text=True, timeout=10).stdout
-        return bool(out.strip())
-    except Exception:
-        return False
+    # The model is told to look for "chrome.exe" because that is what a
+    # process is called on Windows, and pgrep matches the whole command line
+    # on Linux - where the name is "chrome" and ".exe" is not a suffix that
+    # exists. So the documented example never matched anything and every
+    # wait_for(kind="process") quietly timed out. Try the name as given, then
+    # without an .exe suffix, and match the bare name rather than a substring
+    # of the entire command line (which otherwise matches any editor with the
+    # file open).
+    cands = [name]
+    if name.endswith(".exe"):
+        cands.append(name[:-4])
+    for cand in cands:
+        try:
+            out = subprocess.run(["pgrep", "-if", cand], capture_output=True,
+                                 text=True, timeout=10).stdout
+        except Exception:
+            return False
+        if out.strip():
+            return True
+        try:
+            out = subprocess.run(["pgrep", "-ixf", cand], capture_output=True,
+                                 text=True, timeout=10).stdout
+        except Exception:
+            return False
+        if out.strip():
+            return True
+    return False
 
 
 def _url_status(url, timeout=8):
@@ -5924,19 +6150,55 @@ def _ocr_available():
         return False
 
 
-def _full_screen_bbox():
+def _screen_size():
+    """The real size of the desktop, in pixels.
+
+    Order matters: the cheapest thing that cannot lie wins, and the Windows
+    call is last because ctypes.windll does not exist off Windows and used to
+    drop straight through to a hardcoded 1920x1080. That number is not a
+    fallback, it is a false statement - on a 2560x1440 or HiDPI screen the OCR
+    tools cropped a region that does not exist and reported a confident wrong
+    answer instead of admitting they could not see the screen."""
     try:
         from PIL import ImageGrab
-        im = ImageGrab.grab(all_screens=True)
-        return (0, 0, im.size[0], im.size[1])
+        im = ImageGrab.grab()
+        if im.size[0] > 1 and im.size[1] > 1:
+            return (int(im.size[0]), int(im.size[1]))
     except Exception:
         pass
     try:
-        import ctypes
-        user32 = ctypes.windll.user32  # noqa: F841
-        return (0, 0, user32.GetSystemMetrics(78), user32.GetSystemMetrics(79))
+        import pyautogui
+        w, h = pyautogui.size()
+        if w and h:
+            return (int(w), int(h))
     except Exception:
-        return (0, 0, 1920, 1080)
+        pass
+    if IS_LINUX:
+        # "Screen 0: minimum 8 x 8, current 3840 x 2160, ..." - the current
+        # size is the whole virtual desktop, so it is right for multi-monitor
+        # too. xrandr is present on both X11 and XWayland sessions.
+        try:
+            out = subprocess.run(["xrandr", "--current"], capture_output=True,
+                                 text=True, timeout=6).stdout
+            hit = re.search(r"current\s+(\d+)\s*x\s*(\d+)", out)
+            if hit and int(hit.group(1)) > 1:
+                return (int(hit.group(1)), int(hit.group(2)))
+        except Exception:
+            pass
+    if IS_WINDOWS:
+        try:
+            import ctypes
+            user32 = ctypes.windll.user32  # noqa: F841
+            return (int(user32.GetSystemMetrics(78)),
+                    int(user32.GetSystemMetrics(79)))
+        except Exception:
+            pass
+    return (1920, 1080)
+
+
+def _full_screen_bbox():
+    w, h = _screen_size()
+    return (0, 0, w, h)
 
 
 def _wait_for(args):
@@ -6211,17 +6473,35 @@ def _clipboard_image():
         except Exception:
             return None
     if IS_LINUX:
-        exe = shutil.which("xclip")
-        if exe:
+        # Three tools, three desktops. xclip is the X11 one, xsel is what a
+        # minimal install usually has instead, and wl-paste is the only one of
+        # the three that works on a Wayland session - which is the default on
+        # GNOME 42+ and KDE Plasma 6, where xclip is frequently not installed
+        # at all. Looking only for xclip meant "paste the image I just copied"
+        # silently returned nothing on exactly the desktops that need it.
+        # The return code is checked too: without it a failing xclip and an
+        # empty clipboard are the same silence.
+        import io as _io
+        attempts = [
+            ["xclip", "-selection", "clipboard", "-t", "image/png", "-o"],
+            ["xsel", "--clipboard", "--output", "--type", "image/png"],
+            ["wl-paste", "--type", "image/png", "--no-newline"],
+        ]
+        for argv in attempts:
+            exe = shutil.which(argv[0])
+            if not exe:
+                continue
             try:
-                out = subprocess.run([exe, "-selection", "clipboard",
-                                      "-t", "image/png", "-o"],
-                                     capture_output=True, timeout=5)
-                if out.stdout:
-                    import io
-                    return Image.open(io.BytesIO(out.stdout)).convert("RGB")
+                out = subprocess.run([exe] + argv[1:], capture_output=True,
+                                     timeout=5)
             except Exception:
-                pass
+                continue
+            if out.returncode != 0 or not out.stdout:
+                continue
+            try:
+                return Image.open(_io.BytesIO(out.stdout)).convert("RGB")
+            except Exception:
+                continue
     return None
 
 
@@ -6264,7 +6544,10 @@ def _click_text(args):
     clicks = 2 if args.get("double_click") else 1
     if not _ocr_available():
         return {"error": "click_text needs OCR - install pytesseract and the "
-                         "Tesseract engine (winget install UB-Mannheim.TesseractOCR)"}
+                         "Tesseract engine ("
+                         + ("winget install UB-Mannheim.TesseractOCR"
+                            if IS_WINDOWS else "sudo apt install tesseract-ocr")
+                         + ")"}
     offset = (0, 0)
     scope = "screen"
     if win:
@@ -6378,7 +6661,7 @@ def _click_text(args):
     try:
         import pyautogui
     except Exception as exc:
-        return {"error": "pyautogui is not installed: %s" % exc}
+        return {"error": _pyautogui_error(exc)}
     try:
         pyautogui.moveTo(cx, cy, duration=0.15)
         pyautogui.click(clicks=clicks, button=button)
@@ -8635,7 +8918,7 @@ def _archive(args):
             else:
                 return {"error": "only zip / tar / tar.gz / tgz are supported "
                                  "directly - for other formats unpack with a "
-                                 "run_command (e.g. 7z)"}
+                                 "shell command (e.g. 7z)"}
         except Exception as exc:
             return {"error": f"extract failed: {exc}"}
         return {"result": "ok", "extracted_to": dest.replace("\\", "/"),
@@ -8689,6 +8972,14 @@ def _piper_voices():
 
 
 def _play_wav(path):
+    """Play a wav file. Returns the duration when we handled it, or None.
+
+    None used to mean both "a player took it" and "nothing on this machine
+    can play audio at all", and the caller reported success either way - so a
+    Linux box with no PulseAudio, no ALSA and no paplay/aplay/ffplay said the
+    words out loud in a result the model and the user both believed. The
+    caller now checks which one it got.
+    """
     try:
         import numpy as np
         import sounddevice as sd
@@ -8701,12 +8992,14 @@ def _play_wav(path):
         sd.play(data, sr)  # non-blocking; keeps playing in the background
         return round(n / sr, 2)
     except Exception:
-        try:
-            import winsound
-            winsound.PlaySound(path, winsound.SND_FILENAME | winsound.SND_ASYNC)
-            return None
-        except Exception:
-            pass
+        if IS_WINDOWS:
+            try:
+                import winsound
+                winsound.PlaySound(path, winsound.SND_FILENAME
+                                   | winsound.SND_ASYNC)
+                return None
+            except Exception:
+                pass
         for player in ("paplay", "aplay", "ffplay"):
             exe = shutil.which(player)
             if not exe:
@@ -8722,7 +9015,7 @@ def _play_wav(path):
                 return None
             except Exception:
                 continue
-        return None
+        return False
 
 
 def _tts_speak(args):
@@ -8766,11 +9059,20 @@ def _tts_speak(args):
             duration = round(wv.getnframes() / max(1, wv.getframerate()), 2)
     except Exception:
         pass
-    _play_wav(wav_path)
-    return {"result": "ok", "voice": voice, "text": text[:200],
-            "wav": wav_path.replace("\\", "/"),
-            "bytes": os.path.getsize(wav_path),
-            "duration_seconds": duration}
+    played = _play_wav(wav_path)
+    out = {"result": "ok", "voice": voice, "text": text[:200],
+           "wav": wav_path.replace("\\", "/"),
+           "bytes": os.path.getsize(wav_path),
+           "duration_seconds": duration,
+           "played": played is not False}
+    if played is False:
+        # Say so. The audio file is real and on disk, so the honest result is
+        # "written but nobody could play it", with the way out.
+        out["warning"] = (
+            "the speech was generated and saved, but nothing on this machine "
+            "could play it - no sounddevice, and no paplay, aplay or ffplay. "
+            "On Linux install one: sudo apt install pulseaudio-utils")
+    return out
 
 
 # ---------------- Window management ----------------
@@ -12201,11 +12503,28 @@ function afterAdd(j, what) {
 function addModelPick(what) {
   const btn = document.getElementById('addmodelbtn');
   if (btn) { btn.disabled = true; btn.textContent = '...'; }
-  fetch('/api/pick_model', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ what: what }) })
-    .then(function (r) { return r.json(); })
-    .then(function (j) { afterAdd(j, what); })
-    .catch(function () { alert('Could not open the file browser'); })
+  pickModelPost(what, null)
     .then(function () { if (btn) { btn.disabled = false; btn.textContent = '+'; } });
+}
+/* The native browser cannot open everywhere: no python3-tk, or no display at
+   all on a headless Linux box. The server says so plainly instead of reporting
+   a bare "cancelled", and this asks for the path by hand rather than leaving
+   the button to do nothing at all. */
+function pickModelPost(what, path) {
+  const body = { what: what };
+  if (path) body.path = path;
+  return fetch('/api/pick_model', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+    .then(function (r) { return r.json(); })
+    .then(function (j) {
+      if (j && j.no_browser) {
+        const hint = what === 'folder' ? 'folder' : 'full path to the .gguf file';
+        const typed = window.prompt(j.error + '\\n\\nEnter the ' + hint + ':', '');
+        if (typed && typed.trim()) return pickModelPost(what, typed.trim());
+        return null;
+      }
+      return afterAdd(j, what);
+    })
+    .catch(function () { alert('Could not open the file browser'); });
 }
 /* Pasting a model's web page address (openrouter.ai/qwen/qwen3.8-27b:free) is the
    obvious thing to try, but the API wants the base URL and the model id as two
@@ -14639,11 +14958,28 @@ function afterAdd(j, what) {
 function addModelPick(what) {
   const btn = document.getElementById('addmodelbtn');
   if (btn) { btn.disabled = true; btn.textContent = '...'; }
-  fetch('/api/pick_model', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ what: what }) })
-    .then(function (r) { return r.json(); })
-    .then(function (j) { afterAdd(j, what); })
-    .catch(function () { alert('Could not open the file browser'); })
+  pickModelPost(what, null)
     .then(function () { if (btn) { btn.disabled = false; btn.textContent = '+'; } });
+}
+/* The native browser cannot open everywhere: no python3-tk, or no display at
+   all on a headless Linux box. The server says so plainly instead of reporting
+   a bare "cancelled", and this asks for the path by hand rather than leaving
+   the button to do nothing at all. */
+function pickModelPost(what, path) {
+  const body = { what: what };
+  if (path) body.path = path;
+  return fetch('/api/pick_model', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+    .then(function (r) { return r.json(); })
+    .then(function (j) {
+      if (j && j.no_browser) {
+        const hint = what === 'folder' ? 'folder' : 'full path to the .gguf file';
+        const typed = window.prompt(j.error + '\\n\\nEnter the ' + hint + ':', '');
+        if (typed && typed.trim()) return pickModelPost(what, typed.trim());
+        return null;
+      }
+      return afterAdd(j, what);
+    })
+    .catch(function () { alert('Could not open the file browser'); });
 }
 /* Pasting a model's web page address (openrouter.ai/qwen/qwen3.8-27b:free) is the
    obvious thing to try, but the API wants the base URL and the model id as two
@@ -16421,20 +16757,37 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if path == "/api/pick_model":
                 what = str(body.get("what") or "file").strip().lower()
+                # A path typed into the fallback is treated exactly like one
+                # chosen in a dialog, so the fallback is a real second route
+                # rather than a dead end.
+                typed = str(body.get("path") or "").strip()
                 if what == "mmproj":
-                    chosen = _pick_vision_file()
-                    if not chosen:
+                    if not typed:
+                        blocker = _tk_picker_problem()
+                        if blocker:
+                            self._send(200, json.dumps(
+                                {"no_browser": True, "error": blocker}))
+                            return
+                        typed = _pick_vision_file()
+                    if not typed:
                         self._send(200, json.dumps({"cancelled": True}))
                         return
                     self._send(200, json.dumps(
-                        _set_model_mmproj(str(body.get("id") or ""), chosen),
+                        _set_model_mmproj(str(body.get("id") or ""), typed),
                         default=str))
                     return
-                chosen = (_pick_model_folder() if what == "folder"
-                          else _pick_model_file())
-                if not chosen:
+                if not typed:
+                    blocker = _tk_picker_problem()
+                    if blocker:
+                        self._send(200, json.dumps(
+                            {"no_browser": True, "error": blocker}))
+                        return
+                    typed = (_pick_model_folder() if what == "folder"
+                             else _pick_model_file())
+                if not typed:
                     self._send(200, json.dumps({"cancelled": True}))
                     return
+                chosen = typed
                 if what == "folder":
                     res = _add_model_folder(chosen)
                 else:
