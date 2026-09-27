@@ -5185,11 +5185,154 @@ def _ctx_usage(raw_messages, mode=MODE_BUILD, quick=False):
                                  ("remote" if entry and entry.get("type") == "api"
                                   else "model-not-loaded"))
     base = {"used": used, "fixed": fixed, "own": own, "total": total,
-            "exact": exact, "mode": mode, "images": images, "why": why}
+            "exact": exact, "mode": mode, "images": images, "why": why,
+            # the thresholds the console uses to decide when to compact, sent
+            # from here so the two can never drift apart
+            "fold_at": int(COMPACT_AT * 100), "fold_min": COMPACT_MIN_TOKENS,
+            "fold_keep": COMPACT_KEEP}
     if total and used > total:
         return dict(base, ok=False, error="this conversation no longer fits in "
                      "the context window - start a new chat or raise ctx")
     return dict(base, ok=True, pct=round(used * 100.0 / total, 1) if total else None)
+
+
+# --------------------------------------------------------------- compaction
+# A long chat eventually stops fitting in the context window. The old answer
+# was "start a new chat", which throws the whole conversation away. The better
+# one is what a coding agent does: keep the recent part word for word and
+# replace the older part with a summary, so the model still knows what it was
+# asked to do without re-reading every turn.
+#
+# Nothing is deleted. The transcript keeps every message, the fold point is
+# drawn in the chat, and clearing the summary puts the full history back in
+# front of the model. So compaction costs context, never content.
+
+# How much of the tail is never folded. These stay verbatim so the model has
+# the real recent turns to work from, not a summary of them.
+COMPACT_KEEP = 6
+# Fold once the conversation has taken this much of the window.
+COMPACT_AT = 0.80
+# And never bother while the whole thing is this small - a summary of a
+# short chat is longer than the chat.
+COMPACT_MIN_TOKENS = 6000
+
+COMPACT_SYSTEM = (
+    "You are compacting your own working memory. Summarise the conversation "
+    "below so that you can keep working without re-reading it.\n"
+    "Write plain prose under these headings, and keep it under 700 words:\n"
+    "GOAL - what the user ultimately wants.\n"
+    "DECIDED - choices already made, and constraints the user set.\n"
+    "STATE - what exists now: files written, commands that worked or failed, "
+    "and the exact errors still outstanding.\n"
+    "OPEN - the next steps, and anything the user asked for that is not done "
+    "yet.\n"
+    "Be specific. Keep file paths, names, identifiers, versions and error "
+    "text verbatim - those are what you will need later. Drop the pleasantries "
+    "and the restating. Do not add advice, and do not ask questions. Your only "
+    "job is to record what happened."
+)
+
+
+def _compact_fold_index(messages):
+    """Where the summary ends and the verbatim tail begins.
+
+    Always a real message boundary, and never so close to the end that there is
+    nothing worth summarising.
+    """
+    n = len(messages or [])
+    if n <= COMPACT_KEEP + 1:
+        return 0
+    return n - COMPACT_KEEP
+
+
+def _compact_transcript(messages):
+    """The dropped turns, rendered as something a model can actually read."""
+    out = []
+    for m in messages or []:
+        role = str(m.get("role") or "")
+        content = m.get("content")
+        if isinstance(content, list):
+            bits = []
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") == "text" and part.get("text"):
+                    bits.append(str(part["text"]))
+                elif part.get("type") == "image_url":
+                    bits.append("[an image was attached]")
+            content = " ".join(bits)
+        text = str(content or "").strip()
+        if role == "tool":
+            # tool output is the bulkiest and least reusable part; keep the
+            # shape of it, not the payload
+            text = "[tool result] " + text[:600]
+        if not text:
+            continue
+        name = {"user": "User", "assistant": "Assistant",
+                "tool": "Tool", "system": "System"}.get(role, role)
+        out.append("%s: %s" % (name, text[:4000]))
+    return "\n\n".join(out)
+
+
+def _compact_fallback(transcript):
+    """If the model cannot be asked, keep something usable rather than nothing.
+
+    Deliberately not a real summary: just the head and tail of the dropped
+    turns, so the model still has the request and the most recent exchange.
+    """
+    if not transcript:
+        return ""
+    if len(transcript) <= 2400:
+        return transcript
+    return transcript[:1600] + "\n\n[...]\n\n" + transcript[-800:]
+
+
+def _summary_message(summary):
+    """The one message that stands in for everything that was folded away.
+
+    Built here rather than in the page so there is a single copy of the
+    wording: the console puts this exact object at the head of the list.
+    """
+    return {"role": "user", "content":
+            "This is a summary of the earlier part of this conversation, which "
+            "was compacted to fit the context window. Treat it as what really "
+            "happened, and carry on from it:\n\n" + str(summary or "")}
+
+
+def _compact_chat(messages, mode=MODE_BUILD):
+    """Summarise the older turns of a conversation.
+
+    Returns ok=False with a reason rather than raising, so a failure to
+    summarise is a quiet no-op and never a lost turn.
+    """
+    msgs = [m for m in (messages or []) if isinstance(m, dict)]
+    idx = _compact_fold_index(msgs)
+    if idx <= 0:
+        return {"ok": False, "error": "there is not enough here to compact",
+                "folded": 0}
+    dropped = msgs[:idx]
+    transcript = _compact_transcript(dropped)
+    if not transcript.strip():
+        return {"ok": False, "error": "nothing to compact", "folded": 0}
+
+    summary = ""
+    try:
+        ask = [{"role": "system", "content": COMPACT_SYSTEM},
+               {"role": "user", "content":
+                "Conversation so far:\n\n" + transcript}]
+        got = _bonsai_chat(ask, [])
+        summary = str(got.get("content") or "").strip()
+    except Exception:
+        # a provider that is down, or a model that refuses, must not stop the
+        # user compacting - fall back to the extractive version
+        summary = ""
+    if not summary:
+        summary = _compact_fallback(transcript)
+        via = "fallback"
+    else:
+        via = "model"
+    return {"ok": True, "summary": summary, "message": _summary_message(summary),
+            "folded": len(dropped), "kept": len(msgs) - idx, "via": via}
 
 
 def parse_arguments(raw):
@@ -9868,6 +10011,10 @@ PAGE = """<!doctype html>
   .msgrow.user.queued .bubble { border-color: var(--warn); opacity: .92; }
   .qbadge { display: inline-block; font-size: 9.5px; letter-spacing: 1.1px; color: var(--warn); border: 1px dashed var(--warn); border-radius: 999px; padding: 2px 9px; margin-bottom: 6px; animation: qpulse 1.6s ease-in-out infinite; }
   @keyframes qpulse { 0%, 100% { opacity: .55; } 50% { opacity: 1; } }
+  .foldnote { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 10px 0 14px; padding: 7px 10px; border: 1px dashed var(--bd2); border-left: 2px solid var(--acc); border-radius: 6px; background: var(--bg3); }
+  .foldnote .foldb { flex: 1 1 240px; font-size: 10.5px; font-family: Consolas, monospace; color: var(--dim); letter-spacing: .3px; }
+  .foldnote .foldbtn { font-family: Consolas, monospace; font-size: 10px; letter-spacing: .6px; color: var(--acc); background: transparent; border: 1px solid var(--bd2); border-radius: 5px; padding: 3px 8px; cursor: pointer; }
+  .foldnote .foldbtn:hover { border-color: var(--acc); }
   .scopebtn { width: 100%; text-align: left; font-family: Consolas, monospace; font-size: 11px; letter-spacing: 1px; color: var(--acc); background: var(--bg3); border: 1px solid var(--bd2); border-radius: 6px; padding: 6px 8px; cursor: pointer; }
   .scopebtn:hover { border-color: var(--acc); }
   .scopebtn.sc-system { color: var(--err); border-color: var(--err); }
@@ -10274,13 +10421,106 @@ function renderConv() {
   const conv = convEl();
   conv.innerHTML = '';
   if (cur) {
-    cur.messages.forEach(function (m) {
+    const at = (cur.summary && cur.summary_at) ? cur.summary_at : -1;
+    cur.messages.forEach(function (m, i) {
+      if (i === at) addFold(cur);
       if (m.role === 'user') addUser(m.content, !!m.queued);
       else if (m.role === 'assistant') addAsst(m.content, m.calls || [], m.reason, m.stats, m.parts);
     });
+    if (at > cur.messages.length) addFold(cur);
   }
   busy = false;
   requeuePending();
+}
+// A long conversation eventually stops fitting in the context window, and the
+// old answer - "start a new chat" - throws the whole thing away. Instead the
+// older turns are replaced by a summary and the recent ones are kept word for
+// word, which is the same trade a coding agent makes when it runs out of room.
+// Nothing is deleted: the transcript still shows every message, and the button
+// in the divider puts the full history back in front of the model.
+function addFold(chat) {
+  const conv = convEl();
+  const row = document.createElement('div');
+  row.className = 'foldnote';
+  const n = chat.summary_at || 0;
+  const how = chat.summary_via === 'fallback' ? ' (plain extract - the model would not answer)' : '';
+  const b = document.createElement('div');
+  b.className = 'foldb';
+  b.textContent = n + ' earlier message' + (n === 1 ? '' : 's') + ' summarised' + how
+    + ' \u00b7 still shown above, just not sent to the model';
+  const btn = document.createElement('button');
+  btn.className = 'foldbtn';
+  btn.type = 'button';
+  btn.textContent = 'use the full history again';
+  btn.onclick = function () { undoFold(chat); };
+  row.appendChild(b);
+  row.appendChild(btn);
+  conv.appendChild(row);
+}
+function undoFold(chat) {
+  if (!chat || !chat.summary) return;
+  chat.summary = null;
+  chat.summary_at = null;
+  chat.summary_via = null;
+  chat.summary_msg = null;
+  save();
+  renderConv();
+  refreshCtx();
+}
+function pendingList(chat) {
+  return ((chat && chat.messages) || []).filter(function (m) { return !m.queued; });
+}
+// What actually goes to the model. The meter and the request both come through
+// here, so the number on the bar is the number that gets sent.
+function wireFor(chat) {
+  const msgs = pendingList(chat);
+  if (!chat || !chat.summary) return msgs;
+  const at = Math.max(0, Math.min(chat.summary_at || 0, msgs.length));
+  /* the wording comes from the server, so there is one copy of it */
+  const head = chat.summary_msg || { role: 'user', content: chat.summary };
+  return [head].concat(msgs.slice(at));
+}
+let folding = false;
+function maybeFold(quick) {
+  // never mid-word, never mid-turn, and never twice for the same chat
+  if (quick || folding || busy) return;
+  const j = ctxLast;
+  if (!j || !j.ok || !j.total) return;
+  if (!cur || cur.summary) return;
+  if (j.own < (j.fold_min || 0)) return;
+  if (j.used * 100 / j.total < (j.fold_at || 101)) return;
+  const msgs = pendingList(cur);
+  /* below this the summary would be longer than the turns it replaces */
+  if (msgs.length <= (j.fold_keep || 6) + 1) return;
+  foldChat(cur, msgs);
+}
+async function foldChat(chat, msgs) {
+  folding = true;
+  addThinking();
+  setBonsaiState('thinking');
+  if (thinkingRow && thinkingRow.think) {
+    thinkingRow.think.innerHTML = '<span class="dots"><i></i><i></i><i></i></span> Summarising the earlier turns';
+  }
+  try {
+    const r = await fetch('/api/compact', { method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ messages: msgs, mode: chatMode }) });
+    const j = await r.json();
+    doneThinking(null);
+    if (!j || !j.ok || !j.summary) return;
+    chat.summary = j.summary;
+    chat.summary_at = j.folded;
+    chat.summary_via = j.via;
+    chat.summary_msg = j.message;
+    save();
+    renderConv();
+    refreshCtx();
+  } catch (e) {
+    doneThinking('Could not compact: ' + (e && e.message ? e.message : 'unknown error'));
+  } finally {
+    folding = false;
+    setBonsaiState('idle');
+  }
 }
 function esc(s) { return (s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
 function fmt(s) {
@@ -10567,11 +10807,13 @@ function ctxPaint() {
   }
 }
 async function refreshCtx(quick) {
-  const msgs = (cur && cur.messages) ? cur.messages.slice() : [];
-  /* Count what is still in the box. The meter's own tooltip promises the
-     number is right "before you type", but the draft was never included, so
-     the bar only ever moved after a turn had already been sent - you found
-     out a message was too long once it was too late to shorten it. */
+  /* Count what is actually going to be sent - queued messages and, once the
+     chat has been compacted, everything above the fold. The meter's own
+     tooltip promises the number is right "before you type", but the draft was
+     never included, so the bar only ever moved after a turn had already been
+     sent - you found out a message was too long once it was too late to
+     shorten it. */
+  const msgs = (cur && cur.messages) ? wireFor(cur).slice() : [];
   try {
     const draft = (typeof buildUserMsg === 'function') ? buildUserMsg() : null;
     if (draft) msgs.push({ role: 'user', content: draft });
@@ -10583,6 +10825,7 @@ async function refreshCtx(quick) {
     ctxLast = await r.json();
   } catch (e) { ctxLast = { ok: false }; }
   ctxPaint();
+  maybeFold(quick);
 }
 function scheduleCtx(quick) {
   if (ctxTimer) clearTimeout(ctxTimer);
@@ -10671,7 +10914,7 @@ async function go(forcedParts, chat, alreadyAdded, askedMsg) {
   pendingAtt = [];
   renderPreview();
   document.getElementById('user-input').value = '';
-  try { await streamRun(target.messages.filter(function (m) { return !m.queued; }).slice(), target, asked); }
+  try { await streamRun(wireFor(target), target, asked); }
   catch (err) { doneThinking('Error: ' + err.message); setBonsaiState('idle'); }
   busy = false;
   setSendUI();
@@ -12123,6 +12366,10 @@ PAGE_GPT = """<!doctype html>
   .scopebtn:hover { border-color: var(--acc); }
   .scopebtn.sc-system { color: var(--err); border-color: var(--err); }
   .scopebtn.sc-workspace { color: var(--ok); border-color: var(--ok); }
+  .foldnote { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 10px 0 14px; padding: 7px 10px; border: 1px dashed var(--bd); border-left: 2px solid var(--acc); border-radius: 8px; background: var(--bg2); }
+  .foldnote .foldb { flex: 1 1 240px; font-size: 10.5px; font-family: Consolas, monospace; color: var(--dim); letter-spacing: .3px; }
+  .foldnote .foldbtn { font-family: Consolas, monospace; font-size: 10px; letter-spacing: .6px; color: var(--acc); background: transparent; border: 1px solid var(--bd); border-radius: 6px; padding: 4px 9px; cursor: pointer; }
+  .foldnote .foldbtn:hover { border-color: var(--acc); }
   .scopelist { display: flex; flex-direction: column; gap: 3px; }
   .scoperow { display: flex; align-items: center; gap: 4px; font-size: 10.5px; font-family: Consolas, monospace; background: var(--bg2); border: 1px solid var(--bd); border-left-width: 2px; border-radius: 5px; padding: 3px 4px 3px 6px; }
   .scoperow.allow { border-left-color: var(--ok); }
@@ -12737,10 +12984,97 @@ function renderConv() {
     if (empty) { if (!empty.parentNode) conv.appendChild(empty); empty.style.display = 'flex'; }
   } else {
     if (empty) empty.remove();
-    cur.messages.forEach(function (m) {
+    const at = (cur.summary && cur.summary_at) ? cur.summary_at : -1;
+    cur.messages.forEach(function (m, i) {
+      if (i === at) addFold(cur);
       if (m.role === 'user') addUser(m.content);
       else if (m.role === 'assistant') addAsst(m.content, m.calls || [], m.reason, m.stats, m.parts);
     });
+    if (at > cur.messages.length) addFold(cur);
+  }
+}
+// see the other console's copy for why this exists: the older turns are
+// summarised instead of the conversation being thrown away, and nothing is
+// deleted - the button in the divider puts the full history back
+function addFold(chat) {
+  const conv = convInner();
+  const row = document.createElement('div');
+  row.className = 'foldnote';
+  const n = chat.summary_at || 0;
+  const how = chat.summary_via === 'fallback' ? ' (plain extract - the model would not answer)' : '';
+  const b = document.createElement('div');
+  b.className = 'foldb';
+  b.textContent = n + ' earlier message' + (n === 1 ? '' : 's') + ' summarised' + how
+    + ' \u00b7 still shown above, just not sent to the model';
+  const btn = document.createElement('button');
+  btn.className = 'foldbtn';
+  btn.type = 'button';
+  btn.textContent = 'use the full history again';
+  btn.onclick = function () { undoFold(chat); };
+  row.appendChild(b);
+  row.appendChild(btn);
+  conv.appendChild(row);
+}
+function undoFold(chat) {
+  if (!chat || !chat.summary) return;
+  chat.summary = null;
+  chat.summary_at = null;
+  chat.summary_via = null;
+  chat.summary_msg = null;
+  save();
+  renderConv();
+  refreshCtx();
+}
+function pendingList(chat) {
+  return ((chat && chat.messages) || []).filter(function (m) { return !m.queued; });
+}
+function wireFor(chat) {
+  const msgs = pendingList(chat);
+  if (!chat || !chat.summary) return msgs;
+  const at = Math.max(0, Math.min(chat.summary_at || 0, msgs.length));
+  /* the wording comes from the server, so there is one copy of it */
+  const head = chat.summary_msg || { role: 'user', content: chat.summary };
+  return [head].concat(msgs.slice(at));
+}
+let folding = false;
+function maybeFold(quick) {
+  if (quick || folding || busy) return;
+  const j = ctxLast;
+  if (!j || !j.ok || !j.total) return;
+  if (!cur || cur.summary) return;
+  if (j.own < (j.fold_min || 0)) return;
+  if (j.used * 100 / j.total < (j.fold_at || 101)) return;
+  const msgs = pendingList(cur);
+  /* below this the summary would be longer than the turns it replaces */
+  if (msgs.length <= (j.fold_keep || 6) + 1) return;
+  foldChat(cur, msgs);
+}
+async function foldChat(chat, msgs) {
+  folding = true;
+  addThinking();
+  setState('thinking');
+  if (thinkingRow && thinkingRow.think) {
+    thinkingRow.think.innerHTML = '<span class="dots"><i></i><i></i><i></i></span> Summarising the earlier turns';
+  }
+  try {
+    const r = await fetch('/api/compact', { method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ messages: msgs, mode: chatMode }) });
+    const j = await r.json();
+    doneThinking(null);
+    if (!j || !j.ok || !j.summary) return;
+    chat.summary = j.summary;
+    chat.summary_at = j.folded;
+    chat.summary_via = j.via;
+    chat.summary_msg = j.message;
+    save();
+    renderConv();
+    refreshCtx();
+  } catch (e) {
+    doneThinking('Could not compact: ' + (e && e.message ? e.message : 'unknown error'));
+  } finally {
+    folding = false;
+    setState('idle');
   }
 }
 function esc(s) { return (s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
@@ -13342,11 +13676,13 @@ function ctxPaint() {
   }
 }
 async function refreshCtx(quick) {
-  const msgs = (cur && cur.messages) ? cur.messages.slice() : [];
-  /* Count what is still in the box. The meter's own tooltip promises the
-     number is right "before you type", but the draft was never included, so
-     the bar only ever moved after a turn had already been sent - you found
-     out a message was too long once it was too late to shorten it. */
+  /* Count what is actually going to be sent - queued messages and, once the
+     chat has been compacted, everything above the fold. The meter's own
+     tooltip promises the number is right "before you type", but the draft was
+     never included, so the bar only ever moved after a turn had already been
+     sent - you found out a message was too long once it was too late to
+     shorten it. */
+  const msgs = (cur && cur.messages) ? wireFor(cur).slice() : [];
   try {
     const draft = (typeof buildUserMsg === 'function') ? buildUserMsg() : null;
     if (draft) msgs.push({ role: 'user', content: draft });
@@ -13358,6 +13694,7 @@ async function refreshCtx(quick) {
     ctxLast = await r.json();
   } catch (e) { ctxLast = { ok: false }; }
   ctxPaint();
+  maybeFold(quick);
 }
 function scheduleCtx(quick) {
   if (ctxTimer) clearTimeout(ctxTimer);
@@ -13444,7 +13781,7 @@ async function go(forcedParts, chat, alreadyAdded, askedMsg) {
   pendingAtt = [];
   renderPreview();
   document.getElementById('user-input').value = '';
-  try { await streamRun(target.messages.filter(function (m) { return !m.queued; }).slice(), target, asked); }
+  try { await streamRun(wireFor(target), target, asked); }
   catch (err) { doneThinking('Error: ' + err.message); setState('idle'); }
   busy = false;
   setSendUI();
@@ -15380,6 +15717,7 @@ class Handler(BaseHTTPRequestHandler):
                             "/api/answer", "/api/effort", "/api/eject",
                             "/api/tts", "/api/models", "/api/pick_model",
                             "/api/ctx", "/api/revert", "/api/forget_changes",
+                            "/api/compact",
                             "/api/path_policy", "/api/dl_pause",
                             "/api/dl_resume", "/api/dl_cancel",
                             "/api/dl_retry", "/api/dl_clear"):
@@ -15489,6 +15827,17 @@ class Handler(BaseHTTPRequestHandler):
                     _ctx_usage(body.get("messages") or [],
                                body.get("mode") or MODE_BUILD,
                                bool(body.get("quick"))), default=str))
+                return
+            if path == "/api/compact":
+                try:
+                    self._send(200, json.dumps(
+                        _compact_chat(body.get("messages") or [],
+                                      body.get("mode") or MODE_BUILD),
+                        default=str))
+                except Exception as exc:
+                    self._send(200, json.dumps(
+                        {"ok": False, "error": _model_error_text(exc)},
+                        default=str))
                 return
             if path == "/api/pick_model":
                 what = str(body.get("what") or "file").strip().lower()
