@@ -2402,6 +2402,14 @@ PLAN_MODE_SYSTEM = ("\nMODE: PLAN. The user only wants a PLAN right now - do NOT
                     "switch to BUILD mode.")
 
 def _bonsai_ready():
+    # A hosted model has no local server to wait for, and no /health endpoint
+    # to wait on either - OpenRouter answers 404 for it, which used to abort
+    # the turn with "model server could not start". Say it is ready and let the
+    # first real request report a bad key or bad model id, which is the error
+    # the user can actually act on.
+    entry = _active_model()
+    if entry and entry.get("type") == "api" and not _is_loopback(entry):
+        return True
     try:
         req = urllib.request.Request(BONSAI_BASE + "/health",
                                      headers=_model_headers())
@@ -2655,7 +2663,7 @@ def _apply_model(entry):
     # (32768) no matter what the user had actually set.
     ctx = _entry_cfg(entry)["ctx"]
     if entry.get("type") == "api":
-        BONSAI_BASE = (entry.get("base_url") or "http://127.0.0.1:8080").rstrip("/")
+        BONSAI_BASE = _api_base(entry) or "http://127.0.0.1:8080"
         BONSAI_MODEL_ID = entry.get("model") or entry["id"]
         BONSAI_CTX = int(entry.get("ctx") or ctx)
     else:
@@ -2754,6 +2762,50 @@ def _resolve_api_key(ref):
     if env:
         return env.strip()
     return ref
+
+
+def _api_host(base_url):
+    """Just the host of a base URL, lowercased and without the port."""
+    host = str(base_url or "").strip()
+    if "//" in host:
+        host = host.split("//", 1)[1]
+    host = host.split("/", 1)[0]
+    if "@" in host:                       # strip any user:info@ prefix
+        host = host.rsplit("@", 1)[1]
+    if host.startswith("["):              # [::1]:8080
+        host = host[1:].split("]", 1)[0]
+    elif ":" in host:
+        host = host.split(":", 1)[0]
+    return host.lower()
+
+
+def _is_loopback(entry_or_url):
+    """True when this endpoint is a llama-server on this PC rather than a
+    hosted provider. A model on 127.0.0.1 speaks llama.cpp's dialect, which
+    understands keep_alive and chat_template_kwargs; a hosted OpenAI-compatible
+    endpoint does not, and forwards unknown parameters upstream, so those two
+    are only ever sent to a loopback host. Local .gguf models are "local" type
+    and never reach any of this."""
+    if isinstance(entry_or_url, dict):
+        if entry_or_url.get("type") != "api":
+            return False
+        url = entry_or_url.get("base_url")
+    else:
+        url = entry_or_url
+    host = _api_host(url)
+    return host in ("127.0.0.1", "localhost", "::1", "0.0.0.0", "")
+
+
+def _api_base(entry):
+    """The base an api model is talked to on, normalised so the existing
+    "+ /v1/chat/completions" is right. OpenRouter is documented as
+    https://openrouter.ai/api/v1, and the add-model dialog suggests a local
+    server as http://127.0.0.1:1234/v1, so both arrive with the /v1 already
+    attached; strip it and put it back in one place."""
+    base = str((entry or {}).get("base_url") or "").strip().rstrip("/")
+    if base.lower().endswith("/v1"):
+        base = base[:-3]
+    return base
 
 
 def _model_auth_headers(entry=None):
@@ -3147,6 +3199,15 @@ def _unload_bonsai():
     models: best-effort soft unload via keep_alive=0."""
     entry = _active_model()
     if entry and entry.get("type") == "api":
+        if not _is_loopback(entry):
+            # Sending a 1-token "unload" completion to someone else's server
+            # costs a real request and burns free-tier quota to achieve nothing
+            # - the model is not ours to release.
+            return {"ok": True, "method": "remote",
+                    "detail": "'%s' runs on someone else's server - there is "
+                              "nothing to unload here"
+                              % (entry.get("label") or entry.get("model")
+                                 or "this model")}
         try:
             _http_json(BONSAI_BASE + "/v1/chat/completions",
                        {"model": BONSAI_MODEL_ID,
@@ -3155,7 +3216,7 @@ def _unload_bonsai():
             return {"ok": True, "method": "keep_alive",
                     "detail": "asked the external server to unload the model"}
         except Exception as exc:
-            return {"ok": False, "error": str(exc)}
+            return {"ok": False, "error": _model_error_text(exc)}
     port = int(entry.get("port") or 8080) if entry else 8080
     was_running = _port_listening(port)
     _stop_local_server(port)
@@ -3185,8 +3246,19 @@ def set_bonsai_effort(effort):
 
 
 def _effort_params():
+    """The effort knob, in whichever dialect the active endpoint speaks.
+
+    A loopback llama-server takes chat_template_kwargs and calls the reasoning
+    "reasoning_content". A hosted endpoint wants the OpenRouter/OpenAI unified
+    `reasoning` object instead, and passes the text back as `reasoning`."""
     with _EFFORT_LOCK:
         eff = _BONSAI_EFFORT
+    entry = _active_model()
+    if entry and entry.get("type") == "api" and not _is_loopback(entry):
+        # off/low/medium/xhigh are exactly the values a hosted endpoint wants
+        if eff == "off":
+            return {"reasoning": {"enabled": False}}
+        return {"reasoning": {"effort": eff}}
     if eff == "off":
         return {"chat_template_kwargs": {"enable_thinking": False}}
     return {"chat_template_kwargs": {"enable_thinking": True,
@@ -4409,21 +4481,127 @@ def system_prompt(mode):
     return text
 
 
-def _bonsai_chat(messages, tools):
-    payload = {"model": BONSAI_MODEL_ID, "messages": messages,
-               "tools": tools, "stream": False, "keep_alive": -1}
+def _base_payload():
+    """The shared part of every completion request.
+
+    keep_alive is llama.cpp's own field for how long the server holds the
+    model in memory. A hosted endpoint ignores parameters it does not know
+    only when its provider does; the rest are forwarded upstream, so sending
+    it is how you get a 400 from someone else's model server. Loopback only.
+    """
+    payload = {"model": BONSAI_MODEL_ID}
+    entry = _active_model()
+    if not entry or entry.get("type") != "api" or _is_loopback(entry):
+        payload["keep_alive"] = -1
     payload.update(_effort_params())
+    return payload
+
+
+def _bonsai_chat(messages, tools):
+    payload = _base_payload()
+    payload.update({"messages": messages, "tools": tools, "stream": False})
     data = _http_json(BONSAI_BASE + "/v1/chat/completions", payload)
     msg = data.get("choices", [{}])[0].get("message", {})
     msg["_usage"] = data.get("usage") or {}
     msg["_timings"] = data.get("timings") or {}
+    # a hosted endpoint answers with "reasoning"; llama.cpp uses
+    # "reasoning_content". Normalise so the Thought step works on both.
+    if not msg.get("reasoning_content"):
+        msg["reasoning_content"] = _reasoning_text(msg)
     return msg
 
 
+def _provider_message(exc):
+    """The human-readable part of a provider's error body, when it sent one.
+    OpenRouter and friends answer {"error": {"message": "..."}}."""
+    try:
+        body = exc.read()
+    except Exception:
+        return ""
+    if not body:
+        return ""
+    if isinstance(body, bytes):
+        try:
+            body = body.decode("utf-8", "replace")
+        except Exception:
+            return ""
+    try:
+        data = json.loads(body)
+    except Exception:
+        return body.strip()[:300]
+    err = data.get("error") if isinstance(data, dict) else None
+    if isinstance(err, dict):
+        return str(err.get("message") or err.get("code") or "")[:300]
+    if isinstance(err, str):
+        return err[:300]
+    return ""
+
+
+def _model_error_text(exc):
+    """Turn a failed model request into something the reader can act on.
+
+    urllib's default is "HTTP Error 401: Unauthorized", which does not say
+    which key, which model, or what to do about it - and for a hosted endpoint
+    it used to be swallowed entirely behind "model server could not start"."""
+    entry = _active_model()
+    who = str((entry or {}).get("label") or (entry or {}).get("model")
+              or "the model server")
+    detail = _provider_message(exc) if isinstance(
+        exc, urllib.error.HTTPError) else ""
+    code = getattr(exc, "code", None)
+    if code in (401, 403):
+        msg = ("%s rejected the request (%s). The API key is missing or wrong: "
+               "put it in API KEYS.txt and check the key name on the '%s' model."
+               % (who, code, who))
+    elif code == 402:
+        msg = ("%s is out of credit. Top up the account, or pick another model."
+               % who)
+    elif code == 404:
+        msg = ("%s has no such endpoint or model (%s). Check the base URL and "
+               "the model id - the model id is not the web page address."
+               % (who, code))
+    elif code == 429:
+        msg = ("%s is rate limiting us (%s). Free models throttle hard; wait a "
+               "moment, or use a model you have credit for." % (who, code))
+    elif code == 400 and detail:
+        msg = "%s rejected the request: %s" % (who, detail)
+    elif code and code >= 500:
+        msg = "%s is not answering right now (HTTP %s). Try again shortly." % (
+            who, code)
+    elif isinstance(exc, urllib.error.URLError):
+        msg = ("Could not reach %s: %s. Check the base URL and your network."
+               % (who, getattr(exc, "reason", None) or exc))
+    else:
+        msg = str(exc)
+    return msg + (" (%s)" % detail if detail and detail not in msg else "")
+
+
+def _reasoning_text(obj):
+    """Pull reasoning out of a completion chunk or message, whatever the
+    provider called it. llama.cpp and DeepSeek send reasoning_content,
+    OpenRouter sends reasoning, and reasoning_details is the structured form
+    (the raw text lives on entries of type "reasoning.text")."""
+    obj = obj if isinstance(obj, dict) else {}
+    for field in ("reasoning", "reasoning_content"):
+        val = obj.get(field)
+        if isinstance(val, str) and val:
+            return val
+    details = obj.get("reasoning_details")
+    if isinstance(details, list):
+        out = []
+        for det in details:
+            if isinstance(det, dict) and det.get("type") == "reasoning.text":
+                text = det.get("text")
+                if text:
+                    out.append(text)
+        if out:
+            return "".join(out)
+    return ""
+
+
 def _bonsai_stream(messages, tools):
-    payload = {"model": BONSAI_MODEL_ID, "messages": messages,
-               "tools": tools, "stream": True, "keep_alive": -1}
-    payload.update(_effort_params())
+    payload = _base_payload()
+    payload.update({"messages": messages, "tools": tools, "stream": True})
     req = urllib.request.Request(BONSAI_BASE + "/v1/chat/completions",
                                  data=json.dumps(payload).encode("utf-8"),
                                  headers=_model_headers(),
@@ -4453,9 +4631,13 @@ def _bonsai_stream(messages, tools):
             choice = (chunk.get("choices") or [{}])[0]
             delta = choice.get("delta") or {}
             finish = choice.get("finish_reason") or finish
-            if delta.get("reasoning_content"):
-                yield {"kind": "reason", "text": delta["reasoning_content"]}
-            elif delta.get("content"):
+            # reasoning and content are separate ifs, not elif: a provider is
+            # free to put both in one chunk and the answer must not be dropped
+            # because the model thought in the same breath.
+            think = _reasoning_text(delta)
+            if think:
+                yield {"kind": "reason", "text": think}
+            if delta.get("content"):
                 if first_content_ts is None:
                     first_content_ts = time.monotonic()
                     yield {"kind": "think_end", "t_ms": int((first_content_ts - t_start) * 1000)}
@@ -4494,7 +4676,7 @@ def _bonsai_stream(messages, tools):
             "cached_tokens": cached_tok,
             "tok_s": timings.get("predicted_per_second") or 0,
             "ctx_used": prompt_tok + comp_tok,
-            "ctx_left": BONSAI_CTX - prompt_tok - comp_tok,
+            "ctx_left": _ctx_window() - prompt_tok - comp_tok,
         }
         yield {"kind": "end", "tool_calls": ordered, "finish": finish, "stats": stats}
 
@@ -4546,6 +4728,9 @@ def build_messages(raw_messages, mode=MODE_BUILD):
 # baseline is cached per (mode, model) because it only changes when the
 # prompt or the tool list does.
 _CTX_BASE = {}
+# Whether that cached baseline came from the real tokenizer rather than the
+# estimate. Only an exact baseline is worth estimating a conversation against.
+_CTX_EXACT_BASE = {}
 _CTX_LOCK = threading.Lock()
 # A vision projector spends a fixed slice of the window per image, and the
 # exact size depends on the projector. This is a sane average; the meter
@@ -4607,11 +4792,74 @@ def _ctx_server_total():
         return 0
 
 
-def _ctx_usage(raw_messages, mode=MODE_BUILD):
+_API_CTX_CACHE = {}
+# How long a failed /v1/models lookup stays cached. Long enough that a broken
+# key is not re-probed on every keystroke, short enough that pasting the key
+# fixes the meter without a restart.
+_API_CTX_TTL = 60.0
+
+
+def _ctx_api_total(entry):
+    """The real context window of a hosted model, from its /v1/models list.
+
+    A local model reports n_ctx through /props, but a hosted one has no such
+    endpoint, so this used to fall through to the registry default of 32768. On
+    a 262k model that is not a cosmetic number: once used > total the app
+    declares the conversation full and refuses to send it. OpenRouter reports
+    context_length per model; a plain OpenAI-compatible server does not, in
+    which case 0 means "unknown" and the caller keeps the old default."""
+    base = _api_base(entry)
+    model = str(entry.get("model") or entry.get("id") or "")
+    if not base or not model:
+        return 0
+    hit = _API_CTX_CACHE.get((base, model))
+    if hit is not None:
+        val, when = hit
+        # A total is worth trusting; a miss is not. Caching a failed lookup
+        # forever meant a model added before its key was in place stayed stuck
+        # on the 32768 default until the app was restarted, which is exactly
+        # the order things happen in: add model, paste key, look at the meter.
+        if val or (time.time() - when) < _API_CTX_TTL:
+            return val
+    try:
+        data = _http_json_get(base + "/v1/models", timeout=10)
+    except Exception:
+        _API_CTX_CACHE[(base, model)] = (0, time.time())
+        return 0
+    total = 0
+    for item in (data.get("data") or []) if isinstance(data, dict) else []:
+        if str(item.get("id") or "") == model:
+            total = int(item.get("context_length") or 0)
+            break
+    _API_CTX_CACHE[(base, model)] = (total, time.time())
+    return total
+
+
+def _ctx_window():
+    """The window the active model can really read, not the registry default.
+
+    The stats footer and the stream events used to subtract from BONSAI_CTX,
+    a fixed 32768, so a 262k hosted model reported ctx 4k/32k while the meter
+    beside BUILD said 4k/262k."""
+    entry = _active_model()
+    total = _ctx_server_total()
+    if not total and entry and entry.get("type") == "api":
+        total = _ctx_api_total(entry)
+    if not total:
+        total = int(_entry_cfg(entry).get("ctx") or 0)
+    return total or BONSAI_CTX
+
+
+def _ctx_usage(raw_messages, mode=MODE_BUILD, quick=False):
     """How much of the window this conversation is using right now.
 
     Returns fixed (the system prompt + tools cost every turn carries), own
-    (what the conversation itself has added) and total (the real window)."""
+    (what the conversation itself has added) and total (the real window).
+
+    quick=True is the mid-typing refresh: it skips the exact count, which for a
+    local model means two round-trips to the model server, and estimates the
+    conversation instead. The UI marks the result with a ~ so the number is not
+    mistaken for exact."""
     mode = MODE_PLAN if str(mode) == MODE_PLAN else MODE_BUILD
     msgs = build_messages(raw_messages, mode)
     tools = _tools_for(mode)
@@ -4619,33 +4867,58 @@ def _ctx_usage(raw_messages, mode=MODE_BUILD):
     entry = _active_model()
     local = bool(entry) and entry.get("type") != "api" and _bonsai_ready()
 
+    # The baseline first: what an empty conversation in this mode costs. It is
+    # cached per mode+model, so paying for an exact count here is a one-off and
+    # it gives the mid-typing estimate something honest to be measured against.
+    key = (mode, (entry or {}).get("id"))
+    empty = build_messages([], mode)
+    with _CTX_LOCK:
+        fixed = _CTX_BASE.get(key)
+    if fixed is None:
+        fixed = _ctx_exact(empty, tools) if local else None
+        exact_base = fixed is not None
+        if fixed is None:
+            fixed = _ctx_estimate(empty, tools)
+        with _CTX_LOCK:
+            _CTX_BASE[key] = fixed
+            _CTX_EXACT_BASE[key] = exact_base
+    else:
+        exact_base = _CTX_EXACT_BASE.get(key, False)
+
     used = None
     exact = False
-    if local:
+    if local and not quick:
         used = _ctx_exact(msgs, tools)
         exact = used is not None
+    if used is None and quick and exact_base:
+        # Estimate the conversation's marginal cost and add it to the real
+        # baseline. Falling back to a whole-prompt estimate here instead made
+        # the bar jump 11k -> 14k the instant you typed a single character and
+        # fall back again when you stopped, and it reported the whole tool
+        # schema as "this conversation" even with an empty chat.
+        used = fixed + max(0, _ctx_estimate(msgs, tools)
+                           - _ctx_estimate(empty, tools))
     if used is None:
         used = _ctx_estimate(msgs, tools)
     if images:
         used += images * _CTX_IMG_TOKENS
 
-    # The baseline: what an empty conversation in this mode costs.
-    key = (mode, (entry or {}).get("id"))
-    with _CTX_LOCK:
-        fixed = _CTX_BASE.get(key)
-    if fixed is None:
-        empty = build_messages([], mode)
-        if local and exact:
-            fixed = _ctx_exact(empty, tools)
-        if fixed is None:
-            fixed = _ctx_estimate(empty, tools)
-        with _CTX_LOCK:
-            _CTX_BASE[key] = fixed
-
-    total = _ctx_server_total() or int(_entry_cfg(entry).get("ctx") or 0)
+    total = _ctx_server_total()
+    if not total and entry and entry.get("type") == "api":
+        # No /props on a hosted endpoint, and the gear dialog refuses to write
+        # a ctx for a non-local model, so this used to be stuck on the 32768
+        # registry default whatever the model could actually read.
+        total = _ctx_api_total(entry)
+    if not total:
+        total = int(_entry_cfg(entry).get("ctx") or 0)
     own = max(0, used - fixed)
+    # 'why' lets the tooltip say something true. "estimated - model not loaded"
+    # is wrong for a hosted model, which is never going to be loaded here.
+    why = "exact" if exact else ("quick" if quick else
+                                 ("remote" if entry and entry.get("type") == "api"
+                                  else "model-not-loaded"))
     base = {"used": used, "fixed": fixed, "own": own, "total": total,
-            "exact": exact, "mode": mode, "images": images}
+            "exact": exact, "mode": mode, "images": images, "why": why}
     if total and used > total:
         return dict(base, ok=False, error="this conversation no longer fits in "
                      "the context window - start a new chat or raise ctx")
@@ -8738,7 +9011,7 @@ def _confirm_pick_workdir():
 def _empty_stats():
     return {"think_ms": 0, "respond_ms": 0, "total_ms": 0,
             "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
-            "cached_tokens": 0, "tok_s": 0, "ctx_used": 0, "ctx_left": BONSAI_CTX}
+            "cached_tokens": 0, "tok_s": 0, "ctx_used": 0, "ctx_left": _ctx_window()}
 
 
 def _stats_from(usage, timings):
@@ -8751,7 +9024,7 @@ def _stats_from(usage, timings):
             "prompt_tokens": prompt, "completion_tokens": comp,
             "total_tokens": usage.get("total_tokens") or 0, "cached_tokens": cached,
             "tok_s": timings.get("predicted_per_second") or 0,
-            "ctx_used": prompt + comp, "ctx_left": BONSAI_CTX - prompt - comp}
+            "ctx_used": prompt + comp, "ctx_left": _ctx_window() - prompt - comp}
 
 
 def _merge_stats(a, b):
@@ -8765,7 +9038,7 @@ def _merge_stats(a, b):
         out["tok_s"] = round(((a.get("tok_s") or 0) * a_tok + (b.get("tok_s") or 0) * b_tok)
                              / (a_tok + b_tok), 1)
     out["ctx_used"] = b.get("ctx_used") or a.get("ctx_used") or 0
-    out["ctx_left"] = BONSAI_CTX - out["ctx_used"]
+    out["ctx_left"] = _ctx_window() - out["ctx_used"]
     return out
 
 
@@ -10008,7 +10281,10 @@ function ctxPaint() {
     } else {
       let extra = '';
       if (j.images) extra += '<br>images: ' + j.images + ' (about ' + fmtK(j.images * 1024) + ')';
-      if (!j.exact) extra += '<br>estimated - model not loaded';
+      if (!j.exact) extra += '<br>estimated - '
+        + (j.why === 'quick' ? 'still typing'
+          : j.why === 'remote' ? 'the provider counts these for you'
+            : 'model not loaded');
       hint.innerHTML = '<b>' + (j.exact ? '' : '~') + Number(j.used).toLocaleString() + '</b>'
         + ' of <b>' + Number(j.total || 0).toLocaleString() + '</b> tokens'
         + '<br>system prompt + tools: ' + Number(j.fixed || 0).toLocaleString()
@@ -10016,19 +10292,30 @@ function ctxPaint() {
     }
   }
 }
-async function refreshCtx() {
-  const msgs = (cur && cur.messages) ? cur.messages : [];
+async function refreshCtx(quick) {
+  const msgs = (cur && cur.messages) ? cur.messages.slice() : [];
+  /* Count what is still in the box. The meter's own tooltip promises the
+     number is right "before you type", but the draft was never included, so
+     the bar only ever moved after a turn had already been sent - you found
+     out a message was too long once it was too late to shorten it. */
+  try {
+    const draft = (typeof buildUserMsg === 'function') ? buildUserMsg() : null;
+    if (draft) msgs.push({ role: 'user', content: draft });
+  } catch (e) { /* no composer on this view */ }
   try {
     const r = await fetch('/api/ctx', { method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ messages: msgs, mode: chatMode }) });
+      body: JSON.stringify({ messages: msgs, mode: chatMode, quick: !!quick }) });
     ctxLast = await r.json();
   } catch (e) { ctxLast = { ok: false }; }
   ctxPaint();
 }
-function scheduleCtx() {
+function scheduleCtx(quick) {
   if (ctxTimer) clearTimeout(ctxTimer);
-  ctxTimer = setTimeout(refreshCtx, 400);
+  /* While typing, settle quickly but ask for the cheap estimate: an exact
+     count costs two round-trips to the model server, and nobody needs that
+     to be precise mid-word. The bar shows a ~ while it is a guess. */
+  ctxTimer = setTimeout(function () { refreshCtx(quick); }, quick ? 500 : 400);
 }
 function queueNow() {
   const parts = buildUserMsg();
@@ -10798,7 +11085,52 @@ function addModelPick(what) {
     .catch(function () { alert('Could not open the file browser'); })
     .then(function () { if (btn) { btn.disabled = false; btn.textContent = '+'; } });
 }
+/* Pasting a model's web page address (openrouter.ai/qwen/qwen3.8-27b:free) is the
+   obvious thing to try, but the API wants the base URL and the model id as two
+   separate values. Translate a page address into those two fields. Only base
+   URLs that are actually documented are filled in - never guessed. */
+const API_PAGE_BASE = { 'openrouter.ai': 'https://openrouter.ai/api/v1' };
+function fixupApiUrl() {
+  const baseEl = document.getElementById('apibase');
+  const modelEl = document.getElementById('apimodel');
+  if (!baseEl || !modelEl) return false;
+  const raw = (baseEl.value || '').trim();
+  if (raw.indexOf('http') !== 0) return false;
+  let u = null;
+  try { u = new URL(raw); } catch (e) { return false; }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') return false;
+  let host = u.hostname.toLowerCase();
+  if (host.indexOf('www.') === 0) host = host.slice(4);
+  const segs = u.pathname.split('/').filter(function (s) { return s !== ''; });
+  if (!segs.length) return false;
+  const head = segs[0].toLowerCase();
+  /* already an API base address such as .../api/v1 - leave it be */
+  if (head === 'api' || (head.charAt(0) === 'v' && Number(head.slice(1)) > 0)) return false;
+  const known = API_PAGE_BASE[host];
+  if (known) {
+    let slug = '';
+    try { slug = decodeURIComponent(segs.join('/')); } catch (e) { slug = segs.join('/'); }
+    baseEl.value = known;
+    modelEl.value = slug;
+    return true;
+  }
+  /* Unknown provider: rescue the model id from the address, but do not
+     invent a base URL - a wrong one fails in a way that looks like the key is
+     broken rather than like the address is. */
+  if (!(modelEl.value || '').trim()) modelEl.value = segs[segs.length - 1];
+  return 'unknown';
+}
+const _apiBaseEl = document.getElementById('apibase');
+if (_apiBaseEl) _apiBaseEl.onchange = function () {
+  if (fixupApiUrl() === 'unknown') {
+    alert('That looks like a model page address, not an API base URL.\\n\\n' +
+          'I took "' + (document.getElementById('apimodel').value || '') +
+          '" as the model id. Now enter the API base URL for that provider - ' +
+          'for OpenAI-compatible providers it usually ends in /v1.');
+  }
+};
 function addModelApi() {
+  fixupApiUrl();
   const base = (document.getElementById('apibase').value || '').trim();
   const model = (document.getElementById('apimodel').value || '').trim();
   /* a NAME from API KEYS.txt, never the secret itself */
@@ -10918,7 +11250,7 @@ document.addEventListener('keydown', function (ev) {
 refreshModels();
 
 const inp = document.getElementById('user-input');
-inp.addEventListener('input', function () { this.style.height = 'auto'; this.style.height = Math.min(this.scrollHeight, 160) + 'px'; });
+inp.addEventListener('input', function () { this.style.height = 'auto'; this.style.height = Math.min(this.scrollHeight, 160) + 'px'; scheduleCtx(true); });
 inp.addEventListener('keydown', function (ev) { if (ev.key === 'Enter' && !ev.shiftKey) { ev.preventDefault(); handleSubmit(ev); } });
 
 /* ---------- BONSAI FX: clock & metrics ---------- */
@@ -12532,7 +12864,10 @@ function ctxPaint() {
     } else {
       let extra = '';
       if (j.images) extra += '<br>images: ' + j.images + ' (about ' + fmtK(j.images * 1024) + ')';
-      if (!j.exact) extra += '<br>estimated - model not loaded';
+      if (!j.exact) extra += '<br>estimated - '
+        + (j.why === 'quick' ? 'still typing'
+          : j.why === 'remote' ? 'the provider counts these for you'
+            : 'model not loaded');
       hint.innerHTML = '<b>' + (j.exact ? '' : '~') + Number(j.used).toLocaleString() + '</b>'
         + ' of <b>' + Number(j.total || 0).toLocaleString() + '</b> tokens'
         + '<br>system prompt + tools: ' + Number(j.fixed || 0).toLocaleString()
@@ -12540,19 +12875,30 @@ function ctxPaint() {
     }
   }
 }
-async function refreshCtx() {
-  const msgs = (cur && cur.messages) ? cur.messages : [];
+async function refreshCtx(quick) {
+  const msgs = (cur && cur.messages) ? cur.messages.slice() : [];
+  /* Count what is still in the box. The meter's own tooltip promises the
+     number is right "before you type", but the draft was never included, so
+     the bar only ever moved after a turn had already been sent - you found
+     out a message was too long once it was too late to shorten it. */
+  try {
+    const draft = (typeof buildUserMsg === 'function') ? buildUserMsg() : null;
+    if (draft) msgs.push({ role: 'user', content: draft });
+  } catch (e) { /* no composer on this view */ }
   try {
     const r = await fetch('/api/ctx', { method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ messages: msgs, mode: chatMode }) });
+      body: JSON.stringify({ messages: msgs, mode: chatMode, quick: !!quick }) });
     ctxLast = await r.json();
   } catch (e) { ctxLast = { ok: false }; }
   ctxPaint();
 }
-function scheduleCtx() {
+function scheduleCtx(quick) {
   if (ctxTimer) clearTimeout(ctxTimer);
-  ctxTimer = setTimeout(refreshCtx, 400);
+  /* While typing, settle quickly but ask for the cheap estimate: an exact
+     count costs two round-trips to the model server, and nobody needs that
+     to be precise mid-word. The bar shows a ~ while it is a guess. */
+  ctxTimer = setTimeout(function () { refreshCtx(quick); }, quick ? 500 : 400);
 }
 function queueNow() {
   const parts = buildUserMsg();
@@ -12909,7 +13255,52 @@ function addModelPick(what) {
     .catch(function () { alert('Could not open the file browser'); })
     .then(function () { if (btn) { btn.disabled = false; btn.textContent = '+'; } });
 }
+/* Pasting a model's web page address (openrouter.ai/qwen/qwen3.8-27b:free) is the
+   obvious thing to try, but the API wants the base URL and the model id as two
+   separate values. Translate a page address into those two fields. Only base
+   URLs that are actually documented are filled in - never guessed. */
+const API_PAGE_BASE = { 'openrouter.ai': 'https://openrouter.ai/api/v1' };
+function fixupApiUrl() {
+  const baseEl = document.getElementById('apibase');
+  const modelEl = document.getElementById('apimodel');
+  if (!baseEl || !modelEl) return false;
+  const raw = (baseEl.value || '').trim();
+  if (raw.indexOf('http') !== 0) return false;
+  let u = null;
+  try { u = new URL(raw); } catch (e) { return false; }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') return false;
+  let host = u.hostname.toLowerCase();
+  if (host.indexOf('www.') === 0) host = host.slice(4);
+  const segs = u.pathname.split('/').filter(function (s) { return s !== ''; });
+  if (!segs.length) return false;
+  const head = segs[0].toLowerCase();
+  /* already an API base address such as .../api/v1 - leave it be */
+  if (head === 'api' || (head.charAt(0) === 'v' && Number(head.slice(1)) > 0)) return false;
+  const known = API_PAGE_BASE[host];
+  if (known) {
+    let slug = '';
+    try { slug = decodeURIComponent(segs.join('/')); } catch (e) { slug = segs.join('/'); }
+    baseEl.value = known;
+    modelEl.value = slug;
+    return true;
+  }
+  /* Unknown provider: rescue the model id from the address, but do not
+     invent a base URL - a wrong one fails in a way that looks like the key is
+     broken rather than like the address is. */
+  if (!(modelEl.value || '').trim()) modelEl.value = segs[segs.length - 1];
+  return 'unknown';
+}
+const _apiBaseEl = document.getElementById('apibase');
+if (_apiBaseEl) _apiBaseEl.onchange = function () {
+  if (fixupApiUrl() === 'unknown') {
+    alert('That looks like a model page address, not an API base URL.\\n\\n' +
+          'I took "' + (document.getElementById('apimodel').value || '') +
+          '" as the model id. Now enter the API base URL for that provider - ' +
+          'for OpenAI-compatible providers it usually ends in /v1.');
+  }
+};
 function addModelApi() {
+  fixupApiUrl();
   const base = (document.getElementById('apibase').value || '').trim();
   const model = (document.getElementById('apimodel').value || '').trim();
   /* a NAME from API KEYS.txt, never the secret itself */
@@ -13028,7 +13419,7 @@ document.addEventListener('keydown', function (ev) {
 });
 refreshModels();
 const inp = document.getElementById('user-input');
-inp.addEventListener('input', function () { this.style.height = 'auto'; this.style.height = Math.min(this.scrollHeight, 160) + 'px'; });
+inp.addEventListener('input', function () { this.style.height = 'auto'; this.style.height = Math.min(this.scrollHeight, 160) + 'px'; scheduleCtx(true); });
 inp.addEventListener('keydown', function (ev) { if (ev.key === 'Enter' && !ev.shiftKey) { ev.preventDefault(); handleSubmit(ev); } });
 const micBtn = document.getElementById('mic-btn');
 micBtn.onclick = function () {
@@ -14480,7 +14871,8 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/ctx":
                 self._send(200, json.dumps(
                     _ctx_usage(body.get("messages") or [],
-                               body.get("mode") or MODE_BUILD), default=str))
+                               body.get("mode") or MODE_BUILD,
+                               bool(body.get("quick"))), default=str))
                 return
             if path == "/api/pick_model":
                 what = str(body.get("what") or "file").strip().lower()
@@ -14601,7 +14993,7 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception as exc:
                     traceback.print_exc()
                     try:
-                        emit("error", {"text": "The model run failed: " + str(exc)})
+                        emit("error", {"text": _model_error_text(exc)})
                     except Exception:
                         pass
                 finally:
@@ -14619,15 +15011,20 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:
             if isinstance(exc, CLIENT_GONE) or self.wfile.closed:
                 return
+            # Measure what is actually going out. The old +30 fudge for the
+            # "event: error" wrapper was short of the real thing, so a long
+            # error could arrive truncated at exactly the moment it mattered.
+            body = ("event: error\ndata: "
+                    + json.dumps({"text": _model_error_text(exc)},
+                                 ensure_ascii=False) + "\n\n").encode("utf-8")
             try:
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json; charset=utf-8")
-                self.send_header("Content-Length", str(len(str(exc)) + 30))
+                self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
-            except Exception:
-                pass
-            try:
-                sse(self, "error", {"text": str(exc)})
+                self.wfile.write(body)
+            except CLIENT_GONE:
+                return
             except Exception:
                 pass
 
