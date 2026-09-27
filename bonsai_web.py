@@ -10145,6 +10145,13 @@ def _execute_tool_call(name, args, tc, hooks, image_uri):
     elif name == "read":
         raw_result = _read_oc(args.get("filePath") or args.get("path"),
                               args.get("offset"), args.get("limit"))
+        # Reading a .png attaches it so the model can look at it. That
+        # attachment was being dropped on the floor: image_uri was only ever
+        # set in the Blender branch, so the picture was fetched, encoded and
+        # then thrown away, and the model was asked to describe a file it
+        # could not see.
+        if isinstance(raw_result, dict) and raw_result.get("image_data"):
+            image_uri = raw_result["image_data"]
     elif name == "edit":
         raw_result = _edit_oc(args.get("filePath") or args.get("path"),
                               args.get("oldString") or args.get("old_text"),
