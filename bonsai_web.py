@@ -41,6 +41,12 @@ except Exception:
     _WIN_UI = False
 
 HOST, PORT = "127.0.0.1", 8081
+# BONSAI_PORT lets a second copy run alongside the real one - needed for any
+# test that has to exercise the live server, and it defaults to the usual 8081.
+try:
+    PORT = int(os.environ.get("BONSAI_PORT") or PORT)
+except Exception:
+    pass
 
 IS_WINDOWS = os.name == "nt"
 IS_LINUX = sys.platform.startswith("linux")
@@ -2560,15 +2566,73 @@ def _entry_cfg(entry):
     return cfg
 
 
+_KEY_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]*$")
+# how the big providers spell a credential, for telling a name from a secret
+_SECRETISH_RE = re.compile(r"^(sk[-_]|sk-or[-_]|hf_|gsk_|xai[-_]|api[-_]?key|"
+                           r"AIza|bearer\s)", re.I)
+
+
+def _sanitise_key_ref(raw):
+    """A model's api_key field is a *name*, not a secret.
+
+    People paste the key itself out of habit, and models.json is not a place to
+    keep a plaintext credential: it is a file the app rewrites, and a file
+    people paste into, share and commit by accident. So accept an identifier
+    that could name an entry in API KEYS.txt or an environment variable, and
+    refuse anything that looks like the credential with a message that says so.
+    Returns (name, error)."""
+    ref = str(raw or "").strip()
+    if not ref:
+        return "", None
+    # The credential shapes are checked first, and they have to be: "sk-or-v1-..."
+    # is made entirely of characters a name is allowed to use, so a test against
+    # the name pattern alone waves the secret straight through.
+    if _SECRETISH_RE.match(ref) or len(ref) > 48:
+        return "", ("that looks like the key itself, not its name. "
+                    "models.json stores the NAME - put the key in API KEYS.txt "
+                    "under a name like OPENROUTER_API_KEY, and enter that name here")
+    if " " in ref or not _KEY_NAME_RE.match(ref):
+        return "", ("'%s' is not a usable name. Use letters, digits, dot, dash "
+                    "or underscore, starting with a letter" % ref[:40])
+    return ref, None
+
+
 def _set_model_config(mid, raw):
     cfg = _model_sanitise_cfg(raw)
+    key_ref, key_err = _sanitise_key_ref(raw.get("api_key"))
+    if key_err:
+        return {"ok": False, "error": key_err}
     with _MODELS_LOCK:
         entry = next((m for m in _MODELS if m["id"] == mid), None)
         if not entry:
             return {"ok": False, "error": "unknown model '%s'" % mid}
         if entry.get("type", "local") != "local":
-            return {"ok": False,
-                    "error": "sampling settings only apply to local models"}
+            # A hosted model has no llama.cpp flags to reconfigure - the only
+            # thing worth changing once it exists is the key name, and that
+            # used to be impossible without deleting the model and adding it
+            # again. A payload with no api_key at all (an older page, still open
+            # across an update) leaves the name alone rather than clearing it.
+            if "api_key" in (raw or {}):
+                if key_ref:
+                    entry["api_key"] = key_ref
+                else:
+                    entry.pop("api_key", None)
+                _save_models()
+            res = {"ok": True, "id": mid, "cfg": _entry_cfg(entry),
+                   **_public_models()}
+            # say what actually happened: a page that never sent a key did not
+            # clear one, so it must not claim that it did
+            if "api_key" not in (raw or {}):
+                res["detail"] = "saved"
+            elif key_ref:
+                res["detail"] = ("saved - the key name is stored; the secret "
+                                 "stays in API KEYS.txt")
+            else:
+                res["detail"] = "saved - the key name was cleared"
+            res["api_key_set"] = _api_key_present(entry.get("api_key"))
+            if not res["api_key_set"] and not _is_loopback(entry):
+                res["warn"] = _no_key_warning(entry)
+            return res
         was_active = (mid == _ACTIVE_MODEL)
         old_cfg = _entry_cfg(entry)
         entry["cfg"] = cfg
@@ -2745,22 +2809,57 @@ def _load_api_keys(force=False):
     return keys
 
 
+def _api_key_state(ref):
+    """How a model's `api_key` field resolves: (state, secret).
+
+    Four outcomes, and they need opposite treatment:
+
+      none     - nothing set. Fine for a local server, fatal for a hosted one.
+      named    - the name is in API KEYS.txt or the environment. Works.
+      literal  - a credential pasted straight into models.json. Works, but it
+                 is a plaintext secret in a file that gets rewritten, shared
+                 and committed by accident.
+      missing  - a name that matches nothing. This is the one that used to be
+                 invisible: it fell through to "use the reference as the
+                 secret", so a typo was sent as `Bearer MY_KEY` and came back
+                 as a 401 with nothing to act on, while the model page happily
+                 reported a key was configured.
+
+    Deciding here, once, is what lets the gear dialog, the key badge, TEST KEY
+    and the fail-fast check all tell the truth by the same rule."""
+    ref = str(ref or "").strip()
+    if not ref:
+        return "none", ""
+    keys = _load_api_keys()
+    if keys.get(ref):
+        return "named", keys[ref]
+    env = os.environ.get(ref)
+    if env and env.strip():
+        return "named", env.strip()
+    if _SECRETISH_RE.match(ref) or len(ref) >= 40:
+        return "literal", ref
+    return "missing", ""
+
+
+def _api_key_present(ref):
+    """True only when there is an actual credential behind `ref`."""
+    return _api_key_state(ref)[0] in ("named", "literal")
+
+
 def _resolve_api_key(ref):
     """Turn a model's `api_key` field into the real secret.
 
-    The field is a *reference* by preference: the name of an entry in
-    API KEYS.txt, or an environment variable of that name. A value that
-    matches neither is used verbatim, so a key can still be pasted into
-    models.json if someone really wants to."""
+    A name that resolves to nothing is still passed through verbatim rather
+    than dropped, so an existing setup cannot be broken by this change; what
+    changed is that the code around it can now *tell* that is what happened
+    and say so, instead of reporting a working key and failing at the far end
+    of a conversation."""
     ref = str(ref or "").strip()
     if not ref:
         return ""
-    keys = _load_api_keys()
-    if ref in keys and keys[ref]:
-        return keys[ref]
-    env = os.environ.get(ref)
-    if env:
-        return env.strip()
+    state, value = _api_key_state(ref)
+    if state in ("named", "literal"):
+        return value
     return ref
 
 
@@ -2823,6 +2922,78 @@ def _model_auth_headers(entry=None):
         value = key if " " in key.split("=")[0] else "Bearer " + key
         return {"Authorization": value}
     return {header: key}
+
+
+def _test_model_key(entry=None, base=None, model=None, key_ref=None):
+    """Check a key against the endpoint without sending a chat.
+
+    Finding out a key is wrong by sending a message and reading a 401 costs a
+    round trip, burns the turn, and buries the real cause under whatever the
+    assistant was doing. /v1/models is the cheapest authenticated call an
+    OpenAI-compatible provider offers, and it costs nothing on a free tier.
+
+    Takes either a saved entry or the three raw dialog fields, so it can be
+    used to check a key before the model has ever been saved."""
+    entry = entry if entry is not None else _active_model()
+    if entry and entry.get("type") == "api":
+        base = base if base is not None else entry.get("base_url")
+        model = model if model is not None else entry.get("model")
+        if key_ref is None:
+            key_ref = entry.get("api_key")
+    base = str(base or "").strip()
+    if not base:
+        return {"ok": False, "error": "no base URL to test"}
+    if not base.lower().startswith(("http://", "https://")):
+        return {"ok": False, "error": "the base URL must start with http:// or https://"}
+    clean, key_err = _sanitise_key_ref(key_ref)
+    if key_err:
+        return {"ok": False, "error": key_err}
+    state, _secret = _api_key_state(clean)
+    if state in ("none", "missing"):
+        return {"ok": False, "needs_key": True,
+                "error": ("no key to test. API KEYS.txt has no entry called "
+                          "%s, so there is nothing to send - add a line "
+                          "'%s=your-key' to API KEYS.txt, or set an "
+                          "environment variable of that name"
+                          % (clean or "(nothing)", clean or "NAME=value"))}
+    probe = {"type": "api", "base_url": base, "model": str(model or "")}
+    if clean:
+        probe["api_key"] = clean
+    key = _resolve_api_key(clean)
+    url = _api_base(probe) + "/v1/models"
+    # Built by hand rather than via _model_headers(): that helper injects the
+    # *active* model's key, which would offer one provider's credential to a
+    # different host when the key under test is missing.
+    hdrs = {"Content-Type": "application/json"}
+    hdrs.update(_model_auth_headers(probe))
+    try:
+        data = _http_json_get(url, timeout=15, headers=hdrs)
+    except urllib.error.HTTPError as exc:
+        return {"ok": False, "status": getattr(exc, "code", None),
+                "error": _model_error_text(exc, probe)}
+    except Exception as exc:
+        return {"ok": False,
+                "error": "could not reach %s - %s. Check the base URL and your "
+                         "network." % (base, getattr(exc, "reason", None) or exc)}
+    ids = [str(i.get("id") or "") for i in (data.get("data") or [])
+           if isinstance(i, dict)] if isinstance(data, dict) else []
+    out = {"ok": True, "detail": "the key was accepted by %s" % base,
+           "models_visible": len(ids)}
+    want = str(model or "").strip()
+    if want:
+        if want in ids:
+            hit = next((i for i in data.get("data", [])
+                        if str(i.get("id")) == want), {})
+            out["model_ok"] = True
+            if hit.get("context_length"):
+                out["context_length"] = int(hit["context_length"])
+        else:
+            # A valid key that cannot see the model is a different mistake from a
+            # bad key, and conflating them sends people to reissue their key.
+            out["model_ok"] = False
+            out["warn"] = ("the key works, but '%s' is not in the provider's list"
+                           % want)
+    return out
 
 
 def _load_models():
@@ -2901,7 +3072,20 @@ def _public_models():
             item["base_url"] = m.get("base_url")
             item["model"] = m.get("model")
             # only ever report *that* a key is configured, never the value
-            item["api_key_set"] = bool(_resolve_api_key(m.get("api_key")))
+            kstate = _api_key_state(m.get("api_key"))[0]
+            item["api_key_set"] = _api_key_present(m.get("api_key"))
+            item["api_key_state"] = kstate
+            # A *name* is not a secret, and it has to reach the gear dialog or
+            # there is no way to see or correct it short of deleting the model.
+            # A literal key IS a secret, and those are legacy entries: report the
+            # state and let the hint explain the fix, but never send the value to
+            # the browser. Clearing the field and typing a name migrates it.
+            item["api_key_name"] = ("" if kstate == "literal"
+                                    else str(m.get("api_key") or ""))
+            # a remote endpoint cannot answer anything without one, and the
+            # only symptom used to be a 401 in the middle of a conversation
+            item["needs_key"] = bool(mtype == "api" and not item["api_key_set"]
+                                     and not _is_loopback(m))
         out.append(item)
     ready = _bonsai_ready()
     return {"active": entry["id"] if entry else None,
@@ -3094,7 +3278,9 @@ def _add_model(body):
                  "base_url": base, "model": model}
         # a *reference* to an entry in API KEYS.txt (or an env var name), so
         # the secret itself never has to be written into models.json
-        key_ref = str(body.get("api_key") or "").strip()
+        key_ref, key_err = _sanitise_key_ref(body.get("api_key"))
+        if key_err:
+            return {"ok": False, "error": key_err}
         if key_ref:
             entry["api_key"] = key_ref
         key_header = str(body.get("api_key_header") or "").strip()
@@ -3127,7 +3313,25 @@ def _add_model(body):
             return {"ok": False, "error": "a model with id '%s' already exists" % mid}
         _MODELS.append(entry)
     _save_models()
-    return {"ok": True, "added": entry, **_public_models()}
+    res = {"ok": True, "added": entry, **_public_models()}
+    # adding a hosted model with no usable key is allowed - it can be filled in
+    # afterwards - but the user should hear about it now, not from a 401 later
+    if entry.get("type") == "api" and not _api_key_present(entry.get("api_key")) \
+            and not _is_loopback(entry):
+        res["warn"] = _no_key_warning(entry)
+    return res
+
+
+def _no_key_warning(entry):
+    name = str((entry or {}).get("api_key") or "").strip()
+    host = _api_host((entry or {}).get("base_url"))
+    if not name:
+        return ("%s needs an API key. Add a line 'NAME=your-key' to API KEYS.txt, "
+                "then open MODEL SETTINGS for this model and put NAME in the API "
+                "key name field." % host)
+    return ("'%s' is not in API KEYS.txt, so it would be sent to %s as if it were "
+            "the key and every request would come back 401. Add a line "
+            "'%s=your-key' to API KEYS.txt." % (name, host, name))
 
 
 def _remove_model(mid):
@@ -3286,8 +3490,12 @@ def _http_json(url, payload, timeout=300):
         return json.loads(resp.read().decode("utf-8"))
 
 
-def _http_json_get(url, timeout=30):
-    req = urllib.request.Request(url, headers=_model_headers(), method="GET")
+def _http_json_get(url, timeout=30, headers=None):
+    # headers=None keeps the old behaviour: the active model's own headers,
+    # which is what the context lookup wants. A caller testing a key for an
+    # endpoint that is not active yet passes them explicitly.
+    req = urllib.request.Request(url, headers=headers if headers is not None
+                                 else _model_headers(), method="GET")
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
@@ -4537,13 +4745,14 @@ def _provider_message(exc):
     return ""
 
 
-def _model_error_text(exc):
+def _model_error_text(exc, entry=None):
     """Turn a failed model request into something the reader can act on.
 
     urllib's default is "HTTP Error 401: Unauthorized", which does not say
     which key, which model, or what to do about it - and for a hosted endpoint
     it used to be swallowed entirely behind "model server could not start"."""
-    entry = _active_model()
+    if entry is None:
+        entry = _active_model()
     who = str((entry or {}).get("label") or (entry or {}).get("model")
               or "the model server")
     detail = _provider_message(exc) if isinstance(
@@ -9304,6 +9513,11 @@ PAGE = """<!doctype html>
   .cfgrid label { display: flex; flex-direction: column; gap: 4px; font-size: 11.5px; color: var(--mut); }
   .cfgrid input { width: 100%; box-sizing: border-box; background: var(--bg3); border: 1px solid var(--bd2); border-radius: 8px; padding: 8px 10px; color: var(--txt); font: inherit; font-size: 13px; outline: none; }
   .cfgrid input:focus { border-color: var(--acc); }
+  .cfgrid label.keyfield { grid-column: 1 / -1; }
+  .cfgrid .kstate { font-size: 11px; font-weight: 600; letter-spacing: .04em; }
+  .cfgrid .kstate.ok { color: var(--ok, #34d399); }
+  .cfgrid .kstate.bad { color: var(--bad, #f87171); }
+  .cfgrid .kstate.warn { color: var(--warn, #fbbf24); }
   .mdlbox h4 span { color: var(--mut); font-weight: 400; text-transform: none; letter-spacing: 0; }
   .mdlbox .close { margin-top: 14px; text-align: center; color: var(--mut); cursor: pointer; font-size: 12.5px; }
   .mdlbox .close:hover { color: var(--err); }
@@ -9707,7 +9921,7 @@ PAGE = """<!doctype html>
       <div class="row">
         <input id="apibase" placeholder="base URL, e.g. http://127.0.0.1:1234/v1">
         <input id="apimodel" placeholder="model id, e.g. qwen3-8b">
-        <input id="apikey" placeholder="key name from API KEYS.txt (optional)">
+        <input id="apikey" placeholder="API key name, e.g. OPENROUTER_API_KEY" title="The NAME of a line in API KEYS.txt - not the key itself. Most hosted providers need one; a llama-server on this PC does not.">
         <button class="act inline" id="mdl-api">Add</button>
       </div>
       <div class="mdlsep">vision projector (optional - enables screenshots &amp; images)</div>
@@ -9730,10 +9944,12 @@ PAGE = """<!doctype html>
         <label>Top-p<input id="cfg_top_p" type="number" min="0.01" max="1" step="0.01"></label>
         <label>Top-k<input id="cfg_top_k" type="number" min="0" max="1000" step="1"></label>
         <label>GPU layers (-ngl)<input id="cfg_ngl" type="number" min="-1" max="999" step="1"></label>
+        <label class="keyfield" id="cfg-keyrow" hidden>API key name <span class="kstate" id="cfg_keystate"></span><input id="cfg_apikey" type="text" spellcheck="false" autocomplete="off" placeholder="OPENROUTER_API_KEY"></label>
       </div>
       <div class="hint" id="cfghint"></div>
       <div class="row">
         <button class="act inline" id="cfg-save">Save</button>
+        <button class="act inline" id="cfg-testkey" hidden>TEST KEY</button>
         <button class="act inline" id="cfg-defaults">Defaults</button>
         <button class="act inline" id="cfg-close">Close</button>
       </div>
@@ -10366,6 +10582,12 @@ async function go(forcedParts, chat, alreadyAdded, askedMsg) {
   if (chat && chat !== cur && chats.indexOf(chat) !== -1) { cur = chat; renderAll(); }
   const parts = forcedParts || buildUserMsg();
   if (!parts) return;
+  // A remote model with no key would otherwise fail as a 401 halfway through,
+  // after the turn is already spent and buried in a conversation.
+  try {
+    const block = await failFastKey();
+    if (block) { alert(block); return; }
+  } catch (e) { /* never block the send on a failed check */ }
   busy = true;
   setSendUI();
 
@@ -10988,7 +11210,8 @@ function renderModels(j) {
     const o = document.createElement('option');
     o.value = m.id;
     o.textContent = modelLabel(m) + (m.type === 'local' && m.vision ? ' · vision' : '') +
-      (m.type === 'local' && m.available === false ? ' (missing)' : '');
+      (m.type === 'local' && m.available === false ? ' (missing)' : '') +
+      (m.type === 'api' ? ' · ' + (m.needs_key ? 'NO KEY' : (m.api_key_set ? 'key ok' : 'no key needed')) : '');
     if (m.id === j.active) o.selected = true;
     sel.appendChild(o);
   });
@@ -11129,8 +11352,24 @@ if (_apiBaseEl) _apiBaseEl.onchange = function () {
           'for OpenAI-compatible providers it usually ends in /v1.');
   }
 };
+/* Fill in the key name we already know the answer to, so the common case is
+   "paste the key once" rather than "guess what we named it". Only fills an
+   empty box, and only for a host we recognise. */
+var KNOWN_KEY_NAMES = { 'openrouter.ai': 'OPENROUTER_API_KEY', 'api.anthropic.com': 'ANTHROPIC_API_KEY', 'api.openai.com': 'OPENAI_API_KEY', 'generativelanguage.googleapis.com': 'GEMINI_API_KEY', 'api.groq.com': 'GROQ_API_KEY', 'api.mistral.ai': 'MISTRAL_API_KEY', 'api.deepseek.com': 'DEEPSEEK_API_KEY', 'openrouter.ai/api': 'OPENROUTER_API_KEY' };
+function suggestKeyName() {
+  var el = document.getElementById('apikey');
+  if (!el) return;
+  if ((el.value || '').trim()) return;
+  var raw = (document.getElementById('apibase').value || '').trim();
+  if (raw.indexOf('http') !== 0) return;
+  var host;
+  try { host = new URL(raw).hostname.toLowerCase(); } catch (e) { return; }
+  if (host.indexOf('www.') === 0) host = host.slice(4);
+  if (KNOWN_KEY_NAMES[host]) el.value = KNOWN_KEY_NAMES[host];
+}
 function addModelApi() {
   fixupApiUrl();
+  suggestKeyName();
   const base = (document.getElementById('apibase').value || '').trim();
   const model = (document.getElementById('apimodel').value || '').trim();
   /* a NAME from API KEYS.txt, never the secret itself */
@@ -11146,6 +11385,9 @@ function addModelApi() {
       document.getElementById('apibase').value = '';
       document.getElementById('apimodel').value = '';
       if (keyEl) keyEl.value = '';
+      // a remote endpoint with no resolvable key cannot answer anything, and
+      // saying so here beats finding out from a 401 mid-conversation
+      if (j.warn) alert(j.warn);
     })
     .catch(function () { alert('Add failed'); });
 }
@@ -11180,7 +11422,76 @@ const _mdlClose = document.getElementById('addmdl-close');
 if (_mdlClose) _mdlClose.onclick = closeAddMdl;
 const _mdl = document.getElementById('addmdl');
 if (_mdl) _mdl.onclick = function (ev) { if (ev.target === _mdl) closeAddMdl(); };
+/* fail-fast: a remote model with no resolvable key must never reach a chat.
+   Reads the payload renderModels() already cached rather than asking again -
+   /api/models costs a round trip and a readiness probe, which is real time
+   added to every single message. The one case that does re-ask is the case
+   where we are about to refuse the send, because API KEYS.txt is re-read on
+   change and the user may have just pasted their key in. */
+function keyProblem(j) {
+  var act = null;
+  for (var i = 0; i < (j.models || []).length; i++) if (j.models[i].id === j.active) { act = j.models[i]; break; }
+  if (!act) return null;
+  if (!act.needs_key) return null;
+  if (act.api_key_set) return null;
+  return "This model is a remote endpoint but no key is available for '" + (act.api_key_name || 'its API key') + "'. Open the gear (MODEL SETTINGS) and either add that name to API KEYS.txt, or fix the key name - then press TEST KEY.";
+}
+async function failFastKey() {
+  var cached = window.__lastModels;
+  // Nothing known yet: let the message through. Waiting on the network here
+  // would add the /api/models round trip to a send, and that call is not cheap
+  // - it probes model-server readiness, which is seconds when nothing is
+  // listening. Not being able to fail fast is much better than being slow.
+  if (!cached || !cached.models) return null;
+  if (!keyProblem(cached)) return null;
+  // Only now, where we are about to refuse the send, is a fresh read worth
+  // it: API KEYS.txt is re-read on change, so the user may have just pasted
+  // their key in and the cached payload would be out of date.
+  var fresh = null;
+  try { fresh = await fetch('/api/models').then(function (r) { return r.json(); }); }
+  catch (e) { return keyProblem(cached); }
+  if (fresh) {
+    window.__lastModels = fresh;
+    if (typeof renderModels === 'function') renderModels(fresh);
+  }
+  return keyProblem(fresh || cached);
+}
 /* ---------- MODEL SETTINGS modal ---------- */
+/* A model's api_key is a *name* - of a line in API KEYS.txt, or of an
+   environment variable - never the key itself. The backend can tell four
+   states apart and each one needs a different word: reporting "key fine" for a
+   name that is not in the file is how a 401 gets debugged from the wrong end. */
+var KEY_BADGE = {
+  named:   ['KEY FOUND', 'ok'],
+  literal: ['KEY IN MODELS.JSON', 'warn'],
+  missing: ['NOT IN API KEYS.TXT', 'bad'],
+  none:    ['NO KEY', 'bad']
+};
+function keyStateOf(m) { return (m && m.api_key_state) || 'none'; }
+function keyBadgeText(m) {
+  var st = keyStateOf(m);
+  // a llama-server on this PC needs no key, and saying NO KEY in red there
+  // would be a lie about a perfectly working setup
+  if (st === 'none' && m && !m.needs_key) return ['NO KEY NEEDED', ''];
+  return KEY_BADGE[st] || KEY_BADGE.none;
+}
+function showKeyBadge(m) {
+  var el = document.getElementById('cfg_keystate');
+  if (!el) return;
+  var b = keyBadgeText(m);
+  el.textContent = b[0];
+  el.className = 'kstate ' + b[1];
+}
+function keyHint(m) {
+  if (!m || m.type !== 'api') return '';
+  var name = m.api_key_name || '';
+  var st = keyStateOf(m);
+  if (st === 'named') return 'The key name is saved. The key itself stays in API KEYS.txt and is never shown here.';
+  if (st === 'literal') return 'This model has the key itself in models.json, in plain text. Move it into API KEYS.txt under a name and put that name in the field above.';
+  if (st === 'missing') return "'" + name + "' is not in API KEYS.txt, so it would be sent to the provider as if it were the key and every request would come back 401. Add '" + name + "=your-key' to API KEYS.txt, then press TEST KEY.";
+  if (m.needs_key) return 'This endpoint needs a key. Put it in API KEYS.txt as NAME=your-key and put NAME in the field above.';
+  return 'No key needed - this endpoint is on your own machine.';
+}
 function cfgFill(j) {
   const models = (j && j.models) || [];
   const act = models.filter(function (m) { return m.id === (j && j.active); })[0];
@@ -11191,10 +11502,18 @@ function cfgFill(j) {
   set('cfg_top_p', cfg.top_p); set('cfg_top_k', cfg.top_k); set('cfg_ngl', cfg.ngl);
   const who = document.getElementById('cfgwho');
   if (who) who.textContent = act ? ('- ' + (act.label || act.id)) : '';
+  const isApi = !!(act && act.type === 'api');
+  const keyRow = document.getElementById('cfg-keyrow');
+  if (keyRow) keyRow.hidden = !isApi;
+  const testBtn = document.getElementById('cfg-testkey');
+  if (testBtn) testBtn.hidden = !isApi;
+  const keyIn = document.getElementById('cfg_apikey');
+  if (keyIn) keyIn.value = (act && act.api_key_name) || '';
+  showKeyBadge(act);
   const hint = document.getElementById('cfghint');
   if (hint) {
     hint.textContent = !act ? 'No local model selected.'
-      : (act.type === 'api' ? 'External endpoints are configured by their own server.'
+      : (isApi ? keyHint(act)
       : 'Save and the model server restarts, so your next message uses these values. EJECT does the same by hand.');
   }
 }
@@ -11230,22 +11549,56 @@ if (_cfgSave) _cfgSave.onclick = function () {
   };
   const cfg = { ctx: num('cfg_ctx'), temp: num('cfg_temp'), top_p: num('cfg_top_p'),
                 top_k: num('cfg_top_k'), ngl: num('cfg_ngl') };
+  const body = { action: 'config', id: act.id, cfg: cfg };
+  if (act.type === 'api') {
+    const k = document.getElementById('cfg_apikey');
+    body.api_key = k ? (k.value || '').trim() : '';
+  }
   _cfgSave.disabled = true;
   fetch('/api/models', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ action: 'config', id: act.id, cfg: cfg }) })
+    body: JSON.stringify(body) })
     .then(function (r) { return r.json(); })
     .then(function (res) {
       if (!res.ok) { alert('Could not save the settings:\\n' + (res.error || 'unknown error')); return; }
       renderModels(res);
       cfgFill(res);
       const hint = document.getElementById('cfghint');
-      if (hint) hint.textContent = 'Saved. ' + (res.detail || 'These values apply the next time this model is loaded.');
+      if (hint) hint.textContent = res.warn ? ('Saved. ' + res.warn)
+        : ('Saved. ' + (res.detail || 'These values apply the next time this model is loaded.'));
     })
     .catch(function () { alert('Could not save the settings'); })
     .then(function () { _cfgSave.disabled = false; });
 };
+/* One cheap authenticated GET instead of a whole failed conversation. */
+const _cfgTest = document.getElementById('cfg-testkey');
+if (_cfgTest) _cfgTest.onclick = function () {
+  const j = window.__lastModels || {};
+  const act = (j.models || []).filter(function (m) { return m.id === j.active; })[0];
+  if (!act) { alert('No model selected.'); return; }
+  const k = document.getElementById('cfg_apikey');
+  const hint = document.getElementById('cfghint');
+  _cfgTest.disabled = true;
+  const was = _cfgTest.textContent;
+  _cfgTest.textContent = 'TESTING...';
+  fetch('/api/models', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action: 'test_key', base_url: act.base_url,
+                           model: act.model, api_key: k ? (k.value || '').trim() : '' }) })
+    .then(function (r) { return r.json(); })
+    .then(function (res) {
+      if (res && res.ok) {
+        let msg = res.detail || 'the key was accepted';
+        if (res.context_length) msg += ' - context window ' + res.context_length + ' tokens';
+        if (res.model_ok === false) msg = 'The key works. ' + (res.warn || '');
+        if (hint) hint.textContent = msg;
+      } else if (hint) {
+        hint.textContent = (res && res.error) || 'the key test failed';
+      }
+    })
+    .catch(function () { if (hint) hint.textContent = 'the key test could not reach the provider'; })
+    .then(function () { _cfgTest.disabled = false; _cfgTest.textContent = was; });
+};
 document.addEventListener('keydown', function (ev) {
-  if (ev.key === 'Escape') closeAddMdl();
+  if (ev.key === 'Escape') { closeAddMdl(); closeCfgMdl(); }
 });
 refreshModels();
 
@@ -11620,6 +11973,11 @@ PAGE_GPT = """<!doctype html>
   .cfgrid label { display: flex; flex-direction: column; gap: 4px; font-size: 11.5px; color: var(--mut); }
   .cfgrid input { width: 100%; box-sizing: border-box; background: transparent; border: 1px solid var(--bd); border-radius: 8px; padding: 8px 10px; color: var(--txt); font-size: 13px; outline: none; }
   .cfgrid input:focus { border-color: var(--mut); }
+  .cfgrid label.keyfield { grid-column: 1 / -1; }
+  .cfgrid .kstate { font-size: 11px; font-weight: 600; letter-spacing: .04em; }
+  .cfgrid .kstate.ok { color: var(--ok, #34d399); }
+  .cfgrid .kstate.bad { color: var(--bad, #f87171); }
+  .cfgrid .kstate.warn { color: var(--warn, #fbbf24); }
   .mdlbox h4 span { color: var(--mut); font-weight: 400; text-transform: none; letter-spacing: 0; }
   .mdlbox .close { margin-top: 14px; text-align: center; color: var(--mut); cursor: pointer; font-size: 12.5px; }
   .mdlbox .close:hover { color: var(--err); }
@@ -11873,7 +12231,7 @@ PAGE_GPT = """<!doctype html>
         <div class="row">
           <input id="apibase" placeholder="base URL, e.g. http://127.0.0.1:1234/v1">
         <input id="apimodel" placeholder="model id, e.g. qwen3-8b">
-        <input id="apikey" placeholder="key name from API KEYS.txt (optional)">
+        <input id="apikey" placeholder="API key name, e.g. OPENROUTER_API_KEY" title="The NAME of a line in API KEYS.txt - not the key itself. Most hosted providers need one; a llama-server on this PC does not.">
           <button class="act inline" id="mdl-api">Add</button>
         </div>
         <div class="mdlsep">vision projector (optional - enables screenshots &amp; images)</div>
@@ -11896,10 +12254,12 @@ PAGE_GPT = """<!doctype html>
           <label>Top-p<input id="cfg_top_p" type="number" min="0.01" max="1" step="0.01"></label>
           <label>Top-k<input id="cfg_top_k" type="number" min="0" max="1000" step="1"></label>
           <label>GPU layers (-ngl)<input id="cfg_ngl" type="number" min="-1" max="999" step="1"></label>
+          <label class="keyfield" id="cfg-keyrow" hidden>API key name <span class="kstate" id="cfg_keystate"></span><input id="cfg_apikey" type="text" spellcheck="false" autocomplete="off" placeholder="OPENROUTER_API_KEY"></label>
         </div>
         <div class="hint" id="cfghint"></div>
         <div class="row">
           <button class="act inline" id="cfg-save">Save</button>
+          <button class="act inline" id="cfg-testkey" hidden>TEST KEY</button>
           <button class="act inline" id="cfg-defaults">Defaults</button>
           <button class="act inline" id="cfg-close">Close</button>
         </div>
@@ -12948,6 +13308,12 @@ async function go(forcedParts, chat, alreadyAdded, askedMsg) {
   if (chat && chat !== cur && chats.indexOf(chat) !== -1) { cur = chat; renderAll(); }
   const parts = forcedParts || buildUserMsg();
   if (!parts) return;
+  // A remote model with no key would otherwise fail as a 401 halfway through,
+  // after the turn is already spent and buried in a conversation.
+  try {
+    const block = await failFastKey();
+    if (block) { alert(block); return; }
+  } catch (e) { /* never block the send on a failed check */ }
   busy = true;
   setSendUI();
 
@@ -13158,7 +13524,8 @@ function renderModels(j) {
     const o = document.createElement('option');
     o.value = m.id;
     o.textContent = modelLabel(m) + (m.type === 'local' && m.vision ? ' · vision' : '') +
-      (m.type === 'local' && m.available === false ? ' (missing)' : '');
+      (m.type === 'local' && m.available === false ? ' (missing)' : '') +
+      (m.type === 'api' ? ' · ' + (m.needs_key ? 'NO KEY' : (m.api_key_set ? 'key ok' : 'no key needed')) : '');
     if (m.id === j.active) o.selected = true;
     sel.appendChild(o);
   });
@@ -13299,8 +13666,24 @@ if (_apiBaseEl) _apiBaseEl.onchange = function () {
           'for OpenAI-compatible providers it usually ends in /v1.');
   }
 };
+/* Fill in the key name we already know the answer to, so the common case is
+   "paste the key once" rather than "guess what we named it". Only fills an
+   empty box, and only for a host we recognise. */
+var KNOWN_KEY_NAMES = { 'openrouter.ai': 'OPENROUTER_API_KEY', 'api.anthropic.com': 'ANTHROPIC_API_KEY', 'api.openai.com': 'OPENAI_API_KEY', 'generativelanguage.googleapis.com': 'GEMINI_API_KEY', 'api.groq.com': 'GROQ_API_KEY', 'api.mistral.ai': 'MISTRAL_API_KEY', 'api.deepseek.com': 'DEEPSEEK_API_KEY', 'openrouter.ai/api': 'OPENROUTER_API_KEY' };
+function suggestKeyName() {
+  var el = document.getElementById('apikey');
+  if (!el) return;
+  if ((el.value || '').trim()) return;
+  var raw = (document.getElementById('apibase').value || '').trim();
+  if (raw.indexOf('http') !== 0) return;
+  var host;
+  try { host = new URL(raw).hostname.toLowerCase(); } catch (e) { return; }
+  if (host.indexOf('www.') === 0) host = host.slice(4);
+  if (KNOWN_KEY_NAMES[host]) el.value = KNOWN_KEY_NAMES[host];
+}
 function addModelApi() {
   fixupApiUrl();
+  suggestKeyName();
   const base = (document.getElementById('apibase').value || '').trim();
   const model = (document.getElementById('apimodel').value || '').trim();
   /* a NAME from API KEYS.txt, never the secret itself */
@@ -13316,6 +13699,9 @@ function addModelApi() {
       document.getElementById('apibase').value = '';
       document.getElementById('apimodel').value = '';
       if (keyEl) keyEl.value = '';
+      // a remote endpoint with no resolvable key cannot answer anything, and
+      // saying so here beats finding out from a 401 mid-conversation
+      if (j.warn) alert(j.warn);
     })
     .catch(function () { alert('Add failed'); });
 }
@@ -13350,7 +13736,76 @@ const _mdlClose = document.getElementById('addmdl-close');
 if (_mdlClose) _mdlClose.onclick = closeAddMdl;
 const _mdl = document.getElementById('addmdl');
 if (_mdl) _mdl.onclick = function (ev) { if (ev.target === _mdl) closeAddMdl(); };
+/* fail-fast: a remote model with no resolvable key must never reach a chat.
+   Reads the payload renderModels() already cached rather than asking again -
+   /api/models costs a round trip and a readiness probe, which is real time
+   added to every single message. The one case that does re-ask is the case
+   where we are about to refuse the send, because API KEYS.txt is re-read on
+   change and the user may have just pasted their key in. */
+function keyProblem(j) {
+  var act = null;
+  for (var i = 0; i < (j.models || []).length; i++) if (j.models[i].id === j.active) { act = j.models[i]; break; }
+  if (!act) return null;
+  if (!act.needs_key) return null;
+  if (act.api_key_set) return null;
+  return "This model is a remote endpoint but no key is available for '" + (act.api_key_name || 'its API key') + "'. Open the gear (MODEL SETTINGS) and either add that name to API KEYS.txt, or fix the key name - then press TEST KEY.";
+}
+async function failFastKey() {
+  var cached = window.__lastModels;
+  // Nothing known yet: let the message through. Waiting on the network here
+  // would add the /api/models round trip to a send, and that call is not cheap
+  // - it probes model-server readiness, which is seconds when nothing is
+  // listening. Not being able to fail fast is much better than being slow.
+  if (!cached || !cached.models) return null;
+  if (!keyProblem(cached)) return null;
+  // Only now, where we are about to refuse the send, is a fresh read worth
+  // it: API KEYS.txt is re-read on change, so the user may have just pasted
+  // their key in and the cached payload would be out of date.
+  var fresh = null;
+  try { fresh = await fetch('/api/models').then(function (r) { return r.json(); }); }
+  catch (e) { return keyProblem(cached); }
+  if (fresh) {
+    window.__lastModels = fresh;
+    if (typeof renderModels === 'function') renderModels(fresh);
+  }
+  return keyProblem(fresh || cached);
+}
 /* ---------- MODEL SETTINGS modal ---------- */
+/* A model's api_key is a *name* - of a line in API KEYS.txt, or of an
+   environment variable - never the key itself. The backend can tell four
+   states apart and each one needs a different word: reporting "key fine" for a
+   name that is not in the file is how a 401 gets debugged from the wrong end. */
+var KEY_BADGE = {
+  named:   ['KEY FOUND', 'ok'],
+  literal: ['KEY IN MODELS.JSON', 'warn'],
+  missing: ['NOT IN API KEYS.TXT', 'bad'],
+  none:    ['NO KEY', 'bad']
+};
+function keyStateOf(m) { return (m && m.api_key_state) || 'none'; }
+function keyBadgeText(m) {
+  var st = keyStateOf(m);
+  // a llama-server on this PC needs no key, and saying NO KEY in red there
+  // would be a lie about a perfectly working setup
+  if (st === 'none' && m && !m.needs_key) return ['NO KEY NEEDED', ''];
+  return KEY_BADGE[st] || KEY_BADGE.none;
+}
+function showKeyBadge(m) {
+  var el = document.getElementById('cfg_keystate');
+  if (!el) return;
+  var b = keyBadgeText(m);
+  el.textContent = b[0];
+  el.className = 'kstate ' + b[1];
+}
+function keyHint(m) {
+  if (!m || m.type !== 'api') return '';
+  var name = m.api_key_name || '';
+  var st = keyStateOf(m);
+  if (st === 'named') return 'The key name is saved. The key itself stays in API KEYS.txt and is never shown here.';
+  if (st === 'literal') return 'This model has the key itself in models.json, in plain text. Move it into API KEYS.txt under a name and put that name in the field above.';
+  if (st === 'missing') return "'" + name + "' is not in API KEYS.txt, so it would be sent to the provider as if it were the key and every request would come back 401. Add '" + name + "=your-key' to API KEYS.txt, then press TEST KEY.";
+  if (m.needs_key) return 'This endpoint needs a key. Put it in API KEYS.txt as NAME=your-key and put NAME in the field above.';
+  return 'No key needed - this endpoint is on your own machine.';
+}
 function cfgFill(j) {
   const models = (j && j.models) || [];
   const act = models.filter(function (m) { return m.id === (j && j.active); })[0];
@@ -13361,10 +13816,18 @@ function cfgFill(j) {
   set('cfg_top_p', cfg.top_p); set('cfg_top_k', cfg.top_k); set('cfg_ngl', cfg.ngl);
   const who = document.getElementById('cfgwho');
   if (who) who.textContent = act ? ('- ' + (act.label || act.id)) : '';
+  const isApi = !!(act && act.type === 'api');
+  const keyRow = document.getElementById('cfg-keyrow');
+  if (keyRow) keyRow.hidden = !isApi;
+  const testBtn = document.getElementById('cfg-testkey');
+  if (testBtn) testBtn.hidden = !isApi;
+  const keyIn = document.getElementById('cfg_apikey');
+  if (keyIn) keyIn.value = (act && act.api_key_name) || '';
+  showKeyBadge(act);
   const hint = document.getElementById('cfghint');
   if (hint) {
     hint.textContent = !act ? 'No local model selected.'
-      : (act.type === 'api' ? 'External endpoints are configured by their own server.'
+      : (isApi ? keyHint(act)
       : 'Save and the model server restarts, so your next message uses these values. EJECT does the same by hand.');
   }
 }
@@ -13400,22 +13863,56 @@ if (_cfgSave) _cfgSave.onclick = function () {
   };
   const cfg = { ctx: num('cfg_ctx'), temp: num('cfg_temp'), top_p: num('cfg_top_p'),
                 top_k: num('cfg_top_k'), ngl: num('cfg_ngl') };
+  const body = { action: 'config', id: act.id, cfg: cfg };
+  if (act.type === 'api') {
+    const k = document.getElementById('cfg_apikey');
+    body.api_key = k ? (k.value || '').trim() : '';
+  }
   _cfgSave.disabled = true;
   fetch('/api/models', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ action: 'config', id: act.id, cfg: cfg }) })
+    body: JSON.stringify(body) })
     .then(function (r) { return r.json(); })
     .then(function (res) {
       if (!res.ok) { alert('Could not save the settings:\\n' + (res.error || 'unknown error')); return; }
       renderModels(res);
       cfgFill(res);
       const hint = document.getElementById('cfghint');
-      if (hint) hint.textContent = 'Saved. ' + (res.detail || 'These values apply the next time this model is loaded.');
+      if (hint) hint.textContent = res.warn ? ('Saved. ' + res.warn)
+        : ('Saved. ' + (res.detail || 'These values apply the next time this model is loaded.'));
     })
     .catch(function () { alert('Could not save the settings'); })
     .then(function () { _cfgSave.disabled = false; });
 };
+/* One cheap authenticated GET instead of a whole failed conversation. */
+const _cfgTest = document.getElementById('cfg-testkey');
+if (_cfgTest) _cfgTest.onclick = function () {
+  const j = window.__lastModels || {};
+  const act = (j.models || []).filter(function (m) { return m.id === j.active; })[0];
+  if (!act) { alert('No model selected.'); return; }
+  const k = document.getElementById('cfg_apikey');
+  const hint = document.getElementById('cfghint');
+  _cfgTest.disabled = true;
+  const was = _cfgTest.textContent;
+  _cfgTest.textContent = 'TESTING...';
+  fetch('/api/models', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action: 'test_key', base_url: act.base_url,
+                           model: act.model, api_key: k ? (k.value || '').trim() : '' }) })
+    .then(function (r) { return r.json(); })
+    .then(function (res) {
+      if (res && res.ok) {
+        let msg = res.detail || 'the key was accepted';
+        if (res.context_length) msg += ' - context window ' + res.context_length + ' tokens';
+        if (res.model_ok === false) msg = 'The key works. ' + (res.warn || '');
+        if (hint) hint.textContent = msg;
+      } else if (hint) {
+        hint.textContent = (res && res.error) || 'the key test failed';
+      }
+    })
+    .catch(function () { if (hint) hint.textContent = 'the key test could not reach the provider'; })
+    .then(function () { _cfgTest.disabled = false; _cfgTest.textContent = was; });
+};
 document.addEventListener('keydown', function (ev) {
-  if (ev.key === 'Escape') closeAddMdl();
+  if (ev.key === 'Escape') { closeAddMdl(); closeCfgMdl(); }
 });
 refreshModels();
 const inp = document.getElementById('user-input');
@@ -14860,8 +15357,21 @@ class Handler(BaseHTTPRequestHandler):
                     res = _set_model_mmproj(str(body.get("id") or ""),
                                             body.get("mmproj"))
                 elif action == "config":
-                    res = _set_model_config(str(body.get("id") or ""),
-                                            body.get("cfg") or {})
+                    # cfg carries the numbers; api_key travels beside it because
+                    # a hosted model has no numbers worth saving, only a key.
+                    # Only forwarded when the client actually sent it, so an
+                    # older page that knows nothing about keys cannot blank it.
+                    cfg = dict(body.get("cfg") or {})
+                    if "api_key" in body:
+                        cfg["api_key"] = body.get("api_key")
+                    res = _set_model_config(str(body.get("id") or ""), cfg)
+                elif action == "test_key":
+                    if body.get("base_url"):
+                        res = _test_model_key(base=body.get("base_url"),
+                                              model=body.get("model"),
+                                              key_ref=body.get("api_key"))
+                    else:
+                        res = _test_model_key()
                 elif action == "scan":
                     res = _scan_models()
                 else:
@@ -15082,8 +15592,9 @@ def main():
     threading.Thread(target=_sysinfo_loop, daemon=True,
                      name="bonsai-sysinfo").start()
     _sched_load()
-    print("BONSAI is READY on http://127.0.0.1:8081", flush=True)
-    webbrowser.open(f"http://{HOST}:{PORT}")
+    print("BONSAI is READY on http://%s:%d" % (HOST, PORT), flush=True)
+    if not os.environ.get("BONSAI_NO_BROWSER"):
+        webbrowser.open(f"http://{HOST}:{PORT}")
     # a resolver browser that outlives the app would hold a profile lock and
     # a few hundred MB, so it is reaped on the way out
     import atexit
