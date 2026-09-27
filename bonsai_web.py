@@ -93,6 +93,8 @@ WORKDIR = os.path.realpath(os.environ.get("PC_WORKDIR", _DEF_WORKDIR))
 PIPER_DIR = os.environ.get("PC_PIPER_DIR", os.path.join(BONSAI_DIR, "piper"))
 MODELS_FILE = os.path.join(BONSAI_DIR, "models.json")
 MODELS_DIR = os.path.join(BONSAI_DIR, "models")
+# Secrets live here, not in the app: one NAME=value per line, '#' comments.
+API_KEYS_FILE = os.path.join(BONSAI_DIR, "API KEYS.txt")
 
 CREATE_NO_WINDOW = 0x08000000 if IS_WINDOWS else 0
 
@@ -798,18 +800,201 @@ def _read_file(path):
     return {"result": "ok", "path": target, "content": content}
 
 
+# ---- code differencing -------------------------------------------------
+# Every write the model makes is remembered as a real diff against the
+# content the file had *before the session first touched it*. The chat shows
+# the per-step diff, the panel shows the cumulative one, and a revert puts
+# the original text back. Diffs travel to the UI on a side channel (a thread
+# local) so the model never sees them and they never bloat the context.
+
+_CHANGES = {}
+_CHANGES_LOCK = threading.RLock()
+_CHANGE_TLS = threading.local()
+_DIFF_CAP = 4000          # per-step diff shipped with a tool call
+_DIFF_CAP_FULL = 200000   # full diff served by /api/changes
+_MAX_DIFF_BYTES = 4000000
+
+
+def _changes_rel(path):
+    """Path as shown in the UI: relative to the workspace when it is inside,
+    absolute otherwise (the user may have approved a path anywhere)."""
+    try:
+        rel = os.path.relpath(path, os.path.realpath(WORKDIR))
+    except Exception:
+        return path
+    return path if rel.startswith("..") else rel.replace("\\", "/")
+
+
+def _diff_text(before, after, path, context=3):
+    """Unified diff between two texts. Returns (diff_text, added, removed)."""
+    import difflib
+    a = str(before or "").splitlines()
+    b = str(after or "").splitlines()
+    rel = _changes_rel(path)
+    lines = list(difflib.unified_diff(a, b, fromfile="a/" + rel, tofile="b/" + rel,
+                                      lineterm="", n=context))
+    if len(lines) > _MAX_DIFF_BYTES // 40:
+        return "(diff too large to display)", 0, 0
+    added = sum(1 for l in lines if l.startswith("+") and not l.startswith("+++"))
+    removed = sum(1 for l in lines if l.startswith("-") and not l.startswith("---"))
+    return "\n".join(lines), added, removed
+
+
+def _note_change(path, before, after, tool=""):
+    """Record one write. Returns the payload the chat UI shows under the step.
+
+    `before` is the content immediately before this write, `after` the content
+    written. The first time a file is touched its pre-session content is kept,
+    so the panel can always show original -> now and revert to it."""
+    try:
+        key = os.path.realpath(path)
+    except Exception:
+        return None
+    before = str(before or "")
+    after = str(after or "")
+    if before == after:
+        return None
+    step_diff, step_add, step_del = _diff_text(before, after, key)
+    now = time.time()
+    with _CHANGES_LOCK:
+        entry = _CHANGES.get(key)
+        created = entry is None and before == ""
+        if entry is None:
+            entry = {"path": key, "rel": _changes_rel(key), "original": before,
+                     "created": created, "tool": tool, "ts": now, "reverted": False}
+            _CHANGES[key] = entry
+        elif entry.get("reverted"):
+            entry["reverted"] = False
+            entry["ts"] = now
+        entry["tool"] = tool or entry.get("tool") or ""
+        entry["edits"] = int(entry.get("edits") or 0) + 1
+        entry["ts"] = now
+        full_diff, total_add, total_del = _diff_text(entry["original"], after, key)
+        entry["diff"] = full_diff
+        entry["added"] = total_add
+        entry["removed"] = total_del
+        payload = {"path": key, "rel": entry["rel"],
+                   "added": step_add, "removed": step_del,
+                   "total_added": total_add, "total_removed": total_del,
+                   "diff": step_diff[:_DIFF_CAP],
+                   "total_diff": full_diff[:_DIFF_CAP],
+                   "created": bool(entry.get("created")),
+                   "truncated": len(step_diff) > _DIFF_CAP,
+                   "tool": tool}
+    _CHANGE_TLS.last = payload
+    return payload
+
+
+def _take_last_change():
+    """Pop the diff the last write left behind (same thread, so a tool call
+    picks up its own change and nothing else)."""
+    payload = getattr(_CHANGE_TLS, "last", None)
+    _CHANGE_TLS.last = None
+    return payload
+
+
+def _change_summary():
+    with _CHANGES_LOCK:
+        files = [e for e in _CHANGES.values() if not e.get("reverted")]
+    return {"files": len(files),
+            "added": sum(int(e.get("added") or 0) for e in files),
+            "removed": sum(int(e.get("removed") or 0) for e in files)}
+
+
+def _changes_snapshot(include_reverted=False):
+    with _CHANGES_LOCK:
+        entries = [e for e in _CHANGES.values()
+                   if include_reverted or not e.get("reverted")]
+        out = []
+        for e in sorted(entries, key=lambda x: x.get("ts") or 0, reverse=True):
+            diff = e.get("diff") or ""
+            out.append({"path": e.get("path"), "rel": e.get("rel"),
+                        "added": int(e.get("added") or 0),
+                        "removed": int(e.get("removed") or 0),
+                        "edits": int(e.get("edits") or 1),
+                        "tool": e.get("tool") or "",
+                        "created": bool(e.get("created")),
+                        "reverted": bool(e.get("reverted")),
+                        "ts": e.get("ts") or 0,
+                        "diff": diff[:_DIFF_CAP_FULL],
+                        "truncated": len(diff) > _DIFF_CAP_FULL})
+    summary = _change_summary()
+    summary["changes"] = out
+    return summary
+
+
+def _revert_change(path):
+    """Put the pre-session content of a file back and drop its diff."""
+    target = str(path or "").strip()
+    if not target:
+        return {"error": "path is required"}
+    if not os.path.isabs(target):
+        target = os.path.join(WORKDIR, target)
+    key = os.path.realpath(target)
+    with _CHANGES_LOCK:
+        entry = _CHANGES.get(key)
+        if entry is None:
+            return {"error": "no recorded change for that file"}
+        if entry.get("created"):
+            # The model created this file: revert means remove it.
+            try:
+                if os.path.isfile(key):
+                    os.remove(key)
+            except Exception as exc:
+                return {"error": f"could not remove {key}: {exc}"}
+            _CHANGES.pop(key, None)
+            return {"ok": True, "removed": key, "rel": entry.get("rel")}
+        original = entry.get("original") or ""
+        try:
+            with open(key, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(original)
+        except Exception as exc:
+            return {"error": f"could not restore {key}: {exc}"}
+        entry["reverted"] = True
+        entry["diff"] = ""
+        entry["added"] = 0
+        entry["removed"] = 0
+        return {"ok": True, "path": key, "rel": entry.get("rel")}
+
+
+def _forget_changes():
+    """Stop tracking (files stay as they are)."""
+    with _CHANGES_LOCK:
+        n = len(_CHANGES)
+        _CHANGES.clear()
+    return {"ok": True, "forgot": n}
+
+
+def _read_text(path, limit=4000000):
+    """Current content of a file as text, or '' when it does not exist."""
+    try:
+        if not os.path.isfile(path):
+            return ""
+        if os.path.getsize(path) > limit:
+            return ""
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            return fh.read()
+    except Exception:
+        return ""
+
+
 def _write_file(path, content):
+    if not path:
+        return {"error": "path is required"}
     target = _safe_path(path)
     parent = os.path.dirname(target)
     if parent and not os.path.isdir(parent):
         os.makedirs(parent, exist_ok=True)
+    body = str(content or "")
+    before = _read_text(target)
     with open(target, "w", encoding="utf-8", newline="\n") as fh:
-        fh.write(str(content or ""))
+        fh.write(body)
     rel = os.path.relpath(target, os.path.realpath(WORKDIR))
     result = {"result": "ok", "path": target, "bytes": os.path.getsize(target)}
     preview = _preview_url(rel)
     if preview:
         result["preview_url"] = preview
+    _note_change(target, before, body, "write_file")
     return result
 
 
@@ -822,12 +1007,14 @@ def _edit_file(path, old_text, new_text, replace_all):
     if old_text not in content:
         return {"error": f"text not found in {target}: {old_text[:60]!r}"}
     count = content.count(old_text)
+    original = content
     if replace_all:
         content = content.replace(old_text, new_text)
     else:
         content = content.replace(old_text, new_text, 1)
     with open(target, "w", encoding="utf-8", newline="\n") as fh:
         fh.write(content)
+    _note_change(target, original, content, "edit_file")
     return {"result": "ok", "path": target, "replaced": count}
 
 
@@ -1640,6 +1827,8 @@ def _exec_file_tool(name, args):
 
 def _glob_search(pattern, path=None):
     import glob as glob_mod
+    if not pattern:
+        return {"error": "pattern is required"}
     search_dir = path or WORKDIR
     search_dir = os.path.realpath(search_dir)
     if not os.path.isdir(search_dir):
@@ -1663,6 +1852,8 @@ def _glob_search(pattern, path=None):
 
 
 def _read_oc(file_path, offset=None, limit=None):
+    if not file_path:
+        return {"error": "filePath is required"}
     if not os.path.isabs(file_path):
         file_path = os.path.join(WORKDIR, file_path)
     file_path = os.path.realpath(file_path)
@@ -1747,9 +1938,15 @@ def _read_oc(file_path, offset=None, limit=None):
 
 
 def _edit_oc(file_path, old_string, new_string, replace_all=False):
+    if not file_path:
+        return {"error": "filePath is required"}
     if not os.path.isabs(file_path):
         file_path = os.path.join(WORKDIR, file_path)
     file_path = os.path.realpath(file_path)
+    if old_string is None or new_string is None:
+        return {"error": "oldString and newString are both required"}
+    if not isinstance(old_string, str) or not isinstance(new_string, str):
+        return {"error": "oldString and newString must both be strings"}
     if old_string == new_string:
         return {"error": "No changes to apply: oldString and newString are identical."}
     if not os.path.exists(file_path):
@@ -1776,6 +1973,7 @@ def _edit_oc(file_path, old_string, new_string, replace_all=False):
         except Exception as e:
             return {"error": f"Cannot write file: {e}"}
         additions = new_content.count("\n") - content.count("\n")
+        _note_change(file_path, content, new_content, "edit")
         return {"result": "ok", "output": "Edit applied successfully.",
                 "additions": max(0, additions), "deletions": 0, "file": file_path}
     # Fuzzy matching strategies
@@ -1835,6 +2033,7 @@ def _edit_oc(file_path, old_string, new_string, replace_all=False):
                     f.write(new_content)
             except Exception as e:
                 return {"error": f"Cannot write file: {e}"}
+            _note_change(file_path, content, new_content, "edit")
             return {"result": "ok", "output": "Edit applied successfully (fuzzy match).",
                     "file": file_path, "strategy": strategy.__name__}
     return {"error": "Could not find oldString in the file. It must match exactly, including whitespace, indentation, and line endings."}
@@ -1842,8 +2041,10 @@ def _edit_oc(file_path, old_string, new_string, replace_all=False):
 
 def _shell_oc(command, workdir=None, timeout=None):
     import subprocess
+    if not command or not str(command).strip():
+        return {"error": "command is required"}
     cwd = workdir or WORKDIR
-    cwd = os.path.realpath(cwd) if not os.path.isabs(workdir) else workdir
+    cwd = cwd if os.path.isabs(cwd) else os.path.realpath(cwd)
     timeout_s = min(max(int((timeout or 120000) / 1000), 1), 600)
     try:
         result = subprocess.run(command, shell=True, cwd=cwd, capture_output=True,
@@ -2202,7 +2403,9 @@ PLAN_MODE_SYSTEM = ("\nMODE: PLAN. The user only wants a PLAN right now - do NOT
 
 def _bonsai_ready():
     try:
-        h = urllib.request.urlopen(BONSAI_BASE + "/health", timeout=3)
+        req = urllib.request.Request(BONSAI_BASE + "/health",
+                                     headers=_model_headers())
+        h = urllib.request.urlopen(req, timeout=3)
         return json.loads(h.read().decode("utf-8")).get("status") == "ok"
     except Exception:
         return False
@@ -2498,6 +2701,78 @@ def _save_models():
         return False
 
 
+_API_KEYS = None
+_API_KEYS_MTIME = None
+
+
+def _load_api_keys(force=False):
+    """Read API KEYS.txt: one NAME=value per line, '#' starts a comment.
+
+    Values are kept in memory only - they are never written back to
+    models.json, never sent to the browser, and never printed."""
+    global _API_KEYS, _API_KEYS_MTIME
+    path = API_KEYS_FILE
+    try:
+        mtime = os.path.getmtime(path)
+    except Exception:
+        mtime = None
+    if not force and _API_KEYS is not None and mtime == _API_KEYS_MTIME:
+        return _API_KEYS
+    keys = {}
+    if mtime is not None:
+        try:
+            with open(path, encoding="utf-8-sig") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    name, _, value = line.partition("=")
+                    name = name.strip()
+                    value = value.strip().strip('"').strip("'")
+                    if name:
+                        keys[name] = value
+        except Exception:
+            keys = {}
+    _API_KEYS, _API_KEYS_MTIME = keys, mtime
+    return keys
+
+
+def _resolve_api_key(ref):
+    """Turn a model's `api_key` field into the real secret.
+
+    The field is a *reference* by preference: the name of an entry in
+    API KEYS.txt, or an environment variable of that name. A value that
+    matches neither is used verbatim, so a key can still be pasted into
+    models.json if someone really wants to."""
+    ref = str(ref or "").strip()
+    if not ref:
+        return ""
+    keys = _load_api_keys()
+    if ref in keys and keys[ref]:
+        return keys[ref]
+    env = os.environ.get(ref)
+    if env:
+        return env.strip()
+    return ref
+
+
+def _model_auth_headers(entry=None):
+    """Auth headers for a model endpoint; empty for local servers."""
+    entry = entry if entry is not None else _active_model()
+    if not entry or entry.get("type") != "api":
+        return {}
+    key = _resolve_api_key(entry.get("api_key"))
+    if not key:
+        return {}
+    header = str(entry.get("api_key_header") or "").strip()
+    if not header:
+        # "Bearer sk-..." or "Basic ..." is used as written, anything else
+        # gets the standard bearer prefix
+        value = key if " " in key.split("=")[0] else "Bearer " + key
+        return {"Authorization": value}
+    return {header: key}
+
+
 def _load_models():
     global _MODELS, _ACTIVE_MODEL
     data = None
@@ -2573,6 +2848,8 @@ def _public_models():
         else:
             item["base_url"] = m.get("base_url")
             item["model"] = m.get("model")
+            # only ever report *that* a key is configured, never the value
+            item["api_key_set"] = bool(_resolve_api_key(m.get("api_key")))
         out.append(item)
     ready = _bonsai_ready()
     return {"active": entry["id"] if entry else None,
@@ -2763,6 +3040,14 @@ def _add_model(body):
         mid = mid or _model_id_from(label or model)
         entry = {"id": mid, "label": label or model, "type": "api",
                  "base_url": base, "model": model}
+        # a *reference* to an entry in API KEYS.txt (or an env var name), so
+        # the secret itself never has to be written into models.json
+        key_ref = str(body.get("api_key") or "").strip()
+        if key_ref:
+            entry["api_key"] = key_ref
+        key_header = str(body.get("api_key_header") or "").strip()
+        if key_header:
+            entry["api_key_header"] = key_header
     else:
         path = str(body.get("path") or "").strip()
         if not path:
@@ -2908,16 +3193,29 @@ def _effort_params():
                                      "reasoning_effort": eff}}
 
 
+def _model_headers(extra=None):
+    """Headers for a call to the active model server: JSON plus, when the
+    active model is a keyed API endpoint, its Authorization header."""
+    headers = {"Content-Type": "application/json"}
+    try:
+        headers.update(_model_auth_headers())
+    except Exception:
+        pass
+    if extra:
+        headers.update(extra)
+    return headers
+
+
 def _http_json(url, payload, timeout=300):
     req = urllib.request.Request(url, data=json.dumps(payload).encode("utf-8"),
-                                 headers={"Content-Type": "application/json"},
+                                 headers=_model_headers(),
                                  method="POST")
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
 def _http_json_get(url, timeout=30):
-    req = urllib.request.Request(url, method="GET")
+    req = urllib.request.Request(url, headers=_model_headers(), method="GET")
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
@@ -4128,7 +4426,7 @@ def _bonsai_stream(messages, tools):
     payload.update(_effort_params())
     req = urllib.request.Request(BONSAI_BASE + "/v1/chat/completions",
                                  data=json.dumps(payload).encode("utf-8"),
-                                 headers={"Content-Type": "application/json"},
+                                 headers=_model_headers(),
                                  method="POST")
     with urllib.request.urlopen(req, timeout=600) as resp:
         calls = {}
@@ -8185,8 +8483,24 @@ def execute_tool_call(tc, hooks=None):
     _PATH_TLS.on_ask = (hooks or {}).get("on_ask")
     _PATH_TLS.tool = name
     _PATH_TLS.once = set()
+    started = time.time()
     try:
-        return _execute_tool_call(name, args, tc, hooks, image_uri)
+        record = _execute_tool_call(name, args, tc, hooks, image_uri)
+        record["ms"] = int((time.time() - started) * 1000)
+        return record
+    except CLIENT_GONE:
+        # a closed browser is not a tool failure: let the stream unwind
+        raise
+    except Exception as exc:
+        # One bad tool call must not kill the whole turn; hand the failure
+        # back to the model so it can correct the arguments and continue.
+        _take_last_change()
+        err = {"error": f"{type(exc).__name__}: {exc}"}
+        record = {"name": name, "arguments": args, "result": public_result(err),
+                  "full_result": err,
+                  "tool_call_id": tc.get("id") or "call_" + str(len(name))}
+        record["ms"] = int((time.time() - started) * 1000)
+        return record
     finally:
         with _PATH_LOCK:
             for gone in [p for p, g in _PATH_GRANTS.items() if g.get("scope") == "once"]:
@@ -8387,6 +8701,10 @@ def _execute_tool_call(name, args, tc, hooks, image_uri):
     record = {"name": name, "arguments": shown_args, "result": result,
               "full_result": full,
               "tool_call_id": tc.get("id") or "call_" + str(len(name))}
+    change = _take_last_change()
+    if change:
+        # UI-only: the model already got its result, the chat gets the diff.
+        record["change"] = change
     if image_uri:
         record["image_data"] = image_uri
     return record
@@ -9116,6 +9434,7 @@ PAGE = """<!doctype html>
       <div class="row">
         <input id="apibase" placeholder="base URL, e.g. http://127.0.0.1:1234/v1">
         <input id="apimodel" placeholder="model id, e.g. qwen3-8b">
+        <input id="apikey" placeholder="key name from API KEYS.txt (optional)">
         <button class="act inline" id="mdl-api">Add</button>
       </div>
       <div class="mdlsep">vision projector (optional - enables screenshots &amp; images)</div>
@@ -9410,7 +9729,7 @@ function renderConv() {
   if (cur) {
     cur.messages.forEach(function (m) {
       if (m.role === 'user') addUser(m.content, !!m.queued);
-      else if (m.role === 'assistant') addAsst(m.content, m.calls || [], m.reason, m.stats);
+      else if (m.role === 'assistant') addAsst(m.content, m.calls || [], m.reason, m.stats, m.parts);
     });
   }
   busy = false;
@@ -10165,7 +10484,8 @@ async function streamRun(messages, chat, anchorMsg) {
   const savedStats = statsVals && (statsVals.think_ms || statsVals.respond_ms || statsVals.completion_tokens)
       ? JSON.parse(JSON.stringify(statsVals)) : null;
   const entry = { role: 'assistant', content: reply, calls: calls,
-                  reason: reason.trim() ? reason : undefined, stats: savedStats };
+                  reason: reason.trim() ? reason : undefined, stats: savedStats,
+                  parts: (typeof __ocParts === 'function') ? __ocParts() : undefined };
   if (anchorMsg) {
     const at = chat.messages.indexOf(anchorMsg);
     if (at >= 0) chat.messages.splice(at + 1, 0, entry);
@@ -10481,15 +10801,19 @@ function addModelPick(what) {
 function addModelApi() {
   const base = (document.getElementById('apibase').value || '').trim();
   const model = (document.getElementById('apimodel').value || '').trim();
+  /* a NAME from API KEYS.txt, never the secret itself */
+  const keyEl = document.getElementById('apikey');
+  const key = keyEl ? (keyEl.value || '').trim() : '';
   if (!base || !model) { alert('Fill in both the base URL and the model id.'); return; }
   fetch('/api/models', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ action: 'add', type: 'api', label: model, base_url: base, model: model }) })
+    body: JSON.stringify({ action: 'add', type: 'api', label: model, base_url: base, model: model, api_key: key }) })
     .then(function (r) { return r.json(); })
     .then(function (j) {
       if (!j.ok) { alert('Could not add the model:\\n' + (j.error || 'unknown error')); return; }
       renderModels(j); closeAddMdl();
       document.getElementById('apibase').value = '';
       document.getElementById('apimodel').value = '';
+      if (keyEl) keyEl.value = '';
     })
     .catch(function () { alert('Add failed'); });
 }
@@ -11216,7 +11540,8 @@ PAGE_GPT = """<!doctype html>
         <div class="mdlsep">or connect to an API server</div>
         <div class="row">
           <input id="apibase" placeholder="base URL, e.g. http://127.0.0.1:1234/v1">
-          <input id="apimodel" placeholder="model id, e.g. qwen3-8b">
+        <input id="apimodel" placeholder="model id, e.g. qwen3-8b">
+        <input id="apikey" placeholder="key name from API KEYS.txt (optional)">
           <button class="act inline" id="mdl-api">Add</button>
         </div>
         <div class="mdlsep">vision projector (optional - enables screenshots &amp; images)</div>
@@ -11637,7 +11962,7 @@ function renderConv() {
     if (empty) empty.remove();
     cur.messages.forEach(function (m) {
       if (m.role === 'user') addUser(m.content);
-      else if (m.role === 'assistant') addAsst(m.content, m.calls || [], m.reason, m.stats);
+      else if (m.role === 'assistant') addAsst(m.content, m.calls || [], m.reason, m.stats, m.parts);
     });
   }
 }
@@ -12114,7 +12439,8 @@ async function streamRun(messages, chat, anchorMsg) {
   const savedStats = statsVals && (statsVals.think_ms || statsVals.respond_ms || statsVals.completion_tokens)
       ? JSON.parse(JSON.stringify(statsVals)) : null;
   if (last && last.role === 'user') {
-    chat.messages.push({ role: 'assistant', content: reply, calls: calls, reason: reason.trim() ? reason : undefined, stats: savedStats });
+    chat.messages.push({ role: 'assistant', content: reply, calls: calls, reason: reason.trim() ? reason : undefined, stats: savedStats,
+                         parts: (typeof __ocParts === 'function') ? __ocParts() : undefined });
   } else if (last && last.role === 'assistant' && !last.calls && reply) {
     last.content = reply;
     last.reason = reason.trim() ? reason : undefined;
@@ -12586,15 +12912,19 @@ function addModelPick(what) {
 function addModelApi() {
   const base = (document.getElementById('apibase').value || '').trim();
   const model = (document.getElementById('apimodel').value || '').trim();
+  /* a NAME from API KEYS.txt, never the secret itself */
+  const keyEl = document.getElementById('apikey');
+  const key = keyEl ? (keyEl.value || '').trim() : '';
   if (!base || !model) { alert('Fill in both the base URL and the model id.'); return; }
   fetch('/api/models', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ action: 'add', type: 'api', label: model, base_url: base, model: model }) })
+    body: JSON.stringify({ action: 'add', type: 'api', label: model, base_url: base, model: model, api_key: key }) })
     .then(function (r) { return r.json(); })
     .then(function (j) {
       if (!j.ok) { alert('Could not add the model:\\n' + (j.error || 'unknown error')); return; }
       renderModels(j); closeAddMdl();
       document.getElementById('apibase').value = '';
       document.getElementById('apimodel').value = '';
+      if (keyEl) keyEl.value = '';
     })
     .catch(function () { alert('Add failed'); });
 }
@@ -12735,6 +13065,1058 @@ init();
 </html>"""
 
 
+# ---- OpenCode-style tool steps + code differencing (every UI) --------
+# One bundle, injected into both consoles: a tool call renders as a
+# collapsible step line (-> Read, * Grep, pencil Edit, + Thought) and every
+# write carries its diff, viewable and revertible from the CHANGES panel.
+_OC_CSS = (
+    '\n'
+    '  /* ---- OpenCode-style tool steps + code differencing ---------------- */\n'
+    '  .ocsteps { margin: 6px 0 2px; font-family: Consolas, "Courier New", monospace; font-size: 12.5px; }\n'
+    '  .ocsteps:empty { display: none; }\n'
+    "  /* the model's own words sit between the steps: prose, not code */\n"
+    '  .ocpara { margin: 4px 0 8px; font-family: inherit; font-size: inherit;\n'
+    '            line-height: inherit; color: var(--txt); }\n'
+    '  .ocpara:empty { display: none; }\n'
+    '  .ocpara > :first-child { margin-top: 0; }\n'
+    '  .ocpara > :last-child { margin-bottom: 0; }\n'
+    '  .ocpara pre, .ocpara code { font-family: Consolas, "Courier New", monospace; }\n'
+    '  .ocstep { border-left: 2px solid var(--bd); margin: 0 0 1px; }\n'
+    '  .ocstep.err { border-left-color: var(--err); }\n'
+    '  .ocstep.thought { border-left-color: var(--violet); }\n'
+    '  .ocstep.thought.notext > summary { cursor: default; }\n'
+    '  .ocstep.thought.notext > summary:hover { background: none; color: var(--txt); }\n'
+    '  .ocstep.thought .ocbody pre { color: #c4b5fd; white-space: pre-wrap;\n'
+    '                                  max-height: 260px; overflow-y: auto; margin: 0; }\n'
+    '  .ocstep > summary {\n'
+    '    list-style: none; cursor: pointer; display: flex; align-items: baseline; gap: 7px;\n'
+    '    padding: 3px 8px; border-radius: 6px; color: var(--txt2);\n'
+    '  }\n'
+    '  .ocstep > summary::-webkit-details-marker { display: none; }\n'
+    '  .ocstep > summary:hover { background: var(--bg3); color: var(--txt); }\n'
+    '  .ocstep .ocg { flex: 0 0 auto; width: 11px; text-align: center; color: var(--acc); }\n'
+    '  .ocstep.thought .ocg { color: var(--violet); }\n'
+    '  .ocstep.err .ocg { color: var(--err); }\n'
+    '  .ocstep .ocn { font-weight: 700; color: var(--txt); }\n'
+    '  .ocstep .ocd { color: var(--mut); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1 1 auto; }\n'
+    '  .ocstep .ocd .ocq { color: var(--txt2); }\n'
+    '  .ocstep .oct { flex: 0 0 auto; color: var(--mut); font-size: 11.5px; }\n'
+    '  .ocstep .ocadd { color: var(--ok); }\n'
+    '  .ocstep .ocdel { color: var(--err); }\n'
+    '  .ocstep[open] > summary { background: var(--bg3); color: var(--txt); }\n'
+    '  .ocstep .occaret { font-size: 9px; color: var(--mut); transition: transform .12s; }\n'
+    '  .ocstep[open] .occaret { transform: rotate(90deg); }\n'
+    '  .ocbody { margin: 2px 0 6px 12px; padding: 7px 9px; background: var(--bg2);\n'
+    '            border: 1px solid var(--bd); border-radius: 8px; }\n'
+    '  .ocbody pre { margin: 0 0 6px; white-space: pre-wrap; word-break: break-word;\n'
+    '                color: var(--txt2); font-size: 12px; max-height: 320px; overflow: auto; }\n'
+    '  .ocbody pre:last-child { margin-bottom: 0; }\n'
+    '  .ocbody .oclab { color: var(--mut); font-size: 10.5px; letter-spacing: 1px; margin-bottom: 3px; }\n'
+    '  .ocargs { color: var(--mut); font-size: 11.5px; }\n'
+    '  .ocprev { color: var(--acc); text-decoration: none; }\n'
+    '  .ocprev:hover { text-decoration: underline; }\n'
+    '\n'
+    '  /* diff view */\n'
+    '  .ocdiff { border: 1px solid var(--bd); border-radius: 8px; overflow: auto;\n'
+    '            max-height: 460px; background: #0d0d11; font-size: 12px; }\n'
+    '  .ocdiff table { border-collapse: collapse; width: 100%; }\n'
+    '  .ocdiff td { padding: 0 8px; white-space: pre-wrap; word-break: break-word;\n'
+    '               vertical-align: top; font-family: Consolas, "Courier New", monospace; }\n'
+    '  .ocdiff td.ocl { width: 1%; text-align: right; color: #4b4b57; user-select: none;\n'
+    '                   padding: 0 6px 0 4px; font-size: 11px; }\n'
+    '  .ocdiff td.octext { width: 100%; }\n'
+    '  .ocdiff tr.hunk td { color: var(--violet); background: rgba(167,139,250,.08);\n'
+    '                       font-size: 11px; padding-top: 3px; padding-bottom: 3px; }\n'
+    '  .ocdiff tr.add td { background: rgba(52,211,153,.10); color: #b6f2d8; }\n'
+    '  .ocdiff tr.add td.ocl { background: rgba(52,211,153,.18); }\n'
+    '  .ocdiff tr.del td { background: rgba(248,113,113,.10); color: #fbc4c4; }\n'
+    '  .ocdiff tr.del td.ocl { background: rgba(248,113,113,.18); }\n'
+    "  .ocdiff tr.add td.octext::before { content: '+'; color: var(--ok); margin-right: 2px; }\n"
+    "  .ocdiff tr.del td.octext::before { content: '-'; color: var(--err); margin-right: 2px; }\n"
+    '\n'
+    '  /* changes bar + modal */\n'
+    '  .ocbar { display: flex; align-items: center; gap: 8px; margin: 0 0 6px; }\n'
+    '  .ocbarbtn { background: var(--bg3); border: 1px solid var(--bd2); color: var(--txt2);\n'
+    '              border-radius: 8px; padding: 6px 10px; cursor: pointer;\n'
+    '              font-family: Consolas, monospace; font-size: 12px; }\n'
+    '  .ocbarbtn:hover { border-color: var(--acc); color: var(--txt); }\n'
+    '  .ocbarbtn.on { border-color: var(--ok); color: var(--ok); background: rgba(52,211,153,.12); }\n'
+    '  .ocbarbtn .ocadd { color: var(--ok); }\n'
+    '  .ocbarbtn .ocdel { color: var(--err); }\n'
+    '  .ocmodal { position: fixed; inset: 0; z-index: 120; display: none;\n'
+    '             align-items: center; justify-content: center;\n'
+    '             background: rgba(0,0,0,.66); backdrop-filter: blur(3px); }\n'
+    '  .ocmodal.on { display: flex; }\n'
+    '  .ocmbox { width: min(1080px, 94vw); max-height: 88vh; display: flex; flex-direction: column;\n'
+    '            background: var(--bg2); border: 1px solid var(--bd2); border-radius: 14px;\n'
+    '            font-family: Consolas, monospace; }\n'
+    '  .ocmh { display: flex; align-items: center; gap: 10px; padding: 12px 14px;\n'
+    '          border-bottom: 1px solid var(--bd); }\n'
+    '  .ocmh b { color: var(--acc); font-size: 13px; letter-spacing: 1.5px; }\n'
+    '  .ocmh .ocsum { color: var(--mut); font-size: 12px; }\n'
+    '  .ocmh .sp { flex: 1; }\n'
+    '  .ocmact { background: var(--bg3); border: 1px solid var(--bd2); color: var(--txt2);\n'
+    '            border-radius: 8px; padding: 6px 11px; cursor: pointer; font: inherit; font-size: 12px; }\n'
+    '  .ocmact:hover { border-color: var(--acc); color: var(--txt); }\n'
+    '  .ocmact.danger:hover { border-color: var(--err); color: var(--err); }\n'
+    '  .ocmlist { overflow: auto; padding: 8px; }\n'
+    '  .ocmfile { border: 1px solid var(--bd); border-radius: 10px; margin-bottom: 8px;\n'
+    '             background: var(--bg3); overflow: hidden; }\n'
+    '  .ocmfhead { display: flex; align-items: center; gap: 8px; padding: 8px 10px; cursor: pointer; }\n'
+    '  .ocmfhead:hover { background: var(--bg4); }\n'
+    '  .ocmfhead .ocf { color: var(--txt); font-size: 12.5px; word-break: break-all; flex: 1; }\n'
+    '  .ocmfhead .octag { color: var(--mut); font-size: 10.5px; border: 1px solid var(--bd2);\n'
+    '                     border-radius: 5px; padding: 1px 5px; }\n'
+    '  .ocmfbody { padding: 0 10px 10px; display: none; }\n'
+    '  .ocmfile.open .ocmfbody { display: block; }\n'
+    '  .ocmdiff { border: 1px solid var(--bd); border-radius: 8px; overflow: auto;\n'
+    '             max-height: 58vh; background: #0d0d11; font-size: 12px; }\n'
+    '  .ocmempty { color: var(--mut); font-size: 12.5px; padding: 22px; text-align: center; }\n'
+    ''
+)
+
+_OC_JS = (
+    '/* ===================================================================\n'
+    '   OpenCode-style tool steps + code differencing for the BONSAI chats.\n'
+    '   Injected into every UI the server serves, so both consoles behave\n'
+    '   the same way. The page keeps its own functions; these wrappers take\n'
+    '   over the rendering of tool calls (chips are gone) and add:\n'
+    '     -> one collapsible line per tool call, with the args in the header\n'
+    '        and the output in the body\n'
+    '     -> a "Thought" line with the real time the model took to think\n'
+    '     -> a rendered diff for every write, and a project changes panel\n'
+    '        with per-file revert\n'
+    '   =================================================================== */\n'
+    '(function () {\n'
+    '  if (window.__ocSteps) return;\n'
+    '  window.__ocSteps = true;\n'
+    '\n'
+    '  var OCS = {\n'
+    '    steps: null, bubble: null, since: 0, thinkShown: false, running: false,\n'
+    "    thinkMs: 0, roundText: '', thoughtNode: null, tailMs: 0,\n"
+    '    last: null, pending: 0, timer: null,\n'
+    '    /* ordered skeleton of the answer, so a reload can replay the transcript\n'
+    "       exactly as it streamed: {k:'c',i} tool call, {k:'t',v} text,\n"
+    "       {k:'r',ms,v} reasoning that came after the last tool call */\n"
+    "    parts: [], textNode: null, textRaw: '', textPart: null, callIdx: 0,\n"
+    "    tailReason: '', thoughtPart: null\n"
+    '  };\n'
+    '\n'
+    '  /* ---------- formatting helpers ---------- */\n'
+    '  function el(tag, cls, text) {\n'
+    '    var n = document.createElement(tag);\n'
+    '    if (cls) n.className = cls;\n'
+    '    if (text !== undefined && text !== null) n.textContent = String(text);\n'
+    '    return n;\n'
+    '  }\n'
+    '  function secs(ms) {\n'
+    "    if (ms === null || ms === undefined) return '';\n"
+    '    var s = ms / 1000;\n'
+    "    if (s >= 100) return Math.round(s) + 's';\n"
+    "    if (s >= 10) return s.toFixed(1) + 's';\n"
+    "    return s.toFixed(2) + 's';\n"
+    '  }\n'
+    '  function firstLine(s) {\n'
+    "    s = String(s === null || s === undefined ? '' : s);\n"
+    "    var t = s.replace(/[\\r\\n]+/g, ' ').replace(/\\s+/g, ' ').trim();\n"
+    "    return t.length > 70 ? t.slice(0, 70) + '...' : t;\n"
+    '  }\n'
+    '  function num(v) {\n'
+    '    v = parseInt(v, 10);\n'
+    "    return isNaN(v) ? '' : String(v);\n"
+    '  }\n'
+    '  function pathOf(a) {\n'
+    "    if (!a) return '';\n"
+    "    var p = a.path || a.file_path || a.filePath || a.filepath || a.pathname || '';\n"
+    '    if (!p) {\n'
+    '      Object.keys(a).forEach(function (k) {\n'
+    "        if (!p && /path|file/i.test(k) && typeof a[k] === 'string' && a[k].indexOf('\\\\') >= 0\n"
+    "            || (!p && /path|file/i.test(k) && String(a[k] || '').indexOf('/') >= 0)) p = a[k];\n"
+    '      });\n'
+    '    }\n'
+    "    return String(p || '');\n"
+    '  }\n'
+    '  function rel(path) {\n'
+    "    if (!path) return '';\n"
+    '    var parts = String(path).split(/[\\\\\\/]/);\n'
+    "    return parts.length <= 2 ? String(path) : parts.slice(-2).join('/');\n"
+    '  }\n'
+    '\n'
+    '  /* the verb a reader cares about, not the JSON tool name */\n'
+    '  var KINDS = {\n'
+    "    read:     { g: '→', n: 'Read',   edit: false },\n"
+    "    write:    { g: '✎', n: 'Write',  edit: true },\n"
+    "    edit:     { g: '✎', n: 'Edit',   edit: true },\n"
+    "    patch:    { g: '✎', n: 'Patch',  edit: true },\n"
+    "    multiedit:{ g: '✎', n: 'Edit',   edit: true },\n"
+    "    grep:     { g: '✱', n: 'Grep',   edit: false },\n"
+    "    glob:     { g: '✱', n: 'Glob',   edit: false },\n"
+    "    list:     { g: '→', n: 'List',   edit: false },\n"
+    "    ls:       { g: '→', n: 'List',   edit: false },\n"
+    "    search:   { g: '✱', n: 'Search', edit: false },\n"
+    "    shell:    { g: '⚡', n: 'Shell',  edit: false },\n"
+    "    exec:     { g: '⚡', n: 'Shell',  edit: false },\n"
+    "    web:      { g: '→', n: 'Fetch',  edit: false },\n"
+    "    fetch:    { g: '→', n: 'Fetch',  edit: false },\n"
+    "    ask:      { g: '?', n: 'Ask',    edit: false },\n"
+    "    todo:     { g: '☑', n: 'Todo',   edit: false },\n"
+    "    launch:   { g: '⚡', n: 'Open',   edit: false },\n"
+    "    speak:    { g: '♪', n: 'Speak',  edit: false },\n"
+    "    shot:     { g: '◎', n: 'Shot',   edit: false },\n"
+    "    task:     { g: '✱', n: 'Task',   edit: false }\n"
+    '  };\n'
+    '  var ALIASES = {\n'
+    "    read_file: 'read', read_text_file: 'read', view_file: 'read',\n"
+    "    open_file: 'read', view: 'read',\n"
+    "    write_file: 'write', create_file: 'write', save_file: 'write',\n"
+    "    edit_file: 'edit', replace_in_file: 'edit', str_replace: 'edit',\n"
+    "    apply_patch: 'patch', apply_diff: 'patch', multi_edit: 'multiedit',\n"
+    "    search_in_files: 'grep', search_files: 'grep', find_in_files: 'grep',\n"
+    "    codebase_search: 'grep',\n"
+    "    list_files_in_folder: 'list', list_directory: 'list', ls_dir: 'list',\n"
+    "    file_search: 'glob', find_files: 'glob',\n"
+    "    web_search: 'web', web_fetch: 'fetch', fetch_url: 'fetch', http: 'fetch',\n"
+    "    run_shell_command: 'shell', run_command: 'shell', terminal: 'shell',\n"
+    "    shell_oc: 'shell', bash: 'shell', shell_cmd: 'shell',\n"
+    "    question: 'ask', ask_user: 'ask', ask_followup_question: 'ask',\n"
+    "    todo_write: 'todo', update_todo_list: 'todo',\n"
+    "    launch_or_open: 'launch', open_application: 'launch',\n"
+    "    tts_speak: 'speak', speak_text: 'speak',\n"
+    "    screenshot: 'shot', screen_capture: 'shot', capture_screen: 'shot',\n"
+    "    tts: 'speak', task: 'task', agent: 'task'\n"
+    '  };\n'
+    '\n'
+    '  function kindOf(call) {\n'
+    "    var n = String((call && call.name) || '');\n"
+    '    var k = ALIASES[n.toLowerCase()] || n.toLowerCase();\n'
+    "    if (/read|open_file|cat\\b/.test(k)) k = 'read';\n"
+    "    else if (/write|create/.test(k)) k = 'write';\n"
+    "    else if (/edit|patch|replace/.test(k)) k = 'edit';\n"
+    "    else if (/grep|search_in|find_in/.test(k)) k = 'grep';\n"
+    "    else if (/glob/.test(k)) k = 'glob';\n"
+    "    else if (/list|ls\\b|dir\\b/.test(k)) k = 'list';\n"
+    "    else if (/shell|run_command|bash|terminal|exec/.test(k)) k = 'shell';\n"
+    "    else if (/screenshot|capture_screen|screen_shot/.test(k)) k = 'shot';\n"
+    "    else if (/web_search|internet/.test(k)) k = 'web';\n"
+    "    else if (/fetch|url|http|download_page/.test(k)) k = 'fetch';\n"
+    "    else if (/ask|question/.test(k)) k = 'ask';\n"
+    "    else if (/todo/.test(k)) k = 'todo';\n"
+    "    else if (/launch|open_app|start_app|activate/.test(k)) k = 'launch';\n"
+    "    else if (/tts|speak|say|speech/.test(k)) k = 'speak';\n"
+    "    return KINDS[k] ? { key: k, spec: KINDS[k] } : { key: k, spec: { g: '⚙', n: n || 'tool', edit: false } };\n"
+    '  }\n'
+    '\n'
+    '  /* how many things a tool touched, for "(N matches)" */\n'
+    '  function countOf(call, k, res) {\n'
+    '    try {\n'
+    "      if (k === 'grep') {\n"
+    "        if (res && typeof res.count === 'number') return num(res.count);\n"
+    '        var m = /Found (\\d+) match/i.exec(res && (res.output || res.content));\n'
+    '        if (m) return m[1];\n'
+    "        var s = String((res && (res.output || res.content)) || '');\n"
+    "        return num((s.match(/^\\s*(?:\\d+:\\s*)?.*$/gm) || []).length && (s.trim() ? s.trim().split('\\n').length : 0));\n"
+    '      }\n'
+    "      if (k === 'glob' || k === 'list') {\n"
+    "        if (res && typeof res.count === 'number') return num(res.count);\n"
+    '        var e = res && (res.entries || res.files || res.items);\n'
+    '        if (e && e.length) return num(e.length);\n'
+    "        var o = String((res && (res.output || res.result)) || '');\n"
+    "        return o && o !== 'No files found' ? num(o.trim().split('\\n').length) : '0';\n"
+    '      }\n'
+    '    } catch (e) {}\n'
+    "    return '';\n"
+    '  }\n'
+    '\n'
+    '  function header(call, k, spec, res) {\n'
+    '    var a = call.arguments || {}, p = pathOf(a);\n'
+    "    var n = spec.n, extra = '';\n"
+    "    if (k === 'read') {\n"
+    "      if (a.offset) extra = ' [offset=' + num(a.offset);\n"
+    "      if (a.limit) extra += (extra ? ',' : ' [') + 'limit=' + num(a.limit);\n"
+    "      if (extra) extra += ']';\n"
+    "      n = p ? 'Read ' + rel(p) + extra : 'Read';\n"
+    "      extra = '';   /* the range is part of the name, not a trailing tag */\n"
+    '    } else if (spec.edit) {\n'
+    '      n = (p ? rel(p) : (res && res.path ? rel(res.path) : n));\n'
+    "    } else if (k === 'grep') {\n"
+    '      n = \'Grep \' + (a.pattern ? \'"\' + a.pattern + \'"\' : \'\') + (a.path ? \' in \' + a.path : \' in .\');\n'
+    '      var c = countOf(call, k, res);\n'
+    "      if (c !== '') extra = ' (' + c + ' match' + (c === '1' ? '' : 'es') + ')';\n"
+    "    } else if (k === 'glob') {\n"
+    "      n = 'Glob ' + (a.pattern || '') + (a.path ? ' in ' + a.path : '');\n"
+    '      var cg = countOf(call, k, res);\n'
+    "      if (cg !== '') extra = ' (' + cg + ' file' + (cg === '1' ? '' : 's') + ')';\n"
+    "    } else if (k === 'list') {\n"
+    "      n = 'List ' + (p ? a.path : '.');\n"
+    '      var cl = countOf(call, k, res);\n'
+    "      if (cl !== '') extra = ' (' + cl + ' entries)';\n"
+    "    } else if (k === 'shell' || k === 'exec') {\n"
+    "      n = 'Shell ' + firstLine(a.command || a.cmd || a.script || '');\n"
+    "    } else if (k === 'web' || k === 'fetch') {\n"
+    "      n = (k === 'web' ? 'Search ' : 'Fetch ') + firstLine(a.query || a.url || a.q || '');\n"
+    "    } else if (k === 'ask') {\n"
+    "      n = 'Ask ' + firstLine(a.question || a.q || a.prompt || '');\n"
+    "    } else if (k === 'todo') {\n"
+    '      var t = a.todos || a.items || [];\n'
+    "      n = 'Todo list (' + t.length + ')';\n"
+    "    } else if (k === 'launch') {\n"
+    "      n = 'Open ' + firstLine(a.name || a.app || a.target || a.path || '');\n"
+    "    } else if (k === 'speak') {\n"
+    "      n = 'Speak ' + firstLine(a.text || '');\n"
+    "    } else if (k === 'shot') {\n"
+    "      n = 'Screenshot';\n"
+    "    } else if (k === 'task') {\n"
+    "      n = 'Task ' + firstLine(a.description || a.prompt || a.task || '');\n"
+    '    } else {\n'
+    '      var ks = Object.keys(a).filter(function (x) {\n'
+    '        var v = a[x];\n'
+    "        return typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean';\n"
+    '      }).slice(0, 3);\n'
+    "      if (ks.length) n = spec.n + ' ' + ks.map(function (x) { return x + '=' + firstLine(a[x]); }).join(' ');\n"
+    '    }\n'
+    '    return { name: n, extra: extra };\n'
+    '  }\n'
+    '\n'
+    '  /* ---------- diff rendering ---------- */\n'
+    '  function diffRows(diff) {\n'
+    '    var rows = [];\n'
+    "    String(diff || '').split('\\n').forEach(function (l) {\n"
+    '      if (!l) return;\n'
+    "      if (l.indexOf('--- ') === 0 || l.indexOf('+++ ') === 0) return;\n"
+    "      if (l.indexOf('@@') === 0) { rows.push({ c: 'h', t: l }); return; }\n"
+    "      if (l.charAt(0) === '+') { rows.push({ c: 'a', t: l.slice(1) }); return; }\n"
+    "      if (l.charAt(0) === '-') { rows.push({ c: 'd', t: l.slice(1) }); return; }\n"
+    "      if (l.charAt(0) === '\\\\') return;\n"
+    "      rows.push({ c: ' ', t: l.slice(1) });\n"
+    '    });\n'
+    '    return rows;\n'
+    '  }\n'
+    '  function diffTable(diff) {\n'
+    "    var wrap = el('div', 'ocdiff'), tb = el('table'), rows = diffRows(diff);\n"
+    '    if (!rows.length) {\n'
+    "      wrap.appendChild(el('div', 'ocmempty', '(no textual diff)'));\n"
+    '      return wrap;\n'
+    '    }\n'
+    '    var oldn = 0, newn = 0;\n'
+    '    rows.forEach(function (r) {\n'
+    "      if (r.c === 'h') {\n"
+    '        var m = /@@\\s*-(\\d+)/.exec(r.t), m2 = /@@.*\\+(\\d+)/.exec(r.t);\n'
+    '        oldn = m ? parseInt(m[1], 10) : 0;\n'
+    '        newn = m2 ? parseInt(m2[1], 10) : 0;\n'
+    "        var tr = el('tr', 'hunk');\n"
+    "        var td = el('td', 'octext', r.t);\n"
+    "        td.colSpan = 2; tr.appendChild(el('td', 'ocl', '')); tr.appendChild(td);\n"
+    '        tb.appendChild(tr);\n'
+    '        return;\n'
+    '      }\n'
+    "      if (r.c === 'a') newn++;\n"
+    "      else if (r.c === 'd') oldn++;\n"
+    '      else { oldn++; newn++; }\n'
+    "      var tr2 = el('tr', r.c === 'a' ? 'add' : (r.c === 'd' ? 'del' : 'ctx'));\n"
+    "      tr2.appendChild(el('td', 'ocl', r.c === 'a' ? String(newn) : String(oldn)));\n"
+    "      tr2.appendChild(el('td', 'octext', r.t));\n"
+    '      tb.appendChild(tr2);\n'
+    '    });\n'
+    '    wrap.appendChild(tb);\n'
+    '    return wrap;\n'
+    '  }\n'
+    '\n'
+    '  /* ---------- the step line ---------- */\n'
+    '  function resultText(res) {\n'
+    "    if (typeof res === 'string') return res;\n"
+    "    if (!res || typeof res !== 'object') return String(res);\n"
+    '    var copy = {};\n'
+    '    Object.keys(res).forEach(function (key) {\n'
+    "      if (key === 'preview' || key === 'preview_url') return;\n"
+    '      copy[key] = res[key];\n'
+    '    });\n'
+    '    try { return JSON.stringify(copy, null, 2); } catch (e) { return String(res); }\n'
+    '  }\n'
+    '  function shotOf(call) {\n'
+    '    try {\n'
+    "      return typeof shotCardDom === 'function' ? shotCardDom(call) : null;\n"
+    '    } catch (e) { return null; }\n'
+    '  }\n'
+    '  function previewOf(res) {\n'
+    "    var url = res && typeof res === 'object' ? res.preview_url : '';\n"
+    '    if (!url) return null;\n'
+    "    var w = el('div', 'ocargs');\n"
+    "    var a = el('a', 'ocprev', res.path || 'preview');\n"
+    "    a.href = url; a.target = '_blank'; a.rel = 'noreferrer';\n"
+    '    a.onclick = function (e) {\n'
+    "      if (typeof openPreviewStage === 'function' && openPreviewStage(url, res.path || '')) e.preventDefault();\n"
+    '    };\n'
+    '    w.appendChild(a);\n'
+    '    return w;\n'
+    '  }\n'
+    '  function argsBlock(call) {\n'
+    '    var a = call.arguments || {};\n'
+    '    var keys = Object.keys(a);\n'
+    '    if (!keys.length) return null;\n'
+    "    var box = el('div');\n"
+    "    box.appendChild(el('div', 'oclab', 'ARGUMENTS'));\n"
+    "    var pre = el('pre', 'ocargs', JSON.stringify(a, null, 2));\n"
+    '    box.appendChild(pre);\n'
+    '    return box;\n'
+    '  }\n'
+    '\n'
+    '  function stepFor(call) {\n'
+    '    var res = call.result || {};\n'
+    '    var kind = kindOf(call);\n'
+    '    var hd = header(call, kind.key, kind.spec, res);\n'
+    '    var chg = call.change || null;\n'
+    '    var bad = !!(res && res.error);\n'
+    "    var d = el('details', 'ocstep' + (bad ? ' err' : ''));\n"
+    "    var s = el('summary');\n"
+    "    s.appendChild(el('span', 'occaret', '›'));\n"
+    "    s.appendChild(el('span', 'ocg', kind.spec.g));\n"
+    "    s.appendChild(el('span', 'ocn', hd.name));\n"
+    "    if (hd.extra) s.appendChild(el('span', 'ocd', hd.extra));\n"
+    "    else if (!kind.spec.edit) s.appendChild(el('span', 'ocd', ''));\n"
+    '    if (chg && (chg.total_added || chg.total_removed || chg.added || chg.removed)) {\n'
+    '      var a = chg.added !== undefined ? chg.added : chg.total_added;\n'
+    '      var r = chg.removed !== undefined ? chg.removed : chg.total_removed;\n'
+    "      s.appendChild(el('span', 'oct ocadd', '+' + num(a || 0)));\n"
+    "      s.appendChild(el('span', 'oct ocdel', '-' + num(r || 0)));\n"
+    '    }\n'
+    "    if (call.ms !== undefined && call.ms !== null) s.appendChild(el('span', 'oct', secs(call.ms)));\n"
+    '    d.appendChild(s);\n'
+    '\n'
+    "    var body = el('div', 'ocbody');\n"
+    "    if (chg && chg.diff && String(chg.diff).indexOf('@@') >= 0) {\n"
+    "      body.appendChild(el('div', 'oclab', 'DIFF'));\n"
+    '      body.appendChild(diffTable(chg.diff));\n'
+    '    }\n'
+    '    var ab = argsBlock(call);\n'
+    '    if (ab) body.appendChild(ab);\n'
+    "    if (!(chg && chg.diff && String(chg.diff).indexOf('@@') >= 0)) {\n"
+    '      var txt = resultText(res);\n'
+    "      if (txt && txt !== '{}') {\n"
+    "        body.appendChild(el('div', 'oclab', 'OUTPUT'));\n"
+    "        body.appendChild(el('pre', null, txt));\n"
+    '      }\n'
+    '    } else if (res && res.error) {\n'
+    "      body.appendChild(el('pre', null, res.error));\n"
+    '    }\n'
+    '    var pv = previewOf(res);\n'
+    '    if (pv) body.appendChild(pv);\n'
+    '    var sc = shotOf(call);\n'
+    '    if (sc) body.appendChild(sc);\n'
+    '    d.appendChild(body);\n'
+    '    d.__oc = { call: call, kind: kind.key };\n'
+    '    return d;\n'
+    '  }\n'
+    '\n'
+    '  function thoughtStep(ms, text) {\n'
+    "    var d = el('details', 'ocstep thought');\n"
+    "    var s = el('summary');\n"
+    "    s.appendChild(el('span', 'occaret', '›'));\n"
+    "    s.appendChild(el('span', 'ocg', '+'));\n"
+    "    s.appendChild(el('span', 'ocn',\n"
+    "      ms ? 'Thought: ' + secs(ms) : 'Thought'));\n"
+    '    d.appendChild(s);\n'
+    "    var body = String(text || '').trim();\n"
+    '    if (body) {\n'
+    "      var b = el('div', 'ocbody');\n"
+    "      b.appendChild(el('pre', 'octext', body));\n"
+    '      d.appendChild(b);\n'
+    '    } else {\n'
+    "      d.classList.add('notext');\n"
+    '    }\n'
+    '    d.__oc = { call: null, thought: true };\n'
+    '    return d;\n'
+    '  }\n'
+    '\n'
+    '  /* ---------- live step plumbing ---------- */\n'
+    '  function scrollSafe() {\n'
+    "    try { if (typeof scrollBottom === 'function') scrollBottom(); } catch (e) {}\n"
+    '  }\n'
+    '  function liveStep(call) {\n'
+    '    if (!OCS.bubble) return null;\n'
+    '    var box = orderedBox();\n'
+    '    if (!box) return null;\n'
+    '    if (!OCS.thinkShown) OCS.thinkShown = true;\n'
+    '    /* anything said before this tool call belongs above it */\n'
+    '    textClose();\n'
+    '    var d = stepFor(call);\n'
+    '    box.appendChild(d);\n'
+    '    OCS.last = d;\n'
+    '    pushCall(call);\n'
+    '    scrollSafe();\n'
+    '    return d;\n'
+    '  }\n'
+    '  function clearChips() {\n'
+    '    if (!OCS.bubble) return;\n'
+    '    /* the two consoles spell their legacy tool UI differently:\n'
+    '       PAGE uses .toolchip/.pills/.toollog, PAGE_GPT uses .toolsline/.tlog.\n'
+    '       .reasonbox is the old "Thinking (BONSAI) - N chars" box: its text now\n'
+    '       lives inside the "+ Thought" step, so it goes away too. */\n'
+    '    var junk = OCS.bubble.querySelectorAll(\n'
+    "      '.toolchip, .pill, .pills, .toollog, .tlog, .toolsline, .reasonbox');\n"
+    '    for (var i = 0; i < junk.length; i++) {\n'
+    '      var n = junk[i];\n'
+    '      if (n.parentNode) n.parentNode.removeChild(n);\n'
+    '    }\n'
+    "    if (typeof thinkingRow !== 'undefined' && thinkingRow) {\n"
+    '      thinkingRow.reasonD = null;\n'
+    '      thinkingRow.reasonC = null;\n'
+    '    }\n'
+    '  }\n'
+    '  function attach() {\n'
+    '    try {\n'
+    '      /* thinkingRow is a top-level `let` in both pages, so it is NOT on\n'
+    '         window; reach the lexical binding first and fall back to window. */\n'
+    "      var t = (typeof thinkingRow !== 'undefined' && thinkingRow) || window.thinkingRow;\n"
+    '      if (!t || !t.b) return;\n'
+    '      if (OCS.bubble !== t.b) {\n'
+    '        /* a new assistant bubble: drop all per-run state */\n'
+    '        OCS.bubble = t.b;\n'
+    '        OCS.steps = null;\n'
+    '        OCS.last = null;\n'
+    '        OCS.thinkShown = false;\n'
+    '      }\n'
+    '      if (!t.__oc) {\n'
+    '        clearChips();\n'
+    '        t.toolEl = null; t.tlog = null; t.pills = null;\n'
+    '        t.reasonD = t.reasonD || null;\n'
+    '        t.__oc = true;\n'
+    '      }\n'
+    '    } catch (e) {}\n'
+    '  }\n'
+    '  function thoughtFill(node, text) {\n'
+    '    if (!node) return;\n'
+    "    var b = node.querySelector('.ocbody');\n"
+    '    if (!b) {\n'
+    "      b = el('div', 'ocbody');\n"
+    "      b.appendChild(el('pre', 'octext', ''));\n"
+    '      node.appendChild(b);\n'
+    "      node.classList.remove('notext');\n"
+    '    }\n'
+    '    b.firstChild.textContent = text;\n'
+    '    if (OCS.thoughtPart) OCS.thoughtPart.v = text;\n'
+    '  }\n'
+    '\n'
+    '  /* ---------- the ordered transcript ----------\n'
+    '     One container holds every block in the order it arrived: reasoning, the\n'
+    "     model's own text, tool calls, more reasoning, the final answer. The page\n"
+    '     keeps all text in a single .abody, which puts a "sure, one sec" that\n'
+    '     came before the tools *after* them, so the text is rendered here instead. */\n'
+    '\n'
+    '  function orderedBox() {\n'
+    '    if (!OCS.bubble) return null;\n'
+    '    if (!OCS.steps) {\n'
+    "      OCS.steps = el('div', 'ocsteps');\n"
+    '      OCS.bubble.appendChild(OCS.steps);\n'
+    '    }\n'
+    '    return OCS.steps;\n'
+    '  }\n'
+    '\n'
+    '  function textClose() {\n'
+    '    if (!OCS.textNode) return;\n'
+    '    /* streaming shows plain text; the block is upgraded to markdown (lists,\n'
+    '       code, links) once it is finished and will not grow again */\n'
+    "    if (typeof fmt === 'function') {\n"
+    '      try { OCS.textNode.innerHTML = fmt(OCS.textRaw); } catch (e) {}\n'
+    '    }\n'
+    '    OCS.textNode = null;\n'
+    "    OCS.textRaw = '';\n"
+    '    OCS.textPart = null;\n'
+    '  }\n'
+    '\n'
+    '  function textPush(txt) {\n'
+    "    if (txt == null || txt === '') return;\n"
+    '    var box = orderedBox();\n'
+    '    if (!box) return;\n'
+    '    if (!OCS.textNode) {\n'
+    '      /* a new block: only when something else was emitted in between, so a\n'
+    '         run of streamed tokens stays one paragraph */\n'
+    "      var n = el('div', 'ocpara');\n"
+    "      n.textContent = '';\n"
+    '      box.appendChild(n);\n'
+    '      OCS.textNode = n;\n'
+    "      OCS.textRaw = '';\n"
+    '      OCS.last = n;\n'
+    "      OCS.textPart = { k: 't', v: '' };\n"
+    '      OCS.parts.push(OCS.textPart);\n'
+    '    }\n'
+    '    OCS.textRaw += txt;\n'
+    '    OCS.textNode.textContent = OCS.textRaw;\n'
+    '    OCS.textPart.v = OCS.textRaw;\n'
+    '    scrollSafe();\n'
+    '  }\n'
+    '\n'
+    '  function pushCall(call) {\n'
+    "    OCS.parts.push({ k: 'c', i: OCS.callIdx });\n"
+    '    OCS.callIdx++;\n'
+    '  }\n'
+    '\n'
+    '  function pushThought(ms, text) {\n'
+    "    var part = { k: 'r', ms: ms || 0, v: String(text || '') };\n"
+    '    OCS.parts.push(part);\n'
+    '    OCS.thoughtPart = part;\n'
+    '    return part;\n'
+    '  }\n'
+    '\n'
+    '  function showThought(force) {\n'
+    '    if (OCS.thinkShown || !OCS.since) return;\n'
+    '    OCS.thinkShown = true;\n'
+    '    OCS.thinkMs = Date.now() - OCS.since;\n'
+    '    /* the answer itself is not a thought: only show a line when the model\n'
+    '       actually reasoned, or when a tool call proves it spent real time */\n'
+    "    if (!String(OCS.roundText || '').trim() && !force) return;\n"
+    '    var box = orderedBox();\n'
+    '    if (!box) return;\n'
+    '    /* text before this thought is finished */\n'
+    '    textClose();\n'
+    '    var node = thoughtStep(OCS.thinkMs, OCS.roundText);\n'
+    '    box.appendChild(node);\n'
+    '    OCS.thoughtNode = node;\n'
+    '    OCS.last = node;\n'
+    '    /* the reasoning is recorded where it happened, not hung off the next tool\n'
+    '       call: text can come between the two and it must keep its own slot */\n'
+    '    pushThought(OCS.thinkMs, OCS.roundText);\n'
+    '    /* the legacy live box is replaced by this step */\n'
+    "    if (OCS.bubble.querySelector('.reasonbox')) clearChips();\n"
+    '    scrollSafe();\n'
+    '  }\n'
+    '\n'
+    '  /* ---------- override the page renderers ---------- */\n'
+    '  var P = window;\n'
+    '  var oldToolLog = P.addToolLog;\n'
+    '  var oldOnTool = P.onTool;\n'
+    '  var oldOnReason = P.onReason;\n'
+    '  var oldOnDelta = P.onDelta;\n'
+    '\n'
+    '  /* the legacy pill rows are replaced by the step list */\n'
+    '  P.addToolChips = function () {  };\n'
+    '  P.renderLivePills = function () {  };\n'
+    '  P.toolChip = function () { return null; };\n'
+    '\n'
+    '  /* The saved message keeps one `reason` string for the whole answer and the\n'
+    '     page renders it as "Thinking (BONSAI) - N chars". That duplicates the\n'
+    '     "+ Thought" steps, so drop it and let the steps carry the reasoning. */\n'
+    '  var oldAddAsst = P.addAsst;\n'
+    "  if (typeof oldAddAsst === 'function' && !oldAddAsst.__oc) {\n"
+    '    P.addAsst = function (text, calls, reason, stats, parts) {\n'
+    '      var rcalls = calls ? calls.slice() : [];\n'
+    '      if (parts && parts.length) {\n'
+    "        /* the run recorded the order, so replay it instead of the page's\n"
+    '           fixed "thinking, tools, then the whole answer" layout. Calls are\n'
+    '           withheld from the page so its own tool log is never drawn twice. */\n'
+    "        var inner = oldAddAsst.call(this, '', [], null, stats);\n"
+    '        try {\n'
+    '          var bub = inner && inner.parentNode;\n'
+    '          if (bub) {\n'
+    '            stripLegacy(bub);\n'
+    "            var old = bub.querySelector('.abody');\n"
+    '            if (old && old.parentNode) old.parentNode.removeChild(old);\n'
+    '            renderOrdered(bub, rcalls, parts);\n'
+    '          }\n'
+    '        } catch (e) {}\n'
+    '        return inner;\n'
+    '      }\n'
+    '      if (reason && String(reason).trim()) {\n'
+    "        rcalls.push({ __oc_tail: true, name: '__thought__',\n"
+    '                      thought_ms: OCS.tailMs || 0, thought_text: reason });\n'
+    '      }\n'
+    '      var inner = oldAddAsst.call(this, text, rcalls, null, stats);\n'
+    '      try {\n'
+    '        var b = inner && inner.parentNode;\n'
+    "        if (b) b.querySelectorAll('.reasonbox').forEach(function (n) {\n"
+    '          if (n.parentNode) n.parentNode.removeChild(n);\n'
+    '        });\n'
+    '      } catch (e) {}\n'
+    '      return inner;\n'
+    '    };\n'
+    '    P.addAsst.__oc = true;\n'
+    '  }\n'
+    '\n'
+    '  /* rebuild one assistant message from its recorded block order */\n'
+    '  function renderOrdered(bubble, calls, parts) {\n'
+    "    var box = el('div', 'ocsteps');\n"
+    '    parts.forEach(function (p) {\n'
+    '      if (!p) return;\n'
+    "      if (p.k === 'c') {\n"
+    '        var c = calls[p.i];\n'
+    '        if (!c) return;\n'
+    '        /* the reasoning already has its own slot in `parts`, so the copy hung\n'
+    '           off the call is only used for chats saved before blocks existed */\n'
+    '        box.appendChild(stepFor(c));\n'
+    "      } else if (p.k === 't') {\n"
+    "        if (!String(p.v || '').trim()) return;\n"
+    "        var n = el('div', 'ocpara');\n"
+    "        n.innerHTML = (typeof fmt === 'function') ? fmt(p.v) : String(p.v);\n"
+    '        box.appendChild(n);\n'
+    "      } else if (p.k === 'r') {\n"
+    "        if (!String(p.v || '').trim() && !p.ms) return;\n"
+    '        box.appendChild(thoughtStep(p.ms || 0, p.v));\n'
+    '      }\n'
+    '    });\n'
+    '    bubble.insertBefore(box, bubble.firstChild);\n'
+    "    var shots = el('div', 'shots');\n"
+    '    var n = 0;\n'
+    '    (calls || []).forEach(function (c) {\n'
+    '      if (!c || !(c.preview || c.image_data)) return;\n'
+    '      var sc = shotOf(c);\n'
+    '      if (sc) { shots.appendChild(sc); n++; }\n'
+    '    });\n'
+    '    if (n) bubble.insertBefore(shots, box);\n'
+    '  }\n'
+    '  function stripLegacy(root) {\n'
+    '    if (!root || !root.querySelectorAll) return;\n'
+    '    var junk = root.querySelectorAll(\n'
+    "      '.toolchip, .pill, .pills, .toollog, .tlog, .toolsline, .reasonbox');\n"
+    '    for (var i = 0; i < junk.length; i++) {\n'
+    '      if (junk[i].parentNode) junk[i].parentNode.removeChild(junk[i]);\n'
+    '    }\n'
+    '  }\n'
+    '\n'
+    '  /* The page\'s own "Thinking (BONSAI) - N chars" box duplicates the\n'
+    '     "+ Thought" step and is renamed by doneThinking(), so it has to go even\n'
+    '     when the run never calls a tool (clearChips only runs on tool calls). */\n'
+    '  function stripReasonBox() {\n'
+    '    if (OCS.bubble) {\n'
+    '      stripLegacy(OCS.bubble);\n'
+    "      if (!OCS.bubble.querySelector('.reasonbox')) OCS.reasonGone = true;\n"
+    '    }\n'
+    '    try {\n'
+    "      if (typeof thinkingRow !== 'undefined' && thinkingRow) {\n"
+    '        if (thinkingRow.reasonD && thinkingRow.reasonD.parentNode) {\n'
+    '          thinkingRow.reasonD.parentNode.removeChild(thinkingRow.reasonD);\n'
+    '        }\n'
+    '        thinkingRow.reasonD = null;\n'
+    '        thinkingRow.reasonC = null;\n'
+    '      }\n'
+    '    } catch (e) {}\n'
+    '  }\n'
+    '\n'
+    '  P.addToolLog = function (container, calls) {\n'
+    '    if (!container || !calls || !calls.length) return;\n'
+    '    stripLegacy(container);\n'
+    "    var box = el('div', 'ocsteps');    calls.forEach(function (c) {\n"
+    '      if (!c) return;\n'
+    '      if (c.thought_ms || c.thought_text) {\n'
+    '        box.appendChild(thoughtStep(c.thought_ms || 0, c.thought_text));\n'
+    '      }\n'
+    '      if (c.__oc_tail) return;          /* only carried the trailing thought */\n'
+    '      box.appendChild(stepFor(c));\n'
+    '    });\n'
+    '    container.appendChild(box);\n'
+    "    var shots = el('div', 'shots');\n"
+    '    var n = 0;\n'
+    '    calls.forEach(function (c) {\n'
+    '      if (!c || !(c.preview || c.image_data)) return;\n'
+    '      var sc = shotOf(c);\n'
+    '      if (sc) { shots.appendChild(sc); n++; }\n'
+    '    });\n'
+    '    if (n) container.insertBefore(shots, box);\n'
+    '  };\n'
+    '\n'
+    '  P.onReason = function (txt) {\n'
+    '    attach();\n'
+    '    /* keep the round\'s reasoning so the "+ Thought" line can show it */\n'
+    "    OCS.roundText += (txt == null ? '' : String(txt));\n"
+    "    OCS.tailReason += (txt == null ? '' : String(txt));\n"
+    '    if (!OCS.thoughtNode) showThought();\n'
+    '    else thoughtFill(OCS.thoughtNode, OCS.roundText);\n'
+    '    if (oldOnReason) oldOnReason(txt);\n'
+    '    /* the page has just (re)built its own "Thinking (BONSAI)" box: drop it\n'
+    '       right away, otherwise it survives runs that make no tool calls */\n'
+    '    stripReasonBox();\n'
+    '  };\n'
+    '  P.onDelta = function (txt) {\n'
+    '    attach();\n'
+    '    showThought();\n'
+    "    /* the page's own onDelta appends to one .abody that never moves, so the\n"
+    '       text would always end up below the tools: render it in place instead */\n'
+    '    textPush(txt);\n'
+    '    stripReasonBox();\n'
+    '  };\n'
+    '  P.onTool = function (call) {\n'
+    '    attach();\n'
+    '    if (OCS.running && !OCS.thinkShown && OCS.since\n'
+    '        && (Date.now() - OCS.since) > 300) {\n'
+    '      /* the model reasoned without streaming text this round */\n'
+    '      showThought(true);\n'
+    '    }\n'
+    '    if (oldOnTool) {\n'
+    '      try { oldOnTool(call); } catch (e) {}\n'
+    '    }\n'
+    '    clearChips();\n'
+    '    liveStep(call);\n'
+    '    /* the page saves this same call object, so carrying the thought time and\n'
+    '       text on it keeps "+ Thought" lines in the reloaded history too */\n'
+    '    if (call) {\n'
+    '      if (OCS.thinkMs) call.thought_ms = OCS.thinkMs;\n'
+    "      var rt = String(OCS.roundText || '').trim();\n"
+    '      if (rt) call.thought_text = rt;\n'
+    '    }\n'
+    '    OCS.thinkMs = 0;\n'
+    "    OCS.roundText = '';\n"
+    '    OCS.thoughtNode = null;\n'
+    '    OCS.thoughtPart = null;\n'
+    '    /* reasoning from here on is only kept for the tail of the answer */\n'
+    "    OCS.tailReason = '';\n"
+    '    /* the next reasoning round gets its own "+ Thought" line */\n'
+    '    OCS.since = Date.now();\n'
+    '    OCS.thinkShown = false;\n'
+    '    if (call && call.result && call.result.preview_url\n'
+    "        && typeof openPreviewStage === 'function') {\n"
+    "      try { openPreviewStage(call.result.preview_url, call.result.path || ''); } catch (e) {}\n"
+    '    }\n'
+    '    if (call && call.change) refreshChanges();\n'
+    '  };\n'
+    '\n'
+    '  /* the round clock is reset at the start of a run (see noteStart below) */\n'
+    '\n'
+    '  /* ---------- project changes panel ---------- */\n'
+    '  var bar = null, modal = null, lastSnap = null;\n'
+    '\n'
+    '  function changesApi(url, body) {\n'
+    '    return fetch(url, body ? {\n'
+    "      method: 'POST', headers: { 'Content-Type': 'application/json' },\n"
+    '      body: JSON.stringify(body)\n'
+    '    } : undefined).then(function (r) { return r.json(); })\n'
+    '      .catch(function (e) { return { error: String(e) }; });\n'
+    '  }\n'
+    '\n'
+    '  function ensureBar() {\n'
+    '    if (bar) return bar;\n'
+    "    var host = document.querySelector('.chat-wrap') || document.body;\n"
+    "    bar = el('div', 'ocbar');\n"
+    "    var btn = el('button', 'ocbarbtn');\n"
+    "    btn.id = 'occhangesbtn';\n"
+    '    btn.onclick = function () { openChanges(); };\n'
+    '    bar.appendChild(btn);\n'
+    "    var clr = el('button', 'ocbarbtn');\n"
+    "    clr.textContent = 'CLEAR';\n"
+    "    clr.title = 'Stop tracking changes (files stay as they are)';\n"
+    '    clr.onclick = function () {\n'
+    "      changesApi('/api/forget_changes', {}).then(function () { refreshChanges(); });\n"
+    '    };\n'
+    '    bar.appendChild(clr);\n'
+    '    host.insertBefore(bar, host.firstChild);\n'
+    '    paint();\n'
+    '    return bar;\n'
+    '  }\n'
+    '  function paint() {\n'
+    '    if (!bar) return;\n'
+    "    var b = bar.querySelector('#occhangesbtn');\n"
+    '    if (!b) return;\n'
+    '    var s = lastSnap || { files: 0, added: 0, removed: 0 };\n'
+    '    if (!s.files) {\n'
+    "      b.textContent = 'CHANGES 0';\n"
+    "      b.className = 'ocbarbtn';\n"
+    "      b.title = 'No file changes tracked yet';\n"
+    '      return;\n'
+    '    }\n'
+    "    b.innerHTML = '';\n"
+    "    b.appendChild(el('span', null, 'CHANGES ' + s.files + ' file' + (s.files === 1 ? '' : 's') + '  '));\n"
+    "    b.appendChild(el('span', 'ocadd', '+' + (s.added || 0)));\n"
+    "    b.appendChild(el('span', null, ' '));\n"
+    "    b.appendChild(el('span', 'ocdel', '-' + (s.removed || 0)));\n"
+    "    b.className = 'ocbarbtn on';\n"
+    "    b.title = 'Open the change viewer';\n"
+    '  }\n'
+    '  function refreshChanges() {\n'
+    "    return changesApi('/api/changes').then(function (j) {\n"
+    '      lastSnap = j && j.changes ? j : { files: 0, added: 0, removed: 0, changes: [] };\n'
+    '      ensureBar();\n'
+    '      paint();\n'
+    "      if (modal && modal.classList.contains('on')) fillModal();\n"
+    '      return lastSnap;\n'
+    '    });\n'
+    '  }\n'
+    '\n'
+    '  function fileRow(c) {\n'
+    "    var wrap = el('div', 'ocmfile');\n"
+    "    var head = el('div', 'ocmfhead');\n"
+    "    var name = el('div', 'ocf', c.rel || c.path || '(file)');\n"
+    "    name.title = c.path || '';\n"
+    "    head.appendChild(el('span', 'ocg', '→'));\n"
+    '    head.appendChild(name);\n'
+    "    if (c.created) head.appendChild(el('span', 'octag', 'NEW'));\n"
+    "    if ((c.edits || 1) > 1) head.appendChild(el('span', 'octag', c.edits + ' edits'));\n"
+    "    head.appendChild(el('span', 'oct ocadd', '+' + (c.added || 0)));\n"
+    "    head.appendChild(el('span', 'oct ocdel', '-' + (c.removed || 0)));\n"
+    "    var rev = el('button', 'ocmact');\n"
+    "    rev.textContent = c.created ? 'DELETE' : 'REVERT';\n"
+    "    rev.title = c.created ? 'Remove the file the model created'\n"
+    "                           : 'Restore the content from before this session';\n"
+    "    var body = el('div', 'ocmfbody');\n"
+    '    rev.onclick = function (e) {\n'
+    '      e.stopPropagation();\n'
+    "      changesApi('/api/revert', { path: c.path }).then(function (j) {\n"
+    "        if (j && j.error) { alert('Revert failed: ' + j.error); return; }\n"
+    '        refreshChanges();\n'
+    '      });\n'
+    '    };\n'
+    '    head.appendChild(rev);\n'
+    "    head.onclick = function () { wrap.classList.toggle('open'); };\n"
+    '    wrap.appendChild(head);\n'
+    '    wrap.appendChild(body);\n'
+    "    body.appendChild(el('div', 'oclab', 'DIFF  ' + (c.tool || '') + '  ' + new Date((c.ts || 0) * 1000).toLocaleString()));\n"
+    "    body.appendChild(diffTable(c.diff || ''));\n"
+    '    return wrap;\n'
+    '  }\n'
+    '  function fillModal() {\n'
+    "    var list = modal.querySelector('.ocmlist');\n"
+    '    if (!list) return;\n'
+    "    list.innerHTML = '';\n"
+    '    var s = lastSnap || {};\n'
+    '    var ch = s.changes || [];\n'
+    '    if (!ch.length) {\n'
+    "      list.appendChild(el('div', 'ocmempty', 'No changes tracked. Files edited by BONSAI show up here with a diff and a revert button.'));\n"
+    '    } else {\n'
+    '      ch.forEach(function (c) { list.appendChild(fileRow(c)); });\n'
+    '    }\n'
+    "    var sum = modal.querySelector('.ocsum');\n"
+    '    if (sum) {\n'
+    "      sum.textContent = s.files ? (s.files + ' file' + (s.files === 1 ? '' : 's') + '  +' + (s.added || 0) + '  -' + (s.removed || 0)) : 'nothing yet';\n"
+    '    }\n'
+    '  }\n'
+    '  function openChanges() {\n'
+    '    ensureBar();\n'
+    '    if (!modal) {\n'
+    "      modal = el('div', 'ocmodal');\n"
+    '      modal.onclick = function (e) { if (e.target === modal) closeChanges(); };\n'
+    "      var box = el('div', 'ocmbox');\n"
+    "      var h = el('div', 'ocmh');\n"
+    "      h.appendChild(el('b', null, 'CODE CHANGES'));\n"
+    "      h.appendChild(el('span', 'ocsum', ''));\n"
+    "      h.appendChild(el('span', 'sp'));\n"
+    "      var rvAll = el('button', 'ocmact');\n"
+    "      rvAll.textContent = 'REVERT ALL';\n"
+    '      rvAll.onclick = function () {\n'
+    '        var s = lastSnap || { changes: [] };\n'
+    '        var list = (s.changes || []).slice();\n'
+    '        if (!list.length) return;\n'
+    '        var i = 0;\n'
+    '        (function next() {\n'
+    '          if (i >= list.length) { refreshChanges(); return; }\n'
+    '          var c = list[i++];\n'
+    "          changesApi('/api/revert', { path: c.path }).then(next);\n"
+    '        })();\n'
+    '      };\n'
+    '      h.appendChild(rvAll);\n'
+    "      var clr = el('button', 'ocmact');\n"
+    "      clr.textContent = 'CLEAR';\n"
+    "      clr.title = 'Stop tracking (files stay as they are)';\n"
+    '      clr.onclick = function () {\n'
+    "        changesApi('/api/forget_changes', {}).then(function () { refreshChanges(); });\n"
+    '      };\n'
+    '      h.appendChild(clr);\n'
+    "      var x = el('button', 'ocmact');\n"
+    "      x.textContent = 'CLOSE';\n"
+    '      x.onclick = closeChanges;\n'
+    '      h.appendChild(x);\n'
+    '      box.appendChild(h);\n'
+    "      box.appendChild(el('div', 'ocmlist'));\n"
+    '      modal.appendChild(box);\n'
+    '      document.body.appendChild(modal);\n'
+    '    }\n'
+    "    modal.classList.add('on');\n"
+    '    fillModal();\n'
+    '    refreshChanges();\n'
+    '  }\n'
+    "  function closeChanges() { if (modal) modal.classList.remove('on'); }\n"
+    "  document.addEventListener('keydown', function (e) {\n"
+    "    if (e.key === 'Escape') closeChanges();\n"
+    '  });\n'
+    '\n'
+    '  /* start the clock when a run begins: wrap the run hooks if the page has\n'
+    '     them, and always watch fetch() so the clock works on either console\n'
+    '     regardless of which entry point starts the stream. */\n'
+    '  function noteStart() {\n'
+    '    OCS.since = Date.now();\n'
+    '    OCS.thinkShown = false;\n'
+    '    OCS.running = true;\n'
+    '    OCS.steps = null;\n'
+    '    OCS.last = null;\n'
+    "    OCS.roundText = '';\n"
+    '    OCS.thinkMs = 0;\n'
+    '    OCS.thoughtNode = null;\n'
+    '    OCS.parts = [];\n'
+    '    OCS.textNode = null;\n'
+    "    OCS.textRaw = '';\n"
+    '    OCS.textPart = null;\n'
+    '    OCS.callIdx = 0;\n'
+    "    OCS.tailReason = '';\n"
+    '    OCS.thoughtPart = null;\n'
+    '  }\n'
+    '  function noteEnd() {\n'
+    '    /* the reasoning that came after the last tool call is already recorded in\n'
+    '       its own right by showThought(); keep the length only for the legacy\n'
+    '       render of chats saved before blocks existed */\n'
+    '    OCS.tailMs = OCS.thinkMs || (OCS.since ? Date.now() - OCS.since : 0);\n'
+    '    textClose();\n'
+    "    OCS.tailReason = '';\n"
+    '    OCS.running = false;\n'
+    '    OCS.thinkShown = false;\n'
+    '    refreshChanges();\n'
+    '  }\n'
+    '  P.ocNoteStart = noteStart;\n'
+    '  P.ocNoteEnd = noteEnd;\n'
+    '  /* the page saves the assistant message itself, so it needs the block order */\n'
+    '  P.__ocParts = function () { return OCS.parts || []; };\n'
+    '  P.ocState = function () {\n'
+    '    return { since: OCS.since, running: OCS.running, steps: OCS.steps ? OCS.steps.children.length : 0 };\n'
+    '  };\n'
+    '\n'
+    "  ['go', 'streamRun'].forEach(function (fn) {\n"
+    "    if (typeof P[fn] !== 'function' || P[fn].__oc) return;\n"
+    '    var f = P[fn];\n'
+    '    var w = function () { noteStart(); return f.apply(this, arguments); };\n'
+    '    w.__oc = true;\n'
+    '    P[fn] = w;\n'
+    '  });\n'
+    '\n'
+    "  if (typeof P.fetch === 'function' && !P.fetch.__oc) {\n"
+    '    var realFetch = P.fetch;\n'
+    '    var wrappedFetch = function (input, init) {\n'
+    '      try {\n'
+    "        var u = (typeof input === 'string' ? input : (input && input.url)) || '';\n"
+    "        if (String(u).indexOf('/api/stream') >= 0) noteStart();\n"
+    '      } catch (e) {}\n'
+    '      return realFetch.apply(this, arguments);\n'
+    '    };\n'
+    '    wrappedFetch.__oc = true;\n'
+    '    P.fetch = wrappedFetch;\n'
+    '  }\n'
+    '\n'
+    '  /* close the run when the page finishes its stream */\n'
+    "  ['doneThinking', 'onDone', 'endStream'].forEach(function (fn) {\n"
+    "    if (typeof P[fn] !== 'function' || P[fn].__ocEnd) return;\n"
+    '    var f = P[fn];\n'
+    '    var w = function () { try { return f.apply(this, arguments); } finally { noteEnd(); } };\n'
+    '    w.__ocEnd = true;\n'
+    '    P[fn] = w;\n'
+    '  });\n'
+    '\n'
+    '  ensureBar();\n'
+    '  refreshChanges();\n'
+    '  window.ocChanges = { refresh: refreshChanges, open: openChanges, close: closeChanges, state: function () { return lastSnap; } };\n'
+    '})();\n'
+    ''
+)
+
+
+def _inject_steps(html):
+    """Add the step/diff UI to a served page."""
+    if "__ocSteps" in html:
+        return html
+    css = "".join("  " + line + "\n" for line in _OC_CSS.split("\n"))
+    at = html.rfind("</style>")
+    if at > 0:
+        html = html[:at] + css + html[at:]
+    at = html.rfind("</script>")
+    if at > 0:
+        html = html[:at] + _OC_JS + "\n" + html[at:]
+    return html
+
+
+PAGE = _inject_steps(PAGE)
+PAGE_GPT = _inject_steps(PAGE_GPT)
 def _strip_full(record):
     """The tool payload streamed to the UI.
 
@@ -12971,6 +14353,8 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/todos":
             with _TODOS_LOCK:
                 self._send(200, json.dumps({"todos": _TODOS}))
+        elif path == "/api/changes":
+            self._send(200, json.dumps(_changes_snapshot(), default=str))
         elif path == "/api/blender":
             self._send(200, json.dumps(_blender_status_payload()))
         elif path == "/api/tts":
@@ -13001,7 +14385,7 @@ class Handler(BaseHTTPRequestHandler):
                             "/api/pick_workdir", "/api/chats",
                             "/api/answer", "/api/effort", "/api/eject",
                             "/api/tts", "/api/models", "/api/pick_model",
-                            "/api/ctx",
+                            "/api/ctx", "/api/revert", "/api/forget_changes",
                             "/api/path_policy", "/api/dl_pause",
                             "/api/dl_resume", "/api/dl_cancel",
                             "/api/dl_retry", "/api/dl_clear"):
@@ -13014,6 +14398,13 @@ class Handler(BaseHTTPRequestHandler):
                                % (MAX_REQUEST_BYTES // (1024 * 1024))}))
                 return
             body = json.loads(self.rfile.read(length) or b"{}")
+            if path == "/api/revert":
+                self._send(200, json.dumps(_revert_change(body.get("path")),
+                                           default=str))
+                return
+            if path == "/api/forget_changes":
+                self._send(200, json.dumps(_forget_changes()))
+                return
             if path == "/api/eject":
                 self._send(200, json.dumps(_unload_bonsai()))
                 return
@@ -13196,6 +14587,7 @@ class Handler(BaseHTTPRequestHandler):
                 beat = threading.Thread(target=keepalive, name="sse-keepalive")
                 beat.daemon = True
                 beat.start()
+                client_gone = False
                 try:
                     handle_chat(messages or [], stream=True, mode=mode,
                                 on_reason=lambda t: emit("reason", {"text": t}),
@@ -13203,6 +14595,9 @@ class Handler(BaseHTTPRequestHandler):
                                 on_tool=lambda c: emit("tool", {"call": _strip_full(c)}),
                                 on_stats=lambda s: emit("stats", s),
                                 hooks={"on_ask": do_ask, "on_todo": do_todo})
+                except CLIENT_GONE:
+                    # browser closed the tab mid-response: normal, not an error
+                    client_gone = True
                 except Exception as exc:
                     traceback.print_exc()
                     try:
@@ -13211,7 +14606,8 @@ class Handler(BaseHTTPRequestHandler):
                         pass
                 finally:
                     stop_beat.set()
-                emit("done", {"ok": True})
+                if not client_gone:
+                    emit("done", {"ok": True})
             else:
                 if not _ensure_bonsai():
                     self._send(200, json.dumps({"reply": "Bonsai 2 model server could not start.",
@@ -13221,7 +14617,7 @@ class Handler(BaseHTTPRequestHandler):
                 result.pop("_stats", None)
                 self._send(200, json.dumps(result, default=str))
         except Exception as exc:
-            if self.wfile.closed:
+            if isinstance(exc, CLIENT_GONE) or self.wfile.closed:
                 return
             try:
                 self.send_response(200)

@@ -38,6 +38,9 @@ piper/*.wav
 models.json
 models.json.bak
 
+# API keys - plaintext secrets, never commit these
+API KEYS.txt
+
 # Scheduled shell tasks (per-machine state written by schedule_task)
 schedules.json
 schedules.json.tmp
