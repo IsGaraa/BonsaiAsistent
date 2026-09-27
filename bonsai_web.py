@@ -11667,14 +11667,89 @@ async function foldChat(chat, msgs) {
 }
 function esc(s) { return (s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
 function fmt(s) {
-  let t = esc(s);
-  t = t.replace(/```([\\s\\S]*?)```/g, '<pre>$1</pre>');
-  t = t.replace(/`([^`]+)`/g, '<code>$1</code>');
-  t = t.replace(/\\*\\*([^*]+)\\*\\*/g, '<b>$1</b>');
-  t = t.replace(/\\*([^*]+)\\*/g, '<i>$1</i>');
-  t = t.replace(/(https?:\\/\\/[^\\s<]+)/g, '<a href="$1" target="_blank" rel="noreferrer">$1</a>');
-  t = t.replace(/\\n/g, '<br>');
-  return t;
+  /* Block-level markdown, then the inline marks. Models reach for headings
+     and lists constantly and they used to arrive on screen as literal "#" and
+     "-" text, because only the inline marks were ever handled. Fenced code is
+     lifted out first so a list marker inside a code block stays put. */
+  let src = String(s == null ? '' : s).replace(/\\r\\n?/g, '\\n');
+  const fences = [];
+  src = src.replace(/```([\\s\\S]*?)(?:```|$)/g, function (m, body) {
+    fences.push('<pre>' + esc(body.replace(/\\n$/, '')) + '</pre>');
+    return '\\u0000F' + (fences.length - 1) + '\\u0000';
+  });
+
+  const inline = function (x) {
+    let t = esc(x);
+    t = t.replace(/`([^`]+)`/g, '<code>$1</code>');
+    t = t.replace(/\\*\\*([^*]+)\\*\\*/g, '<b>$1</b>');
+    t = t.replace(/\\*([^*]+)\\*/g, '<i>$1</i>');
+    /* Links go into placeholders and are put back at the end, so the bare-url
+       pass cannot swallow the address of a link it has already built - it used
+       to, and the closing bracket ended up inside the address. Only http and
+       https are linked: a model writes these, so this is the one place a
+       javascript: address could get in. esc() does not touch a double quote,
+       so it is escaped here too - a quote in the address used to be able to
+       close the href attribute and add an event handler. */
+    const links = [];
+    const hold = function (html) {
+      links.push(html); return '\\u0001L' + (links.length - 1) + '\\u0001';
+    };
+    const anchor = function (url, text) {
+      const u = String(url).replace(/"/g, '&quot;');
+      return '<a href="' + u + '" target="_blank" rel="noreferrer">' + text + '</a>';
+    };
+    t = t.replace(/\\[([^\\]\\n]+)\\]\\((https?:\\/\\/[^)\\s"]+)\\)/g, function (m, label, url) {
+      return hold(anchor(url, label));
+    });
+    t = t.replace(/(https?:\\/\\/[^\\s<"]+)/g, function (m) {
+      let url = m, tail = '';
+      while (/[),.;:!?]$/.test(url)) {
+        const c = url.slice(-1);
+        if (c === ')' && (url.match(/\\)/g) || []).length <= (url.match(/\\(/g) || []).length) break;
+        tail = c + tail; url = url.slice(0, -1);
+      }
+      return hold(anchor(url, url)) + tail;
+    });
+    t = t.replace(/\\u0001L(\\d+)\\u0001/g, function (m, i) { return links[+i]; });
+    return t;
+  };
+
+  const out = [];
+  let para = [], list = null, quote = [];
+  const flushPara = function () {
+    /* no <p> wrapper: a paragraph of prose is just this, as before, so the
+       spacing inside a bubble does not change */
+    if (para.length) { out.push(para.map(inline).join('<br>')); para = []; }
+  };
+  const flushList = function () {
+    if (list) { out.push('<' + list.tag + '>' + list.items.map(function (i) {
+      return '<li>' + inline(i) + '</li>'; }).join('') + '</' + list.tag + '>'); list = null; }
+  };
+  const flushQuote = function () {
+    if (quote.length) { out.push('<blockquote>' + quote.map(inline).join('<br>') + '</blockquote>'); quote = []; }
+  };
+  const flushAll = function () { flushPara(); flushList(); flushQuote(); };
+
+  String(src).split('\\n').forEach(function (ln) {
+    const fence = ln.match(/^\\u0000F(\\d+)\\u0000$/);
+    if (fence) { flushAll(); out.push(fences[+fence[1]]); return; }
+    if (/^\\s*(-{3,}|\\*{3,}|_{3,})\\s*$/.test(ln)) { flushAll(); out.push('<hr>'); return; }
+    let m = ln.match(/^\\s*(#{1,6})\\s+(.*)$/);
+    if (m) { flushAll(); out.push('<h' + m[1].length + '>' + inline(m[2]) + '</h' + m[1].length + '>'); return; }
+    m = ln.match(/^\\s*>\\s?(.*)$/);
+    if (m) { flushPara(); flushList(); quote.push(m[1]); return; }
+    flushQuote();
+    m = ln.match(/^\\s*[-*+]\\s+(.*)$/);
+    if (m) { flushPara(); if (!list || list.tag !== 'ul') { flushList(); list = { tag: 'ul', items: [] }; } list.items.push(m[1]); return; }
+    m = ln.match(/^\\s*\\d+[.)]\\s+(.*)$/);
+    if (m) { flushPara(); if (!list || list.tag !== 'ol') { flushList(); list = { tag: 'ol', items: [] }; } list.items.push(m[1]); return; }
+    flushList();
+    if (!ln.trim()) { flushPara(); return; }
+    para.push(ln);
+  });
+  flushAll();
+
+  return out.join('');
 }
 function fileChipDom(name) {
   const c = document.createElement('span'); c.className = 'filechip';
@@ -12277,6 +12352,12 @@ function doneThinking(errMsg) {
   }
   if (thinkingRow.body) thinkingRow.body.classList.remove('caret');
   if (errMsg) { const e = document.createElement('div'); e.style.color = '#ff859b'; e.textContent = errMsg; thinkingRow.b.appendChild(e); }
+  /* The ordered renderer draws the reply in its own bubble, so this waiting
+     row is often never written to at all. It used to be left behind as an
+     empty bubble with an avatar under every single answer. */
+  if (!errMsg && !thinkingRow.body && !thinkingRow.reasonD && !thinkingRow.toolEl) {
+    if (thinkingRow.row.parentNode) thinkingRow.row.parentNode.removeChild(thinkingRow.row);
+  }
   thinkingRow = null;
 }
 
@@ -14314,14 +14395,89 @@ async function foldChat(chat, msgs) {
 }
 function esc(s) { return (s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
 function fmt(s) {
-  let t = esc(s);
-  t = t.replace(/```([\\s\\S]*?)```/g, '<pre>$1</pre>');
-  t = t.replace(/`([^`]+)`/g, '<code>$1</code>');
-  t = t.replace(/\\*\\*([^*]+)\\*\\*/g, '<b>$1</b>');
-  t = t.replace(/\\*([^*]+)\\*/g, '<i>$1</i>');
-  t = t.replace(/(https?:\\/\\/[^\\s<]+)/g, '<a href="$1" target="_blank" rel="noreferrer">$1</a>');
-  t = t.replace(/\\n/g, '<br>');
-  return t;
+  /* Block-level markdown, then the inline marks. Models reach for headings
+     and lists constantly and they used to arrive on screen as literal "#" and
+     "-" text, because only the inline marks were ever handled. Fenced code is
+     lifted out first so a list marker inside a code block stays put. */
+  let src = String(s == null ? '' : s).replace(/\\r\\n?/g, '\\n');
+  const fences = [];
+  src = src.replace(/```([\\s\\S]*?)(?:```|$)/g, function (m, body) {
+    fences.push('<pre>' + esc(body.replace(/\\n$/, '')) + '</pre>');
+    return '\\u0000F' + (fences.length - 1) + '\\u0000';
+  });
+
+  const inline = function (x) {
+    let t = esc(x);
+    t = t.replace(/`([^`]+)`/g, '<code>$1</code>');
+    t = t.replace(/\\*\\*([^*]+)\\*\\*/g, '<b>$1</b>');
+    t = t.replace(/\\*([^*]+)\\*/g, '<i>$1</i>');
+    /* Links go into placeholders and are put back at the end, so the bare-url
+       pass cannot swallow the address of a link it has already built - it used
+       to, and the closing bracket ended up inside the address. Only http and
+       https are linked: a model writes these, so this is the one place a
+       javascript: address could get in. esc() does not touch a double quote,
+       so it is escaped here too - a quote in the address used to be able to
+       close the href attribute and add an event handler. */
+    const links = [];
+    const hold = function (html) {
+      links.push(html); return '\\u0001L' + (links.length - 1) + '\\u0001';
+    };
+    const anchor = function (url, text) {
+      const u = String(url).replace(/"/g, '&quot;');
+      return '<a href="' + u + '" target="_blank" rel="noreferrer">' + text + '</a>';
+    };
+    t = t.replace(/\\[([^\\]\\n]+)\\]\\((https?:\\/\\/[^)\\s"]+)\\)/g, function (m, label, url) {
+      return hold(anchor(url, label));
+    });
+    t = t.replace(/(https?:\\/\\/[^\\s<"]+)/g, function (m) {
+      let url = m, tail = '';
+      while (/[),.;:!?]$/.test(url)) {
+        const c = url.slice(-1);
+        if (c === ')' && (url.match(/\\)/g) || []).length <= (url.match(/\\(/g) || []).length) break;
+        tail = c + tail; url = url.slice(0, -1);
+      }
+      return hold(anchor(url, url)) + tail;
+    });
+    t = t.replace(/\\u0001L(\\d+)\\u0001/g, function (m, i) { return links[+i]; });
+    return t;
+  };
+
+  const out = [];
+  let para = [], list = null, quote = [];
+  const flushPara = function () {
+    /* no <p> wrapper: a paragraph of prose is just this, as before, so the
+       spacing inside a bubble does not change */
+    if (para.length) { out.push(para.map(inline).join('<br>')); para = []; }
+  };
+  const flushList = function () {
+    if (list) { out.push('<' + list.tag + '>' + list.items.map(function (i) {
+      return '<li>' + inline(i) + '</li>'; }).join('') + '</' + list.tag + '>'); list = null; }
+  };
+  const flushQuote = function () {
+    if (quote.length) { out.push('<blockquote>' + quote.map(inline).join('<br>') + '</blockquote>'); quote = []; }
+  };
+  const flushAll = function () { flushPara(); flushList(); flushQuote(); };
+
+  String(src).split('\\n').forEach(function (ln) {
+    const fence = ln.match(/^\\u0000F(\\d+)\\u0000$/);
+    if (fence) { flushAll(); out.push(fences[+fence[1]]); return; }
+    if (/^\\s*(-{3,}|\\*{3,}|_{3,})\\s*$/.test(ln)) { flushAll(); out.push('<hr>'); return; }
+    let m = ln.match(/^\\s*(#{1,6})\\s+(.*)$/);
+    if (m) { flushAll(); out.push('<h' + m[1].length + '>' + inline(m[2]) + '</h' + m[1].length + '>'); return; }
+    m = ln.match(/^\\s*>\\s?(.*)$/);
+    if (m) { flushPara(); flushList(); quote.push(m[1]); return; }
+    flushQuote();
+    m = ln.match(/^\\s*[-*+]\\s+(.*)$/);
+    if (m) { flushPara(); if (!list || list.tag !== 'ul') { flushList(); list = { tag: 'ul', items: [] }; } list.items.push(m[1]); return; }
+    m = ln.match(/^\\s*\\d+[.)]\\s+(.*)$/);
+    if (m) { flushPara(); if (!list || list.tag !== 'ol') { flushList(); list = { tag: 'ol', items: [] }; } list.items.push(m[1]); return; }
+    flushList();
+    if (!ln.trim()) { flushPara(); return; }
+    para.push(ln);
+  });
+  flushAll();
+
+  return out.join('');
 }
 function addUser(content) {
   const row = document.createElement('div'); row.className = 'msgrow user';
@@ -14608,6 +14764,12 @@ function doneThinking(errMsg) {
   if (thinkingRow.tlog) thinkingRow.tlog.s.textContent = 'Tool log \u00b7 ' + liveCalls.length + ' call' + (liveCalls.length === 1 ? '' : 's');
   if (thinkingRow.body) { thinkingRow.body.classList.remove('caret'); }
   if (errMsg) { const e = document.createElement('div'); e.style.color = 'var(--err)'; e.style.fontSize = '13px'; e.textContent = errMsg; thinkingRow.b.appendChild(e); }
+  /* The ordered renderer draws the reply in its own bubble, so this waiting
+     row is often never written to at all. It used to be left behind as an
+     empty bubble with an avatar under every single answer. */
+  if (!errMsg && !thinkingRow.body && !thinkingRow.reasonD && !thinkingRow.tlog) {
+    if (thinkingRow.row.parentNode) thinkingRow.row.parentNode.removeChild(thinkingRow.row);
+  }
   thinkingRow = null;
 }
 function effortValue() { return document.getElementById('effort-sel').value; }
