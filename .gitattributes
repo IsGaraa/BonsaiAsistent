@@ -1,0 +1,25 @@
+# A folder that travels carries line endings with it, and a shell script with
+# a carriage return in the shebang is dead on arrival:
+#   /usr/bin/env: 'bash\r': No such file or directory
+# That is what a Linux user got after copying this project across from Windows.
+# Pin the shell scripts to LF everywhere, on every machine, and keep the .bat
+# and .cmd twins on CRLF so Windows still runs them.
+*.sh text eol=lf
+*.bash text eol=lf
+
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# The one Python file in the project: keep it CRLF, the way it is authored.
+bonsai_web.py text eol=crlf
+
+# Text that must never be rewritten, or a diff stops meaning anything.
+*.gguf binary
+*.onnx binary
+*.wav binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.zip binary
+*.tar.gz binary

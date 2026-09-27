@@ -18,7 +18,6 @@ assets/
 *.cact
 config.json
 README.needle.md
-.gitattributes
 android-*/
 ios-*
 linux-*/
