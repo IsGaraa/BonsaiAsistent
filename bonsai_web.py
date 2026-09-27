@@ -4788,6 +4788,28 @@ def _bonsai_chat(messages, tools):
 def _provider_message(exc):
     """The human-readable part of a provider's error body, when it sent one.
 
+    An error body can be read exactly once - `exc.read()` drains it - and more
+    than one caller legitimately wants it. The vision check reads it to see
+    whether this is a refusal it can recover from, and the handler that turns
+    the failure into a message for the user reads it again afterwards. The
+    second read came back empty, so a rate limit that had been reported in the
+    provider's own words quietly turned into our generic "not answering right
+    now". So the answer is kept on the exception and handed back unchanged.
+    """
+    cached = getattr(exc, "_bonsai_provider_message", None)
+    if cached is not None:
+        return cached
+    text = _provider_message_from_body(exc)
+    try:
+        exc._bonsai_provider_message = text
+    except Exception:
+        pass
+    return text
+
+
+def _provider_message_from_body(exc):
+    """Read the body off an HTTP error and pull the sentence worth reading.
+
     OpenRouter keeps the text worth reading in error.metadata.raw and leaves
     error.message as a flat "Provider returned error", so the metadata is
     checked first and the flat message is only a fallback. Whatever comes
@@ -9790,7 +9812,20 @@ def run_agent(messages, on_tool=None, mode=MODE_BUILD, on_stats=None, hooks=None
     msgs = list(messages)
     total = _empty_stats()
     for _ in range(MAX_TOOL_ROUNDS):
-        message = _bonsai_chat(msgs, tools)
+        try:
+            message = _bonsai_chat(msgs, tools)
+        except Exception as exc:
+            # A text-only model that has just been handed a screenshot answers
+            # with a 400. Retry the same round without the image rather than
+            # losing the turn - see _blind_turn.
+            fixed = None if _is_blind() else _blind_turn(msgs, exc)
+            if fixed is None:
+                raise
+            _remember_blind()
+            msgs[:] = fixed
+            if on_tool:
+                on_tool(_blind_record())
+            message = _bonsai_chat(msgs, tools)
         total = _merge_stats(total, _stats_from(message.get("_usage") or {},
                                                 message.get("_timings") or {}))
         tool_calls = message.get("tool_calls") or []
@@ -9814,11 +9849,7 @@ def run_agent(messages, on_tool=None, mode=MODE_BUILD, on_stats=None, hooks=None
                          "content": json.dumps(record["full_result"],
                                                ensure_ascii=False)})
             if image_uri:
-                msgs.append({"role": "user",
-                             "content": [{"type": "text",
-                                          "text": "[I just captured this screenshot - inspect it carefully.]"},
-                                         {"type": "image_url",
-                                          "image_url": {"url": image_uri}}]})
+                _append_shot_image(msgs, {"preview": image_uri})
     if on_stats:
         on_stats(total)
     try:
@@ -9831,14 +9862,163 @@ def run_agent(messages, on_tool=None, mode=MODE_BUILD, on_stats=None, hooks=None
     return {"reply": "Done - completed the steps that could be executed.", "calls": calls, "_stats": total}
 
 
+_VISION_REFUSAL_MARKERS = (
+    "does not support image",
+    "doesn't support image",
+    "does not support vision",
+    "doesn't support vision",
+    "not support image",
+    "not support vision",
+    "no vision",
+    "images are not supported",
+    "image input is not supported",
+    "image inputs are not supported",
+    "unsupported image",
+    "invalid image",
+    "image content type",
+    "multimodal",
+    "text-only model",
+    "text only model",
+    "cannot accept image",
+    "can't accept image",
+    "unable to process image",
+    "does not understand image",
+    "image_url",
+)
+
+# What the model is told instead of the picture. It has to be specific, because
+# the whole point is that the model carries on: it still has every text tool,
+# and the file is on disk.
+_BLIND_NOTE = (
+    "[A screenshot was taken, but this model cannot see images - the provider "
+    "rejected the image. The capture is on disk if you need it. Carry on with "
+    "what you can actually read: window_list, read_file, ui_dump, and reading "
+    "values you are told. Do not call the screenshot tools again this turn, and "
+    "if you truly need to see the screen, say so and let the user describe it.]")
+
+# Learned per model, not per turn. Once a model has refused an image, it will
+# refuse the next one, and the rejected request is not free, so the answer is
+# remembered until that model is not the active one.
+_BLIND_MODELS = set()
+
+
+def _is_blind(entry=None):
+    entry = entry if entry is not None else _active_model()
+    return str((entry or {}).get("id") or "") in _BLIND_MODELS
+
+
+def _remember_blind(entry=None):
+    entry = entry if entry is not None else _active_model()
+    mid = str((entry or {}).get("id") or "")
+    if mid:
+        _BLIND_MODELS.add(mid)
+
+
+def _msgs_have_image(msgs):
+    for m in msgs or []:
+        content = m.get("content") if isinstance(m, dict) else None
+        if isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "image_url":
+                    return True
+    return False
+
+
+def _vision_refusal_text(exc):
+    """The provider's own words when it turned an image down, else ""."""
+    try:
+        text = _model_error_text(exc)
+    except Exception:
+        text = ""
+    blob = ("%s" % text).lower()
+    if not blob.strip():
+        blob = str(exc or "").lower()
+    return text if any(m in blob for m in _VISION_REFUSAL_MARKERS) else ""
+
+
+def _blind_turn(msgs, exc):
+    """A copy of `msgs` with the pictures swapped for a sentence saying why,
+    or None when this failure is something else entirely.
+
+    The model called the screenshot tool, got the image, and the next request
+    came back "I cannot see images". Ending the turn there throws away all the
+    work: the model still has its tools, the capture is still on disk, and
+    everything except the pixels is still doable. So the retry is one message
+    lighter rather than one turn shorter."""
+    refused = _vision_refusal_text(exc)
+    if not refused or not _msgs_have_image(msgs):
+        return None
+    out = []
+    for m in msgs or []:
+        if not isinstance(m, dict):
+            continue
+        content = m.get("content")
+        if not isinstance(content, list):
+            out.append(m)
+            continue
+        had_image = False
+        parts = []
+        noted = False
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") == "image_url":
+                had_image = True
+                continue
+            if (part.get("type") == "text"
+                    and "screenshot" in str(part.get("text") or "").lower()):
+                parts.append({"type": "text", "text": _BLIND_NOTE})
+                noted = True
+                continue
+            parts.append(part)
+        if had_image and not noted:
+            parts.insert(0, {"type": "text", "text": _BLIND_NOTE})
+        if not parts:
+            continue
+        new = dict(m)
+        new["content"] = parts
+        out.append(new)
+    return out or None
+
+
+def _blind_record():
+    """A tool-log line for the vision fallback, so the user can see that it
+    happened rather than watching the model quietly carry on blind."""
+    return {"name": "vision", "arguments": {},
+            "result": {"error": _BLIND_NOTE.strip("[]")},
+            "tool_call_id": "vision_blind", "ms": 0}
+
+
+def _vision_error_text(exc):
+    """A last-resort message for a turn that could not be recovered, so the
+    user learns the model is blind rather than seeing a raw provider error."""
+    refused = _vision_refusal_text(exc)
+    if not refused:
+        return None
+    entry = _active_model()
+    name = (entry or {}).get("label") or (entry or {}).get("id") or "this model"
+    return ("'%s' cannot see images, so the screenshot could not be sent to it "
+            "(%s).\n\nThe capture is still on disk. Either switch to a model "
+            "that takes images, or ask the model to work from window titles, "
+            "file contents and text you provide."
+            % (name, refused))
+
+
 def _append_shot_image(msgs, record):
     image_uri = record.get("preview")
-    if image_uri:
-        msgs.append({"role": "user",
-                     "content": [{"type": "text",
-                                  "text": "[I just captured this screenshot - inspect it carefully.]"},
-                                 {"type": "image_url",
-                                  "image_url": {"url": image_uri}}]})
+    if not image_uri:
+        return
+    if _is_blind():
+        # Already learned this model cannot see. Sending it anyway would buy
+        # the same rejection a second time, and the base64 is not free either.
+        msgs.append({"role": "user", "content": [{"type": "text",
+                                                  "text": _BLIND_NOTE}]})
+        return
+    msgs.append({"role": "user",
+                 "content": [{"type": "text",
+                              "text": "[I just captured this screenshot - inspect it carefully.]"},
+                             {"type": "image_url",
+                              "image_url": {"url": image_uri}}]})
 
 
 def stream_agent(messages, on_reason=None, on_delta=None, on_tool=None,
@@ -9864,11 +10044,26 @@ def stream_agent(messages, on_reason=None, on_delta=None, on_tool=None,
 
     def one_round(tools_for_round):
         tool_calls = None
-        for ev in _bonsai_stream(msgs, tools_for_round):
-            if ev["kind"] == "end":
-                tool_calls = ev["tool_calls"]
+        try:
+            for ev in _bonsai_stream(msgs, tools_for_round):
+                if ev["kind"] == "end":
+                    tool_calls = ev["tool_calls"]
                 emit(ev)
-            else:
+        except Exception as exc:
+            # The model took a screenshot, was handed the image, and the
+            # provider refused it because this model is text-only. That is not
+            # a reason to end the turn with an error: retry the same round with
+            # the picture replaced by a sentence, and let it finish the job.
+            fixed = None if _is_blind() else _blind_turn(msgs, exc)
+            if fixed is None:
+                raise
+            _remember_blind()
+            msgs[:] = fixed
+            if on_tool:
+                on_tool(_blind_record())
+            for ev in _bonsai_stream(msgs, tools_for_round):
+                if ev["kind"] == "end":
+                    tool_calls = ev["tool_calls"]
                 emit(ev)
         return tool_calls or []
 
@@ -9943,7 +10138,7 @@ def handle_chat(messages, on_reason=None, on_delta=None, on_tool=None,
         return run_agent(msgs, on_tool=on_tool, mode=mode, on_stats=on_stats,
                          hooks=hooks)
     except Exception as exc:
-        friendly = _ctx_overflow_text(exc)
+        friendly = _ctx_overflow_text(exc) or _vision_error_text(exc)
         if friendly:
             raise RuntimeError(friendly) from exc
         raise
