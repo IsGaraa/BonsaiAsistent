@@ -1893,6 +1893,108 @@ def _glob_search(pattern, path=None):
     return {"result": "ok", "output": "\n".join(output), "count": len(results), "truncated": truncated}
 
 
+_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tif",
+               ".tiff", ".ico", ".heic", ".heif", ".ppm", ".pgm", ".tga"}
+_BINARY_EXTS = {".zip", ".tar", ".gz", ".tgz", ".bz2", ".xz", ".7z", ".rar",
+                ".exe", ".dll", ".so", ".dylib", ".class", ".jar", ".pyc",
+                ".pyo", ".pyd", ".o", ".a", ".lib", ".obj", ".wasm", ".bin",
+                ".dat", ".db", ".sqlite", ".mdb", ".gguf", ".onnx", ".pt",
+                ".pth", ".safetensors", ".ckpt", ".npy", ".npz", ".pkl",
+                ".pickle", ".blend", ".fbx", ".obj3", ".stl", ".3ds", ".wav",
+                ".mp3", ".flac", ".ogg", ".mp4", ".mkv", ".avi", ".mov",
+                ".webm", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+                ".ttf", ".otf", ".woff", ".woff2", ".eot"}
+
+
+def _is_image_file(path):
+    return os.path.splitext(str(path))[1].lower() in _IMAGE_EXTS
+
+
+def _strip_control_chars(text):
+    """Drop the bytes that are not text.
+
+    A NUL or a stray control character inside a message is not something a
+    model should ever be sent: it inflates the request, some tokenizers reject
+    it outright, and providers answer with a bare "invalid request" that says
+    nothing about which part of the message was wrong. Newlines, tabs and
+    carriage returns are the only ones that carry meaning, so they stay."""
+    if not isinstance(text, str):
+        return text
+    if not any(ord(ch) < 32 and ch not in "\t\n\r" or ord(ch) == 127
+               for ch in text):
+        return text
+    return "".join(ch for ch in text
+                   if ch in "\t\n\r" or (ord(ch) >= 32 and ord(ch) != 127))
+
+
+def _looks_binary(sample, ext=""):
+    """Is this file binary? Judged by what the bytes are, not by the name.
+
+    The old test counted only control characters and gave up above 30%, which
+    sounds reasonable and is wrong for compressed data: a PNG, a zip and a .gz
+    are all near-uniformly distributed, so only about one byte in ten falls in
+    the control range and they all passed as text. The model was then handed
+    raw compressed bytes as if they were a document, and the next request came
+    back "invalid request" with no clue why. Decodability is the real signal.
+    """
+    if ext and ext in _BINARY_EXTS:
+        return True
+    if not sample:
+        return False
+    if b"\x00" in sample:
+        return True
+    try:
+        text = sample.decode("utf-8")
+    except UnicodeDecodeError:
+        # A few odd bytes in an otherwise normal text file is still text, so
+        # only call it binary when the high bytes are actually common.
+        high = sum(1 for b in sample if b > 127)
+        if high / len(sample) > 0.10:
+            return True
+        text = sample.decode("utf-8", "replace")
+    printable = sum(1 for ch in text
+                    if ch in "\t\n\r" or 32 <= ord(ch) < 127 or ord(ch) > 159)
+    if printable / len(text) <= 0.90:
+        return True
+    return False
+
+
+def _read_image_attachment(file_path):
+    """Hand an image to the model as something it can actually look at.
+
+    The tool has always described itself as returning images as attachments,
+    and refused them as binary instead. Refusing is not the same as being able
+    to see: the model has a vision projector, the whole point of the file being
+    on disk is that it wanted to look at it, and "cannot read binary file" sent
+    it off to grep a picture instead."""
+    try:
+        from PIL import Image
+    except Exception:
+        return {"error": f"{file_path} is an image and this model needs Pillow "
+                         f"to look at it: pip install pillow"}
+    try:
+        with Image.open(file_path) as im:
+            im.load()
+            data_uri, w, h = _image_payload(im)
+            fmt = (im.format or "image").lower()
+    except Exception as exc:
+        return {"error": f"could not open the image {file_path}: {exc}"}
+    if os.path.getsize(file_path) > MAX_IMAGE_BYTES * 4:
+        return {"error": f"image is too large to send: {file_path}"}
+    return {
+        "result": "ok",
+        "type": "image",
+        "path": file_path,
+        "format": fmt,
+        "width": w,
+        "height": h,
+        "output": f"<path>{file_path}</path>\n<type>image</type>\n"
+                  f"<detail>{fmt} image, {w}x{h}. Attached below - look at it "
+                  f"to answer.</detail>",
+        "image_data": data_uri,
+    }
+
+
 def _read_oc(file_path, offset=None, limit=None):
     if not file_path:
         return {"error": "filePath is required"}
@@ -1935,21 +2037,17 @@ def _read_oc(file_path, offset=None, limit=None):
     # Check binary
     try:
         with open(file_path, "rb") as f:
-            sample = f.read(4096)
+            sample = f.read(8192)
     except Exception as e:
         return {"error": f"Cannot read file: {e}"}
-    # Binary detection
-    binary_exts = {".zip", ".tar", ".gz", ".exe", ".dll", ".so", ".class", ".jar",
-                   ".7z", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".bin",
-                   ".dat", ".obj", ".o", ".a", ".lib", ".wasm", ".pyc", ".pyo"}
     ext = os.path.splitext(file_path)[1].lower()
-    is_binary = ext in binary_exts
-    if not is_binary and sample:
-        non_printable = sum(1 for b in sample if b == 0 or (b < 9 or (b > 13 and b < 32)))
-        if non_printable / len(sample) > 0.3:
-            is_binary = True
-    if is_binary:
-        return {"error": f"Cannot read binary file: {file_path}"}
+    if _is_image_file(file_path):
+        return _read_image_attachment(file_path)
+    if _looks_binary(sample, ext):
+        return {"error": f"Cannot read binary file: {file_path} - it is not "
+                         f"text, so there is nothing to show the model. Use an "
+                         f"archive tool to look inside it, or copy out the part "
+                         f"you need."}
     # Read text
     try:
         with open(file_path, "r", encoding="utf-8", errors="replace") as f:
@@ -1964,11 +2062,27 @@ def _read_oc(file_path, offset=None, limit=None):
     selected = lines[start:end]
     truncated = end < total or (selected and len(selected[-1]) > 2000)
     output_lines = [f"<path>{file_path}</path>", "<type>file</type>", "<content>"]
+    # A cap on the bytes that actually go into the conversation, not just on
+    # the line count. "limit=2000" is no limit at all on a minified bundle
+    # where one line is 400k of characters, and the result of that is a request
+    # the provider refuses as invalid, or a context that is gone. MAX_TEXT_FILE_BYTES
+    # existed for this and was never wired up.
+    budget = MAX_TEXT_FILE_BYTES
+    spent = 0
+    cut_at = None
     for i, line in enumerate(selected):
-        line_text = line.rstrip("\n")
+        line_text = _strip_control_chars(line.rstrip("\n"))
         if len(line_text) > 2000:
             line_text = line_text[:2000] + "... (line truncated to 2000 chars)"
-        output_lines.append(f"{start + i + 1}: {line_text}")
+        row = f"{start + i + 1}: {line_text}"
+        if spent + len(row) > budget:
+            cut_at = i
+            break
+        spent += len(row)
+        output_lines.append(row)
+    if cut_at is not None:
+        selected = selected[:cut_at]
+        truncated = True
     last = start + len(selected)
     if truncated:
         output_lines.append(f"\n(Showing lines {start + 1}-{last} of {total}. Use offset={last + 1} to continue.)")
@@ -5083,7 +5197,21 @@ def _model_error_text(exc, entry=None):
             "Free models throttle hard; wait a moment, or use a model you "
             "have credit for."))
     elif code == 400 and detail:
-        msg = "%s rejected the request: %s" % (who, detail)
+        low = detail.lower()
+        if any(m in low for m in _INVALID_REQUEST_MARKERS):
+            # "invalid_request_error: invalid request" names no field and no
+            # reason, so repeating it helps nobody. In this app the usual
+            # cause is a single piece of tool output too large for the model,
+            # and the turn is retried with it shortened before this is ever
+            # reached - so if it is still here, say what to do.
+            msg = ("%s rejected the whole request as invalid (400) without "
+                   "saying which part. That normally means one message is too "
+                   "large for this model - a big file read, a long directory "
+                   "listing or a scraped page. Start a new chat, or ask for a "
+                   "smaller slice, or switch to a model with a bigger context "
+                   "window. Provider said: %s" % (who, detail))
+        else:
+            msg = "%s rejected the request: %s" % (who, detail)
     elif code and code >= 500:
         msg = "%s is not answering right now (HTTP %s). Try again shortly." % (
             who, code)
@@ -9261,13 +9389,17 @@ def _capture_bbox(bbox):
 
 
 def _image_payload(img, quality=82, max_edge=1280):
-    """Downscale + JPEG-encode a PIL image, returning (data_uri, w, h)."""
+    """Downscale + JPEG-encode a PIL image, returning (data_uri, w, h).
+
+    w and h are the size of the image that was actually encoded, not the size
+    it was on disk. They used to be the original, so a 1600x1200 screenshot
+    was sent to the model at 1280x960 and described as 1600x1200 - and the
+    model is the one being asked to reason about what it can see."""
     from PIL import Image
-    w, h = img.size
     view = img
-    if max(w, h) > max_edge:
-        r = max_edge / float(max(w, h))
-        size = (max(1, int(w * r)), max(1, int(h * r)))
+    if max(img.size) > max_edge:
+        r = max_edge / float(max(img.size))
+        size = (max(1, int(img.size[0] * r)), max(1, int(img.size[1] * r)))
         try:
             view = img.resize(size, Image.Resampling.LANCZOS)
         except Exception:
@@ -9278,7 +9410,7 @@ def _image_payload(img, quality=82, max_edge=1280):
     view.save(buf, "JPEG", quality=quality)
     data_uri = "data:image/jpeg;base64," + \
         base64.b64encode(buf.getvalue()).decode("ascii")
-    return data_uri, w, h
+    return data_uri, view.size[0], view.size[1]
 
 
 def _screenshot_window(args):
@@ -10153,16 +10285,34 @@ def run_agent(messages, on_tool=None, mode=MODE_BUILD, on_stats=None, hooks=None
             message = _bonsai_chat(msgs, tools)
         except Exception as exc:
             # A text-only model that has just been handed a screenshot answers
-            # with a 400. Retry the same round without the image rather than
-            # losing the turn - see _blind_turn.
-            fixed = None if _is_blind() else _blind_turn(msgs, exc)
-            if fixed is None:
-                raise
-            _remember_blind()
-            msgs[:] = fixed
-            if on_tool:
-                on_tool(_blind_record())
-            message = _bonsai_chat(msgs, tools)
+            # with a 400: retry the same round without the image rather than
+            # losing the turn - see _blind_turn. And a tool result too large
+            # for the provider fails the whole request: shorten it and retry -
+            # see _oversize_turn. Neither is a reason to discard the work.
+            if not _is_blind():
+                fixed = _blind_turn(msgs, exc)
+                if fixed is not None:
+                    _remember_blind()
+                    msgs[:] = fixed
+                    if on_tool:
+                        on_tool(_blind_record())
+                    message = _bonsai_chat(msgs, tools)
+                else:
+                    fixed = _oversize_turn(msgs, exc)
+                    if fixed is None:
+                        raise
+                    msgs[:] = fixed
+                    if on_tool:
+                        on_tool(_oversize_record())
+                    message = _bonsai_chat(msgs, tools)
+            else:
+                fixed = _oversize_turn(msgs, exc)
+                if fixed is None:
+                    raise
+                msgs[:] = fixed
+                if on_tool:
+                    on_tool(_oversize_record())
+                message = _bonsai_chat(msgs, tools)
         total = _merge_stats(total, _stats_from(message.get("_usage") or {},
                                                 message.get("_timings") or {}))
         tool_calls = message.get("tool_calls") or []
@@ -10341,8 +10491,78 @@ def _vision_error_text(exc):
             % (name, refused))
 
 
+_INVALID_REQUEST_MARKERS = (
+    "invalid_request", "invalid request", "invalid_request_error",
+    "upstream request failed", "context length", "context_length_exceeded",
+    "too many tokens", "request too large", "payload too large",
+    "reduce the length", "string too long", "too many images",
+)
+
+# One tool result is allowed to be this big before a provider is likely to
+# refuse the whole request. Anything larger is trimmed rather than fatal.
+_OVERSIZE_TOOL_CHARS = 60000
+
+
+def _oversize_turn(msgs, exc):
+    """A copy of `msgs` with any bloated tool output cut down, or None.
+
+    "invalid_request_error / invalid request" says nothing about which part of
+    the request was wrong, and the usual cause is size: one tool result - a
+    whole file, a directory listing, a page of scraped text - grew past what
+    the provider will accept and took the entire conversation down with it. The
+    work already done is not lost, the offending text is just too big, so it is
+    replaced with a note saying so and the turn is retried once. The model can
+    always ask for a slice of it back."""
+    try:
+        blob = ("%s %s" % (_model_error_text(exc), exc)).lower()
+    except Exception:
+        return None
+    if not any(m in blob for m in _INVALID_REQUEST_MARKERS):
+        return None
+    fixed, trimmed = [], 0
+    for m in msgs:
+        content = m.get("content")
+        if m.get("role") == "tool" and isinstance(content, str) \
+                and len(content) > _OVERSIZE_TOOL_CHARS:
+            head = content[:_OVERSIZE_TOOL_CHARS // 2]
+            tail = content[-_OVERSIZE_TOOL_CHARS // 4:]
+            fixed.append(dict(m, content=(
+                head + "\n\n... [%d characters of this result were removed - it "
+                "was too large for the provider. Ask for a specific slice if you "
+                "need the middle.] ...\n\n" % (len(content) - len(head) - len(tail))
+                + tail)))
+            trimmed += 1
+        else:
+            fixed.append(m)
+    return fixed if trimmed else None
+
+
+def _oversize_record():
+    return {"name": "oversize_result", "label": "Oversized result",
+            "result": {"ok": True, "trimmed": True},
+            "full_result": {"ok": True, "trimmed": True,
+                            "note": "a tool result was too large for the "
+                                    "provider and was shortened"},
+            "ms": 1}
+
+
+def _shot_caption(record):
+    """What to say about the picture, so the model is not misled about it."""
+    detail = record.get("full_result")
+    if not isinstance(detail, dict):
+        detail = record if isinstance(record, dict) else {}
+    explicit = detail.get("caption") or record.get("caption")
+    if explicit:
+        return explicit
+    if detail.get("type") == "image" or detail.get("image_data"):
+        name = os.path.basename(str(detail.get("path") or "the image"))
+        return ("[Here is the image file you asked me to read - %s. Look at it "
+                "carefully to answer.]" % name)
+    return "[I just captured this screenshot - inspect it carefully.]"
+
+
 def _append_shot_image(msgs, record):
-    image_uri = record.get("preview")
+    image_uri = record.get("preview") or record.get("image_data")
     if not image_uri:
         return
     if _is_blind():
@@ -10351,9 +10571,12 @@ def _append_shot_image(msgs, record):
         msgs.append({"role": "user", "content": [{"type": "text",
                                                   "text": _BLIND_NOTE}]})
         return
+    # Say which it is. A picture the model was just handed is a file it asked
+    # to look at, and calling it a screenshot makes it describe a capture it
+    # never took.
+    lead = _shot_caption(record)
     msgs.append({"role": "user",
-                 "content": [{"type": "text",
-                              "text": "[I just captured this screenshot - inspect it carefully.]"},
+                 "content": [{"type": "text", "text": lead},
                              {"type": "image_url",
                               "image_url": {"url": image_uri}}]})
 
@@ -10387,17 +10610,30 @@ def stream_agent(messages, on_reason=None, on_delta=None, on_tool=None,
                     tool_calls = ev["tool_calls"]
                 emit(ev)
         except Exception as exc:
-            # The model took a screenshot, was handed the image, and the
-            # provider refused it because this model is text-only. That is not
-            # a reason to end the turn with an error: retry the same round with
-            # the picture replaced by a sentence, and let it finish the job.
-            fixed = None if _is_blind() else _blind_turn(msgs, exc)
+            # Two things are worth a retry rather than the end of the turn.
+            # The model was handed a screenshot and this provider will not take
+            # an image: replace the picture with a sentence and let it finish.
+            # Or a tool result was too big and the provider refused the whole
+            # request: shorten it and let it finish. Neither is a reason to
+            # throw away work that is already done.
+            if not _is_blind():
+                fixed = _blind_turn(msgs, exc)
+                if fixed is not None:
+                    _remember_blind()
+                    msgs[:] = fixed
+                    if on_tool:
+                        on_tool(_blind_record())
+                    for ev in _bonsai_stream(msgs, tools_for_round):
+                        if ev["kind"] == "end":
+                            tool_calls = ev["tool_calls"]
+                        emit(ev)
+                    return tool_calls or []
+            fixed = _oversize_turn(msgs, exc)
             if fixed is None:
                 raise
-            _remember_blind()
             msgs[:] = fixed
             if on_tool:
-                on_tool(_blind_record())
+                on_tool(_oversize_record())
             for ev in _bonsai_stream(msgs, tools_for_round):
                 if ev["kind"] == "end":
                     tool_calls = ev["tool_calls"]
@@ -16920,16 +17156,28 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:
             if isinstance(exc, CLIENT_GONE) or self.wfile.closed:
                 return
-            # Measure what is actually going out. The old +30 fudge for the
-            # "event: error" wrapper was short of the real thing, so a long
-            # error could arrive truncated at exactly the moment it mattered.
-            body = ("event: error\ndata: "
-                    + json.dumps({"text": _model_error_text(exc)},
-                                 ensure_ascii=False) + "\n\n").encode("utf-8")
+            # Whatever went wrong, the client is mid-stream and is parsing SSE,
+            # so this has to arrive as SSE. It used to be written in the SSE
+            # framing but sent as application/json with a Content-Length, and
+            # a reader that trusts the header got a body it could not parse -
+            # an error about the error. Match the framing to the stream.
+            try:
+                already_streaming = self.path == "/api/stream"
+            except Exception:
+                already_streaming = False
+            if already_streaming:
+                body = ("event: error\ndata: "
+                        + json.dumps({"text": _model_error_text(exc)},
+                                     ensure_ascii=False) + "\n\n").encode("utf-8")
+                ctype = "text/event-stream; charset=utf-8"
+            else:
+                body = json.dumps({"error": _model_error_text(exc)},
+                                  ensure_ascii=False).encode("utf-8")
+                ctype = "application/json; charset=utf-8"
             try:
                 self.send_response(200)
-                self.send_header("Content-Type", "application/json; charset=utf-8")
-                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Content-Type", ctype)
+                self.send_header("Cache-Control", "no-cache")
                 self.end_headers()
                 self.wfile.write(body)
             except CLIENT_GONE:
