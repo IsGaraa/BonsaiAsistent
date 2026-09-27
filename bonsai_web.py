@@ -2940,6 +2940,27 @@ def _api_base(entry):
     return base
 
 
+# The two OpenAI-shaped completion APIs this app can speak. "chat" is
+# /v1/chat/completions, which every OpenAI-compatible provider answers and which
+# this app has always spoken. "responses" is OpenAI's second one.
+_API_WIRE_CHAT = "chat"
+_API_WIRE_RESPONSES = "responses"
+
+
+def _api_wire(entry):
+    """Which completion dialect an api model is talked to in.
+
+    /v1/responses is not a renamed /v1/chat/completions: a different body, a
+    flat tool schema, a separate instructions field and a typed event stream
+    instead of anonymous delta chunks. So a model that only publishes that
+    endpoint - OpenCode Zen's Muse Spark, for one - cannot be reached by
+    changing the URL alone, and the choice is recorded per model as
+    `"wire": "responses"` in models.json. Anything unset means chat, which is
+    what every existing model already is and keeps them all working."""
+    wire = str((entry or {}).get("wire") or "").strip().lower()
+    return wire if wire in (_API_WIRE_CHAT, _API_WIRE_RESPONSES) else _API_WIRE_CHAT
+
+
 def _model_auth_headers(entry=None):
     """Auth headers for a model endpoint; empty for local servers."""
     entry = entry if entry is not None else _active_model()
@@ -3104,6 +3125,7 @@ def _public_models():
         else:
             item["base_url"] = m.get("base_url")
             item["model"] = m.get("model")
+            item["wire"] = _api_wire(m)
             # only ever report *that* a key is configured, never the value
             kstate = _api_key_state(m.get("api_key"))[0]
             item["api_key_set"] = _api_key_present(m.get("api_key"))
@@ -3319,6 +3341,15 @@ def _add_model(body):
         key_header = str(body.get("api_key_header") or "").strip()
         if key_header:
             entry["api_key_header"] = key_header
+        # /v1/responses is a different protocol, not another URL, so a model that
+        # only offers it has to be marked as speaking it. Left off means chat.
+        wire = str(body.get("wire") or "").strip().lower()
+        if wire and wire not in (_API_WIRE_CHAT, _API_WIRE_RESPONSES):
+            return {"ok": False,
+                    "error": "wire must be '%s' or '%s'" % (_API_WIRE_CHAT,
+                                                             _API_WIRE_RESPONSES)}
+        if wire == _API_WIRE_RESPONSES:
+            entry["wire"] = wire
     else:
         path = str(body.get("path") or "").strip()
         if not path:
@@ -4739,6 +4770,8 @@ def _base_payload():
 
 
 def _bonsai_chat(messages, tools):
+    if _api_wire(_active_model()) == _API_WIRE_RESPONSES:
+        return _responses_chat(messages, tools)
     payload = _base_payload()
     payload.update({"messages": messages, "tools": tools, "stream": False})
     data = _http_json(BONSAI_BASE + "/v1/chat/completions", payload)
@@ -4867,6 +4900,10 @@ def _reasoning_text(obj):
 
 
 def _bonsai_stream(messages, tools):
+    if _api_wire(_active_model()) == _API_WIRE_RESPONSES:
+        for ev in _responses_stream(messages, tools):
+            yield ev
+        return
     payload = _base_payload()
     payload.update({"messages": messages, "tools": tools, "stream": True})
     req = urllib.request.Request(BONSAI_BASE + "/v1/chat/completions",
@@ -4946,6 +4983,301 @@ def _bonsai_stream(messages, tools):
             "ctx_left": _ctx_window() - prompt_tok - comp_tok,
         }
         yield {"kind": "end", "tool_calls": ordered, "finish": finish, "stats": stats}
+
+
+# ------------------------------------------------- OpenAI /v1/responses wire
+# The second OpenAI completion API is a different protocol, not a renamed
+# /v1/chat/completions. The body differs (input, not messages; tools flattened;
+# the system prompt in its own field), a tool call is identified by a call_id
+# that has to survive into the tool result, and the stream is a typed event log
+# rather than anonymous chunks that happen to carry a delta.
+#
+# Rather than teach the streaming reader, the tool loop and the renderer a
+# second dialect, everything is translated back into the events this app
+# already knows how to draw. That keeps the four call sites of _bonsai_chat and
+# _bonsai_stream unchanged, and means a model that only offers this endpoint
+# behaves like any other instead of being a special case threaded through the
+# agent loop.
+
+
+def _responses_tools(tools):
+    """chat tools -> responses tools.
+
+    Responses lifts the name, description and schema out of the "function"
+    wrapper that chat nests them in. An empty list is left out of the body
+    entirely: "tools": [] is a 400 on the real endpoint, not a no-op."""
+    out = []
+    for t in tools or []:
+        fn = t.get("function") if isinstance(t, dict) else None
+        if not isinstance(fn, dict):
+            continue
+        item = {"type": "function",
+                "name": fn.get("name") or "",
+                "parameters": fn.get("parameters")
+                or {"type": "object", "properties": {}}}
+        if fn.get("description"):
+            item["description"] = fn["description"]
+        out.append(item)
+    return out
+
+
+def _content_to_text(content):
+    """The text of a chat content field, whether it is a string or a list of
+    parts, so the system prompt can be lifted out whole."""
+    if isinstance(content, str):
+        return content
+    out = []
+    for part in content or []:
+        if isinstance(part, dict) and part.get("type") == "text" and part.get("text"):
+            out.append(str(part["text"]))
+    return "\n".join(out)
+
+
+def _responses_input(messages):
+    """chat messages -> (instructions, input items).
+
+    The role words are the same two the app already uses; only the content
+    parts are renamed, and they are renamed by direction: what goes in is
+    input_text, what the model said comes back as output_text. Sending a past
+    assistant turn as input_text is a 400, which is an easy way to break a
+    second turn of any conversation."""
+    instructions, items = [], []
+    for m in messages or []:
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role")
+        content = m.get("content")
+        if role == "system":
+            text = _content_to_text(content)
+            if text.strip():
+                instructions.append(text)
+            continue
+        if role not in ("user", "assistant"):
+            continue
+        parts = []
+        if isinstance(content, list):
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") == "text" and part.get("text"):
+                    parts.append({"type": "input_text", "text": str(part["text"])})
+                elif part.get("type") == "image_url":
+                    url = str((part.get("image_url") or {}).get("url") or "")
+                    if url:
+                        parts.append({"type": "input_image", "image_url": url})
+        elif isinstance(content, str) and content.strip():
+            parts.append({"type": "input_text", "text": content})
+        if not parts:
+            continue
+        if role == "assistant":
+            parts = [{"type": "output_text", "text": p["text"]}
+                     for p in parts if p.get("type") == "input_text"]
+            if not parts:
+                continue
+        items.append({"role": role, "content": parts})
+    return instructions, items
+
+
+def _responses_payload(messages, tools, stream):
+    """The shared request body for both the streaming and one-shot paths."""
+    payload = _base_payload()
+    # _base_payload adds keep_alive for llama.cpp and the unified "reasoning"
+    # effort object for hosted chat providers. Neither is part of a responses
+    # body, and this API validates rather than ignoring what it does not know.
+    for field in ("keep_alive", "reasoning", "chat_template_kwargs"):
+        payload.pop(field, None)
+    instructions, items = _responses_input(messages)
+    payload["input"] = items
+    if instructions:
+        payload["instructions"] = "\n\n".join(instructions)
+    rtools = _responses_tools(tools)
+    if rtools:
+        payload["tools"] = rtools
+    payload["stream"] = bool(stream)
+    return payload
+
+
+def _responses_error_text(obj):
+    """The readable part of a responses error, or "" when there isn't one."""
+    if isinstance(obj, str):
+        text = obj
+    elif isinstance(obj, dict):
+        text = str(obj.get("message") or obj.get("code") or "")
+    else:
+        return ""
+    text = text.strip()
+    if not text or _generic_provider_text(text):
+        return ""
+    return _redact_embedded_secrets(text)[:300]
+
+
+def _responses_usage(usage):
+    """responses usage -> the chat field names the stats block uses."""
+    usage = usage if isinstance(usage, dict) else {}
+    return {
+        "prompt_tokens": usage.get("input_tokens") or 0,
+        "completion_tokens": usage.get("output_tokens") or 0,
+        "cached_tokens": (usage.get("input_tokens_details")
+                          or {}).get("cached_tokens") or 0,
+    }
+
+
+def _responses_chat(messages, tools):
+    """The one-shot sibling of _bonsai_stream, for the calls that want an
+    answer and not a stream: summarising, titling, the no-tools retry.
+
+    Returns a message in the shape _bonsai_chat has always returned, so the
+    callers cannot tell which wire the answer came over."""
+    url = _api_base(_active_model()) + "/v1/responses"
+    data = _http_json(url, _responses_payload(messages, tools, False))
+    if not isinstance(data, dict):
+        return {"role": "assistant", "content": "", "reasoning_content": None,
+                "tool_calls": None, "_usage": {}, "_timings": {}}
+    if data.get("error"):
+        raise RuntimeError(_responses_error_text(data["error"])
+                           or "the provider returned an error")
+    text, thinking, calls = [], [], []
+    for item in data.get("output") or []:
+        if not isinstance(item, dict):
+            continue
+        kind = item.get("type")
+        if kind == "message":
+            for part in item.get("content") or []:
+                if (isinstance(part, dict) and part.get("type") == "output_text"
+                        and part.get("text")):
+                    text.append(str(part["text"]))
+        elif kind == "reasoning":
+            for part in item.get("summary") or []:
+                if isinstance(part, dict) and part.get("text"):
+                    thinking.append(str(part["text"]))
+        elif kind == "function_call":
+            calls.append({"id": item.get("call_id") or item.get("id") or "call_0",
+                          "type": "function",
+                          "function": {"name": item.get("name") or "",
+                                       "arguments": item.get("arguments") or ""}})
+    usage = _responses_usage(data.get("usage"))
+    return {"role": "assistant", "content": "".join(text),
+            "reasoning_content": "".join(thinking) or None,
+            "tool_calls": calls or None,
+            "_usage": {"prompt_tokens": usage["prompt_tokens"],
+                       "completion_tokens": usage["completion_tokens"]},
+            "_timings": {}}
+
+
+def _responses_stream(messages, tools):
+    """Stream a /v1/responses turn as the events the rest of the app reads.
+
+    Every yield here is one of the four kinds _bonsai_stream already emits, so
+    the reader, the agent loop and the Thought step are unchanged - which is
+    the whole point, because those were never written to know about this API."""
+    url = _api_base(_active_model()) + "/v1/responses"
+    req = urllib.request.Request(url,
+                                 data=json.dumps(_responses_payload(messages, tools,
+                                                                    True)).encode("utf-8"),
+                                 headers=_model_headers(), method="POST")
+    calls = {}
+    usage = {}
+    finish = None
+    first_content_ts = None
+    t_start = time.monotonic()
+    with urllib.request.urlopen(req, timeout=BONSAI_SOCKET_TIMEOUT) as resp:
+        for raw in resp:
+            line = raw.decode("utf-8", "replace").strip()
+            if not line.startswith("data:"):
+                continue
+            body = line[5:].strip()
+            if not body or body == "[DONE]":
+                continue
+            try:
+                ev = json.loads(body)
+            except Exception:
+                continue
+            if not isinstance(ev, dict):
+                continue
+            kind = ev.get("type") or ""
+            # usage only ever arrives on the terminal event, nested one level
+            # down under the finished response
+            done = ev.get("response")
+            if isinstance(done, dict) and done.get("usage"):
+                usage = done["usage"] or {}
+            if kind in ("response.failed", "error"):
+                err = (done or {}).get("error") if isinstance(done, dict) else None
+                raise RuntimeError(_responses_error_text(err)
+                                   or _responses_error_text(ev)
+                                   or "the provider reported an error")
+            if kind == "response.incomplete":
+                finish = "length"
+            if kind in ("response.output_text.delta", "response.refusal.delta"):
+                # text first, and the point it starts is when thinking stopped,
+                # which is what think_end measures
+                text = str(ev.get("delta") or "")
+                if text:
+                    if first_content_ts is None:
+                        first_content_ts = time.monotonic()
+                        yield {"kind": "think_end",
+                               "t_ms": int((first_content_ts - t_start) * 1000)}
+                    yield {"kind": "delta", "text": text}
+            elif kind in ("response.reasoning_summary_text.delta",
+                          "response.reasoning_text.delta"):
+                think = str(ev.get("delta") or "")
+                if think:
+                    yield {"kind": "reason", "text": think}
+            elif kind == "response.output_item.added":
+                item = ev.get("item")
+                if isinstance(item, dict) and item.get("type") == "function_call":
+                    idx = ev.get("output_index", 0)
+                    calls[idx] = {"id": item.get("call_id") or item.get("id")
+                                  or "call_%s" % idx,
+                                  "type": "function",
+                                  "function": {"name": item.get("name") or "",
+                                               "arguments": item.get("arguments") or ""}}
+            elif kind == "response.function_call_arguments.delta":
+                slot = calls.get(ev.get("output_index", 0))
+                if slot is not None:
+                    slot["function"]["arguments"] += str(ev.get("delta") or "")
+            elif kind == "response.output_item.done":
+                # the finished item is authoritative, in both directions: the
+                # arguments deltas can belong to an item never announced, and
+                # only this event carries the call_id that the tool result has
+                # to quote back
+                item = ev.get("item")
+                if isinstance(item, dict) and item.get("type") == "function_call":
+                    idx = ev.get("output_index", 0)
+                    slot = calls.setdefault(
+                        idx, {"id": item.get("call_id") or item.get("id")
+                              or "call_%s" % idx, "type": "function",
+                              "function": {"name": "", "arguments": ""}})
+                    if item.get("call_id"):
+                        slot["id"] = item["call_id"]
+                    if item.get("name"):
+                        slot["function"]["name"] = item["name"]
+                    if item.get("arguments"):
+                        slot["function"]["arguments"] = item["arguments"]
+            if kind == "response.completed":
+                break
+    ordered = [calls[i] for i in sorted(calls)]
+    t_end = time.monotonic()
+    think_ms = int((first_content_ts - t_start) * 1000) if first_content_ts else None
+    total_ms = int((t_end - t_start) * 1000)
+    respond_ms = total_ms - think_ms if think_ms is not None else total_ms
+    use = _responses_usage(usage)
+    prompt_tok = use["prompt_tokens"]
+    comp_tok = use["completion_tokens"]
+    if finish is None:
+        finish = "tool_calls" if ordered else "stop"
+    stats = {
+        "think_ms": think_ms,
+        "respond_ms": respond_ms,
+        "total_ms": total_ms,
+        "prompt_tokens": prompt_tok,
+        "completion_tokens": comp_tok,
+        "total_tokens": prompt_tok + comp_tok,
+        "cached_tokens": use["cached_tokens"],
+        "tok_s": 0,
+        "ctx_used": prompt_tok + comp_tok,
+        "ctx_left": _ctx_window() - prompt_tok - comp_tok,
+    }
+    yield {"kind": "end", "tool_calls": ordered, "finish": finish, "stats": stats}
 
 
 def build_messages(raw_messages, mode=MODE_BUILD):
