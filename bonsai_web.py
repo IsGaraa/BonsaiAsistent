@@ -10888,25 +10888,36 @@ PAGE = """<!doctype html>
   .mdlbox .close { margin-top: 14px; text-align: center; color: var(--mut); cursor: pointer; font-size: 12.5px; }
   .mdlbox .close:hover { color: var(--err); }
 
+  /* The middle column is the live-preview pane and nothing else. It is not
+     reserved space: with no preview open the grid is two columns and the chat
+     has the whole window, and opening a preview lends a column back to it, so
+     the chat gives the width up and gets it again on close. */
   main.grid {
-    display: grid; grid-template-columns: 250px 1fr 1.35fr; gap: 12px;
+    display: grid; grid-template-columns: 250px 1fr; gap: 12px;
     flex: 1; min-height: 0; margin: 12px 0;
   }
+  main.grid.previewing { grid-template-columns: 250px 1.25fr 1fr; }
   @media (max-width: 1180px) {
     main.grid { grid-template-columns: 220px 1fr; }
-    .center { display: none; }
+    /* Too narrow for three columns, so the preview becomes a full-width band
+       above the chat. It used to be display:none here, which meant a preview
+       opened on a narrow window simply showed nothing at all. */
+    main.grid.previewing { grid-template-rows: minmax(0, 42vh) 1fr; }
+    main.grid.previewing .left   { grid-column: 1; grid-row: 2; }
+    main.grid.previewing .center { grid-column: 1 / -1; grid-row: 1; }
+    main.grid.previewing .right  { grid-column: 2; grid-row: 2; }
   }
   @media (max-width: 860px) {
     main.grid { grid-template-columns: 1fr; }
     .left { display: none; }
+    main.grid.previewing .right { grid-column: 1; }
   }
 
   .panel { border-radius: 12px; display: flex; flex-direction: column; min-height: 0; }
-  .center { align-items: center; justify-content: center; padding: 20px; position: relative; }
-  #reactorwrap { display: flex; flex-direction: column; align-items: center; justify-content: center; width: 100%; }
-  .center.previewing #reactorwrap { display: none; }
+  .center { display: none; position: relative; padding: 0; }
+  main.grid.previewing .center { display: flex; }
   .stage { display: none; position: absolute; inset: 0; flex-direction: column; background: var(--bg2); border-radius: 12px; overflow: hidden; }
-  .center.previewing .stage { display: flex; }
+  main.grid.previewing .stage { display: flex; }
   .stagehd { display: flex; align-items: center; gap: 10px; padding: 7px 10px; border-bottom: 1px solid var(--bd); font-size: 11px; letter-spacing: 1.5px; color: var(--mut); font-family: Consolas, monospace; flex: none; }
   .stagehd b { color: var(--acc); }
   .stagehd #stagename { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; letter-spacing: 0; }
@@ -10927,57 +10938,13 @@ PAGE = """<!doctype html>
   .chat-item .del { background: none; border: none; color: var(--mut); cursor: pointer; font-size: 14px; }
   .chat-item .del:hover { color: var(--err); }
 
-  /* center: arc reactor */
-  .arc-container { position: relative; width: 210px; height: 210px; display: flex; align-items: center; justify-content: center; }
-  .arc-container { --ring: rgba(56,189,248,.45); --core1: #7dd3fc; --core2: rgba(14,165,233,.75); --glow1: #38bdf8; --glow2: #0ea5e9; }
-  .arc-ring-outer { position: absolute; width: 100%; height: 100%; border-radius: 50%; border: 2px dashed var(--ring); animation: rotC 20s linear infinite; transition: border-color .3s; }
-  .arc-ring-mid { position: absolute; width: 78%; height: 78%; border-radius: 50%; border: 2px solid transparent; border-top-color: var(--glow1); border-bottom-color: var(--glow2); animation: rotCC 8s linear infinite; transition: border-color .3s; }
-  .arc-ring-inner { position: absolute; width: 58%; height: 58%; border-radius: 50%; border: 3px dotted var(--ring); animation: rotC 12s linear infinite; transition: border-color .3s; }
-  .arc-core {
-    position: absolute; width: 38%; height: 38%; border-radius: 50%;
-    background: radial-gradient(circle, #f8fafc 0%, var(--core1) 40%, var(--core2) 70%, transparent 100%);
-    box-shadow: 0 0 26px var(--glow1), 0 0 48px var(--glow2); transition: all .3s ease;
-  }
-  @keyframes rotC { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
-  @keyframes rotCC { from { transform: rotate(360deg); } to { transform: rotate(0deg); } }
-
-  .arc-container.thinking { --ring: rgba(251,191,36,.45); --core1: #fcd34d; --core2: rgba(245,158,11,.7); --glow1: #fbbf24; --glow2: #f59e0b; }
-  .arc-container.tools { --ring: rgba(52,211,153,.45); --core1: #6ee7b7; --core2: rgba(16,185,129,.7); --glow1: #34d399; --glow2: #10b981; }
-  .arc-container.planmode { --ring: rgba(167,139,250,.5); --core1: #c4b5fd; --core2: rgba(124,58,237,.75); --glow1: #a78bfa; --glow2: #7c3aed; }
-  .arc-container.rainbow { animation: hueSpin 9s linear infinite; }
-  @keyframes hueSpin { from { filter: hue-rotate(0deg) saturate(1.15); } to { filter: hue-rotate(360deg) saturate(1.15); } }
-
-  .arc-container.thinking .arc-core { animation: pulseFast .3s infinite alternate; }
-  .arc-container.tools .arc-core { animation: pulseGreen .4s infinite alternate; }
-  .arc-container.thinking .arc-ring-outer { animation-duration: 6s; }
-  .arc-container.tools .arc-ring-outer { animation-duration: 4s; }
-  .arc-container.thinking .arc-ring-inner { animation-duration: 5s; }
-  .arc-container.tools .arc-ring-inner { animation-duration: 3.5s; }
-  @keyframes pulseFast { 0% { transform: scale(.95); opacity: .8; } 100% { transform: scale(1.1); opacity: 1; } }
-  @keyframes pulseGreen { 0% { transform: scale(.92); box-shadow: 0 0 16px var(--glow1); } 100% { transform: scale(1.18); box-shadow: 0 0 42px var(--glow1), 0 0 66px var(--glow2); } }
-  #waveform { display: flex; align-items: center; justify-content: center; gap: 6px; height: 40px; margin: 16px 0; }
-  .wave-bar { width: 3px; height: 14px; border-radius: 2px; background-color: var(--acc); transition: background-color .3s; }
-  body.thinking .wave-bar { background-color: var(--warn); }
-  body.tools .wave-bar { background-color: var(--ok); }
-  .active-wave .wave-bar { animation: waveAnim .8s infinite ease-in-out alternate; }
-  .wave-bar:nth-child(2) { animation-delay: .1s; } .wave-bar:nth-child(3) { animation-delay: .2s; }
-  .wave-bar:nth-child(4) { animation-delay: .3s; } .wave-bar:nth-child(5) { animation-delay: .4s; }
-  .wave-bar:nth-child(6) { animation-delay: .5s; } .wave-bar:nth-child(7) { animation-delay: .6s; }
-  .wave-bar:nth-child(8) { animation-delay: .7s; } .wave-bar:nth-child(9) { animation-delay: .8s; }
-  .wave-bar:nth-child(10) { animation-delay: .9s; }
-  @keyframes waveAnim { 0% { height: 6px; } 100% { height: 35px; } }
-  #bonsai-state-label { font-size: 12px; letter-spacing: 3px; color: var(--txt2); text-align: center; font-family: Consolas, monospace; text-transform: uppercase; margin: 0; }
-  .sub { font-size: 11px; color: var(--mut); margin: 6px 0 0; text-align: center; font-family: Consolas, monospace; }
-
-  /* meters for metrics */
-  .meterrow { padding: 10px 12px; }
-  .meter { margin-bottom: 12px; }
-  .meter:last-child { margin-bottom: 0; }
-  .meter .lab { display: flex; justify-content: space-between; font-size: 12.5px; margin-bottom: 5px; color: var(--mut); font-family: Consolas, monospace; }
-  .meter .lab b { color: var(--txt2); }
-  .meter .bar { height: 6px; background: var(--bg3); border: 1px solid var(--bd); border-radius: 4px; overflow: hidden; }
-  .meter .fill { height: 100%; border-radius: 4px; width: 0%; transition: width .5s; background: linear-gradient(90deg, var(--acc2), var(--acc)); }
-  .fill.gold { background: linear-gradient(90deg, #d97706, var(--warn)); }
+  /* what it is doing, said once in the console's own title bar. It used to be
+     a spinning reactor in the middle of the page, which was taking a whole
+     column to say the same four words. */
+  #console-state { color: var(--mut); }
+  #console-state.thinking { color: var(--warn); }
+  #console-state.tools { color: var(--ok); }
+  #console-state.planmode { color: #a78bfa; }
 
   /* right: chat console */
   .right .chat-wrap { flex: 1; min-height: 0; display: flex; flex-direction: column; padding: 10px; }
@@ -11365,35 +11332,14 @@ PAGE = """<!doctype html>
         <div class="stagehd">
           <b>LIVE PREVIEW</b>
           <span id="stagename"></span>
-          <button class="stagex" id="stageclose" title="Close the preview and bring back the reactor">&times;</button>
+          <button class="stagex" id="stageclose" title="Close the preview and give the space back to the chat">&times;</button>
         </div>
         <iframe id="stageframe" class="stageframe" title="HTML preview" sandbox="allow-scripts"></iframe>
-      </div>
-      <div id="reactorwrap">
-      <div id="arc-reactor" class="arc-container" title="PC Assistant">
-        <div class="arc-ring-outer"></div>
-        <div class="arc-ring-mid"></div>
-        <div class="arc-ring-inner"></div>
-        <div class="arc-core"></div>
-      </div>
-      <div id="waveform">
-        <div class="wave-bar"></div><div class="wave-bar"></div><div class="wave-bar"></div>
-        <div class="wave-bar"></div><div class="wave-bar"></div><div class="wave-bar"></div>
-        <div class="wave-bar"></div><div class="wave-bar"></div><div class="wave-bar"></div>
-        <div class="wave-bar"></div>
-      </div>
-      <p id="bonsai-state-label">BONSAI READY</p>
-      <p id="bonsai-sub" class="sub">Awaiting your command</p>
-      <div class="meterrow" style="width:100%; margin-top:8px;">
-        <div class="meter"><div class="lab"><span>CPU</span><b id="cpu-val">0%</b></div><div class="bar"><div class="fill" id="cpu-bar"></div></div></div>
-        <div class="meter"><div class="lab"><span>RAM</span><b id="ram-val">0%</b></div><div class="bar"><div class="fill" id="ram-bar"></div></div></div>
-        <div class="meter"><div class="lab"><span>GPU</span><b id="gpu-val">0%</b></div><div class="bar"><div class="fill gold" id="gpu-bar"></div></div></div>
-      </div>
       </div>
     </section>
 
     <section class="right panel hud-border">
-      <div class="ptitle"><span>CONVERSATION CONSOLE</span></div>
+      <div class="ptitle"><span>CONVERSATION CONSOLE</span><span id="console-state">READY</span></div>
       <div class="chat-wrap">
         <div id="chat-container"></div>
         <div id="preview"></div>
@@ -11939,6 +11885,10 @@ function openPreviewStage(url, name) {
     const nm = document.getElementById('stagename');
     if (nm) nm.textContent = name || '';
     panel.classList.add('previewing');
+    /* the grid is what actually gives up the width - a class on the child
+       column cannot change the column count of its parent */
+    const grid = document.querySelector('main.grid');
+    if (grid) grid.classList.add('previewing');
     return true;
   }
   const box = document.getElementById('pvbox');
@@ -11959,6 +11909,8 @@ function closePreviewStage() {
   if (panel && frame) {
     frame.src = 'about:blank';
     panel.classList.remove('previewing');
+    const grid = document.querySelector('main.grid');
+    if (grid) grid.classList.remove('previewing');
   }
   const box = document.getElementById('pvbox');
   const lf = document.getElementById('pvframe');
@@ -13672,49 +13624,17 @@ function startSchedWatch() {
   tick();
   setInterval(tick, 4000);
 }
-function startMetrics() {
-  const set = function (id, v) {
-    const el = document.getElementById(id + '-val');
-    const bar = document.getElementById(id + '-bar');
-    if (el) el.textContent = (v === null || v === undefined) ? 'n/a' : v + '%';
-    if (bar) bar.style.width = (v === null || v === undefined) ? '0%' : Math.max(0, Math.min(100, v)) + '%';
-  };
-  const tick = function () {
-    fetch('/api/sysinfo')
-      .then(function (r) { return r.json(); })
-      .then(function (j) { set('cpu', j.cpu); set('ram', j.ram); set('gpu', j.gpu); })
-      .catch(function () { set('cpu', null); set('ram', null); set('gpu', null); });
-  };
-  tick();
-  setInterval(tick, 2500);
-}
 
-const reactor = document.getElementById('arc-reactor');
-const waveform = document.getElementById('waveform');
-const stateLabel = document.getElementById('bonsai-state-label');
-const subLabel = document.getElementById('bonsai-sub');
 let bonsaiState = 'idle';
 function setBonsaiState(state) {
   bonsaiState = state;
-  ['thinking', 'tools', 'rainbow', 'planmode'].forEach(function (s) {
-    reactor.classList.remove(s); document.body.classList.remove(s);
-  });
-  waveform.classList.remove('active-wave');
-  if (state === 'thinking') {
-    reactor.classList.add('thinking'); document.body.classList.add('thinking');
-    stateLabel.textContent = 'PROCESSING COMMAND...';
-    if (subLabel) subLabel.textContent = 'Thinking it through...';
-  } else if (state === 'tools') {
-    reactor.classList.add('tools'); document.body.classList.add('tools');
-    waveform.classList.add('active-wave');
-    stateLabel.textContent = 'EXECUTING TOOLS...';
-    if (subLabel) subLabel.textContent = 'Working on your PC...';
-  } else {
-    const plan = chatMode === 'plan';
-    reactor.classList.add(plan ? 'planmode' : 'rainbow');
-    stateLabel.textContent = plan ? 'PLAN MODE' : 'BONSAI READY';
-    if (subLabel) subLabel.textContent = plan ? 'Read-only - no tools will run' : 'Awaiting your command';
-  }
+  const el = document.getElementById('console-state');
+  if (!el) return;
+  el.className = '';
+  if (state === 'thinking') { el.className = 'thinking'; el.textContent = 'THINKING'; }
+  else if (state === 'tools') { el.className = 'tools'; el.textContent = 'EXECUTING TOOLS'; }
+  else if (chatMode === 'plan') { el.className = 'planmode'; el.textContent = 'PLAN MODE - READ ONLY'; }
+  else el.textContent = 'READY';
 }
 
 /* voice input */
@@ -13743,7 +13663,6 @@ micBtn.onclick = function () {
 document.querySelectorAll('.err, .micerr').forEach(function () {});
 updateClock();
 setInterval(updateClock, 1000);
-startMetrics();
 init();
 </script>
 </body>
@@ -17537,73 +17456,6 @@ def _read_chat_file(path):
     return [c for c in data if _valid_chat(c)]
 
 
-_SYSINFO_CACHE = {"ts": 0, "data": {}}
-_SYSINFO_TTL = 2.0
-
-
-def _gpu_percent():
-    """GPU utilisation from nvidia-smi (cached; None when unavailable)."""
-    try:
-        exe = shutil.which("nvidia-smi")
-        if not exe:
-            return None
-        out = subprocess.run(
-            [exe, "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=4,
-            creationflags=CREATE_NO_WINDOW).stdout
-        vals = [int(x) for x in out.replace("%", "").split() if x.strip().isdigit()]
-        if not vals:
-            return None
-        return max(0, min(100, round(sum(vals) / len(vals))))
-    except Exception:
-        return None
-
-
-def _sample_sysinfo():
-    data = {"cpu": None, "ram": None, "gpu": None,
-            "cpu_cores": os.cpu_count()}
-    try:
-        import psutil
-        data["cpu"] = int(round(psutil.cpu_percent(interval=None)))
-        vm = psutil.virtual_memory()
-        data["ram"] = int(round(vm.percent))
-        data["ram_total"] = int(round(vm.total / (1024 ** 3)))
-    except Exception:
-        data["cpu"] = None
-    data["gpu"] = _gpu_percent()
-    _SYSINFO_CACHE["ts"] = time.time()
-    _SYSINFO_CACHE["data"] = data
-    return data
-
-
-def _sysinfo_loop():
-    """Samples CPU/RAM/GPU on one dedicated thread.
-
-    psutil's cpu_percent() averages since its previous call and returns 0.0
-    the first time it is called from a new thread, so the sampling has to stay
-    on a single thread instead of running inside request handlers."""
-    try:
-        import psutil
-        psutil.cpu_percent(interval=None)  # discard the first sample
-    except Exception:
-        pass
-    while True:
-        try:
-            _sample_sysinfo()
-        except Exception:
-            pass
-        time.sleep(1.5)
-
-
-def _sysinfo():
-    """Latest real CPU / RAM / GPU usage for the HUD meters."""
-    d = _SYSINFO_CACHE.get("data") or {}
-    if d:
-        return d
-    return {"cpu": None, "ram": None, "gpu": None,
-            "cpu_cores": os.cpu_count()}
-
-
 def _load_chats():
     data = _read_chat_file(CHATS_FILE)
     if data is None:
@@ -17734,8 +17586,6 @@ class Handler(BaseHTTPRequestHandler):
                                         "folder": PIPER_DIR}))
         elif path == "/api/models":
             self._send(200, json.dumps(_public_models(), default=str))
-        elif path == "/api/sysinfo":
-            self._send(200, json.dumps(_sysinfo(), default=str))
         elif path == "/api/path_policy":
             self._send(200, json.dumps(_path_state(), default=str))
         elif path == "/api/sched_results":
@@ -18208,8 +18058,6 @@ def main():
     # copy of the app, or a test harness, has no use for it.
     if not os.environ.get("BONSAI_NO_BLENDER"):
         threading.Thread(target=_blender_kickoff, daemon=True).start()
-    threading.Thread(target=_sysinfo_loop, daemon=True,
-                     name="bonsai-sysinfo").start()
     _sched_load()
     print("BONSAI is READY on http://%s:%d" % (HOST, PORT), flush=True)
     if not os.environ.get("BONSAI_NO_BROWSER"):
