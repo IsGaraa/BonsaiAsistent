@@ -2580,13 +2580,21 @@ PLAN_MODE_SYSTEM = ("\nMODE: PLAN. The user only wants a PLAN right now - do NOT
                     "switch to BUILD mode.")
 
 def _bonsai_ready():
-    # A hosted model has no local server to wait for, and no /health endpoint
-    # to wait on either - OpenRouter answers 404 for it, which used to abort
-    # the turn with "model server could not start". Say it is ready and let the
-    # first real request report a bad key or bad model id, which is the error
-    # the user can actually act on.
+    # "Ready" only means one thing here: is there a model server this app is
+    # responsible for starting? A model of type "api" is somebody else's
+    # server - OpenRouter, LM Studio, Ollama, a gateway - and this app neither
+    # starts it nor owns it, so there is nothing to wait for.
+    #
+    # It used to exempt only *hosted* api models, and any api model on
+    # 127.0.0.1 was therefore treated as the local llama-server and probed for
+    # /health. LM Studio and Ollama do not serve /health, they answer 404, the
+    # probe failed, and the whole chat was refused with "Bonsai 2 model server
+    # could not start" - for a server that was running perfectly well and that
+    # the app was never going to start. If it genuinely is not up, the first
+    # real request says so, in words that name the URL, which is a far better
+    # error than one about a server we do not manage.
     entry = _active_model()
-    if entry and entry.get("type") == "api" and not _is_loopback(entry):
+    if entry and entry.get("type") == "api":
         return True
     try:
         req = urllib.request.Request(BONSAI_BASE + "/health",
