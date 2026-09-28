@@ -5009,12 +5009,12 @@ RICH_TEXT_TOOL = {
                 "monospace": {"type": "boolean",
                               "description": "Use a monospaced font. Default false."},
                 "action": {"type": "string",
-                           "enum": ["copy", "paste", "send"],
-                           "description": "copy (default) only fills the "
-                                          "clipboard. paste also puts the caret in "
-                                          "the Bonsai chat box and presses Ctrl+V. "
-                                          "send also presses Enter afterwards, which "
-                                          "sends the message."}
+                           "enum": ["send", "paste", "copy"],
+                           "description": "send (default) fills the clipboard, "
+                                          "puts the caret in the chat box, pastes, "
+                                          "and presses Enter. paste does the same "
+                                          "without pressing Enter. copy only "
+                                          "fills the clipboard."}
             },
             "required": ["text"]
         }
@@ -7123,7 +7123,10 @@ def _rich_text(args):
     if put.get("error"):
         return put
 
-    action = str(args.get("action") or "copy").strip().lower()
+    action = str(args.get("action") or "send").strip().lower()
+    if action not in ("copy", "paste", "send"):
+        return {"error": "action must be 'send', 'paste' or 'copy', not %r"
+                         % args.get("action")}
     result = {"result": "ok", "action": action, "chars": len(text)}
     result.update({k: v for k, v in put.items() if k != "error"})
     if action == "copy":
@@ -12118,23 +12121,15 @@ function addAsst(text, calls, reason, stats, entry) {
       : '(this reply was cut off - the work above was kept)';
     b.appendChild(e);
   }
-  if (stats) addStatsChip(b, stats);
+  /* No per-reply stats chip here. "THINK 0.0s · SPEAK 7.5s" was drawn as its
+     own bubble with its own avatar under every answer, which read as another
+     message rather than as a footnote - and it only came back on a reload, so
+     a chat looked different depending on when you opened it. The live counters
+     are still in the header, which is where a running number belongs. */
   row.appendChild(av); row.appendChild(b);
   convEl().appendChild(row);
   scrollBottom();
   return inner;
-}
-function addStatsChip(container, s) {
-  const c = document.createElement('span');
-  c.className = 'statschip';
-  const think = (s.think_ms || 0) / 1000;
-  const speak = (s.respond_ms || 0) / 1000;
-  let txt = 'THINK ' + think.toFixed(1) + 's &middot; SPEAK ' + speak.toFixed(1) + 's';
-  if (s.tok_s) txt += ' &middot; ' + s.tok_s.toFixed(1) + ' tok/s';
-  if (s.completion_tokens) txt += ' &middot; ' + s.completion_tokens + ' tok';
-  if (s.ctx_used) txt += ' &middot; ctx ' + s.ctx_used + '/' + (s.ctx_used + (s.ctx_left || 0));
-  c.innerHTML = '&#9202; ' + txt;
-  container.appendChild(c);
 }
 function addReasonBox(container, text) {
   const d = document.createElement('details'); d.className = 'reasonbox';
@@ -15181,17 +15176,6 @@ function addReasonBox(container, text, live) {
   d.appendChild(s); d.appendChild(c); container.appendChild(d);
   return { d: d, s: s, c: c };
 }
-function addStatsChip(container, s) {
-  const c = document.createElement('span'); c.className = 'statschip';
-  const think = (s.think_ms || 0) / 1000;
-  const speak = (s.respond_ms || 0) / 1000;
-  let txt = 'THINK ' + think.toFixed(1) + 's \u00b7 SPEAK ' + speak.toFixed(1) + 's';
-  if (s.tok_s) txt += ' \u00b7 ' + s.tok_s.toFixed(1) + ' tok/s';
-  if (s.completion_tokens) txt += ' \u00b7 ' + s.completion_tokens + ' tok';
-  if (s.ctx_used) txt += ' \u00b7 ctx ' + s.ctx_used + '/' + (s.ctx_used + (s.ctx_left || 0));
-  c.textContent = txt;
-  container.appendChild(c);
-}
 function addAsst(text, calls, reason, stats, entry) {
   const row = document.createElement('div'); row.className = 'msgrow';
   const b = document.createElement('div');
@@ -15210,7 +15194,7 @@ function addAsst(text, calls, reason, stats, entry) {
       : '(this reply was cut off - the work above was kept)';
     b.appendChild(e);
   }
-  if (stats) addStatsChip(b, stats);
+  /* no stats chip: see the note in the other page copy */
   row.appendChild(b); convInner().appendChild(row); scrollBottom();
   return inner;
 }
@@ -17248,6 +17232,18 @@ _OC_JS = (
     "            var old = bub.querySelector('.abody');\n"
     '            if (old && old.parentNode) old.parentNode.removeChild(old);\n'
     '            renderOrdered(bub, rcalls, parts);\n'
+    '            /* The steps and the answer are drawn as rows of their own, so\n'
+    '               this bubble can be left with nothing in it. It used to be\n'
+    '               filled by the stats chip; with that gone a reloaded chat\n'
+    '               ended in an empty bubble with an avatar under every reply.\n'
+    '               The row is not removed, only hidden: it is the anchor the\n'
+    '               steps are placed against, and taking it away leaves them\n'
+    '               with nothing to sit beside. */\n'
+    "            if (!(bub.textContent || '').trim()\n"
+    "                && !bub.querySelector('img, pre, table, video')) {\n"
+    '              var row = bub.parentNode;\n'
+    "              if (row) { row.style.display = 'none'; row.setAttribute('aria-hidden', 'true'); }\n"
+    '            }\n'
     '          }\n'
     '        } catch (e) {}\n'
     '        return inner;\n'
