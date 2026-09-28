@@ -11416,8 +11416,31 @@ function buildPersist(keepRecentImages) {
     return copy;
   });
 }
+/* Two pages share this history, and each one holds its own view of it. Saving
+   used to write the in-memory list straight over the top, so the page that
+   saved last deleted whatever the other had added - on reload, on tab switch,
+   on close, and from the 5-second autosave. Merge instead: same id, the copy
+   with the longer history wins, ties go to the newer one. */
+function mergeChats(older, newer) {
+  const byId = {}, order = [], anonymous = [];
+  const take = function (c) {
+    if (!c) return;
+    if (!c.id) { anonymous.push(c); return; }
+    const prev = byId[c.id];
+    if (!prev) { byId[c.id] = c; order.push(c.id); return; }
+    const a = (c.messages || []).length, b = (prev.messages || []).length;
+    if (a > b || (a === b && (c.ts || 0) > (prev.ts || 0))) byId[c.id] = c;
+  };
+  (older || []).forEach(take);
+  (newer || []).forEach(take);
+  return order.map(function (id) { return byId[id]; }).concat(anonymous);
+}
 function save() {
-  try { localStorage.setItem('jarvis_chats', JSON.stringify(buildPersist(false))); } catch (e) {}
+  try {
+    const stored = load();
+    const merged = mergeChats(stored, buildPersist(false)).slice(-200);
+    localStorage.setItem('jarvis_chats', JSON.stringify(merged));
+  } catch (e) {}
   try {
     fetch('/api/chats', { method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ chats: buildPersist(true) }) }).catch(function () {});
@@ -11456,10 +11479,14 @@ async function serverLoad() {
 }
 function newChat() {
   if (cur && chats.indexOf(cur) !== -1 && cur.messages.length === 0 && cur.title === 'New chat') {
-    started = false;
-    renderAll();
-    return;
+    /* Reuse the empty chat rather than litter the history with blanks - but only if it is
+       still empty right now. This page can hold a stale copy of a chat that another page has
+       since started a conversation in, and reusing that would silently overwrite what they
+       wrote, the two being the same chat by id. */
+    const fresh = load().filter(function (c) { return c.id === cur.id; })[0];
+    if (!fresh || (fresh.messages || []).length === 0) { started = false; renderAll(); return; }
   }
+
   if (cur && cur.messages.length > 0 && chats.indexOf(cur) === -1) chats.push(cur);
   cur = { id: 'c' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
           title: 'New chat', ts: Date.now(), messages: [] };
@@ -14078,7 +14105,7 @@ PAGE_GPT = """<!doctype html>
 let BONSAI_CTX = 0;
 let chats = load();
 let cur = null, busy = false, pendingAtt = [], started = false, abortCtrl = null, msgQueue = [];
-let chatMode = localStorage.getItem('bonsai_gpt_mode') === 'plan' ? 'plan' : 'build';
+let chatMode = localStorage.getItem('jarvis_mode') === 'plan' ? 'plan' : 'build';
 let workdir = '';
 let thinkingRow = null, liveCalls = [], statsTimer = null;
 let statsVals = { think_ms: 0, respond_ms: 0, tok_s: 0, ctx_used: 0, ctx_left: 0, prompt_tokens: 0, completion_tokens: 0 };
@@ -14086,7 +14113,13 @@ let statsVals = { think_ms: 0, respond_ms: 0, tok_s: 0, ctx_used: 0, ctx_left: 0
 const SEND_SVG = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><path d="M12 19V5M5 12l7-7 7 7"/></svg>';
 const STOP_SVG = '<svg width="13" height="13" viewBox="0 0 24 24"><rect x="5" y="5" width="14" height="14" rx="2" fill="currentColor"/></svg>';
 
-function load() { try { const v = JSON.parse(localStorage.getItem('bonsai_gpt_chats') || '[]'); return Array.isArray(v) ? v : []; } catch (e) { return []; } }
+/* Both pages read and write the same history: the same localStorage key, and
+   the same chats.json on the server. They used to keep separate copies -
+   jarvis_chats here, bonsai_gpt_chats there, and this page never spoke to the
+   server at all - so a conversation made on one was invisible on the other.
+   The key keeps its old jarvis name; renaming it would orphan real history to
+   tidy up a string. */
+function load() { try { const v = JSON.parse(localStorage.getItem('jarvis_chats') || '[]'); return Array.isArray(v) ? v : []; } catch (e) { return []; } }
 const IMG_KEEP = 200 * 1024;
 function stripHeavyImages(m) {
   if (!Array.isArray(m.content)) return;
@@ -14098,24 +14131,97 @@ function stripHeavyImages(m) {
   });
   if (dropped) m.content = keep.length ? keep : '[large image removed from history]';
 }
+/* one copy of the persist shape for both targets: images survive only in the
+   five most recent chats, and never as raw base64 in the server file. */
+function buildPersist(keepRecentImages) {
+  let ids = null;
+  if (keepRecentImages) {
+    ids = {};
+    chats.slice().sort(function (a, b) { return (b.ts || 0) - (a.ts || 0); })
+      .slice(0, 5).forEach(function (c) { ids[c.id] = 1; });
+  }
+  return chats.slice(-200).map(function (ch) {
+    const copy = JSON.parse(JSON.stringify(ch));
+    (copy.messages || []).forEach(function (m) {
+      if (m.calls) (m.calls).forEach(function (cl) { if (cl.preview) delete cl.preview; });
+      if (!ids || !ids[ch.id]) stripHeavyImages(m);
+    });
+    return copy;
+  });
+}
+/* Two pages share this history, and each one holds its own view of it. Saving
+   used to write the in-memory list straight over the top, so the page that
+   saved last deleted whatever the other had added - on reload, on tab switch,
+   on close, and from the 5-second autosave. Merge instead: same id, the copy
+   with the longer history wins, ties go to the newer one. */
+function mergeChats(older, newer) {
+  const byId = {}, order = [], anonymous = [];
+  const take = function (c) {
+    if (!c) return;
+    if (!c.id) { anonymous.push(c); return; }
+    const prev = byId[c.id];
+    if (!prev) { byId[c.id] = c; order.push(c.id); return; }
+    const a = (c.messages || []).length, b = (prev.messages || []).length;
+    if (a > b || (a === b && (c.ts || 0) > (prev.ts || 0))) byId[c.id] = c;
+  };
+  (older || []).forEach(take);
+  (newer || []).forEach(take);
+  return order.map(function (id) { return byId[id]; }).concat(anonymous);
+}
 function save() {
   try {
-    const recent = {};
-    chats.slice().sort(function (a, b) { return (b.ts || 0) - (a.ts || 0); })
-      .slice(0, 5).forEach(function (c) { recent[c.id] = 1; });
-    const c = chats.slice(-200).map(function (ch) {
-      const copy = JSON.parse(JSON.stringify(ch));
-      (copy.messages || []).forEach(function (m) {
-        if (m.calls) (m.calls).forEach(function (cl) { if (cl.preview) delete cl.preview; });
-        if (!recent[ch.id]) stripHeavyImages(m);
-      });
-      return copy;
-    });
-    localStorage.setItem('bonsai_gpt_chats', JSON.stringify(c));
+    const stored = load();
+    const merged = mergeChats(stored, buildPersist(false)).slice(-200);
+    localStorage.setItem('jarvis_chats', JSON.stringify(merged));
+  } catch (e) {}
+  try {
+    fetch('/api/chats', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chats: buildPersist(true) }) }).catch(function () {});
   } catch (e) {}
 }
+/* pull the server's copy in and merge it with what this browser has, keeping
+   whichever copy of a chat has the longer history. */
+async function serverLoad() {
+  try {
+    const r = await fetch('/api/chats');
+    const j = await r.json();
+    if (j && Array.isArray(j.chats) && j.chats.length) {
+      const byId = {};
+      chats.forEach(function (c, i) { byId[c.id] = i; });
+      let changed = false;
+      j.chats.forEach(function (c) {
+        if (!c || !c.id) return;
+        const i = byId[c.id];
+        if (i === undefined) { byId[c.id] = chats.length; chats.push(c); changed = true; return; }
+        const loc = chats[i];
+        if ((c.messages || []).length > (loc.messages || []).length) { chats[i] = c; changed = true; }
+        else if ((c.ts || 0) > (loc.ts || 0)) { loc.ts = c.ts; changed = true; }
+      });
+      const before = chats.length;
+      dedupeChats();
+      if (chats.length !== before) changed = true;
+      if (cur) {
+        const keep = chats.filter(function (c) { return c.id === cur.id; })[0];
+        if (keep) cur = keep;
+      }
+      if (changed) save();
+      if (!cur || !chats.some(function (c) { return c.id === cur.id; })) cur = chats[chats.length - 1];
+      renderAll();
+      return true;
+    }
+  } catch (e) {}
+  return false;
+}
 function newChat() {
-  if (cur && chats.indexOf(cur) !== -1 && cur.messages.length === 0 && cur.title === 'New chat') { started = false; renderAll(); return; }
+  if (cur && chats.indexOf(cur) !== -1 && cur.messages.length === 0 && cur.title === 'New chat') {
+    /* Reuse the empty chat rather than litter the history with blanks - but only if it is
+       still empty right now. This page can hold a stale copy of a chat that another page has
+       since started a conversation in, and reusing that would silently overwrite what they
+       wrote, the two being the same chat by id. */
+    const fresh = load().filter(function (c) { return c.id === cur.id; })[0];
+    if (!fresh || (fresh.messages || []).length === 0) { started = false; renderAll(); return; }
+  }
+
   if (cur && cur.messages.length > 0 && chats.indexOf(cur) === -1) chats.push(cur);
   cur = { id: 'c' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6), title: 'New chat', ts: Date.now(), messages: [] };
   chats.push(cur); started = false; save(); renderAll();
@@ -14338,6 +14444,7 @@ function init() {
   dedupeChats();
   if (!chats.length) newChat(); else cur = chats[chats.length - 1];
   renderAll(); setSendUI();
+  serverLoad();
   startSchedWatch();
   startDlWatch();
   bindScope();
@@ -14351,7 +14458,7 @@ function bindModeBtn() {
   const btn = document.getElementById('modebtn');
   const update = function () { btn.textContent = chatMode === 'plan' ? 'PLAN' : 'BUILD'; btn.classList.toggle('plan', chatMode === 'plan'); };
   update();
-  btn.onclick = function () { chatMode = chatMode === 'plan' ? 'build' : 'plan'; localStorage.setItem('bonsai_gpt_mode', chatMode); update(); scheduleCtx(); };
+  btn.onclick = function () { chatMode = chatMode === 'plan' ? 'build' : 'plan'; localStorage.setItem('jarvis_mode', chatMode); update(); scheduleCtx(); };
 }
 function bindTheme() {
   const b = document.getElementById('themebtn');
@@ -17463,10 +17570,46 @@ def _load_chats():
     return data if isinstance(data, list) else []
 
 
+def _merge_chats(old, new):
+    """Union of two chat lists, keyed by id, keeping the longer history.
+
+    More than one page can be open at once, each holding its own view of the
+    history, and each posting its whole list back. Whoever posted last used to
+    win outright, so a conversation made in the other page was gone from the
+    file and neither page ever noticed. Merging here means a page can only ever
+    add to the history or lengthen a chat, never delete one."""
+    by_id = {}
+    order = []
+    anonymous = []
+
+    def take(c):
+        if not _valid_chat(c):
+            return
+        cid = c.get("id")
+        if not isinstance(cid, str) or not cid:
+            anonymous.append(c)
+            return
+        prev = by_id.get(cid)
+        if prev is None:
+            by_id[cid] = c
+            order.append(cid)
+            return
+        a = len(c.get("messages") or [])
+        b = len(prev.get("messages") or [])
+        if a > b or (a == b and (c.get("ts") or 0) > (prev.get("ts") or 0)):
+            by_id[cid] = c
+
+    for c in (old or []):
+        take(c)
+    for c in (new or []):
+        take(c)
+    return [by_id[cid] for cid in order] + anonymous
+
+
 def _save_chats(chats):
     if not isinstance(chats, list):
         return False
-    keep = [c for c in chats if _valid_chat(c)][-200:]
+    keep = _merge_chats(_read_chat_file(CHATS_FILE), chats)[-200:]
     tmp = CHATS_FILE + ".tmp"
     try:
         os.makedirs(os.path.dirname(CHATS_FILE), exist_ok=True)
