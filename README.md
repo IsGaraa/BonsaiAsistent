@@ -553,7 +553,7 @@ requirements.md        # full dependency list (required vs optional)
 requirements.txt       # pip installs for the extended tools (pywin32 is Windows-only)
 tools/                 # optional helper scripts (screenshot, clipboard, scraper, OCR) - the same capabilities are also built into bonsai_web.py
 tools.json             # tool-call spec reference (auto-generated from code)
-gpt_ui.html            # standalone copy of the /chat UI (extracted for reference)
+gpt_ui.html            # read-only copy of the /chat UI. bonsai_web.py is the source of truth; refresh it with `python tools\dump_gpt_ui.py`
 instructions.txt       # quick-start guide (English)
 piper/                 # Piper TTS: tts.py + download_voices.py; voice .onnx models are git-ignored (fetch with `python piper\download_voices.py`)
 *.gguf                 # the model weights (local only, not in git)

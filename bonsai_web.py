@@ -16907,19 +16907,7 @@ _OC_JS = (
     '     answer bubble rather than up with the steps. textClose() also runs at\n'
     '     every tool boundary, but a step follows there, so the paragraph is only\n'
     '     moved when nothing comes after it: the end of the turn. */\n'
-    '  function adoptFinalAnswer() {\n'
-    '    var n = OCS.textNode;\n'
-    '    if (!n) return;\n'
-    "    if (String(OCS.textRaw || '').trim()) {\n"
-    "      if (typeof fmt === 'function') {\n"
-    '        try { n.innerHTML = fmt(OCS.textRaw); } catch (e) {}\n'
-    '      }\n'
-    "      n.classList.add('ocfinal');\n"
-    '    }\n'
-    '    OCS.textNode = null;\n'
-    "    OCS.textRaw = '';\n"
-    '    OCS.textPart = null;\n'
-    '  }\n'
+    '  \n'
     '\n'
     '  function textClose() {\n'
     '    if (!OCS.textNode) return;\n'
