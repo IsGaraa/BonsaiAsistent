@@ -5250,6 +5250,19 @@ def _model_error_text(exc, entry=None):
                    "window. Provider said: %s" % (who, detail))
         else:
             msg = "%s rejected the request: %s" % (who, detail)
+    elif code == 400:
+        # No body at all, which is what a bare llama.cpp or a proxy sends. This
+        # used to arrive as "HTTP Error 400: Bad Request" and nothing else, so
+        # there was nothing to act on and no way to tell a bad model id from a
+        # request the endpoint would not accept. Name the causes that are
+        # actually reachable from here.
+        entry_now = entry if entry is not None else _active_model()
+        model_id = (entry_now or {}).get("model") or (entry_now or {}).get("id")
+        msg = ("%s rejected the request (400) and sent no reason. Usual causes: "
+               "the model id %r is not one this endpoint serves, or the request "
+               "carries something it will not accept. Check the model id and "
+               "base URL on the '%s' model, and try a different model."
+               % (who, model_id, who))
     elif code and code >= 500:
         msg = "%s is not answering right now (HTTP %s). Try again shortly." % (
             who, code)
@@ -18075,7 +18088,15 @@ class Handler(BaseHTTPRequestHandler):
                         # browser closed the tab mid-response: normal, not an error
                         client_gone = True
                     except Exception as exc:
-                        traceback.print_exc()
+                        # A provider saying no - 400, 401, 403, 429, 5xx - is a
+                        # normal outcome that the reader is told about in plain
+                        # words just below. Printing the stack for it buried the
+                        # useful line under thirty of traceback, and made a
+                        # routine rate limit look like a crash. Only an
+                        # unexpected failure is worth a traceback.
+                        if not isinstance(exc, (urllib.error.HTTPError,
+                                                urllib.error.URLError)):
+                            traceback.print_exc()
                         try:
                             emit("error", {"text": _model_error_text(exc)})
                         except Exception:
