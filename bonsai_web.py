@@ -10948,11 +10948,18 @@ PAGE = """<!doctype html>
   #console-state.planmode { color: #a78bfa; }
 
   /* right: chat console */
-  .right .chat-wrap { flex: 1; min-height: 0; display: flex; flex-direction: column; padding: 10px; }
+  /* One comfortable reading column, centred. The chat is not the window - it
+     is a column in it, and it should be the width a line of text actually
+     wants rather than every pixel available, which is what makes a wide
+     layout tiring. The conversation, the attachments and the composer all
+     share this one measure, the way ChatGPT and Gemini do it, so nothing
+     drifts out of alignment with anything else. */
+  .right .chat-wrap { flex: 1; min-height: 0; display: flex; flex-direction: column;
+                      padding: 10px; width: 100%; max-width: 820px; margin: 0 auto; }
   #chat-container { flex: 1; overflow-y: auto; overflow-x: hidden; padding: 4px 6px; }
   .endednote { margin-top: 6px; font-size: 12px; color: var(--mut);
                font-style: italic; font-family: Consolas, monospace; }
-  .msgrow { display: flex; gap: 10px; padding: 12px 0; width: 100%; max-width: 1060px; margin: 0 auto; }
+  .msgrow { display: flex; gap: 10px; padding: 12px 0; }
   .msgrow.user { flex-direction: row-reverse; }
   /* an empty chat used to be 1300px of nothing. Say what this thing is for. */
   .emptyhint { max-width: 430px; margin: 0 auto; padding: 14vh 24px 0;
