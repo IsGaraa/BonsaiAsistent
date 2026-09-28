@@ -10931,6 +10931,23 @@ PAGE = """<!doctype html>
 
   /* left: chat history */
   .left .new { margin: 10px 12px; }
+  /* Four things were stacked in a 250px rail and each got a third of nothing.
+     Tabs give one of them the full height, and the counts sit on the tab itself
+     so a todo added while you are in CHATS still tells you it is there. */
+  .wbtn.wide { display: block; width: calc(100% - 16px); margin: 8px; text-align: left;
+               overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ltabs { display: flex; gap: 2px; padding: 0 6px 6px; border-bottom: 1px solid var(--bd); flex: none; }
+  .ltab { flex: 1; background: none; border: none; border-bottom: 2px solid transparent;
+          color: var(--mut); font: inherit; font-size: 10.5px; letter-spacing: 1px;
+          padding: 7px 2px; cursor: pointer; display: flex; align-items: center;
+          justify-content: center; gap: 4px; }
+  .ltab:hover { color: var(--txt2); }
+  .ltab.on { color: var(--acc); border-bottom-color: var(--acc); }
+  .lbadge { min-width: 14px; padding: 0 4px; border-radius: 7px; background: var(--bg4);
+            color: var(--mut); font-size: 9.5px; letter-spacing: 0; line-height: 14px; }
+  .ltab.on .lbadge { background: rgba(56,189,248,.16); color: var(--acc); }
+  .lpane { display: none; flex: 1; min-height: 0; flex-direction: column; }
+  .lpane.on { display: flex; }
   #chatlist { flex: 1; overflow-y: auto; padding: 4px 8px; }
   .chat-item { display: flex; align-items: center; gap: 8px; padding: 9px 10px; border-radius: 8px; cursor: pointer; font-size: 13.5px; color: var(--txt2); }
   .chat-item:hover { background: var(--bg3); }
@@ -10955,7 +10972,7 @@ PAGE = """<!doctype html>
      share this one measure, the way ChatGPT and Gemini do it, so nothing
      drifts out of alignment with anything else. */
   .right .chat-wrap { flex: 1; min-height: 0; display: flex; flex-direction: column;
-                      padding: 10px; width: 100%; max-width: 820px; margin: 0 auto; }
+                      padding: 10px; width: 100%; max-width: 850px; margin: 0 auto; }
   #chat-container { flex: 1; overflow-y: auto; overflow-x: hidden; padding: 4px 6px; }
   .endednote { margin-top: 6px; font-size: 12px; color: var(--mut);
                font-style: italic; font-family: Consolas, monospace; }
@@ -10992,6 +11009,11 @@ PAGE = """<!doctype html>
   .filechip { display: inline-flex; align-items: center; gap: 6px; background: var(--bg3); border: 1px solid var(--bd2); color: var(--txt2); border-radius: 8px; padding: 5px 10px; margin: 2px 6px 2px 0; font-size: 12.5px; font-family: Consolas, monospace; }
   .filechip .fname { font-weight: 700; }
 
+  /* The controls sit on their own slim row above the input rather than
+     competing with it, so the box you type in is only the box you type in. */
+  .composerwrap { display: flex; flex-direction: column; }
+  .composerctl { display: flex; align-items: center; gap: 8px; padding: 0 2px 6px; }
+  .composerctl .ctxmeter { margin-left: auto; }
   .composer { display: flex; align-items: flex-end; gap: 8px; padding: 8px 0 2px; }
   .field {
     flex: 1; position: relative; display: flex; align-items: flex-end; gap: 6px;
@@ -11089,9 +11111,9 @@ PAGE = """<!doctype html>
   /* context window meter - always visible, so you can see the cost of the
      system prompt + tools before you even type, and how it grows. */
   .ctxmeter {
-    display: flex; align-items: center; gap: 6px; align-self: center;
+    display: flex; align-items: center; gap: 6px;
     background: var(--bg3); border: 1px solid var(--bd2); border-radius: 12px;
-    padding: 0 10px; height: 34px; cursor: default; white-space: nowrap;
+    padding: 0 10px; height: 30px; cursor: default; white-space: nowrap;
     font-size: 11px; font-family: Consolas, monospace; user-select: none;
     transition: border-color .15s;
   }
@@ -11267,7 +11289,6 @@ PAGE = """<!doctype html>
         <div class="t" id="clock-time">00:00:00</div>
         <div class="d" id="clock-date"></div>
       </div>
-      <button class="wbtn" id="workbtn" title="Click to choose the workspace folder">\\WORKSPACE</button>
       <select class="hbtn modelsel" id="modelsel" title="Active AI model - pick a local .gguf or an external OpenAI-compatible endpoint"></select>
       <button class="hbtn add" id="addmodelbtn" title="Add a model (local .gguf file or an external API endpoint)">+</button>
       <button class="hbtn add" id="cfgbtn" title="Model settings - context size, temperature, GPU layers">&#9881;</button>
@@ -11324,21 +11345,32 @@ PAGE = """<!doctype html>
 
   <main class="grid">
     <section class="left panel hud-border">
-      <div class="ptitle"><span>CHAT HISTORY</span><span>LOCAL</span></div>
-      <button class="hbtn new" id="newchat2">+ NEW CHAT</button>
-      <div id="chatlist"></div>
-      <div class="ptitle" id="todotitle" style="margin-top:8px; border-top:1px solid #164e63; padding-top:8px;"><span>TODO</span><span id="todocount"></span></div>
-      <div id="todopanel"></div>
-      <div class="ptitle" style="margin-top:8px; border-top:1px solid #164e63; padding-top:8px;"><span>DOWNLOADS</span><span id="dlcount"></span></div>
-      <div class="dllist" id="dllist"></div>
-      <div class="dlclearrow" id="dlclearrow">
-        <button class="dlclear" id="dlclear" title="Remove finished, failed and cancelled downloads from the list">CLEAR FINISHED</button>
-        <button class="dlclear danger" id="dlclearall" title="Remove every entry - finished, failed, cancelled, queued and paused. A download that is actively transferring right now is left to finish on its own.">CLEAR ALL</button>
+      <button class="wbtn wide" id="workbtn" title="Click to choose the workspace folder">\\WORKSPACE</button>
+      <div class="ltabs" role="tablist" aria-label="Side panels">
+        <button class="ltab on" data-pane="chats" role="tab" aria-selected="true" title="Your conversations">CHATS</button>
+        <button class="ltab" data-pane="todo" role="tab" aria-selected="false" title="Things it has lined up to do">TODO<span class="lbadge" id="todocount"></span></button>
+        <button class="ltab" data-pane="files" role="tab" aria-selected="false" title="Downloads it has started">FILES<span class="lbadge" id="dlcount"></span></button>
+        <button class="ltab" data-pane="scope" role="tab" aria-selected="false" title="How far it may reach outside the workspace">SCOPE</button>
       </div>
-      <div class="ptitle" style="margin-top:8px; border-top:1px solid #164e63; padding-top:8px;"><span>PATH SCOPE</span></div>
-      <button class="scopebtn" id="scopebtn" title="How far Bonsai may reach outside the workspace. Click to switch: WORKSPACE (hard sandbox) / ASK (ask me every time) / SYSTEM (no prompts).">SCOPE: ...</button>
-      <div class="scopelist" id="scopelist"></div>
-      <button class="scopeclear" id="scopeclear" title="Forget every approved and denied path">CLEAR APPROVALS</button>
+      <div class="lpane on" id="pane-chats" role="tabpanel">
+        <button class="hbtn new" id="newchat2">+ NEW CHAT</button>
+        <div id="chatlist"></div>
+      </div>
+      <div class="lpane" id="pane-todo" role="tabpanel">
+        <div id="todopanel"></div>
+      </div>
+      <div class="lpane" id="pane-files" role="tabpanel">
+        <div class="dllist" id="dllist"></div>
+        <div class="dlclearrow" id="dlclearrow">
+          <button class="dlclear" id="dlclear" title="Remove finished, failed and cancelled downloads from the list">CLEAR FINISHED</button>
+          <button class="dlclear danger" id="dlclearall" title="Remove every entry - finished, failed, cancelled, queued and paused. A download that is actively transferring right now is left to finish on its own.">CLEAR ALL</button>
+        </div>
+      </div>
+      <div class="lpane" id="pane-scope" role="tabpanel">
+        <button class="scopebtn" id="scopebtn" title="How far Bonsai may reach outside the workspace. Click to switch: WORKSPACE (hard sandbox) / ASK (ask me every time) / SYSTEM (no prompts).">SCOPE: ...</button>
+        <div class="scopelist" id="scopelist"></div>
+        <button class="scopeclear" id="scopeclear" title="Forget every approved and denied path">CLEAR APPROVALS</button>
+      </div>
     </section>
 
     <section class="center panel hud-border" id="centerpanel">
@@ -11357,17 +11389,8 @@ PAGE = """<!doctype html>
       <div class="chat-wrap">
         <div id="chat-container"></div>
         <div id="preview"></div>
-        <form id="chat-form" class="composer" onsubmit="handleSubmit(event)">
-          <div class="field">
-            <textarea id="user-input" rows="1" placeholder="Type a command..."></textarea>
-            <button type="button" class="iconbtn" id="attach" title="Attach images / files">&#128206;</button>
-            <button type="button" class="iconbtn" id="mic-btn" title="Microphone">&#127908;</button>
-            <div class="ctxmeter" id="ctxmeter" title="Context window in use - the system prompt and all tools are already counted, before you type">
-              <span class="ctxtag">CTX</span>
-              <span class="ctxbar"><span class="ctxfill" id="ctxfill"></span></span>
-              <span class="ctxnum" id="ctxnum">--</span>
-              <span class="ctxhint" id="ctxhint"></span>
-            </div>
+        <div class="composerwrap">
+          <div class="composerctl">
             <button type="button" class="modebtn" id="modebtn" title="Switch Plan / Build mode - Plan is read-only (no tools run)">BUILD</button>
             <select id="effort-sel" title="Thinking effort - how deeply BONSAI reasons (this can change the response quality)">
               <option value="off">THINK: OFF</option>
@@ -11375,10 +11398,22 @@ PAGE = """<!doctype html>
               <option value="med" selected>THINK: MED</option>
               <option value="high">THINK: HIGH</option>
             </select>
-            <button type="submit" id="send">SEND</button>
+            <div class="ctxmeter" id="ctxmeter" title="Context window in use - the system prompt and all tools are already counted, before you type">
+              <span class="ctxbar"><span class="ctxfill" id="ctxfill"></span></span>
+              <span class="ctxnum" id="ctxnum">--</span>
+              <span class="ctxhint" id="ctxhint"></span>
+            </div>
           </div>
-        </form>
-        <div class="statsline" id="statsline"></div>
+          <form id="chat-form" class="composer" onsubmit="handleSubmit(event)">
+            <div class="field">
+              <textarea id="user-input" rows="1" placeholder="Type a command..."></textarea>
+              <button type="button" class="iconbtn" id="attach" title="Attach images / files">&#128206;</button>
+              <button type="button" class="iconbtn" id="mic-btn" title="Microphone">&#127908;</button>
+              <button type="submit" id="send">SEND</button>
+            </div>
+          </form>
+          <div class="statsline" id="statsline"></div>
+        </div>
       </div>
     </section>
   </main>
@@ -11510,10 +11545,11 @@ function newChat() {
   renderAll();
   postPolicy({ clear: true });
 }
-function init() {
-  bindModeBtn();
-  loadWorkdir();
-  dedupeChats();
+  function init() {
+    bindModeBtn();
+    loadWorkdir();
+    bindPanes();
+    dedupeChats();
   if (!chats.length) newChat();
   else cur = chats[chats.length - 1];
   renderAll();
@@ -12534,6 +12570,34 @@ function bindScope() {
   if (clr) clr.onclick = function () { postPolicy({ clear: true }); };
   loadPathPolicy();
 }
+/* Which of the four side panels is showing. Remembered, because being kicked
+   back to CHATS on every reload is the sort of small thing that makes a UI
+   feel like it is arguing with you. */
+function showPane(name) {
+  const tabs = document.querySelectorAll('.ltab');
+  let found = false;
+  for (let i = 0; i < tabs.length; i++) {
+    const on = tabs[i].getAttribute('data-pane') === name;
+    tabs[i].classList.toggle('on', on);
+    tabs[i].setAttribute('aria-selected', on ? 'true' : 'false');
+    if (on) found = true;
+  }
+  if (!found) name = 'chats';
+  const panes = document.querySelectorAll('.lpane');
+  for (let i = 0; i < panes.length; i++) {
+    panes[i].classList.toggle('on', panes[i].id === 'pane-' + name);
+  }
+  try { localStorage.setItem('bonsai_pane', name); } catch (e) {}
+}
+function bindPanes() {
+  const tabs = document.querySelectorAll('.ltab');
+  for (let i = 0; i < tabs.length; i++) {
+    tabs[i].onclick = function () { showPane(this.getAttribute('data-pane')); };
+  }
+  let want = 'chats';
+  try { want = localStorage.getItem('bonsai_pane') || 'chats'; } catch (e) {}
+  showPane(want);
+}
 function onAsk(j) {
   const old = document.getElementById('askov');
   if (old) old.remove();
@@ -12697,15 +12761,12 @@ function renderTodo(items) {
     if (!items || !items.length) {
       el.classList.remove('on'); el.innerHTML = '';
       if (cnt) cnt.textContent = '';
-      /* a heading with nothing under it just reads as a broken panel */
-      const ttl = document.getElementById('todotitle');
-      if (ttl) ttl.style.display = 'none';
       return;
     }
-    const ttl0 = document.getElementById('todotitle');
-    if (ttl0) ttl0.style.display = '';
   el.classList.add('on'); el.innerHTML = '';
   const done = items.filter(function (t) { return t.status === 'completed'; }).length;
+  /* the count rides on the TODO tab now, so a todo added while you are in
+     CHATS still tells you it is waiting */
   if (cnt) cnt.textContent = done + '/' + items.length;
   items.forEach(function (t) {
     const d = document.createElement('div');
