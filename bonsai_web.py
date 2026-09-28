@@ -134,10 +134,6 @@ _ACTIVE_MODEL = None
 _MODELS_LOCK = threading.RLock()
 _ASKS = {}
 _ASKS_LOCK = threading.Lock()
-# set by a tool that wants the caret in the chat box (rich_text with
-# action=paste/send). The turn's keepalive thread drains it and tells the page,
-# which is the only thing that can actually focus its own input.
-_UI_FOCUS = threading.Event()
 _TODOS = []
 _TODOS_LOCK = threading.Lock()
 _LAST_ACTIVITY = time.time()
@@ -2568,7 +2564,17 @@ SYSTEM = ("You are the friendly assistant living on the user's "
           "tools (get_scene_info, get_object_info, execute_blender_code, "
           "get_viewport_screenshot) to work inside Blender: build and move "
           "objects with code, inspect the scene, and confirm your results with "
-          "a viewport screenshot.")
+          "a viewport screenshot. "
+          "You can write part of a reply in colour: wrap it in "
+          "[color=NAME]...[/color] and only that part is drawn in colour, the "
+          "rest stays as it is. For example: [color=red]Heey![/color] how are "
+          "you doing? Use it when it actually carries meaning - a warning, an "
+          "error, a key value, the one word that answers the question - and "
+          "leave ordinary sentences plain. Names: red, orange, amber, yellow, "
+          "lime, green, emerald, teal, cyan, sky, blue, indigo, purple, violet, "
+          "pink, magenta, brown, white, silver, gray, black, or a hex value "
+          "such as #ff3b30. Never put a colour tag inside a code block, and "
+          "never use one where plain text would do.")
 
 PLAN_MODE_SYSTEM = ("\nMODE: PLAN. The user only wants a PLAN right now - do NOT "
                     "write, edit, create or delete any files, and do NOT launch "
@@ -4976,51 +4982,6 @@ COPY_CLIPBOARD_TOOL = {
     }
 }
 
-RICH_TEXT_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "rich_text",
-        "description":
-            "Put styled text on the system clipboard for another app's chat box, "
-            "and optionally paste and send it there. The same text is offered as "
-            "plain text, as RTF and as HTML at the same time, because apps read "
-            "whichever of those they understand - Word and Outlook want RTF, a "
-            "browser or Slack wants HTML, and a plain terminal wants text. Use "
-            "this to hand a highlighted warning or a styled answer to another "
-            "program's message box.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "text": {"type": "string",
-                         "description": "The text to place, styled."},
-                "color": {"type": "string",
-                          "description": "Text colour. A name (red, green, blue, "
-                                         "yellow, orange, purple, pink, white, "
-                                         "black, grey) or a hex value like "
-                                         "#ff3b30. Default: left as it is."},
-                "bg": {"type": "string",
-                       "description": "Highlight colour behind the text. Same "
-                                      "names and hex values as color. Default: none."},
-                "bold": {"type": "boolean",
-                         "description": "Bold the text. Default false."},
-                "size": {"type": "number",
-                         "description": "Text size in points, 6 to 72. Default: "
-                                        "the app's own size."},
-                "monospace": {"type": "boolean",
-                              "description": "Use a monospaced font. Default false."},
-                "action": {"type": "string",
-                           "enum": ["send", "paste", "copy"],
-                           "description": "send (default) fills the clipboard, "
-                                          "puts the caret in the chat box, pastes, "
-                                          "and presses Enter. paste does the same "
-                                          "without pressing Enter. copy only "
-                                          "fills the clipboard."}
-            },
-            "required": ["text"]
-        }
-    }
-}
-
 PASTE_CLIPBOARD_TOOL = {
     "type": "function",
     "function": {
@@ -5078,7 +5039,6 @@ CLICK_TEXT_TOOL = {
 NEW_TOOLS = [WINDOW_LIST_TOOL, WINDOW_ACTION_TOOL,
              SCREENSHOT_WINDOW_TOOL, WAIT_FOR_TOOL,
              COPY_CLIPBOARD_TOOL, PASTE_CLIPBOARD_TOOL, CLICK_TEXT_TOOL,
-             RICH_TEXT_TOOL,
              API_CALL_TOOL, WS_TEST_TOOL,
              SCHEDULE_TOOL, LIST_SCHEDULES_TOOL, UNSCHEDULE_TOOL,
              TTS_VOICES_TOOL, TTS_SPEAK_TOOL, PREVIEW_HTML_TOOL]
@@ -6899,262 +6859,6 @@ def _clipboard(args):
     except Exception as exc:
         return {"error": f"clipboard {action} failed: {exc}"}
     return {"error": "action must be 'get' or 'set'"}
-
-
-# ---------------- rich text for another app's chat box ----------------
-#
-# A chat composer only takes what the clipboard offers it, and different ones
-# read different things: Word and Outlook want "Rich Text Format", a browser or
-# Slack want "HTML Format", a terminal wants plain text. So the same styled
-# text is put on the clipboard in all three at once and the app is left to take
-# the richest one it understands. Nothing here needs an RTF library - the
-# markup is small and the CF_HTML offsets are the only fiddly part.
-
-_RICH_COLOURS = {
-    "red": "ff3b30", "green": "34c759", "blue": "007aff",
-    "yellow": "ffcc00", "orange": "ff9500", "purple": "af52de",
-    "pink": "ff2d55", "white": "ffffff", "black": "000000",
-    "grey": "8e8e93", "gray": "8e8e93", "cyan": "32ade6",
-    "brown": "a2845e",
-}
-
-
-def _rich_hex(value):
-    """A named colour or #rrggbb to (r, g, b), or None."""
-    s = str(value or "").strip().lower()
-    if not s:
-        return None
-    if not s.startswith("#"):
-        s = _RICH_COLOURS.get(s, "")
-        if not s:
-            return None
-    s = s.lstrip("#")
-    if len(s) == 3:
-        s = "".join(ch * 2 for ch in s)
-    if len(s) != 6:
-        return None
-    try:
-        return (int(s[0:2], 16), int(s[2:4], 16), int(s[4:6], 16))
-    except ValueError:
-        return None
-
-
-def _rich_rtf_text(s):
-    """RTF body escapes: braces and backslashes, and anything non-ascii as a
-    \\uNNNN escape, because the RTF header claims a single-byte code page."""
-    out = []
-    for ch in str(s or ""):
-        if ch in "\\{}":
-            out.append("\\" + ch)
-        elif ord(ch) < 128:
-            out.append(ch)
-        else:
-            n = ord(ch)
-            if n > 0xFFFF:  # outside the BMP: a surrogate pair
-                n -= 0x10000
-                hi = 0xD800 + (n >> 10)
-                lo = 0xDC00 + (n & 0x3FF)
-                out.append("\\u%d?\\u%d?" % (hi, lo))
-            else:
-                out.append("\\u%d?" % n)
-    return "".join(out)
-
-
-def _rich_rtf(text, fg, bg, bold, half_pt, mono):
-    table = [";"]
-    idx_fg = idx_bg = 0
-    if fg:
-        idx_fg = len(table)
-        table.append("\\red%d\\green%d\\blue%d;" % fg)
-    if bg:
-        idx_bg = len(table)
-        table.append("\\red%d\\green%d\\blue%d;" % bg)
-    font = "{\\f1\\fmodern Consolas;}" if mono else "{\\f0\\fswiss Segoe UI;}"
-    cmd = ["\\pard\\plain ", "\\f1" if mono else "\\f0"]
-    if half_pt:
-        cmd.append("\\fs%d" % half_pt)
-    if idx_fg:
-        cmd.append("\\cf%d" % idx_fg)
-    if idx_bg:
-        cmd.append("\\chcbpat%d" % idx_bg)
-    if bold:
-        cmd.append("\\b")
-    body = _rich_rtf_text(text)
-    if bold:
-        body += "\\b0"
-    return ("{\\rtf1\\ansi\\ansicpg1252\\deff0{\\fonttbl%s}"
-            "{\\colortbl%s}%s %s\\par\n}" % (font, "".join(table),
-                                            "".join(cmd), body))
-
-
-def _rich_html_fragment(text, fg, bg, bold, size, mono):
-    import html as _html
-    css = []
-    if fg:
-        css.append("color:#%02x%02x%02x" % fg)
-    if bg:
-        css.append("background-color:#%02x%02x%02x" % bg)
-    if bold:
-        css.append("font-weight:bold")
-    if size:
-        css.append("font-size:%gpt" % size)
-    if mono:
-        css.append("font-family:Consolas,'Courier New',monospace")
-    inner = _html.escape(str(text or "")).replace("\n", "<br>")
-    return '<span style="%s">%s</span>' % (";".join(css), inner)
-
-
-def _rich_cf_html(fragment):
-    """The CF_HTML header carries byte offsets into itself. The numbers are
-    zero padded to a fixed width, so the header is the same length whatever the
-    offsets turn out to be - build it once to learn that length, then again with
-    the real numbers in it."""
-    head = ("Version:1.0\r\nStartHTML:%010d\r\nEndHTML:%010d\r\n"
-            "StartFragment:%010d\r\nEndFragment:%010d\r\n")
-    start_html = len(head % (0, 0, 0, 0))
-    prefix = "<html><body>\r\n<!--StartFragment-->"
-    suffix = "<!--EndFragment-->\r\n</body></html>"
-    start_frag = start_html + len(prefix.encode("utf-8"))
-    end_frag = start_frag + len(fragment.encode("utf-8"))
-    end_html = end_frag + len(suffix.encode("utf-8"))
-    return (head % (start_html, end_html, start_frag, end_frag)
-            + prefix + fragment + suffix).encode("utf-8")
-
-
-def _set_clipboard_rich(rich_rtf, html_bytes, plain):
-    """Fill the clipboard with all three flavours at once."""
-    if os.name != "nt":
-        # no CF_HTML on the other desktops; the best a terminal can do is text
-        out = None
-        for cmd in (["wl-copy"], ["xclip", "-selection", "clipboard"],
-                    ["xsel", "--clipboard", "--input"]):
-            try:
-                p = subprocess.run(cmd, input=str(plain).encode("utf-8"),
-                                   timeout=10)
-                if p.returncode == 0:
-                    out = " ".join(cmd)
-                    break
-            except Exception:
-                continue
-        if not out:
-            return {"error": "no clipboard tool found (need xclip, xsel or "
-                             "wl-copy on this system)"}
-        return {"via": out, "flavours": ["text"]}
-    try:
-        import ctypes
-        from ctypes import wintypes
-    except Exception as exc:
-        return {"error": "ctypes is unavailable: %s" % exc}
-    u32 = ctypes.WinDLL("user32", use_last_error=True)
-    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    u32.RegisterClipboardFormatW.restype = wintypes.UINT
-    u32.RegisterClipboardFormatW.argtypes = [wintypes.LPCWSTR]
-    k32.GlobalAlloc.restype = wintypes.HGLOBAL
-    k32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
-    k32.GlobalLock.restype = ctypes.c_void_p
-    k32.GlobalLock.argtypes = [wintypes.HGLOBAL]
-    k32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
-    u32.SetClipboardData.restype = wintypes.HANDLE
-    u32.SetClipboardData.argtypes = [wintypes.UINT, wintypes.HANDLE]
-    CF_UNICODETEXT = 13
-    GMEM_MOVEABLE = 0x0002
-    rtf_fmt = u32.RegisterClipboardFormatW("Rich Text Format")
-    html_fmt = u32.RegisterClipboardFormatW("HTML Format")
-    if not u32.OpenClipboard(None):
-        return {"error": "another program is holding the clipboard: %s"
-                         % ctypes.WinError(ctypes.get_last_error())}
-    try:
-        u32.EmptyClipboard()
-        items = [(CF_UNICODETEXT, str(plain).encode("utf-16-le") + b"\x00\x00")]
-        if rtf_fmt:
-            items.append((rtf_fmt, rich_rtf.encode("ascii", "replace")))
-        if html_fmt:
-            items.append((html_fmt, html_bytes))
-        for fmt, data in items:
-            handle = k32.GlobalAlloc(GMEM_MOVEABLE, len(data))
-            if not handle:
-                return {"error": "out of memory for the clipboard"}
-            ptr = k32.GlobalLock(handle)
-            if not ptr:
-                k32.GlobalFree(handle)
-                return {"error": "could not lock the clipboard"}
-            try:
-                ctypes.memmove(ptr, data, len(data))
-            finally:
-                k32.GlobalUnlock(handle)
-            if not u32.SetClipboardData(fmt, handle):
-                k32.GlobalFree(handle)
-                return {"error": "the clipboard refused format %d" % fmt}
-    finally:
-        u32.CloseClipboard()
-    return {"flavours": ["text", "rtf", "html"]}
-
-
-def _rich_text(args):
-    text = args.get("text")
-    if text is None or not str(text):
-        return {"error": "text is required"}
-    text = str(text)
-    fg = _rich_hex(args.get("color"))
-    bg = _rich_hex(args.get("bg"))
-    bold = bool(args.get("bold"))
-    mono = bool(args.get("monospace"))
-    size = args.get("size")
-    try:
-        size = float(size) if size not in (None, "") else None
-    except (TypeError, ValueError):
-        size = None
-    if size is not None:
-        size = max(6.0, min(72.0, size))
-    if args.get("color") and not fg:
-        return {"error": "color must be a name or #rrggbb, not %r"
-                         % args.get("color")}
-    if args.get("bg") and not bg:
-        return {"error": "bg must be a name or #rrggbb, not %r" % args.get("bg")}
-
-    half_pt = int(round(size * 2)) if size else None
-    rtf = _rich_rtf(text, fg, bg, bold, half_pt, mono)
-    frag = _rich_html_fragment(text, fg, bg, bold, size, mono)
-    cf_html = _rich_cf_html(frag)
-    try:
-        put = _set_clipboard_rich(rtf, cf_html, text)
-    except Exception as exc:
-        return {"error": "could not use the clipboard: %s" % exc}
-    if put.get("error"):
-        return put
-
-    action = str(args.get("action") or "send").strip().lower()
-    if action not in ("copy", "paste", "send"):
-        return {"error": "action must be 'send', 'paste' or 'copy', not %r"
-                         % args.get("action")}
-    result = {"result": "ok", "action": action, "chars": len(text)}
-    result.update({k: v for k, v in put.items() if k != "error"})
-    if action == "copy":
-        result["note"] = ("on the clipboard as plain text, RTF and HTML; "
-                          "use action=paste or send to put it in a chat box")
-        return result
-
-    # paste, or paste and send
-    pasted = sent = False
-    try:
-        import pyautogui
-        # ask the page to put the caret in its own input first, so the paste
-        # does not land in whatever the user happened to be looking at
-        _UI_FOCUS.set()
-        time.sleep(0.6)
-        pyautogui.hotkey("ctrl", "v")
-        pasted = True
-        time.sleep(0.35)
-        if action == "send":
-            pyautogui.press("enter")
-            sent = True
-    except Exception as exc:
-        result["pasted"] = False
-        result["error"] = "clipboard is set, but pasting failed: %s" % exc
-        return result
-    result["pasted"] = pasted
-    result["sent"] = sent
-    return result
 
 
 def _url_ok(url):
@@ -10400,8 +10104,6 @@ def _execute_tool_call(name, args, tc, hooks, image_uri):
         raw_result = _control_input(args)
     elif name == "clipboard":
         raw_result = _clipboard(args)
-    elif name == "rich_text":
-        raw_result = _rich_text(args)
     elif name == "download_file":
         raw_result = _download_file(args)
     elif name == "web_resolve":
@@ -11985,6 +11687,44 @@ async function foldChat(chat, msgs) {
   }
 }
 function esc(s) { return (s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+/* The model writes in colour by wrapping a few words in a tag:
+     [color=red]Heey![/color] how are you doing?
+   and the chat draws that part of the line in red and the rest as usual. It
+   is BBCode, which models already know, and the system prompt says so.
+
+   Only a colour that passes the checks below is ever put into the style
+   attribute, and the only thing that reaches it is a value this function
+   built itself - a name from the table turned into #rrggbb, or hex that
+   matched a strict pattern. Anything else is left as plain text, so a reply
+   cannot smuggle a style, a url or an event handler in through the tag. */
+const COLOURS = {
+  red: '#ff3b30', crimson: '#dc143c', orange: '#ff9500', amber: '#ffc400',
+  yellow: '#ffd60a', lime: '#32d74b', green: '#34c759', emerald: '#00a86b',
+  teal: '#00c7be', cyan: '#22d3ee', sky: '#6ec6ff', blue: '#0a84ff',
+  indigo: '#5e5ce6', purple: '#af52de', violet: '#8e4ec6', pink: '#ff2d55',
+  magenta: '#d6409f', brown: '#a2845e', sage: '#9caf88', white: '#ffffff',
+  silver: '#c7c7cc', gray: '#8e8e93', grey: '#8e8e93', black: '#1c1c1e'
+};
+function inkOf(spec) {
+  const s = String(spec || '').trim().toLowerCase();
+  if (!s) return '';
+  if (COLOURS[s]) return COLOURS[s];
+  const h = s.charAt(0) === '#' ? s.slice(1) : s;
+  if (!/^[0-9a-f]{3}$/.test(h) && !/^[0-9a-f]{6}$/.test(h)) return '';
+  const full = h.length === 3 ? h[0] + h[0] + h[1] + h[1] + h[2] + h[2] : h;
+  return '#' + full;
+}
+function colourise(t) {
+  return t.replace(
+    /\\[color=([^\\]\\n]{1,24})\\]([\\s\\S]*?)\\[\\/color\\]/gi,
+    function (m, spec, body) {
+      const ink = inkOf(spec);
+      /* an unknown colour is not an error, it is just not a colour */
+      if (!ink) return m;
+      if (!body) return m;
+      return '<span style="color:' + ink + '">' + body + '</span>';
+    });
+}
 function fmt(s) {
   /* Block-level markdown, then the inline marks. Models reach for headings
      and lists constantly and they used to arrive on screen as literal "#" and
@@ -11999,9 +11739,16 @@ function fmt(s) {
 
   const inline = function (x) {
     let t = esc(x);
-    t = t.replace(/`([^`]+)`/g, '<code>$1</code>');
+    /* Inline code is set aside first, so a colour tag written inside a code
+       span stays text - a snippet about the syntax must not go pink. */
+    const spans = [];
+    const keep = function (html) {
+      spans.push(html); return '\\u0001S' + (spans.length - 1) + '\\u0001';
+    };
+    t = t.replace(/`([^`]+)`/g, function (m, c) { return keep('<code>' + c + '</code>'); });
     t = t.replace(/\\*\\*([^*]+)\\*\\*/g, '<b>$1</b>');
     t = t.replace(/\\*([^*]+)\\*/g, '<i>$1</i>');
+    t = colourise(t);
     /* Links go into placeholders and are put back at the end, so the bare-url
        pass cannot swallow the address of a link it has already built - it used
        to, and the closing bracket ended up inside the address. Only http and
@@ -12030,6 +11777,7 @@ function fmt(s) {
       return hold(anchor(url, url)) + tail;
     });
     t = t.replace(/\\u0001L(\\d+)\\u0001/g, function (m, i) { return links[+i]; });
+    t = t.replace(/\\u0001S(\\d+)\\u0001/g, function (m, i) { return spans[+i]; });
     return t;
   };
 
@@ -12527,7 +12275,7 @@ const ACTIVITY = {
   search: 'Searching the folder', grep: 'Searching the folder',
   web_search: 'Searching the web', fetch: 'Fetching a page',
   screenshot: 'Taking a screenshot', question: 'Waiting for your answer',
-  rich_text: 'Pasting rich text', todo_write: 'Writing the to-do list',
+  rich_text: 'Pasting text', todo_write: 'Writing the to-do list',
   memory: 'Writing a memory'
 };
 function activityFor(name) {
@@ -12545,18 +12293,6 @@ function setStatus(text) {
   for (let i = 0; i < 3; i++) d.appendChild(document.createElement('i'));
   t.appendChild(d);
   t.appendChild(document.createTextNode(' ' + text));
-}
-/* Put the caret in the chat box and get it ready to receive a paste. The page
-   is the only thing that can focus its own input, so a tool that is about to
-   press Ctrl+V asks for this first. */
-function focusChatInput() {
-  try {
-    const el = document.getElementById('user-input');
-    if (!el) return false;
-    el.focus();
-    try { el.scrollIntoView({ block: 'nearest' }); } catch (e) {}
-    return document.activeElement === el;
-  } catch (e) { return false; }
 }
 function showLoading() {
   const row = thinkingRow;
@@ -13026,7 +12762,6 @@ async function streamRun(messages, chat, anchorMsg) {
         let j; try { j = JSON.parse(data); } catch (e) { continue; }
         if (ev === 'start') { setModelStatus(!!j.model_ready, !j.model_ready); }
         else if (ev === 'waiting') { showLoading(); }
-        else if (ev === 'focus') { focusChatInput(); }
         else if (ev === 'delta') { if (!modelUp) { modelUp = true; setModelStatus(true, false); } reply += j.text; onDelta(j.text); statsVals.respond_ms = Date.now() - startedAt; }
         else if (ev === 'reason') { if (!modelUp) { modelUp = true; setModelStatus(true, false); } reason += j.text; onReason(j.text); setBonsaiState('thinking'); statsVals.think_ms = Date.now() - startedAt; }
         else if (ev === 'tool') { if (!modelUp) { modelUp = true; setModelStatus(true, false); } calls.push(j.call); onTool(j.call); setBonsaiState('tools'); }
@@ -14850,6 +14585,44 @@ async function foldChat(chat, msgs) {
   }
 }
 function esc(s) { return (s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+/* The model writes in colour by wrapping a few words in a tag:
+     [color=red]Heey![/color] how are you doing?
+   and the chat draws that part of the line in red and the rest as usual. It
+   is BBCode, which models already know, and the system prompt says so.
+
+   Only a colour that passes the checks below is ever put into the style
+   attribute, and the only thing that reaches it is a value this function
+   built itself - a name from the table turned into #rrggbb, or hex that
+   matched a strict pattern. Anything else is left as plain text, so a reply
+   cannot smuggle a style, a url or an event handler in through the tag. */
+const COLOURS = {
+  red: '#ff3b30', crimson: '#dc143c', orange: '#ff9500', amber: '#ffc400',
+  yellow: '#ffd60a', lime: '#32d74b', green: '#34c759', emerald: '#00a86b',
+  teal: '#00c7be', cyan: '#22d3ee', sky: '#6ec6ff', blue: '#0a84ff',
+  indigo: '#5e5ce6', purple: '#af52de', violet: '#8e4ec6', pink: '#ff2d55',
+  magenta: '#d6409f', brown: '#a2845e', sage: '#9caf88', white: '#ffffff',
+  silver: '#c7c7cc', gray: '#8e8e93', grey: '#8e8e93', black: '#1c1c1e'
+};
+function inkOf(spec) {
+  const s = String(spec || '').trim().toLowerCase();
+  if (!s) return '';
+  if (COLOURS[s]) return COLOURS[s];
+  const h = s.charAt(0) === '#' ? s.slice(1) : s;
+  if (!/^[0-9a-f]{3}$/.test(h) && !/^[0-9a-f]{6}$/.test(h)) return '';
+  const full = h.length === 3 ? h[0] + h[0] + h[1] + h[1] + h[2] + h[2] : h;
+  return '#' + full;
+}
+function colourise(t) {
+  return t.replace(
+    /\\[color=([^\\]\\n]{1,24})\\]([\\s\\S]*?)\\[\\/color\\]/gi,
+    function (m, spec, body) {
+      const ink = inkOf(spec);
+      /* an unknown colour is not an error, it is just not a colour */
+      if (!ink) return m;
+      if (!body) return m;
+      return '<span style="color:' + ink + '">' + body + '</span>';
+    });
+}
 function fmt(s) {
   /* Block-level markdown, then the inline marks. Models reach for headings
      and lists constantly and they used to arrive on screen as literal "#" and
@@ -14864,9 +14637,16 @@ function fmt(s) {
 
   const inline = function (x) {
     let t = esc(x);
-    t = t.replace(/`([^`]+)`/g, '<code>$1</code>');
+    /* Inline code is set aside first, so a colour tag written inside a code
+       span stays text - a snippet about the syntax must not go pink. */
+    const spans = [];
+    const keep = function (html) {
+      spans.push(html); return '\\u0001S' + (spans.length - 1) + '\\u0001';
+    };
+    t = t.replace(/`([^`]+)`/g, function (m, c) { return keep('<code>' + c + '</code>'); });
     t = t.replace(/\\*\\*([^*]+)\\*\\*/g, '<b>$1</b>');
     t = t.replace(/\\*([^*]+)\\*/g, '<i>$1</i>');
+    t = colourise(t);
     /* Links go into placeholders and are put back at the end, so the bare-url
        pass cannot swallow the address of a link it has already built - it used
        to, and the closing bracket ended up inside the address. Only http and
@@ -14895,6 +14675,7 @@ function fmt(s) {
       return hold(anchor(url, url)) + tail;
     });
     t = t.replace(/\\u0001L(\\d+)\\u0001/g, function (m, i) { return links[+i]; });
+    t = t.replace(/\\u0001S(\\d+)\\u0001/g, function (m, i) { return spans[+i]; });
     return t;
   };
 
@@ -15121,7 +14902,7 @@ const ACTIVITY = {
   search: 'Searching the folder', grep: 'Searching the folder',
   web_search: 'Searching the web', fetch: 'Fetching a page',
   screenshot: 'Taking a screenshot', question: 'Waiting for your answer',
-  rich_text: 'Pasting rich text', todo_write: 'Writing the to-do list',
+  rich_text: 'Pasting text', todo_write: 'Writing the to-do list',
   memory: 'Writing a memory'
 };
 function activityFor(name) {
@@ -15139,18 +14920,6 @@ function setStatus(text) {
   for (let i = 0; i < 3; i++) d.appendChild(document.createElement('i'));
   t.appendChild(d);
   t.appendChild(document.createTextNode(' ' + text));
-}
-/* Put the caret in the chat box and get it ready to receive a paste. The page
-   is the only thing that can focus its own input, so a tool that is about to
-   press Ctrl+V asks for this first. */
-function focusChatInput() {
-  try {
-    const el = document.getElementById('user-input');
-    if (!el) return false;
-    el.focus();
-    try { el.scrollIntoView({ block: 'nearest' }); } catch (e) {}
-    return document.activeElement === el;
-  } catch (e) { return false; }
 }
 function showLoading() {
   const row = thinkingRow;
@@ -15479,7 +15248,6 @@ async function streamRun(messages, chat, anchorMsg) {
         let j; try { j = JSON.parse(data); } catch (e) { continue; }
         if (ev === 'start') { if (j.workdir) setWorkdirInUI(j.workdir); setState('idle'); }
         else if (ev === 'waiting') { showLoading(); }
-        else if (ev === 'focus') { focusChatInput(); }
         else if (ev === 'delta') { reply += j.text; onDelta(j.text); statsVals.respond_ms = Date.now() - startedAt; }
         else if (ev === 'reason') { reason += j.text; onReason(j.text); setState('thinking'); statsVals.think_ms = Date.now() - startedAt; }
         else if (ev === 'tool') { calls.push(j.call); onTool(j.call); setState('tools'); }
@@ -18274,26 +18042,11 @@ class Handler(BaseHTTPRequestHandler):
                 stop_beat = threading.Event()
 
                 def keepalive():
-                    # Polled often, because a tool can ask for the caret in the
-                    # chat box and the paste follows a fraction of a second
-                    # later - a ten second wait would paste into the wrong
-                    # window. The keepalive itself still goes out every ten
-                    # seconds, which is what is holding the socket open.
-                    last = time.time()
-                    while not stop_beat.wait(0.25):
+                    while not stop_beat.wait(10):
                         try:
-                            if _UI_FOCUS.is_set():
-                                _UI_FOCUS.clear()
-                                with write_lock:
-                                    self.wfile.write(
-                                        b"event: focus\ndata: {\"what\": "
-                                        b"\"input\"}\n\n")
-                                    self.wfile.flush()
-                            if time.time() - last >= 10:
-                                last = time.time()
-                                with write_lock:
-                                    self.wfile.write(b": keepalive\n\n")
-                                    self.wfile.flush()
+                            with write_lock:
+                                self.wfile.write(b": keepalive\n\n")
+                                self.wfile.flush()
                         except Exception:
                             return
 
