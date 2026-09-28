@@ -134,6 +134,7 @@ _ACTIVE_MODEL = None
 _MODELS_LOCK = threading.RLock()
 _ASKS = {}
 _ASKS_LOCK = threading.Lock()
+_CHATS_LOCK = threading.RLock()   # read-merge-write on chats.json must be atomic
 _TODOS = []
 _TODOS_LOCK = threading.Lock()
 _LAST_ACTIVITY = time.time()
@@ -10951,8 +10952,14 @@ PAGE = """<!doctype html>
   #chat-container { flex: 1; overflow-y: auto; overflow-x: hidden; padding: 4px 6px; }
   .endednote { margin-top: 6px; font-size: 12px; color: var(--mut);
                font-style: italic; font-family: Consolas, monospace; }
-  .msgrow { display: flex; gap: 10px; padding: 12px 0; }
+  .msgrow { display: flex; gap: 10px; padding: 12px 0; width: 100%; max-width: 1060px; margin: 0 auto; }
   .msgrow.user { flex-direction: row-reverse; }
+  /* an empty chat used to be 1300px of nothing. Say what this thing is for. */
+  .emptyhint { max-width: 430px; margin: 0 auto; padding: 14vh 24px 0;
+               text-align: center; color: var(--mut); display: flex;
+               flex-direction: column; gap: 10px; }
+  .emptyhint b { color: var(--txt2); font-size: 15px; font-weight: 600; }
+  .emptyhint span { font-size: 12.5px; line-height: 1.65; }
   .av { width: 30px; height: 30px; border-radius: 8px; flex-shrink: 0; display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: 700; font-family: Consolas, monospace; }
   .av.bonsai { background: var(--bg3); border: 1px solid var(--bd2); color: var(--acc); }
   .av.me { background: var(--bg4); border: 1px solid var(--bd2); color: var(--txt2); }
@@ -11313,7 +11320,7 @@ PAGE = """<!doctype html>
       <div class="ptitle"><span>CHAT HISTORY</span><span>LOCAL</span></div>
       <button class="hbtn new" id="newchat2">+ NEW CHAT</button>
       <div id="chatlist"></div>
-      <div class="ptitle" style="margin-top:8px; border-top:1px solid #164e63; padding-top:8px;"><span>TODO</span><span id="todocount"></span></div>
+      <div class="ptitle" id="todotitle" style="margin-top:8px; border-top:1px solid #164e63; padding-top:8px;"><span>TODO</span><span id="todocount"></span></div>
       <div id="todopanel"></div>
       <div class="ptitle" style="margin-top:8px; border-top:1px solid #164e63; padding-top:8px;"><span>DOWNLOADS</span><span id="dlcount"></span></div>
       <div class="dllist" id="dllist"></div>
@@ -11573,7 +11580,7 @@ function scrollBottom() { const c = convEl(); c.scrollTop = c.scrollHeight; }
 function renderConv() {
   const conv = convEl();
   conv.innerHTML = '';
-  if (cur) {
+  if (cur && cur.messages.length) {
     const at = (cur.summary && cur.summary_at) ? cur.summary_at : -1;
     cur.messages.forEach(function (m, i) {
       if (i === at) addFold(cur);
@@ -11581,6 +11588,13 @@ function renderConv() {
       else if (m.role === 'assistant') addAsst(m.content, m.calls || [], m.reason, m.stats, m.parts, m);
     });
     if (at > cur.messages.length) addFold(cur);
+  } else {
+    const hint = document.createElement('div');
+    hint.className = 'emptyhint';
+    hint.innerHTML = '<b>Ask Bonsai to do something on this PC.</b>'
+      + '<span>It reads and changes files, runs commands and drives your windows. '
+      + 'Switch to PLAN and it will only look and tell you what it would do.</span>';
+    conv.appendChild(hint);
   }
   busy = false;
   requeuePending();
@@ -11814,6 +11828,11 @@ function fileChipDom(name) {
 }
 function addUser(content, queued) {
   const conv = convEl();
+  /* the empty-chat hint is put there by renderConv, and a live turn appends to
+     the container rather than re-rendering it, so take the hint away as soon
+     as there is a real message to show instead */
+  const hint = conv.querySelector('.emptyhint');
+  if (hint) hint.remove();
   const row = document.createElement('div'); row.className = 'msgrow user' + (queued ? ' queued' : '');
   const av = document.createElement('div'); av.className = 'av me'; av.textContent = 'U';
   const b = document.createElement('div'); b.className = 'bubble';
@@ -12668,11 +12687,16 @@ function renderTodo(items) {
   const el = document.getElementById('todopanel');
   const cnt = document.getElementById('todocount');
   if (!el) return;
-  if (!items || !items.length) {
-    el.classList.remove('on'); el.innerHTML = '';
-    if (cnt) cnt.textContent = '';
-    return;
-  }
+    if (!items || !items.length) {
+      el.classList.remove('on'); el.innerHTML = '';
+      if (cnt) cnt.textContent = '';
+      /* a heading with nothing under it just reads as a broken panel */
+      const ttl = document.getElementById('todotitle');
+      if (ttl) ttl.style.display = 'none';
+      return;
+    }
+    const ttl0 = document.getElementById('todotitle');
+    if (ttl0) ttl0.style.display = '';
   el.classList.add('on'); el.innerHTML = '';
   const done = items.filter(function (t) { return t.status === 'completed'; }).length;
   if (cnt) cnt.textContent = done + '/' + items.length;
@@ -17288,11 +17312,12 @@ _OC_JS = (
     '    if (!b) return;\n'
     '    var s = lastSnap || { files: 0, added: 0, removed: 0 };\n'
     '    if (!s.files) {\n'
-    "      b.textContent = 'CHANGES 0';\n"
-    "      b.className = 'ocbarbtn';\n"
-    "      b.title = 'No file changes tracked yet';\n"
+    "      /* nothing tracked, so nothing to clear either - this was two dead\n"
+    "         buttons sitting at the top of every empty chat */\n"
+    "      bar.style.display = 'none';\n"
     '      return;\n'
-    '    }\n'
+    "    }\n"
+    "    bar.style.display = 'flex';\n"
     "    b.innerHTML = '';\n"
     "    b.appendChild(el('span', null, 'CHANGES ' + s.files + ' file' + (s.files === 1 ? '' : 's') + '  '));\n"
     "    b.appendChild(el('span', 'ocadd', '+' + (s.added || 0)));\n"
@@ -17597,25 +17622,30 @@ def _merge_chats(old, new):
 def _save_chats(chats):
     if not isinstance(chats, list):
         return False
-    keep = _merge_chats(_read_chat_file(CHATS_FILE), chats)[-200:]
     tmp = CHATS_FILE + ".tmp"
-    try:
-        os.makedirs(os.path.dirname(CHATS_FILE), exist_ok=True)
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(keep, f, ensure_ascii=False, default=str)
-        if os.path.exists(CHATS_FILE):
+    # The merge has to happen inside the lock. Two pages can post at the same
+    # moment - each on its own 5-second autosave - and both would otherwise
+    # read the same old file, merge their own view into it, and write; the
+    # second write would then drop whatever only the first one knew about.
+    with _CHATS_LOCK:
+        keep = _merge_chats(_read_chat_file(CHATS_FILE), chats)[-200:]
+        try:
+            os.makedirs(os.path.dirname(CHATS_FILE), exist_ok=True)
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(keep, f, ensure_ascii=False, default=str)
+            if os.path.exists(CHATS_FILE):
+                try:
+                    os.replace(CHATS_FILE, CHATS_FILE + ".bak")
+                except Exception:
+                    pass
+            os.replace(tmp, CHATS_FILE)
+            return True
+        except Exception:
             try:
-                os.replace(CHATS_FILE, CHATS_FILE + ".bak")
+                os.remove(tmp)
             except Exception:
                 pass
-        os.replace(tmp, CHATS_FILE)
-        return True
-    except Exception:
-        try:
-            os.remove(tmp)
-        except Exception:
-            pass
-        return False
+            return False
 
 
 class Handler(BaseHTTPRequestHandler):
