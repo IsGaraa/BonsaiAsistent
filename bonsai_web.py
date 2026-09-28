@@ -134,6 +134,10 @@ _ACTIVE_MODEL = None
 _MODELS_LOCK = threading.RLock()
 _ASKS = {}
 _ASKS_LOCK = threading.Lock()
+# set by a tool that wants the caret in the chat box (rich_text with
+# action=paste/send). The turn's keepalive thread drains it and tells the page,
+# which is the only thing that can actually focus its own input.
+_UI_FOCUS = threading.Event()
 _TODOS = []
 _TODOS_LOCK = threading.Lock()
 _LAST_ACTIVITY = time.time()
@@ -4972,6 +4976,51 @@ COPY_CLIPBOARD_TOOL = {
     }
 }
 
+RICH_TEXT_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "rich_text",
+        "description":
+            "Put styled text on the system clipboard for another app's chat box, "
+            "and optionally paste and send it there. The same text is offered as "
+            "plain text, as RTF and as HTML at the same time, because apps read "
+            "whichever of those they understand - Word and Outlook want RTF, a "
+            "browser or Slack wants HTML, and a plain terminal wants text. Use "
+            "this to hand a highlighted warning or a styled answer to another "
+            "program's message box.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string",
+                         "description": "The text to place, styled."},
+                "color": {"type": "string",
+                          "description": "Text colour. A name (red, green, blue, "
+                                         "yellow, orange, purple, pink, white, "
+                                         "black, grey) or a hex value like "
+                                         "#ff3b30. Default: left as it is."},
+                "bg": {"type": "string",
+                       "description": "Highlight colour behind the text. Same "
+                                      "names and hex values as color. Default: none."},
+                "bold": {"type": "boolean",
+                         "description": "Bold the text. Default false."},
+                "size": {"type": "number",
+                         "description": "Text size in points, 6 to 72. Default: "
+                                        "the app's own size."},
+                "monospace": {"type": "boolean",
+                              "description": "Use a monospaced font. Default false."},
+                "action": {"type": "string",
+                           "enum": ["copy", "paste", "send"],
+                           "description": "copy (default) only fills the "
+                                          "clipboard. paste also puts the caret in "
+                                          "the Bonsai chat box and presses Ctrl+V. "
+                                          "send also presses Enter afterwards, which "
+                                          "sends the message."}
+            },
+            "required": ["text"]
+        }
+    }
+}
+
 PASTE_CLIPBOARD_TOOL = {
     "type": "function",
     "function": {
@@ -5029,6 +5078,7 @@ CLICK_TEXT_TOOL = {
 NEW_TOOLS = [WINDOW_LIST_TOOL, WINDOW_ACTION_TOOL,
              SCREENSHOT_WINDOW_TOOL, WAIT_FOR_TOOL,
              COPY_CLIPBOARD_TOOL, PASTE_CLIPBOARD_TOOL, CLICK_TEXT_TOOL,
+             RICH_TEXT_TOOL,
              API_CALL_TOOL, WS_TEST_TOOL,
              SCHEDULE_TOOL, LIST_SCHEDULES_TOOL, UNSCHEDULE_TOOL,
              TTS_VOICES_TOOL, TTS_SPEAK_TOOL, PREVIEW_HTML_TOOL]
@@ -6851,9 +6901,261 @@ def _clipboard(args):
     return {"error": "action must be 'get' or 'set'"}
 
 
+# ---------------- rich text for another app's chat box ----------------
+#
+# A chat composer only takes what the clipboard offers it, and different ones
+# read different things: Word and Outlook want "Rich Text Format", a browser or
+# Slack want "HTML Format", a terminal wants plain text. So the same styled
+# text is put on the clipboard in all three at once and the app is left to take
+# the richest one it understands. Nothing here needs an RTF library - the
+# markup is small and the CF_HTML offsets are the only fiddly part.
+
+_RICH_COLOURS = {
+    "red": "ff3b30", "green": "34c759", "blue": "007aff",
+    "yellow": "ffcc00", "orange": "ff9500", "purple": "af52de",
+    "pink": "ff2d55", "white": "ffffff", "black": "000000",
+    "grey": "8e8e93", "gray": "8e8e93", "cyan": "32ade6",
+    "brown": "a2845e",
+}
+
+
+def _rich_hex(value):
+    """A named colour or #rrggbb to (r, g, b), or None."""
+    s = str(value or "").strip().lower()
+    if not s:
+        return None
+    if not s.startswith("#"):
+        s = _RICH_COLOURS.get(s, "")
+        if not s:
+            return None
+    s = s.lstrip("#")
+    if len(s) == 3:
+        s = "".join(ch * 2 for ch in s)
+    if len(s) != 6:
+        return None
+    try:
+        return (int(s[0:2], 16), int(s[2:4], 16), int(s[4:6], 16))
+    except ValueError:
+        return None
+
+
+def _rich_rtf_text(s):
+    """RTF body escapes: braces and backslashes, and anything non-ascii as a
+    \\uNNNN escape, because the RTF header claims a single-byte code page."""
+    out = []
+    for ch in str(s or ""):
+        if ch in "\\{}":
+            out.append("\\" + ch)
+        elif ord(ch) < 128:
+            out.append(ch)
+        else:
+            n = ord(ch)
+            if n > 0xFFFF:  # outside the BMP: a surrogate pair
+                n -= 0x10000
+                hi = 0xD800 + (n >> 10)
+                lo = 0xDC00 + (n & 0x3FF)
+                out.append("\\u%d?\\u%d?" % (hi, lo))
+            else:
+                out.append("\\u%d?" % n)
+    return "".join(out)
+
+
+def _rich_rtf(text, fg, bg, bold, half_pt, mono):
+    table = [";"]
+    idx_fg = idx_bg = 0
+    if fg:
+        idx_fg = len(table)
+        table.append("\\red%d\\green%d\\blue%d;" % fg)
+    if bg:
+        idx_bg = len(table)
+        table.append("\\red%d\\green%d\\blue%d;" % bg)
+    font = "{\\f1\\fmodern Consolas;}" if mono else "{\\f0\\fswiss Segoe UI;}"
+    cmd = ["\\pard\\plain ", "\\f1" if mono else "\\f0"]
+    if half_pt:
+        cmd.append("\\fs%d" % half_pt)
+    if idx_fg:
+        cmd.append("\\cf%d" % idx_fg)
+    if idx_bg:
+        cmd.append("\\chcbpat%d" % idx_bg)
+    if bold:
+        cmd.append("\\b")
+    body = _rich_rtf_text(text)
+    if bold:
+        body += "\\b0"
+    return ("{\\rtf1\\ansi\\ansicpg1252\\deff0{\\fonttbl%s}"
+            "{\\colortbl%s}%s %s\\par\n}" % (font, "".join(table),
+                                            "".join(cmd), body))
+
+
+def _rich_html_fragment(text, fg, bg, bold, size, mono):
+    import html as _html
+    css = []
+    if fg:
+        css.append("color:#%02x%02x%02x" % fg)
+    if bg:
+        css.append("background-color:#%02x%02x%02x" % bg)
+    if bold:
+        css.append("font-weight:bold")
+    if size:
+        css.append("font-size:%gpt" % size)
+    if mono:
+        css.append("font-family:Consolas,'Courier New',monospace")
+    inner = _html.escape(str(text or "")).replace("\n", "<br>")
+    return '<span style="%s">%s</span>' % (";".join(css), inner)
+
+
+def _rich_cf_html(fragment):
+    """The CF_HTML header carries byte offsets into itself. The numbers are
+    zero padded to a fixed width, so the header is the same length whatever the
+    offsets turn out to be - build it once to learn that length, then again with
+    the real numbers in it."""
+    head = ("Version:1.0\r\nStartHTML:%010d\r\nEndHTML:%010d\r\n"
+            "StartFragment:%010d\r\nEndFragment:%010d\r\n")
+    start_html = len(head % (0, 0, 0, 0))
+    prefix = "<html><body>\r\n<!--StartFragment-->"
+    suffix = "<!--EndFragment-->\r\n</body></html>"
+    start_frag = start_html + len(prefix.encode("utf-8"))
+    end_frag = start_frag + len(fragment.encode("utf-8"))
+    end_html = end_frag + len(suffix.encode("utf-8"))
+    return (head % (start_html, end_html, start_frag, end_frag)
+            + prefix + fragment + suffix).encode("utf-8")
+
+
+def _set_clipboard_rich(rich_rtf, html_bytes, plain):
+    """Fill the clipboard with all three flavours at once."""
+    if os.name != "nt":
+        # no CF_HTML on the other desktops; the best a terminal can do is text
+        out = None
+        for cmd in (["wl-copy"], ["xclip", "-selection", "clipboard"],
+                    ["xsel", "--clipboard", "--input"]):
+            try:
+                p = subprocess.run(cmd, input=str(plain).encode("utf-8"),
+                                   timeout=10)
+                if p.returncode == 0:
+                    out = " ".join(cmd)
+                    break
+            except Exception:
+                continue
+        if not out:
+            return {"error": "no clipboard tool found (need xclip, xsel or "
+                             "wl-copy on this system)"}
+        return {"via": out, "flavours": ["text"]}
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except Exception as exc:
+        return {"error": "ctypes is unavailable: %s" % exc}
+    u32 = ctypes.WinDLL("user32", use_last_error=True)
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    u32.RegisterClipboardFormatW.restype = wintypes.UINT
+    u32.RegisterClipboardFormatW.argtypes = [wintypes.LPCWSTR]
+    k32.GlobalAlloc.restype = wintypes.HGLOBAL
+    k32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+    k32.GlobalLock.restype = ctypes.c_void_p
+    k32.GlobalLock.argtypes = [wintypes.HGLOBAL]
+    k32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
+    u32.SetClipboardData.restype = wintypes.HANDLE
+    u32.SetClipboardData.argtypes = [wintypes.UINT, wintypes.HANDLE]
+    CF_UNICODETEXT = 13
+    GMEM_MOVEABLE = 0x0002
+    rtf_fmt = u32.RegisterClipboardFormatW("Rich Text Format")
+    html_fmt = u32.RegisterClipboardFormatW("HTML Format")
+    if not u32.OpenClipboard(None):
+        return {"error": "another program is holding the clipboard: %s"
+                         % ctypes.WinError(ctypes.get_last_error())}
+    try:
+        u32.EmptyClipboard()
+        items = [(CF_UNICODETEXT, str(plain).encode("utf-16-le") + b"\x00\x00")]
+        if rtf_fmt:
+            items.append((rtf_fmt, rich_rtf.encode("ascii", "replace")))
+        if html_fmt:
+            items.append((html_fmt, html_bytes))
+        for fmt, data in items:
+            handle = k32.GlobalAlloc(GMEM_MOVEABLE, len(data))
+            if not handle:
+                return {"error": "out of memory for the clipboard"}
+            ptr = k32.GlobalLock(handle)
+            if not ptr:
+                k32.GlobalFree(handle)
+                return {"error": "could not lock the clipboard"}
+            try:
+                ctypes.memmove(ptr, data, len(data))
+            finally:
+                k32.GlobalUnlock(handle)
+            if not u32.SetClipboardData(fmt, handle):
+                k32.GlobalFree(handle)
+                return {"error": "the clipboard refused format %d" % fmt}
+    finally:
+        u32.CloseClipboard()
+    return {"flavours": ["text", "rtf", "html"]}
+
+
+def _rich_text(args):
+    text = args.get("text")
+    if text is None or not str(text):
+        return {"error": "text is required"}
+    text = str(text)
+    fg = _rich_hex(args.get("color"))
+    bg = _rich_hex(args.get("bg"))
+    bold = bool(args.get("bold"))
+    mono = bool(args.get("monospace"))
+    size = args.get("size")
+    try:
+        size = float(size) if size not in (None, "") else None
+    except (TypeError, ValueError):
+        size = None
+    if size is not None:
+        size = max(6.0, min(72.0, size))
+    if args.get("color") and not fg:
+        return {"error": "color must be a name or #rrggbb, not %r"
+                         % args.get("color")}
+    if args.get("bg") and not bg:
+        return {"error": "bg must be a name or #rrggbb, not %r" % args.get("bg")}
+
+    half_pt = int(round(size * 2)) if size else None
+    rtf = _rich_rtf(text, fg, bg, bold, half_pt, mono)
+    frag = _rich_html_fragment(text, fg, bg, bold, size, mono)
+    cf_html = _rich_cf_html(frag)
+    try:
+        put = _set_clipboard_rich(rtf, cf_html, text)
+    except Exception as exc:
+        return {"error": "could not use the clipboard: %s" % exc}
+    if put.get("error"):
+        return put
+
+    action = str(args.get("action") or "copy").strip().lower()
+    result = {"result": "ok", "action": action, "chars": len(text)}
+    result.update({k: v for k, v in put.items() if k != "error"})
+    if action == "copy":
+        result["note"] = ("on the clipboard as plain text, RTF and HTML; "
+                          "use action=paste or send to put it in a chat box")
+        return result
+
+    # paste, or paste and send
+    pasted = sent = False
+    try:
+        import pyautogui
+        # ask the page to put the caret in its own input first, so the paste
+        # does not land in whatever the user happened to be looking at
+        _UI_FOCUS.set()
+        time.sleep(0.6)
+        pyautogui.hotkey("ctrl", "v")
+        pasted = True
+        time.sleep(0.35)
+        if action == "send":
+            pyautogui.press("enter")
+            sent = True
+    except Exception as exc:
+        result["pasted"] = False
+        result["error"] = "clipboard is set, but pasting failed: %s" % exc
+        return result
+    result["pasted"] = pasted
+    result["sent"] = sent
+    return result
+
+
 def _url_ok(url):
     return str(url or "").strip().lower().startswith(("http://", "https://"))
-
 
 def _name_from_response(url, headers):
     """Best filename for a download: Content-Disposition, then the URL path."""
@@ -10095,6 +10397,8 @@ def _execute_tool_call(name, args, tc, hooks, image_uri):
         raw_result = _control_input(args)
     elif name == "clipboard":
         raw_result = _clipboard(args)
+    elif name == "rich_text":
+        raw_result = _rich_text(args)
     elif name == "download_file":
         raw_result = _download_file(args)
     elif name == "web_resolve":
@@ -11126,6 +11430,18 @@ PAGE = """<!doctype html>
   .askbox .opts { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
   .askbox .opt { background: var(--bg3); border: 1px solid var(--bd2); color: var(--txt2); border-radius: 10px; padding: 8px 14px; cursor: pointer; font-size: 13px; font-family: Consolas, monospace; }
   .askbox .opt:hover { background: var(--bg4); border-color: var(--acc); color: var(--txt); }
+  .askbox .opt.hasdesc { display: flex; flex-direction: column; align-items: flex-start; gap: 3px; text-align: left; padding: 9px 14px; max-width: 260px; }
+  .askbox .opt .olab { font-weight: 700; color: var(--txt); }
+  .askbox .opt .odesc { font-size: 12px; color: var(--mut); line-height: 1.35; font-weight: 400; }
+  .askbox .opt.picked { border-color: var(--acc); background: var(--bg4); box-shadow: 0 0 0 1px var(--acc) inset; }
+  .askbox .opt.picked .olab { color: var(--acc); }
+  .askbox .opt.allow { border-color: #2f7d5b; }
+  .askbox .opt.deny { border-color: #7d3040; }
+  .askbox .aqcard { border-top: 1px solid var(--bd2); margin-top: 14px; padding-top: 4px; }
+  .askbox .aqcard:first-of-type { border-top: none; margin-top: 0; padding-top: 0; }
+  .askbox .aall { display: flex; justify-content: flex-end; margin-top: 16px; }
+  .askbox .asubmit { background: var(--acc); color: #04212e; border: none; border-radius: 10px; padding: 10px 18px; font-weight: 700; cursor: pointer; font-size: 14px; font-family: Consolas, monospace; }
+  .askbox .asubmit:hover { filter: brightness(1.08); }
   .askbox .afree { display: flex; gap: 8px; margin-top: 14px; }
   .askbox .afree input { flex: 1; min-width: 0; background: var(--bg3); border: 1px solid var(--bd2); border-radius: 10px; padding: 10px; color: var(--txt); font-size: 14px; font-family: Consolas, monospace; outline: none; }
   .askbox .afree input:focus { border-color: var(--acc); }
@@ -12203,17 +12519,65 @@ function onStats(j) {
 // note once it is clear the wait is real.
 var waitTimer = null;
 function clearWaitWatch() { if (waitTimer) { clearInterval(waitTimer); waitTimer = null; } }
+/* One line that says what is actually going on. It said "The model is loading"
+   for the whole wait, which is wrong the moment anything else happens: the
+   model is not loading while a shell command runs or an edit is being written.
+   It is also wrong when nothing is loading at all, which is the usual case. */
+const ACTIVITY = {
+  shell: 'Executing shell', run: 'Executing shell', execute: 'Executing shell',
+  write_file: 'Preparing edit', write: 'Preparing edit', create_file: 'Preparing edit',
+  edit_file: 'Preparing edit', edit: 'Preparing edit', apply_patch: 'Preparing edit',
+  read_file: 'Reading the file', read: 'Reading the file', view: 'Reading the file',
+  list_dir: 'Listing the folder', ls: 'Listing the folder', glob: 'Listing the folder',
+  search: 'Searching the folder', grep: 'Searching the folder',
+  web_search: 'Searching the web', fetch: 'Fetching a page',
+  screenshot: 'Taking a screenshot', question: 'Waiting for your answer',
+  rich_text: 'Pasting rich text', todo_write: 'Writing the to-do list',
+  memory: 'Writing a memory'
+};
+function activityFor(name) {
+  const k = String(name || '').toLowerCase();
+  if (ACTIVITY[k]) return ACTIVITY[k];
+  return 'Running ' + (k.replace(/_/g, ' ') || 'a tool');
+}
+function setStatus(text) {
+  const row = (typeof thinkingRow !== 'undefined' && thinkingRow) || window.thinkingRow;
+  if (!row || !row.think || !row.think.isConnected) return;
+  const t = row.think;
+  t.textContent = '';
+  const d = document.createElement('span');
+  d.className = 'dots';
+  for (let i = 0; i < 3; i++) d.appendChild(document.createElement('i'));
+  t.appendChild(d);
+  t.appendChild(document.createTextNode(' ' + text));
+}
+/* Put the caret in the chat box and get it ready to receive a paste. The page
+   is the only thing that can focus its own input, so a tool that is about to
+   press Ctrl+V asks for this first. */
+function focusChatInput() {
+  try {
+    const el = document.getElementById('user-input');
+    if (!el) return false;
+    el.focus();
+    try { el.scrollIntoView({ block: 'nearest' }); } catch (e) {}
+    return document.activeElement === el;
+  } catch (e) { return false; }
+}
 function showLoading() {
   const row = thinkingRow;
   if (!row || !row.think || !row.think.isConnected) { clearWaitWatch(); return; }
-  row.think.innerHTML = '<span class="dots"><i></i><i></i><i></i></span> The model is loading';
+  setStatus('Waking the model');
 }
 function startWaitWatch() {
   clearWaitWatch();
+  /* This used to swap the label for "The model is loading" after six seconds of
+     silence. Silence is not evidence of a load - a long tool run and a long
+     opening thought are both silent - and it fired often enough to say the
+     model was loading while a shell command was still running. The server
+     sends a real `waiting` event when it is actually starting a model, and only
+     that may claim it. */
   waitTimer = setInterval(function () {
-    if (!thinkingRow || !thinkingRow.think || !thinkingRow.think.isConnected) { clearWaitWatch(); return; }
-    clearWaitWatch();
-    showLoading();
+    if (!thinkingRow || !thinkingRow.think || !thinkingRow.think.isConnected) clearWaitWatch();
   }, 6000);
 }
 function addThinking() {
@@ -12222,7 +12586,7 @@ function addThinking() {
   const av = document.createElement('div'); av.className = 'av bonsai'; av.textContent = 'B';
   const b = document.createElement('div'); b.className = 'bubble';
   const t = document.createElement('div'); t.className = 'think';
-  t.innerHTML = '<span class="dots"><i></i><i></i><i></i></span> processing...';
+  t.innerHTML = '<span class="dots"><i></i><i></i><i></i></span> Starting';
   b.appendChild(t);
   row.appendChild(av); row.appendChild(b);
   convEl().appendChild(row);
@@ -12424,24 +12788,15 @@ function onAsk(j) {
   const ov = document.createElement('div'); ov.className = 'askov'; ov.id = 'askov';
   const box = document.createElement('div'); box.className = 'askbox';
   const perm = j.kind === 'path_approval';
-  const h = document.createElement('h4');
-  h.textContent = perm ? 'PERMISSION NEEDED' : 'BONSAI is asking you';
-  box.appendChild(h);
   if (perm) {
+    const h = document.createElement('h4');
+    h.textContent = 'PERMISSION NEEDED';
+    box.appendChild(h);
     const p = document.createElement('div'); p.className = 'askpath';
     p.textContent = j.path || '';
     const w = document.createElement('div'); w.className = 'asktool';
     w.textContent = 'tool: ' + (j.tool || 'file tool') + '  -  outside the workspace';
     box.appendChild(p); box.appendChild(w);
-  } else {
-    if (j.header) {
-      const hh = document.createElement('div'); hh.className = 'aqhead';
-      hh.textContent = j.header;
-      box.appendChild(hh);
-    }
-    const q = document.createElement('div'); q.className = 'aq';
-    q.textContent = j.question || 'What should I do?';
-    box.appendChild(q);
   }
   const say = function (ans) {
     ov.remove();
@@ -12449,33 +12804,138 @@ function onAsk(j) {
     fetch('/api/answer', { method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ id: j.id, answer: ans }) }).catch(function () {});
   };
-  if (j.options && j.options.length) {
-    const opts = document.createElement('div'); opts.className = 'opts';
-    (j.options).forEach(function (o) {
-      const b = document.createElement('button');
-      b.className = 'opt' + (/^ALLOW/.test(o) ? ' allow' : (/^DENY/.test(o) ? ' deny' : ''));
-      b.textContent = o;
-      b.onclick = function () { say(o); };
-      opts.appendChild(b);
-    });
-    box.appendChild(opts);
-  }
   if (perm) {
+    if (j.options && j.options.length) {
+      const opts = document.createElement('div'); opts.className = 'opts';
+      j.options.forEach(function (o) {
+        const label = (o && typeof o === 'object') ? (o.label || '') : String(o);
+        const b = document.createElement('button');
+        b.className = 'opt' + (/^ALLOW/.test(label) ? ' allow' : (/^DENY/.test(label) ? ' deny' : ''));
+        b.textContent = label;
+        b.onclick = function () { say(label); };
+        opts.appendChild(b);
+      });
+      box.appendChild(opts);
+    }
     ov.appendChild(box);
     document.body.appendChild(ov);
     return;
   }
-  const free = document.createElement('div'); free.className = 'afree';
-  const inp = document.createElement('input'); inp.placeholder = 'Type your answer...';
-  const btn = document.createElement('button'); btn.textContent = 'SEND';
-  const go = function () { const v = inp.value.trim(); if (v) say(v); };
-  btn.onclick = go;
-  inp.onkeydown = function (e) { if (e.key === 'Enter') { e.preventDefault(); go(); } };
-  free.appendChild(inp); free.appendChild(btn);
-  box.appendChild(free);
+
+  /* How many things are being asked. A model that needs one thing gets one
+     card and a single box. A model that asks three gets three cards, each with
+     its own choices, answered together - so a follow-up question is not
+     silently dropped on the floor. */
+  const asked = (Array.isArray(j.questions) && j.questions.length)
+    ? j.questions
+    : [{ question: j.question || 'What should I do?', header: j.header || '',
+         options: j.options || [] }];
+  const many = asked.length > 1;
+
+  const h = document.createElement('h4');
+  h.textContent = many ? ('BONSAI has ' + asked.length + ' questions') : 'BONSAI is asking you';
+  box.appendChild(h);
+
+  const picks = [];
+  const inputs = [];
+  asked.forEach(function (one, idx) {
+    const card = document.createElement('div'); card.className = 'aqcard';
+    if (one.header) {
+      const hh = document.createElement('div'); hh.className = 'aqhead';
+      hh.textContent = (many ? (idx + 1) + '. ' : '') + one.header;
+      card.appendChild(hh);
+    }
+    const q = document.createElement('div'); q.className = 'aq';
+    q.textContent = one.question || one.header || 'What should I do?';
+    card.appendChild(q);
+
+    /* Choices are only drawn when there are any. A plain question stays a
+       plain question with a box to type in. */
+    const opts = one.options || [];
+    if (opts.length) {
+      const row = document.createElement('div'); row.className = 'opts';
+      picks[idx] = '';
+      opts.forEach(function (o) {
+        const label = (o && typeof o === 'object') ? String(o.label || '') : String(o);
+        const desc = (o && typeof o === 'object') ? String(o.description || '') : '';
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.className = 'opt' + (desc ? ' hasdesc' : '')
+          + (/^ALLOW/i.test(label) ? ' allow' : (/^DENY/i.test(label) ? ' deny' : ''));
+        const t = document.createElement('span'); t.className = 'olab'; t.textContent = label;
+        b.appendChild(t);
+        if (desc) {
+          const d = document.createElement('span'); d.className = 'odesc'; d.textContent = desc;
+          b.appendChild(d);
+        }
+        b.onclick = function () {
+          picks[idx] = label;
+          Array.from(row.children).forEach(function (n) { n.classList.remove('picked'); });
+          b.classList.add('picked');
+          const inp = inputs[idx];
+          if (inp) { inp.value = ''; inp.placeholder = 'or type your own answer...'; }
+          if (!many) say(label);
+        };
+        row.appendChild(b);
+      });
+      card.appendChild(row);
+    } else {
+      picks[idx] = '';
+    }
+
+    const free = document.createElement('div'); free.className = 'afree';
+    const inp = document.createElement('input');
+    inp.className = 'ain';
+    inp.placeholder = 'Type your answer...';
+    const btn = document.createElement('button');
+    btn.type = 'button'; btn.textContent = many ? 'NEXT' : 'SEND';
+    const submit = function () {
+      const typed = inp.value.trim();
+      const val = typed || picks[idx] || '';
+      if (!many) { if (val) say(val); return; }
+      picks[idx] = val;
+      if (idx < asked.length - 1) { inputs[idx + 1].focus(); return; }
+      say(asked.map(function (_, k) { return picks[k]; }));
+    };
+    btn.onclick = submit;
+    inp.onkeydown = function (e) {
+      if (e.key !== 'Enter') return;
+      e.preventDefault();
+      if (many && !inp.value.trim() && picks[idx] && idx < asked.length - 1) {
+        picks[idx] = picks[idx];
+        inputs[idx + 1].focus();
+        return;
+      }
+      submit();
+    };
+    free.appendChild(inp); free.appendChild(btn);
+    card.appendChild(free);
+    inputs[idx] = inp;
+    box.appendChild(card);
+  });
+
+  if (many) {
+    const all = document.createElement('div'); all.className = 'aall';
+    const b = document.createElement('button');
+    b.type = 'button'; b.className = 'asubmit'; b.textContent = 'SEND ALL ANSWERS';
+    b.onclick = function () {
+      asked.forEach(function (_, k) {
+        const typed = inputs[k].value.trim();
+        if (typed) picks[k] = typed;
+      });
+      if (picks.every(function (p) { return p; })) {
+        say(asked.map(function (_, k) { return picks[k]; }));
+      } else {
+        inputs[picks.findIndex(function (p) { return !p; })].focus();
+      }
+    };
+    all.appendChild(b);
+    box.appendChild(all);
+  }
+
   ov.appendChild(box);
   document.body.appendChild(ov);
-  inp.focus();
+  inputs[0].focus();
 }
 
 function renderTodo(items) {
@@ -12571,6 +13031,7 @@ async function streamRun(messages, chat, anchorMsg) {
         let j; try { j = JSON.parse(data); } catch (e) { continue; }
         if (ev === 'start') { setModelStatus(!!j.model_ready, !j.model_ready); }
         else if (ev === 'waiting') { showLoading(); }
+        else if (ev === 'focus') { focusChatInput(); }
         else if (ev === 'delta') { if (!modelUp) { modelUp = true; setModelStatus(true, false); } reply += j.text; onDelta(j.text); statsVals.respond_ms = Date.now() - startedAt; }
         else if (ev === 'reason') { if (!modelUp) { modelUp = true; setModelStatus(true, false); } reason += j.text; onReason(j.text); setBonsaiState('thinking'); statsVals.think_ms = Date.now() - startedAt; }
         else if (ev === 'tool') { if (!modelUp) { modelUp = true; setModelStatus(true, false); } calls.push(j.call); onTool(j.call); setBonsaiState('tools'); }
@@ -14652,17 +15113,65 @@ function addToolLog(container, calls) {
 // the same lie, and the fix is the same - never abandon a turn on a timer
 var waitTimer = null;
 function clearWaitWatch() { if (waitTimer) { clearInterval(waitTimer); waitTimer = null; } }
+/* One line that says what is actually going on. It said "The model is loading"
+   for the whole wait, which is wrong the moment anything else happens: the
+   model is not loading while a shell command runs or an edit is being written.
+   It is also wrong when nothing is loading at all, which is the usual case. */
+const ACTIVITY = {
+  shell: 'Executing shell', run: 'Executing shell', execute: 'Executing shell',
+  write_file: 'Preparing edit', write: 'Preparing edit', create_file: 'Preparing edit',
+  edit_file: 'Preparing edit', edit: 'Preparing edit', apply_patch: 'Preparing edit',
+  read_file: 'Reading the file', read: 'Reading the file', view: 'Reading the file',
+  list_dir: 'Listing the folder', ls: 'Listing the folder', glob: 'Listing the folder',
+  search: 'Searching the folder', grep: 'Searching the folder',
+  web_search: 'Searching the web', fetch: 'Fetching a page',
+  screenshot: 'Taking a screenshot', question: 'Waiting for your answer',
+  rich_text: 'Pasting rich text', todo_write: 'Writing the to-do list',
+  memory: 'Writing a memory'
+};
+function activityFor(name) {
+  const k = String(name || '').toLowerCase();
+  if (ACTIVITY[k]) return ACTIVITY[k];
+  return 'Running ' + (k.replace(/_/g, ' ') || 'a tool');
+}
+function setStatus(text) {
+  const row = (typeof thinkingRow !== 'undefined' && thinkingRow) || window.thinkingRow;
+  if (!row || !row.think || !row.think.isConnected) return;
+  const t = row.think;
+  t.textContent = '';
+  const d = document.createElement('span');
+  d.className = 'dots';
+  for (let i = 0; i < 3; i++) d.appendChild(document.createElement('i'));
+  t.appendChild(d);
+  t.appendChild(document.createTextNode(' ' + text));
+}
+/* Put the caret in the chat box and get it ready to receive a paste. The page
+   is the only thing that can focus its own input, so a tool that is about to
+   press Ctrl+V asks for this first. */
+function focusChatInput() {
+  try {
+    const el = document.getElementById('user-input');
+    if (!el) return false;
+    el.focus();
+    try { el.scrollIntoView({ block: 'nearest' }); } catch (e) {}
+    return document.activeElement === el;
+  } catch (e) { return false; }
+}
 function showLoading() {
   const row = thinkingRow;
   if (!row || !row.think || !row.think.isConnected) { clearWaitWatch(); return; }
-  row.think.innerHTML = '<span class="dots"><i></i><i></i><i></i></span> The model is loading';
+  setStatus('Waking the model');
 }
 function startWaitWatch() {
   clearWaitWatch();
+  /* This used to swap the label for "The model is loading" after six seconds of
+     silence. Silence is not evidence of a load - a long tool run and a long
+     opening thought are both silent - and it fired often enough to say the
+     model was loading while a shell command was still running. The server
+     sends a real `waiting` event when it is actually starting a model, and only
+     that may claim it. */
   waitTimer = setInterval(function () {
-    if (!thinkingRow || !thinkingRow.think || !thinkingRow.think.isConnected) { clearWaitWatch(); return; }
-    clearWaitWatch();
-    showLoading();
+    if (!thinkingRow || !thinkingRow.think || !thinkingRow.think.isConnected) clearWaitWatch();
   }, 6000);
 }
 function addReasonBox(container, text, live) {
@@ -14986,6 +15495,7 @@ async function streamRun(messages, chat, anchorMsg) {
         let j; try { j = JSON.parse(data); } catch (e) { continue; }
         if (ev === 'start') { if (j.workdir) setWorkdirInUI(j.workdir); setState('idle'); }
         else if (ev === 'waiting') { showLoading(); }
+        else if (ev === 'focus') { focusChatInput(); }
         else if (ev === 'delta') { reply += j.text; onDelta(j.text); statsVals.respond_ms = Date.now() - startedAt; }
         else if (ev === 'reason') { reason += j.text; onReason(j.text); setState('thinking'); statsVals.think_ms = Date.now() - startedAt; }
         else if (ev === 'tool') { calls.push(j.call); onTool(j.call); setState('tools'); }
@@ -15907,8 +16417,22 @@ _OC_CSS = (
     '  .ocstep > summary::-webkit-details-marker { display: none; }\n'
     '  .ocstep > summary:hover { background: var(--bg3); color: var(--txt); }\n'
     '  .ocstep .ocg { flex: 0 0 auto; width: 11px; text-align: center; color: var(--acc); }\n'
+    '  .ocstatus { display: flex; align-items: center; gap: 8px; margin: 6px 0 2px 44px;\n'
+    '             font-size: 12.5px; color: var(--mut); font-family: Consolas, monospace; }\n'
+    '  .ocstatus .ocs { color: var(--acc); animation: ocpulse 1.1s ease-in-out infinite; }\n'
+    '  @keyframes ocpulse { 0%, 100% { opacity: .25; } 50% { opacity: 1; } }\n'
+    '  @media (prefers-reduced-motion: reduce) { .ocstatus .ocs { animation: none; } }\n'
     '  .ocstep.thought .ocg { color: var(--violet); }\n'
     '  .ocstep.err .ocg { color: var(--err); }\n'
+    '  /* while the model is still in this block of reasoning the + turns and the\n'
+    '     label says Thinking; when the block ends it stops and reads Thought */\n'
+    '  .ocstep.thought.live .ocg { animation: ocspin 1.05s linear infinite; }\n'
+    '  .ocstep.thought.live .ocn { color: var(--violet); }\n'
+    '  .ocstep.thought.live > summary { cursor: default; }\n'
+    '  @keyframes ocspin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }\n'
+    '  @media (prefers-reduced-motion: reduce) {\n'
+    '    .ocstep.thought.live .ocg { animation: none; }\n'
+    '  }\n'
     '  .ocstep .ocn { font-weight: 700; color: var(--txt); }\n'
     '  .ocstep .ocd { color: var(--mut); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1 1 auto; }\n'
     '  .ocstep .ocd .ocq { color: var(--txt2); }\n'
@@ -16006,7 +16530,7 @@ _OC_JS = (
     '  var OCS = {\n'
     '    steps: null, bubble: null, since: 0, thinkShown: false, running: false,\n'
     "    thinkMs: 0, roundText: '', thoughtNode: null, tailMs: 0,\n"
-    '    last: null, pending: 0, timer: null,\n'
+    '    last: null, pending: 0, timer: null, tick: null, status: null,\n'
     '    /* ordered skeleton of the answer, so a reload can replay the transcript\n'
     "       exactly as it streamed: {k:'c',i} tool call, {k:'t',v} text,\n"
     "       {k:'r',ms,v} reasoning that came after the last tool call */\n"
@@ -16393,6 +16917,56 @@ _OC_JS = (
     '    return d;\n'
     '  }\n'
     '\n'
+    '  /* ---------- a thought that is still happening ----------\n'
+    '     The entry goes on screen as soon as the reasoning starts, spinning, and\n'
+    '     only becomes "Thought" when the block ends - at a tool call, or at the\n'
+    '     end of the turn. The clock is measured from the start of the block\n'
+    '     rather than taken once at the end, and it ticks while it runs, because\n'
+    '     a thought that read 0.0s for thirty seconds looked broken. */\n'
+    '  function thoughtLive(text) {\n'
+    '    var box = orderedBox();\n'
+    '    if (!box) return null;\n'
+    '    textClose();\n'
+    '    if (OCS.thoughtNode) thoughtClose();\n'
+    '    var d = thoughtStep(0, text);\n'
+    "    d.classList.add('live');\n"
+    "    var lab = d.querySelector('.ocn');\n"
+    "    if (lab) lab.textContent = 'Thinking';\n"
+    '    d.__ocSince = Date.now();\n'
+    '    d.__ocOpen = true;\n'
+    '    d.__ocText = text || "";\n'
+    '    box.appendChild(d);\n'
+    '    OCS.thoughtNode = d;\n'
+    '    OCS.last = d;\n'
+    '    tickThought();\n'
+    '    return d;\n'
+    '  }\n'
+    '  function tickThought() {\n'
+    '    stopTick();\n'
+    '    OCS.tick = setInterval(function () {\n'
+    '      var n = OCS.thoughtNode;\n'
+    '      if (!n || !n.__ocOpen) { stopTick(); return; }\n'
+    "      var lab = n.querySelector('.ocn');\n"
+    "      if (lab) lab.textContent = 'Thinking: ' + secs(Date.now() - n.__ocSince);\n"
+    '    }, 100);\n'
+    '  }\n'
+    '  function stopTick() {\n'
+    '    if (OCS.tick) { clearInterval(OCS.tick); OCS.tick = null; }\n'
+    '  }\n'
+    '  function thoughtClose() {\n'
+    '    var n = OCS.thoughtNode;\n'
+    '    stopTick();\n'
+    '    if (!n) return;\n'
+    "    var ms = Math.max(0, Date.now() - (n.__ocSince || Date.now()));\n"
+    "    n.classList.remove('live');\n"
+    "    var lab = n.querySelector('.ocn');\n"
+    "    if (lab) lab.textContent = 'Thought: ' + secs(ms);\n"
+    '    n.__ocMs = ms;\n'
+    '    n.__ocOpen = false;\n'
+    '    /* the saved history carries the real duration, not the round start */\n'
+    '    if (OCS.thoughtPart) OCS.thoughtPart.ms = ms;\n'
+    '  }\n'
+    '\n'
     '  /* ---------- live step plumbing ---------- */\n'
     '  function scrollSafe() {\n'
     "    try { if (typeof scrollBottom === 'function') scrollBottom(); } catch (e) {}\n"
@@ -16404,7 +16978,7 @@ _OC_JS = (
     '    if (!OCS.thinkShown) OCS.thinkShown = true;\n'
      '    /* a tool call ends the block of reasoning before it, so whatever comes\n'
      '       after it is a new thought and not a continuation of this one */\n'
-     '    if (OCS.thoughtNode) { showThought(true); OCS.thoughtNode.__ocOpen = false; OCS.roundText = \'\'; }\n'
+     '    if (OCS.thoughtNode) { showThought(true); thoughtClose(); OCS.thoughtNode.__ocOpen = false; OCS.roundText = \'\'; }\n'
     '    /* anything said before this tool call belongs above it */\n'
     '    textClose();\n'
     '    var d = stepFor(call);\n'
@@ -16414,8 +16988,53 @@ _OC_JS = (
     '    scrollSafe();\n'
     '    return d;\n'
     '  }\n'
-    '  function clearChips() {\n'
-    '    if (!OCS.bubble) return;\n'
+    '  /* ---------- what it is doing right now ----------\n'
+    '     A line of its own, above the steps, that lives for the whole turn.\n'
+    '     The waiting bubble it used to live in is gone the moment the model\n'
+    '     says anything, so a tool running two rounds later had nowhere to say\n'
+    '     what it was - and the one string that was there for the entire wait\n'
+    '     said the model was loading, which is only true for a moment of it. */\n'
+    '  function statusLine() {\n'
+    '    /* Anchored to the conversation itself, not to the bubble: the bubble is\n'
+    '       rebuilt and moved as the answer is put in its final place, and a line\n'
+    '       left behind as its sibling ends up in a tree that is off the page.\n'
+    '       "isConnected" is not enough on its own - the app can swap in a new\n'
+    '       conversation and leave the old one in the document, so a line in\n'
+    '       there still looks connected and is still on screen to nobody. It has\n'
+    '       to be in the conversation that is on the page right now. */\n'
+    "    var host = document.getElementById('chat-container');\n"
+    '    if (!host) return null;\n'
+    '    if (OCS.status && host.contains(OCS.status.row)) return OCS.status;\n'
+    '    OCS.status = null;\n'
+    "    var row = OCS.bubble && OCS.bubble.parentNode;\n"
+    "    var d = el('div', 'ocstatus');\n"
+    "    var g = el('span', 'ocs', '\\u25cf');\n"
+    "    var t = el('span', 'oct2');\n"
+    '    d.appendChild(g); d.appendChild(t);\n'
+    '    if (row && row.parentNode === host) host.insertBefore(d, row);\n'
+    '    else host.appendChild(d);\n'
+    '    OCS.status = { row: d, glyph: g, text: t };\n'
+    '    return OCS.status;\n'
+    '  }\n'
+    '  function setActivity(text) {\n'
+    '    var s = statusLine();\n'
+    '    if (!s) return;\n'
+    '    s.text.textContent = text;\n'
+    '    /* a record of what was said and when, which is the only way to tell\n'
+    '       after the fact whether the line was up while a tool was running */\n'
+    '    try {\n'
+    '      (window.__ocAct = window.__ocAct || []).push(\n'
+    '        Math.round(Date.now() / 100) + \' \' + text);\n'
+    '    } catch (e) {}\n'
+    '  }\n'
+    '  function clearActivity() {\n'
+    '    if (OCS.status && OCS.status.row && OCS.status.row.parentNode) {\n'
+    '      OCS.status.row.parentNode.removeChild(OCS.status.row);\n'
+    '    }\n'
+    '    OCS.status = null;\n'
+    '  }\n'
+    '\n'
+    '  function clearChips() {\n'    '    if (!OCS.bubble) return;\n'
     '    /* the two consoles spell their legacy tool UI differently:\n'
     '       PAGE uses .toolchip/.pills/.toollog, PAGE_GPT uses .toolsline/.tlog.\n'
     '       .reasonbox is the old "Thinking (BONSAI) - N chars" box: its text now\n'
@@ -16439,6 +17058,7 @@ _OC_JS = (
     '      if (!t || !t.b) return;\n'
     '      if (OCS.bubble !== t.b) {\n'
     '        /* a new assistant bubble: drop all per-run state */\n'
+    '        clearActivity();\n'
     '        OCS.bubble = t.b;\n'
     '        OCS.steps = null;\n'
     '        OCS.last = null;\n'
@@ -16577,14 +17197,13 @@ _OC_JS = (
      '       reasoning was entered twice. */\n'
      '    if (OCS.thoughtNode && OCS.thoughtNode.__ocText === OCS.roundText) return;\n'
      '    var box = orderedBox();\n'
-    '    if (!box) return;\n'
-    '    /* text before this thought is finished */\n'
-    '    textClose();\n'
-    '    var node = thoughtStep(OCS.thinkMs, OCS.roundText);\n'
+     '    if (!box) return;\n'
+     '    /* text before this thought is finished */\n'
+     '    textClose();\n'
+     '    var node = thoughtLive(OCS.roundText);\n'
+    '    if (!node) return;\n'
     '    node.__ocText = OCS.roundText;\n'
     '    node.__ocOpen = true;\n'
-    '    box.appendChild(node);\n'
-    '    OCS.thoughtNode = node;\n'
     '    OCS.last = node;\n'
     '    /* the reasoning is recorded where it happened, not hung off the next tool\n'
     '       call: text can come between the two and it must keep its own slot */\n'
@@ -16754,6 +17373,18 @@ _OC_JS = (
     '    if (n) container.insertBefore(shots, box);\n'
     '  };\n'
     '\n'
+    '  var oldDoneThinking = P.doneThinking;\n'
+    "  if (typeof oldDoneThinking === 'function' && !oldDoneThinking.__oc) {\n"
+    '    P.doneThinking = function (errMsg) {\n'
+    '      /* however the turn ended - finished, stopped, or failed - the thought\n'
+    '         that was still running stops turning and reads "Thought" now */\n'
+    '      try { thoughtClose(); } catch (e) {}\n'
+    '      try { clearActivity(); } catch (e) {}\n'
+    '      return oldDoneThinking.apply(this, arguments);\n'
+    '    };\n'
+    '    P.doneThinking.__oc = true;\n'
+    '  }\n'
+    '\n'
     '  P.onReason = function (txt) {\n'
     '    attach();\n'
     '    /* keep the round\'s reasoning so the "+ Thought" line can show it */\n'
@@ -16775,6 +17406,10 @@ _OC_JS = (
     '  P.onDelta = function (txt) {\n'
     '    attach();\n'
     '    showThought();\n'
+    '    /* the model is answering now, whatever it was doing before */\n'
+    '    if (OCS.bubble) {\n'
+    '      try { setActivity(\'Writing the answer\'); } catch (e) {}\n'
+    '    }\n'
     "    /* the page's own onDelta appends to one .abody that never moves, so the\n"
     '       text would always end up below the tools: render it in place instead */\n'
     '    textPush(txt);\n'
@@ -16792,6 +17427,11 @@ _OC_JS = (
     '    }\n'
     '    clearChips();\n'
     '    liveStep(call);\n'
+    '    /* say what this call is doing, not that a model is loading */\n'
+    '    if (call && call.name) {\n'
+    '      try { setActivity(activityFor(call.name)); }\n'
+    '      catch (e) { if (window.console) console.warn(\'activity\', e); }\n'
+    '    }\n'
     '    /* the page saves this same call object, so carrying the thought time and\n'
     '       text on it keeps "+ Thought" lines in the reloaded history too */\n'
     '    if (call) {\n'
@@ -16801,6 +17441,7 @@ _OC_JS = (
     '    }\n'
     '    OCS.thinkMs = 0;\n'
     "    OCS.roundText = '';\n"
+    '    thoughtClose();\n'
     '    OCS.thoughtNode = null;\n'
     '    OCS.thoughtPart = null;\n'
     '    /* reasoning from here on is only kept for the tail of the answer */\n'
@@ -16976,6 +17617,9 @@ _OC_JS = (
     '     them, and always watch fetch() so the clock works on either console\n'
     '     regardless of which entry point starts the stream. */\n'
     '  function noteStart() {\n'
+    '    stopTick();\n'
+    '    thoughtClose();\n'
+    '    clearActivity();\n'
     '    OCS.since = Date.now();\n'
     '    OCS.thinkShown = false;\n'
     '    OCS.running = true;\n'
@@ -17391,7 +18035,12 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if path == "/api/answer":
                 ask_id = str(body.get("id") or "")
-                answer = str(body.get("answer") or "")
+                # one answer, or one per question when the model asked several
+                given = body.get("answer")
+                if isinstance(given, list):
+                    answer = [str(x or "") for x in given]
+                else:
+                    answer = str(given or "")
                 with _ASKS_LOCK:
                     pending = _ASKS.get(ask_id)
                     if pending:
@@ -17538,41 +18187,83 @@ class Handler(BaseHTTPRequestHandler):
                     # every batch question arrived as a bare "What should I do?"
                     # with an empty text box and no way to pick from the choices
                     # the model had carefully written out.
+                    # Taking only questions[0] then threw away the rest of a
+                    # batch, which is exactly when a model asks two things and
+                    # gets an answer to one of them.
                     if isinstance(q, dict) and isinstance(q.get("questions"), list) \
                             and q["questions"]:
-                        q = dict(q["questions"][0])
+                        batch = [x for x in q["questions"] if isinstance(x, dict)]
+                        if not batch:
+                            batch = [{"question": str(x)} for x in q["questions"]]
+                    else:
+                        batch = [q if isinstance(q, dict) else {"question": str(q)}]
+
+                    def options_of(one):
+                        out = []
+                        for o in (one.get("options") or []):
+                            if isinstance(o, dict):
+                                label = str(o.get("label") or o.get("text")
+                                            or o.get("value") or "").strip()
+                                desc = str(o.get("description") or "").strip()
+                                if label:
+                                    out.append({"label": label, "description": desc})
+                            elif str(o).strip():
+                                out.append({"label": str(o).strip(), "description": ""})
+                        return out
+
+                    # a permission prompt is one fixed question and never a batch
+                    if batch[0].get("kind") == "path_approval":
+                        batch = batch[:1]
+
+                    cards = []
+                    for one in batch:
+                        cards.append({
+                            "question": str(one.get("question") or one.get("header") or ""),
+                            "header": str(one.get("header") or ""),
+                            "options": options_of(one),
+                            "kind": one.get("kind") or "question",
+                            "path": one.get("path") or "",
+                            "tool": one.get("tool") or "",
+                        })
                     ask_id = uuid.uuid4().hex[:12]
                     event = threading.Event()
                     entry = {"event": event, "answer": None}
                     with _ASKS_LOCK:
                         _ASKS[ask_id] = entry
-                    opts = []
-                    for o in (q.get("options") or []):
-                        if isinstance(o, dict):
-                            label = str(o.get("label") or o.get("text")
-                                        or o.get("value") or "").strip()
-                            desc = str(o.get("description") or "").strip()
-                            if label:
-                                opts.append(label + (" - " + desc if desc else ""))
-                        elif str(o).strip():
-                            opts.append(str(o).strip())
+                    first = cards[0]
                     emit("ask", {"id": ask_id,
-                                 "kind": q.get("kind") or "question",
-                                 "question": q.get("question")
-                                 or q.get("header") or "",
-                                 "header": q.get("header") or "",
-                                 "path": q.get("path") or "",
-                                 "tool": q.get("tool") or "",
-                                 "options": opts})
+                                 "kind": first["kind"],
+                                 "question": first["question"],
+                                 "header": first["header"],
+                                 "path": first["path"],
+                                 "tool": first["tool"],
+                                 # the options keep their shape, so the page can
+                                 # draw a title and an explanation instead of one
+                                 # flat "label - description" line
+                                 "options": [o["label"] for o in first["options"]]
+                                 if not any(o["description"] for o in first["options"])
+                                 else first["options"],
+                                 "questions": cards})
                     _touch_activity()
                     try:
                         event.wait(BONSAI_KEEP_ALIVE)
                     except Exception:
                         pass
                     with _ASKS_LOCK:
-                        answer = (entry.get("answer") or "").strip() or "(no answer)"
+                        given = entry.get("answer")
                         _ASKS.pop(ask_id, None)
-                    return answer
+                    answers = []
+                    for i in range(len(cards)):
+                        val = ""
+                        if isinstance(given, list):
+                            if i < len(given):
+                                val = str(given[i] or "").strip()
+                        elif i == 0:
+                            val = str(given or "").strip()
+                        answers.append(val or "(no answer)")
+                    # one question keeps the plain string it always returned;
+                    # a batch gets one answer per question, in order
+                    return answers[0] if len(answers) == 1 else answers
 
                 def do_todo(items):
                     emit("todo", {"todos": items})
@@ -17587,11 +18278,26 @@ class Handler(BaseHTTPRequestHandler):
                 stop_beat = threading.Event()
 
                 def keepalive():
-                    while not stop_beat.wait(10):
+                    # Polled often, because a tool can ask for the caret in the
+                    # chat box and the paste follows a fraction of a second
+                    # later - a ten second wait would paste into the wrong
+                    # window. The keepalive itself still goes out every ten
+                    # seconds, which is what is holding the socket open.
+                    last = time.time()
+                    while not stop_beat.wait(0.25):
                         try:
-                            with write_lock:
-                                self.wfile.write(b": keepalive\n\n")
-                                self.wfile.flush()
+                            if _UI_FOCUS.is_set():
+                                _UI_FOCUS.clear()
+                                with write_lock:
+                                    self.wfile.write(
+                                        b"event: focus\ndata: {\"what\": "
+                                        b"\"input\"}\n\n")
+                                    self.wfile.flush()
+                            if time.time() - last >= 10:
+                                last = time.time()
+                                with write_lock:
+                                    self.wfile.write(b": keepalive\n\n")
+                                    self.wfile.flush()
                         except Exception:
                             return
 
