@@ -16345,6 +16345,7 @@ _OC_CSS = (
     '  .ocbody pre:last-child { margin-bottom: 0; }\n'
     '  .ocbody .oclab { color: var(--mut); font-size: 10.5px; letter-spacing: 1px; margin-bottom: 3px; }\n'
     '  .ocargs { color: var(--mut); font-size: 11.5px; }\n'
+    "  .ocargnote { color: var(--mut); font-size: 11.5px; opacity: .85; }\n"
     '  .ocprev { color: var(--acc); text-decoration: none; }\n'
     '  .ocprev:hover { text-decoration: underline; }\n'
     '\n'
@@ -16739,16 +16740,40 @@ _OC_JS = (
     '    w.appendChild(a);\n'
     '    return w;\n'
     '  }\n'
-    '  function argsBlock(call) {\n'
-    '    var a = call.arguments || {};\n'
-    '    var keys = Object.keys(a);\n'
-    '    if (!keys.length) return null;\n'
-    "    var box = el('div');\n"
-    "    box.appendChild(el('div', 'oclab', 'ARGUMENTS'));\n"
-    "    var pre = el('pre', 'ocargs', JSON.stringify(a, null, 2));\n"
-    '    box.appendChild(pre);\n'
-    '    return box;\n'
-    '  }\n'
+  '  function argsBlock(call, hasDiff) {\n'
+  '    var a = call.arguments || {};\n'
+  '    var keys = Object.keys(a);\n'
+  '    if (!keys.length) return null;\n'
+  "    /* A file's whole contents as escaped JSON is unreadable, and it is not\n"
+  "       news: the diff right above it shows exactly what changed. So a long\n"
+  "       value is named and measured rather than printed. Short arguments -\n"
+  "       a path, a flag, a search term - are still shown as they were. */\n"
+  '    var LIMIT = 200;\n'
+  '    var size = function (v) {\n'
+  "      var s = typeof v === 'string' ? v : JSON.stringify(v);\n"
+  '      return s ? s.length : 0;\n'
+  '    };\n'
+  '    var shown = {}, big = [];\n'
+  '    keys.forEach(function (k) {\n'
+  '      var n = size(a[k]);\n'
+  "      if (n > LIMIT) { big.push({ k: k, n: n }); return; }\n"
+  '      shown[k] = a[k];\n'
+  '    });\n'
+  "    var box = el('div');\n"
+  "    if (Object.keys(shown).length) {\n"
+  "      box.appendChild(el('div', 'oclab', 'ARGUMENTS'));\n"
+  "      box.appendChild(el('pre', 'ocargs', JSON.stringify(shown, null, 2)));\n"
+  '    }\n'
+  '    if (big.length) {\n'
+  "      var t = big.map(function (h) {\n"
+  "        return h.k + '  ' + h.n.toLocaleString() + ' characters';\n"
+  "      }).join('  \\u00b7  ');\n"
+  "      box.appendChild(el('div', 'ocargnote', t\n"
+  "        + (hasDiff ? '  \\u2014 shown in the diff above' : '')));\n"
+  '    }\n'
+  '    if (!box.childNodes.length) return null;\n'
+  '    return box;\n'
+  '  }\n'
     '\n'
     '  function stepFor(call) {\n'
     '    var res = call.result || {};\n'
@@ -16783,7 +16808,7 @@ _OC_JS = (
     "      body.appendChild(el('div', 'oclab', 'DIFF'));\n"
     '      body.appendChild(diffTable(chg.diff));\n'
     '    }\n'
-    '    var ab = argsBlock(call);\n'
+    '    var ab = argsBlock(call, hasDiff);\n'
     '    if (ab) body.appendChild(ab);\n'
     "    if (!(chg && chg.diff && String(chg.diff).indexOf('@@') >= 0)) {\n"
     '      var txt = resultText(res);\n'
