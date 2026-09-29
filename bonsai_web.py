@@ -2555,10 +2555,9 @@ SYSTEM = ("You are the friendly assistant living on the user's "
           "Colour: wrap only the part of a reply that carries meaning in "
           "[color=NAME]...[/color] and leave the rest plain - a warning, an "
           "error, a key value, the one word that answers the question, and "
-          "nowhere plain text would do. Never inside a code block. Names: red, "
-          "crimson, orange, amber, yellow, lime, green, emerald, teal, cyan, "
-          "sky, blue, indigo, purple, violet, pink, magenta, brown, sage, "
-          "white, silver, gray, black, or a hex value such as #ff3b30.")
+          "nowhere plain text would do. Never inside a code block. Names: "
+          "red, orange, yellow, green, cyan, blue, purple, gray; for any "
+          "other colour use a hex value such as #ff3b30.")
 
 PLAN_MODE_SYSTEM = ("\nMODE: PLAN. The user only wants a PLAN right now - do NOT "
                     "write, edit, create or delete any files, and do NOT launch "
