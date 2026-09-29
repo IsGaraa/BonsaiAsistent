@@ -3401,6 +3401,8 @@ def _public_models():
             item["model"] = m.get("model")
             item["wire"] = _api_wire(m)
             # only ever report *that* a key is configured, never the value
+            if m.get("omit"):
+                item["omit"] = m["omit"]
             kstate = _api_key_state(m.get("api_key"))[0]
             item["api_key_set"] = _api_key_present(m.get("api_key"))
             item["api_key_state"] = kstate
@@ -3641,6 +3643,10 @@ def _add_model(body):
         # /v1/responses is a different protocol, not another URL, so a model that
         # only offers it has to be marked as speaking it. Left off means chat.
         wire = str(body.get("wire") or "").strip().lower()
+        omit = [str(x).strip().lower() for x in (body.get("omit") or [])
+                if str(x).strip()]
+        if omit:
+            entry["omit"] = omit
         if wire and wire not in (_API_WIRE_CHAT, _API_WIRE_RESPONSES):
             return {"ok": False,
                     "error": "wire must be '%s' or '%s'" % (_API_WIRE_CHAT,
@@ -3810,6 +3816,20 @@ def set_bonsai_effort(effort):
     return _BONSAI_EFFORT
 
 
+def _model_omits(entry, field):
+    """Does this endpoint refuse to be sent `field` at all?
+
+    Most OpenAI-compatible providers ignore what they do not know. Google's
+    does not: it answers 400 "Unknown name \"reasoning\"" and the turn is
+    refused before it starts. A model can say so, rather than every user
+    having to find that out the hard way."""
+    try:
+        want = [str(x).strip().lower() for x in ((entry or {}).get("omit") or [])]
+        return field.lower() in want
+    except Exception:
+        return False
+
+
 def _effort_params():
     """The effort knob, in whichever dialect the active endpoint speaks.
 
@@ -3819,6 +3839,8 @@ def _effort_params():
     with _EFFORT_LOCK:
         eff = _BONSAI_EFFORT
     entry = _active_model()
+    if _model_omits(entry, "reasoning"):
+        return {}
     if entry and entry.get("type") == "api" and not _is_loopback(entry):
         # off/low/medium/xhigh are exactly the values a hosted endpoint wants
         if eff == "off":
@@ -5138,6 +5160,11 @@ def _provider_message_from_body(exc):
         data = json.loads(body)
     except Exception:
         return _redact_embedded_secrets(body.strip())[:300]
+    if isinstance(data, list) and data:
+        # Google's OpenAI-compatible layer answers with a one-element list, and
+        # reading only a dict left the user with "400 and sent no reason" when
+        # the body had plainly said which field it disliked.
+        data = data[0] if isinstance(data[0], dict) else None
     err = data.get("error") if isinstance(data, dict) else None
     if isinstance(err, dict):
         meta = err.get("metadata")
