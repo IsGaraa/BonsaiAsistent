@@ -91,6 +91,19 @@ else:
     _cfg_dir = os.environ.get("XDG_CONFIG_HOME") or \
         os.path.expanduser("~/.config")
     CHATS_FILE = os.path.join(_cfg_dir, "BonsaiAsistent", "chats.json")
+# Attachments live beside chats.json. An image in a message used to be kept as a
+# base64 data URL inside the message itself, which meant two things went wrong:
+# localStorage refused to save once the pictures added up (its whole quota, for
+# every chat at once, not just this one), and chats.json grew by megabytes per
+# screenshot. Files on disk and a short reference in the message fix both, and
+# the file name is the content's own hash, so the same picture pasted twice is
+# stored once and can never collide with a name someone else chose.
+ATTACH_DIR = os.environ.get("BONSAI_ATTACH_DIR") or os.path.join(
+    os.path.dirname(CHATS_FILE), "attachments")
+_ATTACH_EXT = {"image/png": ".png", "image/jpeg": ".jpg",
+               "image/webp": ".webp", "image/gif": ".gif",
+               "image/bmp": ".bmp"}
+_ATTACH_RE = re.compile(r"^[0-9a-f]{64}\.(png|jpg|webp|gif|bmp)$")
 # Tool calls are effectively unlimited - the model calls tools for as long as it
 # needs and the conversation context is the natural stop. The guard counter only
 # exists to catch a pathological infinite loop; tune it with BONSAI_MAX_TOOL_ROUNDS
@@ -1552,6 +1565,32 @@ def _web_fetch(url, max_chars=6000):
             "content": text[:max_chars]}
 
 
+CHAT_TITLE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "set_chat_title",
+        "description": "Name this conversation. Call it once, early, as soon as you "
+                       "know what the conversation is actually about - a short "
+                       "human title like 'Fix the login redirect' or 'Plan the Q3 "
+                       "budget', not a restatement of the first message and not a "
+                       "question. It replaces the placeholder title the app made "
+                       "from the opening words, and it is how the user finds this "
+                       "chat again in the list later.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "title": {
+                    "type": "string",
+                    "description": "2-6 words. Plain text, no quotes, no "
+                                   "punctuation at the end."
+                }
+            },
+            "required": ["title"],
+        },
+    },
+}
+
+
 WEB_TOOLS = {
     "web_search": {
         "type": "function",
@@ -2552,6 +2591,9 @@ SYSTEM = ("You are the friendly assistant living on the user's "
           "(web_fetch). When you need a choice, a password or a confirmation, "
           "ask with the question tool rather than assuming. For a longer task, "
           "keep a visible list of steps with todo_write.\n"
+          "Early in a conversation, once you know what it is about, name it with "
+          "set_chat_title - two to six words, so the user can find it again "
+          "later.\n"
           "Colour: wrap only the part of a reply that carries meaning in "
           "[color=NAME]...[/color] and leave the rest plain - a warning, an "
           "error, a key value, the one word that answers the question, and "
@@ -5086,9 +5128,9 @@ PC_TOOLS = [SHOT_TOOL, INPUT_TOOL, CLIPBOARD_TOOL,
 def _tools_for(mode):
     if mode == MODE_PLAN:
         return [FILE_TOOLS["list_dir"],
-                FILE_TOOLS["grep"]] + WEB_SPECS
+                FILE_TOOLS["grep"]] + WEB_SPECS + [CHAT_TITLE_TOOL]
     return ([TOOL_SPEC] + list(FILE_TOOLS.values()) + WEB_SPECS +
-            PC_TOOLS + _blender_tool_schemas())
+            PC_TOOLS + _blender_tool_schemas() + [CHAT_TITLE_TOOL])
 
 
 def system_prompt(mode):
@@ -10105,6 +10147,35 @@ def execute_tool_call(tc, hooks=None):
         _PATH_TLS.once = None
 
 
+_CHAT_TITLE_LOCK = threading.Lock()
+_LAST_CHAT_TITLE = {"title": ""}
+
+
+def _set_chat_title(title, hooks):
+    """Let the model name the conversation.
+
+    The title is only a label, so the rules are about being findable later
+    rather than about correctness: one line, trimmed of the quotes and
+    trailing punctuation models like to add, and a length cap, because a chat
+    list is a fixed-width column and a paragraph in it is useless.
+    """
+    text = str(title or "").strip()
+    text = text.strip('"').strip("'").strip()
+    text = re.sub(r"\s+", " ", text)
+    text = text.rstrip(".,;:!?").strip()
+    if not text:
+        return {"error": "the title was empty - pass 2-6 words describing "
+                         "what this conversation is about"}
+    if len(text) > 80:
+        text = text[:80].rsplit(" ", 1)[0]
+    with _CHAT_TITLE_LOCK:
+        _LAST_CHAT_TITLE["title"] = text
+    on_title = (hooks or {}).get("on_title")
+    if on_title:
+        on_title(text)
+    return {"result": "ok", "title": text}
+
+
 def _execute_tool_call(name, args, tc, hooks, image_uri):
     global _TODOS
     if name == "launch_or_open":
@@ -10203,6 +10274,8 @@ def _execute_tool_call(name, args, tc, hooks, image_uri):
         if on_todo:
             on_todo(items)
         raw_result = {"result": "ok", "todos": items}
+    elif name == "set_chat_title":
+        raw_result = _set_chat_title(args.get("title"), hooks)
     elif name == "execute":
         raw_result = _execute_js(args.get("code", ""), args.get("timeout"))
     elif name == "window_list":
@@ -11445,7 +11518,7 @@ PAGE = """<!doctype html>
           </div>
           <form id="chat-form" class="composer" onsubmit="handleSubmit(event)">
             <div class="field">
-              <textarea id="user-input" rows="1" placeholder="Type a command..."></textarea>
+              <textarea id="user-input" rows="1" placeholder="Type a command..." title="Ctrl+V also attaches an image from the clipboard"></textarea>
               <button type="button" class="iconbtn" id="attach" title="Attach images / files">&#128206;</button>
               <button type="button" class="iconbtn" id="mic-btn" title="Microphone">&#127908;</button>
               <button type="submit" id="send">SEND</button>
@@ -11783,7 +11856,7 @@ async function foldChat(chat, msgs) {
   try {
     const r = await fetch('/api/compact', { method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ messages: msgs, mode: chatMode }) });
+      body: JSON.stringify({ messages: await hydrateAtt(msgs), mode: chatMode }) });
     const j = await r.json();
     doneThinking(null);
     if (!j || !j.ok || !j.summary) return;
@@ -12383,7 +12456,7 @@ async function go(forcedParts, chat, alreadyAdded, askedMsg) {
   pendingAtt = [];
   renderPreview();
   document.getElementById('user-input').value = '';
-  try { await streamRun(wireFor(target), target, asked); }
+  try { await streamRun(await hydrateAtt(wireFor(target)), target, asked); }
   catch (err) { doneThinking('Error: ' + err.message); setBonsaiState('idle'); }
   busy = false;
   sweepStaleThinking();
@@ -13004,6 +13077,7 @@ async function streamRun(messages, chat, anchorMsg) {
         else if (ev === 'stats') { onStats(j); }
         else if (ev === 'ask') { onAsk(j); setBonsaiState('thinking'); }
         else if (ev === 'todo') { renderTodo(j.todos); }
+    else if (ev === 'title') { applyChatTitle(j.title); }
         else if (ev === 'error') { doneThinking('Error: ' + j.text); setBonsaiState('idle'); if (!modelUp) setModelStatus(false, false); stopStats(); throw new Error(j.text); }
         else if (ev === 'done') { gotEnd = true; doneThinking(); setBonsaiState('idle'); }
       }
@@ -13072,6 +13146,53 @@ function renderPreview() {
   });
 }
 
+/* An image is kept on the server as a file and referred to as /att/<hash>.
+   The message that gets stored - in localStorage and in chats.json - then holds
+   a short path instead of megabytes of base64, which is what made attachments
+   quietly break history saving: localStorage has one small quota for the whole
+   app, so a couple of screenshots filled it and the whole save was thrown away.
+   ATT_DATA is the bytes for this session, so a picture is uploaded once and
+   never re-read. */
+const ATT_DATA = {};
+async function storeAtt(dataUrl) {
+  try {
+    const r = await fetch('/api/attach', { method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ data: dataUrl }) });
+    const j = await r.json();
+    if (j && j.ok && j.url) { ATT_DATA[j.url] = dataUrl; return j.url; }
+  } catch (e) { /* fall through: the picture is still usable this session */ }
+  return null;
+}
+function isAttUrl(u) { return typeof u === 'string' && u.indexOf('/att/') === 0; }
+function attToDataUrl(url) {
+  return new Promise(function (res) {
+    fetch(url).then(function (r) { return r.blob(); })
+      .then(function (b) { const fr = new FileReader(); fr.onload = function () { res(fr.result); }; fr.readAsDataURL(b); })
+      .catch(function () { res(null); });
+  });
+}
+/* Put the real bytes back in before a request goes to a model. Returns a copy;
+   what is stored in the conversation keeps the short reference. */
+async function hydrateAtt(msgs) {
+  const out = [];
+  for (const m of (msgs || [])) {
+    const content = m.content;
+    if (!Array.isArray(content)) { out.push(m); continue; }
+    let changed = false;
+    const parts = [];
+    for (const p of content) {
+      if (p.type === 'image_url' && p.image_url && isAttUrl(p.image_url.url)) {
+        const u = p.image_url.url;
+        const data = ATT_DATA[u] || await attToDataUrl(u);
+        if (data) { ATT_DATA[u] = data; parts.push({ type: 'image_url', image_url: { url: data } }); changed = true; continue; }
+      }
+      parts.push(p);
+    }
+    out.push(changed ? Object.assign({}, m, { content: parts }) : m);
+  }
+  return out;
+}
 function addFiles(files) {
   const arr = Array.from(files || []);
   if (!arr.length) return;
@@ -13082,7 +13203,21 @@ function addFiles(files) {
     if (isImg) {
       if (f.size > 10 * 1024 * 1024) return;
       const r = new FileReader();
-      r.onload = function () { pendingAtt.push({ type: 'img', src: r.result }); renderPreview(); };
+      r.onload = function () {
+        const dataUrl = r.result;
+        /* Show it right away, then swap in the stored reference once the
+           server has it. The preview works either way, so there is no wait. */
+        const a = { type: 'img', src: dataUrl };
+        pendingAtt.push(a);
+        renderPreview();
+        storeAtt(dataUrl).then(function (url) {
+          if (!url) return;
+          ATT_DATA[url] = dataUrl;
+          a.stored = url;
+          a.src = url;
+          renderPreview();
+        });
+      };
       r.readAsDataURL(f);
     } else {
       if (f.size > 200 * 1024) { pendingAtt.push({ type: 'file', name: f.name, text: '[file too large for direct read]' }); renderPreview(); return; }
@@ -13100,6 +13235,47 @@ function addFiles(files) {
 
 document.getElementById('attach').onclick = function () { document.getElementById('filein').click(); };
 document.getElementById('filein').onchange = function () { addFiles(this.files); this.value = ''; };
+/* Ctrl+V with an image on the clipboard attaches it, instead of pasting
+   nothing at all. The image goes through the same addFiles() the paperclip
+   uses, so it lands in the same preview, obeys the same four-attachment cap
+   and the same 10 MB limit, and is sent the same way.
+   The guard is the important part: the paste is only taken over when the
+   clipboard really does hold an image. Ordinary text - a snippet of code, a
+   path, a sentence - has to keep pasting as text exactly as the browser
+   would, and this returns without touching the event when it does. */
+/* Above this many characters a pasted text is treated as a file to read
+   rather than something to type. Deliberately generous - an ordinary sentence,
+   a path, a short snippet still pastes as text. */
+const LONG_PASTE_CHARS = 2000;
+function addTextAttachment(text) {
+  const slots = 4 - pendingAtt.length;
+  if (slots <= 0) { alert('Too many attachments (max 4) - remove one first'); return; }
+  const d = new Date();
+  const pad = function (n) { return (n < 10 ? '0' : '') + n; };
+  const name = 'pasted-' + pad(d.getHours()) + pad(d.getMinutes()) + pad(d.getSeconds()) + '.txt';
+  let body = text;
+  if (body.length > 60000) body = body.slice(0, 60000) + '\n[... paste truncated at 60000 characters ...]';
+  pendingAtt.push({ type: 'file', name: name, text: body });
+  renderPreview();
+}
+document.getElementById('user-input').addEventListener('paste', function (e) {
+  var cd = e.clipboardData;
+  if (!cd) return;
+  var isImg = function (f) { return (f.type || '').indexOf('image/') === 0; };
+  var items = cd.items ? Array.from(cd.items) : [];
+  if (!items.some(function (it) { return it.kind === 'file' && isImg(it); })) return;
+  var files = cd.files ? Array.from(cd.files).filter(isImg) : [];
+  if (files.length) { e.preventDefault(); addFiles(files); return; }
+  /* No image on the clipboard, so it is a normal text paste - unless it is a
+     lot of text. A pasted file, a stack trace or a long log is far more useful
+     as something the model can be told to read than as a wall of text in the
+     box, and the composer should not fill up with it either. Short pastes are
+     left completely alone; only real blocks of text are caught. */
+  var text = cd.getData ? (cd.getData('text/plain') || '') : '';
+  if (text.length < LONG_PASTE_CHARS) return;
+  e.preventDefault();
+  addTextAttachment(text);
+});
 
 (function () {
   const wrap = document.querySelector('.chat-wrap');
@@ -13278,6 +13454,19 @@ function fmtCtx(c) {
 }
 function modelCtxLabel(m) {
   return m.ctx ? ' \u00b7 ' + fmtCtx(m.ctx) + ' ctx' : '';
+}
+/* The model named the conversation. This replaces the placeholder title the app
+   made from the opening words. The sidebar row, the header and the stored chat
+   are three different things showing the same name, so all three are updated
+   and the change is saved - the whole point of the tool is being able to find
+   this conversation again in the list later. */
+function applyChatTitle(t) {
+  if (!t) return;
+  t = String(t).replace(/&#\\d+;/g, '').trim();
+  if (!t) return;
+  if (cur) { cur.title = t; cur.titled_by = 'ai'; }
+  renderList();
+  save();
 }
 function setModelStatus(ready, loading) {
   const t = document.getElementById('system-status-text');
@@ -14936,7 +15125,7 @@ async function foldChat(chat, msgs) {
   try {
     const r = await fetch('/api/compact', { method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ messages: msgs, mode: chatMode }) });
+      body: JSON.stringify({ messages: await hydrateAtt(msgs), mode: chatMode }) });
     const j = await r.json();
     doneThinking(null);
     if (!j || !j.ok || !j.summary) return;
@@ -15643,6 +15832,7 @@ async function streamRun(messages, chat, anchorMsg) {
         else if (ev === 'stats') { onStats(j); }
         else if (ev === 'ask') { onAsk(j); setState('thinking'); }
         else if (ev === 'todo') { renderTodo(j.todos); }
+    else if (ev === 'title') { applyChatTitle(j.title); }
         else if (ev === 'error') { doneThinking('Error: ' + j.text); setState('idle'); stopStats(); throw new Error(j.text); }
         else if (ev === 'done') { gotEnd = true; }
       }
@@ -15941,7 +16131,7 @@ async function go(forcedParts, chat, alreadyAdded, askedMsg) {
   pendingAtt = [];
   renderPreview();
   document.getElementById('user-input').value = '';
-  try { await streamRun(wireFor(target), target, asked); }
+  try { await streamRun(await hydrateAtt(wireFor(target)), target, asked); }
   catch (err) { doneThinking('Error: ' + err.message); setState('idle'); }
   busy = false;
   sweepStaleThinking();
@@ -15972,6 +16162,53 @@ function renderPreview() {
     }
   });
 }
+/* An image is kept on the server as a file and referred to as /att/<hash>.
+   The message that gets stored - in localStorage and in chats.json - then holds
+   a short path instead of megabytes of base64, which is what made attachments
+   quietly break history saving: localStorage has one small quota for the whole
+   app, so a couple of screenshots filled it and the whole save was thrown away.
+   ATT_DATA is the bytes for this session, so a picture is uploaded once and
+   never re-read. */
+const ATT_DATA = {};
+async function storeAtt(dataUrl) {
+  try {
+    const r = await fetch('/api/attach', { method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ data: dataUrl }) });
+    const j = await r.json();
+    if (j && j.ok && j.url) { ATT_DATA[j.url] = dataUrl; return j.url; }
+  } catch (e) { /* fall through: the picture is still usable this session */ }
+  return null;
+}
+function isAttUrl(u) { return typeof u === 'string' && u.indexOf('/att/') === 0; }
+function attToDataUrl(url) {
+  return new Promise(function (res) {
+    fetch(url).then(function (r) { return r.blob(); })
+      .then(function (b) { const fr = new FileReader(); fr.onload = function () { res(fr.result); }; fr.readAsDataURL(b); })
+      .catch(function () { res(null); });
+  });
+}
+/* Put the real bytes back in before a request goes to a model. Returns a copy;
+   what is stored in the conversation keeps the short reference. */
+async function hydrateAtt(msgs) {
+  const out = [];
+  for (const m of (msgs || [])) {
+    const content = m.content;
+    if (!Array.isArray(content)) { out.push(m); continue; }
+    let changed = false;
+    const parts = [];
+    for (const p of content) {
+      if (p.type === 'image_url' && p.image_url && isAttUrl(p.image_url.url)) {
+        const u = p.image_url.url;
+        const data = ATT_DATA[u] || await attToDataUrl(u);
+        if (data) { ATT_DATA[u] = data; parts.push({ type: 'image_url', image_url: { url: data } }); changed = true; continue; }
+      }
+      parts.push(p);
+    }
+    out.push(changed ? Object.assign({}, m, { content: parts }) : m);
+  }
+  return out;
+}
 function addFiles(files) {
   const arr = Array.from(files || []);
   if (!arr.length) return;
@@ -15982,7 +16219,21 @@ function addFiles(files) {
     if (isImg) {
       if (f.size > 10 * 1024 * 1024) return;
       const r = new FileReader();
-      r.onload = function () { pendingAtt.push({ type: 'img', src: r.result }); renderPreview(); };
+      r.onload = function () {
+        const dataUrl = r.result;
+        /* Show it right away, then swap in the stored reference once the
+           server has it. The preview works either way, so there is no wait. */
+        const a = { type: 'img', src: dataUrl };
+        pendingAtt.push(a);
+        renderPreview();
+        storeAtt(dataUrl).then(function (url) {
+          if (!url) return;
+          ATT_DATA[url] = dataUrl;
+          a.stored = url;
+          a.src = url;
+          renderPreview();
+        });
+      };
       r.readAsDataURL(f);
     } else {
       if (f.size > 200 * 1024) { pendingAtt.push({ type: 'file', name: f.name, text: '[file too large for direct read]' }); renderPreview(); return; }
@@ -15999,6 +16250,47 @@ function addFiles(files) {
 }
 document.getElementById('attach').onclick = function () { document.getElementById('filein').click(); };
 document.getElementById('filein').onchange = function () { addFiles(this.files); this.value = ''; };
+/* Ctrl+V with an image on the clipboard attaches it, instead of pasting
+   nothing at all. The image goes through the same addFiles() the paperclip
+   uses, so it lands in the same preview, obeys the same four-attachment cap
+   and the same 10 MB limit, and is sent the same way.
+   The guard is the important part: the paste is only taken over when the
+   clipboard really does hold an image. Ordinary text - a snippet of code, a
+   path, a sentence - has to keep pasting as text exactly as the browser
+   would, and this returns without touching the event when it does. */
+/* Above this many characters a pasted text is treated as a file to read
+   rather than something to type. Deliberately generous - an ordinary sentence,
+   a path, a short snippet still pastes as text. */
+const LONG_PASTE_CHARS = 2000;
+function addTextAttachment(text) {
+  const slots = 4 - pendingAtt.length;
+  if (slots <= 0) { alert('Too many attachments (max 4) - remove one first'); return; }
+  const d = new Date();
+  const pad = function (n) { return (n < 10 ? '0' : '') + n; };
+  const name = 'pasted-' + pad(d.getHours()) + pad(d.getMinutes()) + pad(d.getSeconds()) + '.txt';
+  let body = text;
+  if (body.length > 60000) body = body.slice(0, 60000) + '\n[... paste truncated at 60000 characters ...]';
+  pendingAtt.push({ type: 'file', name: name, text: body });
+  renderPreview();
+}
+document.getElementById('user-input').addEventListener('paste', function (e) {
+  var cd = e.clipboardData;
+  if (!cd) return;
+  var isImg = function (f) { return (f.type || '').indexOf('image/') === 0; };
+  var items = cd.items ? Array.from(cd.items) : [];
+  if (!items.some(function (it) { return it.kind === 'file' && isImg(it); })) return;
+  var files = cd.files ? Array.from(cd.files).filter(isImg) : [];
+  if (files.length) { e.preventDefault(); addFiles(files); return; }
+  /* No image on the clipboard, so it is a normal text paste - unless it is a
+     lot of text. A pasted file, a stack trace or a long log is far more useful
+     as something the model can be told to read than as a wall of text in the
+     box, and the composer should not fill up with it either. Short pastes are
+     left completely alone; only real blocks of text are caught. */
+  var text = cd.getData ? (cd.getData('text/plain') || '') : '';
+  if (text.length < LONG_PASTE_CHARS) return;
+  e.preventDefault();
+  addTextAttachment(text);
+});
 (function () {
   const wrap = document.getElementById('messages');
   const ov = document.createElement('div');
@@ -16154,6 +16446,19 @@ function fmtCtx(c) {
 }
 function modelCtxLabel(m) {
   return m.ctx ? ' \u00b7 ' + fmtCtx(m.ctx) + ' ctx' : '';
+}
+/* The model named the conversation. This replaces the placeholder title the app
+   made from the opening words. The sidebar row, the header and the stored chat
+   are three different things showing the same name, so all three are updated
+   and the change is saved - the whole point of the tool is being able to find
+   this conversation again in the list later. */
+function applyChatTitle(t) {
+  if (!t) return;
+  t = String(t).replace(/&#\\d+;/g, '').trim();
+  if (!t) return;
+  if (cur) { cur.title = t; cur.titled_by = 'ai'; }
+  renderList();
+  save();
 }
 function setModelStatus(ready, loading) {
   const t = document.getElementById('system-status-text');
@@ -18069,6 +18374,63 @@ def _load_chats():
     return data if isinstance(data, list) else []
 
 
+# ---- attachments ------------------------------------------------------------
+# One file per distinct image, named after the SHA-256 of its own bytes. The
+# name therefore cannot be chosen by the client, so there is nothing to escape
+# and no way for one upload to overwrite another; serving it only accepts that
+# exact shape, which also means a crafted path cannot walk out of the folder.
+_ATTACH_LOCK = threading.Lock()
+
+
+def _store_attachment(data_url):
+    """Save one data URL and return the /att/... reference for it.
+
+    Returns None for anything that is not a small enough image, rather than
+    raising: a failed attachment should cost you the picture, not the message
+    it was attached to.
+    """
+    if not isinstance(data_url, str):
+        return None
+    head, _, payload = data_url.partition(",")
+    if not payload or "base64" not in head:
+        return None
+    mime = head.split(";")[0].strip().lower()
+    if mime.startswith("data:"):
+        mime = mime[5:]
+    ext = _ATTACH_EXT.get(mime)
+    if not ext:
+        return None
+    try:
+        raw = base64.b64decode(payload, validate=False)
+    except Exception:
+        return None
+    if not raw or len(raw) > 12 * 1024 * 1024:
+        return None
+    name = hashlib.sha256(raw).hexdigest() + ext
+    path = os.path.join(ATTACH_DIR, name)
+    try:
+        os.makedirs(ATTACH_DIR, exist_ok=True)
+        if not os.path.exists(path):
+            # Write beside the target and rename, so a crash mid-write cannot
+            # leave a half image that later looks like a valid attachment.
+            with _ATTACH_LOCK:
+                if not os.path.exists(path):
+                    tmp = path + ".part"
+                    with open(tmp, "wb") as fh:
+                        fh.write(raw)
+                    os.replace(tmp, path)
+    except OSError:
+        return None
+    return "/att/" + name
+
+
+def _attach_path(name):
+    """Resolve an /att/ name to a real path, or None if it is not one of ours."""
+    if not name or not _ATTACH_RE.match(name):
+        return None
+    return os.path.join(ATTACH_DIR, name)
+
+
 _CHATS_DELETED_FILE = os.path.join(os.path.dirname(CHATS_FILE),
                                    "chats.deleted.json")
 _CHATS_DELETED = set()
@@ -18265,6 +18627,32 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, json.dumps(
                 {"chats": _load_chats(),
                  "deleted": _chats_deleted_list()}, default=str))
+        elif path.startswith("/att/"):
+            name = path[len("/att/"):].split("?")[0]
+            real = _attach_path(name)
+            if not real or not os.path.exists(real):
+                self._send(404, "no such attachment", "text/plain")
+                return
+            ext = os.path.splitext(name)[1].lower()
+            mime = {".png": "image/png", ".jpg": "image/jpeg",
+                    ".webp": "image/webp", ".gif": "image/gif",
+                    ".bmp": "image/bmp"}.get(ext, "application/octet-stream")
+            try:
+                with open(real, "rb") as fh:
+                    data = fh.read()
+            except OSError:
+                self._send(404, "no such attachment", "text/plain")
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", mime)
+            self.send_header("Content-Length", str(len(data)))
+            # The name is the content hash, so the bytes at this URL can never
+            # change. Saying so keeps a reload from re-downloading every photo
+            # in every conversation you have open.
+            self.send_header("Cache-Control", "public, max-age=31536000, immutable")
+            self.end_headers()
+            self.wfile.write(data)
+            return
         elif path == "/api/todos":
             with _TODOS_LOCK:
                 self._send(200, json.dumps({"todos": _TODOS}))
@@ -18299,7 +18687,7 @@ class Handler(BaseHTTPRequestHandler):
                             "/api/answer", "/api/effort", "/api/eject",
                             "/api/tts", "/api/models", "/api/pick_model",
                             "/api/ctx", "/api/revert", "/api/forget_changes",
-                            "/api/compact",
+                            "/api/compact", "/api/attach",
                             "/api/path_policy", "/api/dl_pause",
                             "/api/dl_resume", "/api/dl_cancel",
                             "/api/dl_retry", "/api/dl_clear"):
@@ -18329,6 +18717,16 @@ class Handler(BaseHTTPRequestHandler):
                 _remember_chats_deleted(body.get("deleted"))
                 _save_chats(body.get("chats"))
                 self._send(200, json.dumps({"ok": True}))
+                return
+            if path == "/api/attach":
+                url = _store_attachment(body.get("data"))
+                if not url:
+                    self._send(200, json.dumps(
+                        {"ok": False,
+                         "error": "not a usable image (png, jpeg, webp, gif "
+                                   "or bmp, up to 12 MB)"}))
+                    return
+                self._send(200, json.dumps({"ok": True, "url": url}))
                 return
             if path == "/api/path_policy":
                 if body.get("clear"):
@@ -18590,6 +18988,9 @@ class Handler(BaseHTTPRequestHandler):
                 def do_todo(items):
                     emit("todo", {"todos": items})
 
+                def do_title(text):
+                    emit("title", {"title": text})
+
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream; charset=utf-8")
                 self.send_header("Cache-Control", "no-cache")
@@ -18633,7 +19034,8 @@ class Handler(BaseHTTPRequestHandler):
                                     on_delta=lambda t: emit("delta", {"text": t}),
                                     on_tool=lambda c: emit("tool", {"call": _strip_full(c)}),
                                     on_stats=lambda s: emit("stats", s),
-                                    hooks={"on_ask": do_ask, "on_todo": do_todo})
+                                    hooks={"on_ask": do_ask, "on_todo": do_todo,
+                                           "on_title": do_title})
                     except CLIENT_GONE:
                         # browser closed the tab mid-response: normal, not an error
                         client_gone = True
