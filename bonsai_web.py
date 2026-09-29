@@ -2602,8 +2602,15 @@ def _start_bonsai():
     mmproj = entry.get("mmproj") or ""
     port = int(entry.get("port") or 8080)
     cfg = _entry_cfg(entry)
-    log_out = os.path.join(BONSAI_DIR, "bonsai-server.out.log")
-    log_err = os.path.join(BONSAI_DIR, "bonsai-server.err.log")
+    # Deliberately not bonsai-server.*.log. Those are this process's own
+    # stdout/stderr, and whoever started us may hold them open - launching via
+    # `python bonsai_web.py >> bonsai-server.out.log` does exactly that. Opening
+    # the same file again for the model server then fails with "Permission
+    # denied", the local model never starts, and the chat is refused with
+    # "model server could not start" while the reason is a log-file lock
+    # nobody would think to look for.
+    log_out = os.path.join(BONSAI_DIR, "bonsai-model.out.log")
+    log_err = os.path.join(BONSAI_DIR, "bonsai-model.err.log")
     if not os.path.exists(LLAMA_EXE):
         print(f"llama-server not found at {LLAMA_EXE}", flush=True)
         return False
@@ -13225,6 +13232,44 @@ refreshTts();
 function modelLabel(m) {
   return (m.type === 'api' ? '\u2601 ' : '\u25C9 ') + (m.label || m.id);
 }
+/* Which service a model actually comes from, read off its own base_url rather
+   than guessed from the name. A dozen providers all call themselves "gpt", and
+   a hand-kept table of them is a table that goes stale. Anything we cannot
+   place is filed under its host, so a new gateway still groups sensibly
+   instead of vanishing into a flat list. */
+function modelProvider(m) {
+  if (m.type !== 'api') return 'Local';
+  var base = String(m.base_url || '').toLowerCase();
+  var host = base.split('://')[1] ? base.split('://')[1].split('/')[0] : base;
+  var known = [
+    ['openrouter', 'OpenRouter'],
+    ['googleapis', 'Google Gemini'],
+    ['generativelanguage', 'Google Gemini'],
+    ['api.groq.com', 'Groq'],
+    ['api.mistral.ai', 'Mistral'],
+    ['api.openai.com', 'OpenAI'],
+    ['azure.com', 'OpenAI'],
+    ['anthropic.com', 'Anthropic'],
+    ['api.cerebras.ai', 'Cerebras'],
+    ['nvidia.com', 'NVIDIA'],
+    ['ollama', 'Ollama'],
+    ['lmstudio', 'LM Studio'],
+    ['lm-studio', 'LM Studio'],
+    ['opencod', 'OpenCode'],
+    ['127.0.0.1', 'On this PC'],
+    ['localhost', 'On this PC']
+  ];
+  for (var i = 0; i < known.length; i++) {
+    if (base.indexOf(known[i][0]) >= 0) return known[i][1];
+  }
+  if (m.provider) return m.provider;
+  return host || 'Other';
+}
+function providerOrder(p) {
+  if (p === 'Local') return 0;
+  if (p === 'On this PC') return 1;
+  return 10;
+}
 function fmtCtx(c) {
   c = Number(c) || 0;
   if (c >= 1000000) { const t = c / 1000000; return (t >= 10 ? Math.round(t) : Math.round(t * 10) / 10) + 'M'; }
@@ -13250,14 +13295,35 @@ function renderModels(j) {
   if (_am && _am.ctx) BONSAI_CTX = _am.ctx;
   scheduleCtx();
   sel.innerHTML = '';
+  /* Grouped by who serves the model, so OpenRouter's pile, Google's pile and
+     the local weights are separate things you can actually see. A plain
+     <select> cannot hold headings, so they come from optgroup - which is what
+     a select is for when the list has structure. One group per provider, local
+     first because it is the one that needs no key and no network. */
+  var groups = {};
+  var order = [];
   (j.models || []).forEach(function (m) {
-    const o = document.createElement('option');
-    o.value = m.id;
-    o.textContent = modelLabel(m) + modelCtxLabel(m) + (m.type === 'local' && m.vision ? ' · vision' : '') +
-      (m.type === 'local' && m.available === false ? ' (missing)' : '') +
-      (m.type === 'api' ? ' · ' + (m.needs_key ? 'NO KEY' : (m.api_key_set ? 'key ok' : 'no key needed')) : '');
-    if (m.id === j.active) o.selected = true;
-    sel.appendChild(o);
+    var p = modelProvider(m);
+    if (!groups[p]) { groups[p] = []; order.push(p); }
+    groups[p].push(m);
+  });
+  order.sort(function (a, b) {
+    var d = providerOrder(a) - providerOrder(b);
+    return d !== 0 ? d : a.localeCompare(b);
+  });
+  order.forEach(function (p) {
+    var g = document.createElement('optgroup');
+    g.label = p;
+    groups[p].forEach(function (m) {
+      const o = document.createElement('option');
+      o.value = m.id;
+      o.textContent = modelLabel(m) + modelCtxLabel(m) + (m.type === 'local' && m.vision ? ' · vision' : '') +
+        (m.type === 'local' && m.available === false ? ' (missing)' : '') +
+        (m.type === 'api' ? ' · ' + (m.needs_key ? 'NO KEY' : (m.api_key_set ? 'key ok' : 'no key needed')) : '');
+      if (m.id === j.active) o.selected = true;
+      g.appendChild(o);
+    });
+    sel.appendChild(g);
   });
   sel.classList.toggle('off', !j.managed);
   sel.setAttribute('data-prev', j.active || '');
@@ -16042,6 +16108,44 @@ refreshTts();
 function modelLabel(m) {
   return (m.type === 'api' ? '\u2601 ' : '\u25C9 ') + (m.label || m.id);
 }
+/* Which service a model actually comes from, read off its own base_url rather
+   than guessed from the name. A dozen providers all call themselves "gpt", and
+   a hand-kept table of them is a table that goes stale. Anything we cannot
+   place is filed under its host, so a new gateway still groups sensibly
+   instead of vanishing into a flat list. */
+function modelProvider(m) {
+  if (m.type !== 'api') return 'Local';
+  var base = String(m.base_url || '').toLowerCase();
+  var host = base.split('://')[1] ? base.split('://')[1].split('/')[0] : base;
+  var known = [
+    ['openrouter', 'OpenRouter'],
+    ['googleapis', 'Google Gemini'],
+    ['generativelanguage', 'Google Gemini'],
+    ['api.groq.com', 'Groq'],
+    ['api.mistral.ai', 'Mistral'],
+    ['api.openai.com', 'OpenAI'],
+    ['azure.com', 'OpenAI'],
+    ['anthropic.com', 'Anthropic'],
+    ['api.cerebras.ai', 'Cerebras'],
+    ['nvidia.com', 'NVIDIA'],
+    ['ollama', 'Ollama'],
+    ['lmstudio', 'LM Studio'],
+    ['lm-studio', 'LM Studio'],
+    ['opencod', 'OpenCode'],
+    ['127.0.0.1', 'On this PC'],
+    ['localhost', 'On this PC']
+  ];
+  for (var i = 0; i < known.length; i++) {
+    if (base.indexOf(known[i][0]) >= 0) return known[i][1];
+  }
+  if (m.provider) return m.provider;
+  return host || 'Other';
+}
+function providerOrder(p) {
+  if (p === 'Local') return 0;
+  if (p === 'On this PC') return 1;
+  return 10;
+}
 function fmtCtx(c) {
   c = Number(c) || 0;
   if (c >= 1000000) { const t = c / 1000000; return (t >= 10 ? Math.round(t) : Math.round(t * 10) / 10) + 'M'; }
@@ -16067,14 +16171,35 @@ function renderModels(j) {
   if (_am && _am.ctx) BONSAI_CTX = _am.ctx;
   scheduleCtx();
   sel.innerHTML = '';
+  /* Grouped by who serves the model, so OpenRouter's pile, Google's pile and
+     the local weights are separate things you can actually see. A plain
+     <select> cannot hold headings, so they come from optgroup - which is what
+     a select is for when the list has structure. One group per provider, local
+     first because it is the one that needs no key and no network. */
+  var groups = {};
+  var order = [];
   (j.models || []).forEach(function (m) {
-    const o = document.createElement('option');
-    o.value = m.id;
-    o.textContent = modelLabel(m) + modelCtxLabel(m) + (m.type === 'local' && m.vision ? ' · vision' : '') +
-      (m.type === 'local' && m.available === false ? ' (missing)' : '') +
-      (m.type === 'api' ? ' · ' + (m.needs_key ? 'NO KEY' : (m.api_key_set ? 'key ok' : 'no key needed')) : '');
-    if (m.id === j.active) o.selected = true;
-    sel.appendChild(o);
+    var p = modelProvider(m);
+    if (!groups[p]) { groups[p] = []; order.push(p); }
+    groups[p].push(m);
+  });
+  order.sort(function (a, b) {
+    var d = providerOrder(a) - providerOrder(b);
+    return d !== 0 ? d : a.localeCompare(b);
+  });
+  order.forEach(function (p) {
+    var g = document.createElement('optgroup');
+    g.label = p;
+    groups[p].forEach(function (m) {
+      const o = document.createElement('option');
+      o.value = m.id;
+      o.textContent = modelLabel(m) + modelCtxLabel(m) + (m.type === 'local' && m.vision ? ' · vision' : '') +
+        (m.type === 'local' && m.available === false ? ' (missing)' : '') +
+        (m.type === 'api' ? ' · ' + (m.needs_key ? 'NO KEY' : (m.api_key_set ? 'key ok' : 'no key needed')) : '');
+      if (m.id === j.active) o.selected = true;
+      g.appendChild(o);
+    });
+    sel.appendChild(g);
   });
   sel.classList.toggle('off', !j.managed);
   sel.setAttribute('data-prev', j.active || '');
