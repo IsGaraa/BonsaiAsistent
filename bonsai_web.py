@@ -16445,18 +16445,24 @@ _OC_JS = (
     "    var b = document.getElementById('detailbtn');\n"
     "    if (b) b.textContent = 'DETAIL: ' + (ocFull() ? 'FULL' : 'BRIEF');\n"
     '  }\n'
-    '  function applyDetail() {\n'
-    '    var on = ocFull();\n'
-    "    var all = document.querySelectorAll('.ocstep');\n"
-    '    for (var i = 0; i < all.length; i++) all[i].open = on;\n'
-    '  }\n'
+  '  function applyDetail() {\n'
+  '    var on = ocFull();\n'
+  "    var all = document.querySelectorAll('.ocstep');\n"
+  '    for (var i = 0; i < all.length; i++) {\n'
+  '      /* DETAIL never closes a step that shows code */\n'
+  "      if (all[i].querySelector('.ocdiff')) { all[i].open = true; continue; }\n"
+  '      all[i].open = on;\n'
+  '    }\n'
+  '  }\n'
     "  document.addEventListener('DOMContentLoaded', function () {\n"
     '    renderStepBtn();\n'
     "    var b = document.getElementById('detailbtn');\n"
-    "    if (b) b.onclick = function () {\n"
+    "  if (b) b.onclick = function () {\n"
     "      try { localStorage.setItem('bonsai_stepdetail', ocFull() ? 'brief' : 'full'); } catch (e) {}\n"
     '      renderStepBtn(); applyDetail();\n'
     '    };\n'
+    '    b.title = "Show each step in the chat as one collapsed line, or fully'
+    ' expanded. Steps that show code always stay expanded.";\n'
     '  });\n'
     '  /* The model saying something is a response, not a step, so it gets a\n'
     '     message bubble of its own rather than a line inside the step block.\n'
@@ -16752,6 +16758,11 @@ _OC_JS = (
     '    var bad = !!(res && res.error);\n'
     "    var d = el('details', 'ocstep' + (bad ? ' err' : ''));\n"
     '    if (ocFull()) d.open = true;\n'
+    "    var hasDiff = !!(chg && chg.diff && String(chg.diff).indexOf('@@') >= 0);\n"
+    "    /* A step carrying a diff is showing you what it changed to the disk.\n"
+    "       That is the only reason to open it, so it is never folded away -\n"
+    "       otherwise the lines it removed are the one thing you cannot see. */\n"
+    '    if (hasDiff) d.open = true;\n'
     "    var s = el('summary');\n"
     "    s.appendChild(el('span', 'occaret', '›'));\n"
     "    s.appendChild(el('span', 'ocg', kind.spec.g));\n"
@@ -17439,6 +17450,9 @@ _OC_JS = (
     '    };\n'
     '    head.appendChild(rev);\n'
     "    head.onclick = function () { wrap.classList.toggle('open'); };\n"
+    "    /* open by default: the point of this panel is to see what changed, and\n"
+    "       what changed includes the lines that went away */\n"
+    "    if (c.diff && String(c.diff).indexOf('@@') >= 0) wrap.classList.add('open');\n"
     '    wrap.appendChild(head);\n'
     '    wrap.appendChild(body);\n'
     "    body.appendChild(el('div', 'oclab', 'DIFF  ' + (c.tool || '') + '  ' + new Date((c.ts || 0) * 1000).toLocaleString()));\n"
