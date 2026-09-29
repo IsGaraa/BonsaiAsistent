@@ -11627,8 +11627,23 @@ function renderList() {
     el.appendChild(row);
   });
 }
-function convEl() { return document.getElementById('chat-container'); }
-function scrollBottom() { const c = convEl(); c.scrollTop = c.scrollHeight; }
+  function convEl() { return document.getElementById('chat-container'); }
+  /* Follow the conversation only while the reader is already at the bottom.
+     Scrolling up to read something is not a request to be dragged back, and
+     during a long stream there was no way to escape it at all. 40px of slack
+     so that being a line or two off still counts as "following". */
+  let followBottom = true;
+  function atBottom(c) { return c.scrollHeight - c.scrollTop - c.clientHeight < 40; }
+  function scrollBottom() {
+    const c = convEl();
+    if (!c || !followBottom) return;
+    c.scrollTop = c.scrollHeight;
+  }
+  (function () {
+    const c = convEl();
+    if (!c) return;
+    c.addEventListener('scroll', function () { followBottom = atBottom(c); });
+  })();
 function renderConv() {
   const conv = convEl();
   conv.innerHTML = '';
@@ -14626,7 +14641,20 @@ function renderList() {
   });
 }
 function convInner() { return document.querySelector('#messages .inner'); }
-function scrollBottom() { const c = document.getElementById('messages'); c.scrollTop = c.scrollHeight; }
+/* Same rule as the front page: follow only while already at the bottom, and
+   let a reader who scrolls up stay where they are. */
+let followBottom = true;
+function atBottom(c) { return c.scrollHeight - c.scrollTop - c.clientHeight < 40; }
+function scrollBottom() {
+  const c = document.getElementById('messages');
+  if (!c || !followBottom) return;
+  c.scrollTop = c.scrollHeight;
+}
+(function () {
+  const c = document.getElementById('messages');
+  if (!c) return;
+  c.addEventListener('scroll', function () { followBottom = atBottom(c); });
+})();
 function renderConv() {
   const conv = convInner();
   const empty = document.getElementById('empty');
