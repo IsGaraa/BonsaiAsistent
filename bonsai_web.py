@@ -10948,6 +10948,17 @@ PAGE = """<!doctype html>
   .ltab.on .lbadge { background: rgba(56,189,248,.16); color: var(--acc); }
   .lpane { display: none; flex: 1; min-height: 0; flex-direction: column; }
   .lpane.on { display: flex; }
+  /* TODO is never behind a tab. A thing it has lined up to do is exactly the
+     thing you must be able to see without asking for it, so it is pinned to
+     the bottom of the rail permanently - empty or not. */
+  .todofoot { flex: none; border-top: 1px solid var(--bd); display: flex;
+              flex-direction: column; max-height: 36%; min-height: 0; }
+  .todofoot-hd { display: flex; justify-content: space-between; align-items: center;
+                 padding: 8px 12px 6px; font-size: 10.5px; letter-spacing: 1.5px;
+                 color: var(--mut); font-family: Consolas, monospace; }
+  #todopanel { flex: 1; min-height: 0; overflow-y: auto; padding: 0 8px 8px; }
+  .todopanel-empty { padding: 2px 4px 4px; font-size: 11.5px; color: var(--mut);
+                     font-style: italic; }
   #chatlist { flex: 1; overflow-y: auto; padding: 4px 8px; }
   .chat-item { display: flex; align-items: center; gap: 8px; padding: 9px 10px; border-radius: 8px; cursor: pointer; font-size: 13.5px; color: var(--txt2); }
   .chat-item:hover { background: var(--bg3); }
@@ -11138,8 +11149,6 @@ PAGE = """<!doctype html>
   .ctxmeter .ctxhint b { color: var(--acc); }
 
   /* todo panel */
-  #todopanel { display: none; padding: 4px 8px; }
-  #todopanel.on { display: block; }
   #todopanel .todo { display: flex; align-items: flex-start; gap: 8px; padding: 5px 6px; border-radius: 6px; font-size: 13px; font-family: Consolas, monospace; }
   #todopanel .todo .st { width: 14px; flex: 0 0 14px; }
   #todopanel .todo.pending { color: var(--mut); }
@@ -11348,16 +11357,12 @@ PAGE = """<!doctype html>
       <button class="wbtn wide" id="workbtn" title="Click to choose the workspace folder">\\WORKSPACE</button>
       <div class="ltabs" role="tablist" aria-label="Side panels">
         <button class="ltab on" data-pane="chats" role="tab" aria-selected="true" title="Your conversations">CHATS</button>
-        <button class="ltab" data-pane="todo" role="tab" aria-selected="false" title="Things it has lined up to do">TODO<span class="lbadge" id="todocount"></span></button>
         <button class="ltab" data-pane="files" role="tab" aria-selected="false" title="Downloads it has started">FILES<span class="lbadge" id="dlcount"></span></button>
         <button class="ltab" data-pane="scope" role="tab" aria-selected="false" title="How far it may reach outside the workspace">SCOPE</button>
       </div>
       <div class="lpane on" id="pane-chats" role="tabpanel">
         <button class="hbtn new" id="newchat2">+ NEW CHAT</button>
         <div id="chatlist"></div>
-      </div>
-      <div class="lpane" id="pane-todo" role="tabpanel">
-        <div id="todopanel"></div>
       </div>
       <div class="lpane" id="pane-files" role="tabpanel">
         <div class="dllist" id="dllist"></div>
@@ -11370,6 +11375,10 @@ PAGE = """<!doctype html>
         <button class="scopebtn" id="scopebtn" title="How far Bonsai may reach outside the workspace. Click to switch: WORKSPACE (hard sandbox) / ASK (ask me every time) / SYSTEM (no prompts).">SCOPE: ...</button>
         <div class="scopelist" id="scopelist"></div>
         <button class="scopeclear" id="scopeclear" title="Forget every approved and denied path">CLEAR APPROVALS</button>
+      </div>
+      <div class="todofoot">
+        <div class="todofoot-hd"><span>TODO</span><span id="todocount"></span></div>
+        <div id="todopanel"></div>
       </div>
     </section>
 
@@ -12759,7 +12768,8 @@ function renderTodo(items) {
   const cnt = document.getElementById('todocount');
   if (!el) return;
     if (!items || !items.length) {
-      el.classList.remove('on'); el.innerHTML = '';
+      el.classList.remove('on');
+      el.innerHTML = '<div class="todopanel-empty">Nothing lined up.</div>';
       if (cnt) cnt.textContent = '';
       return;
     }
