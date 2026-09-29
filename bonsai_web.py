@@ -3842,10 +3842,19 @@ def _effort_params():
     if _model_omits(entry, "reasoning"):
         return {}
     if entry and entry.get("type") == "api" and not _is_loopback(entry):
-        # off/low/medium/xhigh are exactly the values a hosted endpoint wants
+        # The effort knob is a short word in the UI; the unified field wants the
+        # provider's own spelling of it. OpenRouter accepts
+        # max|xhigh|high|medium|low|minimal|none, so the UI's "med" went out
+        # verbatim and every turn came back 400 "Invalid option: expected one
+        # of ... medium ...". The comment here claimed the values were already
+        # right, which is exactly why it was not noticed.
+        hosted = {"off": "none", "med": "medium", "minimal": "minimal",
+                  "low": "low", "medium": "medium", "high": "high",
+                  "xhigh": "xhigh", "max": "max"}
+        level = hosted.get(str(eff or "").strip().lower(), "medium")
         if eff == "off":
             return {"reasoning": {"enabled": False}}
-        return {"reasoning": {"effort": eff}}
+        return {"reasoning": {"effort": level}}
     if eff == "off":
         return {"chat_template_kwargs": {"enable_thinking": False}}
     return {"chat_template_kwargs": {"enable_thinking": True,
