@@ -11478,7 +11478,11 @@ function mergeChats(older, newer) {
   };
   (older || []).forEach(take);
   (newer || []).forEach(take);
-  return order.map(function (id) { return byId[id]; }).concat(anonymous);
+  /* a chat someone deleted is never brought back by a save */
+  const gone = {};
+  (typeof deletedIds !== 'undefined' ? deletedIds : []).forEach(function (id) { gone[id] = 1; });
+  return order.filter(function (id) { return !gone[id]; })
+              .map(function (id) { return byId[id]; }).concat(anonymous);
 }
 function save() {
   try {
@@ -11488,13 +11492,23 @@ function save() {
   } catch (e) {}
   try {
     fetch('/api/chats', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chats: buildPersist(true) }) }).catch(function () {});
+      body: JSON.stringify({ chats: buildPersist(true), deleted: deletedIds }) }).catch(function () {});
   } catch (e) {}
 }
 async function serverLoad() {
   try {
     const r = await fetch('/api/chats');
     const j = await r.json();
+    if (j && Array.isArray(j.deleted) && j.deleted.length) {
+      let grew = false;
+      j.deleted.forEach(function (id) {
+        if (deletedIds.indexOf(id) === -1) { deletedIds.push(id); grew = true; }
+      });
+      if (grew) {
+        saveDeletedIds();
+        chats = chats.filter(function (c) { return deletedIds.indexOf(c.id) === -1; });
+      }
+    }
     if (j && Array.isArray(j.chats) && j.chats.length) {
       const byId = {};
       chats.forEach(function (c, i) { byId[c.id] = i; });
@@ -11608,7 +11622,8 @@ function renderList() {
     row.className = 'chat-item' + (isActive ? ' active' : '');
     const t = document.createElement('span'); t.className = 'tit'; t.textContent = c.title; t.title = c.title;
     const d = document.createElement('button'); d.className = 'del'; d.textContent = '\u00d7';
-    d.onclick = function (e) { e.stopPropagation(); chats = chats.filter(function (x) { return x.id !== c.id; }); if (!chats.length) { cur = null; newChat(); } else { if (cur && cur.id === c.id) cur = chats[chats.length - 1]; save(); renderAll(); } };
+    d.onclick = function (e) { e.stopPropagation(); chats = chats.filter(function (x) { return x.id !== c.id; });
+    noteDeleted(c.id); if (!chats.length) { cur = null; newChat(); } else { if (cur && cur.id === c.id) cur = chats[chats.length - 1]; save(); renderAll(); } };
     row.onclick = function () { cur = c; started = cur.messages.length > 0; renderAll(); setBonsaiState('idle'); };
     row.appendChild(t); row.appendChild(d);
     el.appendChild(row);
@@ -12170,6 +12185,26 @@ async function refreshCtx(quick) {
     const draft = (typeof buildUserMsg === 'function') ? buildUserMsg() : null;
     if (draft) msgs.push({ role: 'user', content: draft });
   } catch (e) { /* no composer on this view */ }
+  /* A long chat was re-serialised and re-shipped to the server after every
+     pause in typing - a few hundred kilobytes of JSON built on the main
+     thread, which is what made the composer unusable in a big conversation.
+     Past the point where the round trip earns its keep, count it here. The
+     number is an estimate while you are typing either way, and the end of a
+     turn still asks the server for the real one. */
+  let tooBig = false;
+  try { tooBig = JSON.stringify(msgs).length > 120000; } catch (e) { tooBig = false; }
+  if (tooBig) {
+    let chars = 0;
+    msgs.forEach(function (m) {
+      chars += typeof m.content === 'string' ? m.content.length
+              : (JSON.stringify(m.content || '').length);
+    });
+    ctxLast = { ok: true, used: Math.max(1, Math.round(chars / 4)),
+                total: (typeof BONSAI_CTX !== 'undefined' && BONSAI_CTX) || 0 };
+    ctxPaint();
+    maybeFold(quick);
+    return;
+  }
   try {
     const r = await fetch('/api/ctx', { method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -12184,8 +12219,30 @@ function scheduleCtx(quick) {
   /* While typing, settle quickly but ask for the cheap estimate: an exact
      count costs two round-trips to the model server, and nobody needs that
      to be precise mid-word. The bar shows a ~ while it is a guess. */
-  ctxTimer = setTimeout(function () { refreshCtx(quick); }, quick ? 500 : 400);
+  ctxTimer = setTimeout(function () { refreshCtx(quick); }, quick ? 900 : 400);
 }
+/* Deleting a chat used to mean dropping it from the array and saving - and
+   the save merges, so the copy still sitting in storage was merged straight
+   back and the chat was there again on the next refresh. A merge can only ever
+   add, so a removal has to be said out loud: the id goes on this list, the
+   merge honours it, and the server is told so another browser cannot bring it
+   back either. */
+let deletedIds = loadDeletedIds();
+function loadDeletedIds() {
+  try {
+    const v = JSON.parse(localStorage.getItem('jarvis_chats_deleted') || '[]');
+    return Array.isArray(v) ? v : [];
+  } catch (e) { return []; }
+}
+function saveDeletedIds() {
+  try { localStorage.setItem('jarvis_chats_deleted', JSON.stringify(deletedIds)); } catch (e) {}
+}
+function noteDeleted(id) {
+  if (!id || deletedIds.indexOf(id) !== -1) return;
+  deletedIds.push(id);
+  saveDeletedIds();
+}
+function forgetDeleted() { deletedIds = []; saveDeletedIds(); }
 function queueNow() {
   const parts = buildUserMsg();
   if (!parts) return;
@@ -14307,7 +14364,11 @@ function mergeChats(older, newer) {
   };
   (older || []).forEach(take);
   (newer || []).forEach(take);
-  return order.map(function (id) { return byId[id]; }).concat(anonymous);
+  /* a chat someone deleted is never brought back by a save */
+  const gone = {};
+  (typeof deletedIds !== 'undefined' ? deletedIds : []).forEach(function (id) { gone[id] = 1; });
+  return order.filter(function (id) { return !gone[id]; })
+              .map(function (id) { return byId[id]; }).concat(anonymous);
 }
 function save() {
   try {
@@ -14317,7 +14378,7 @@ function save() {
   } catch (e) {}
   try {
     fetch('/api/chats', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chats: buildPersist(true) }) }).catch(function () {});
+      body: JSON.stringify({ chats: buildPersist(true), deleted: deletedIds }) }).catch(function () {});
   } catch (e) {}
 }
 /* pull the server's copy in and merge it with what this browser has, keeping
@@ -14326,6 +14387,16 @@ async function serverLoad() {
   try {
     const r = await fetch('/api/chats');
     const j = await r.json();
+    if (j && Array.isArray(j.deleted) && j.deleted.length) {
+      let grew = false;
+      j.deleted.forEach(function (id) {
+        if (deletedIds.indexOf(id) === -1) { deletedIds.push(id); grew = true; }
+      });
+      if (grew) {
+        saveDeletedIds();
+        chats = chats.filter(function (c) { return deletedIds.indexOf(c.id) === -1; });
+      }
+    }
     if (j && Array.isArray(j.chats) && j.chats.length) {
       const byId = {};
       chats.forEach(function (c, i) { byId[c.id] = i; });
@@ -14656,6 +14727,7 @@ function renderList() {
     d.onclick = function (e) {
       e.stopPropagation();
       chats = chats.filter(function (x) { return x.id !== c.id; });
+    noteDeleted(c.id);
       if (!chats.length) { cur = null; newChat(); }
       else { if (cur && cur.id === c.id) cur = chats[chats.length - 1]; save(); renderAll(); }
     };
@@ -15615,6 +15687,26 @@ async function refreshCtx(quick) {
     const draft = (typeof buildUserMsg === 'function') ? buildUserMsg() : null;
     if (draft) msgs.push({ role: 'user', content: draft });
   } catch (e) { /* no composer on this view */ }
+  /* A long chat was re-serialised and re-shipped to the server after every
+     pause in typing - a few hundred kilobytes of JSON built on the main
+     thread, which is what made the composer unusable in a big conversation.
+     Past the point where the round trip earns its keep, count it here. The
+     number is an estimate while you are typing either way, and the end of a
+     turn still asks the server for the real one. */
+  let tooBig = false;
+  try { tooBig = JSON.stringify(msgs).length > 120000; } catch (e) { tooBig = false; }
+  if (tooBig) {
+    let chars = 0;
+    msgs.forEach(function (m) {
+      chars += typeof m.content === 'string' ? m.content.length
+              : (JSON.stringify(m.content || '').length);
+    });
+    ctxLast = { ok: true, used: Math.max(1, Math.round(chars / 4)),
+                total: (typeof BONSAI_CTX !== 'undefined' && BONSAI_CTX) || 0 };
+    ctxPaint();
+    maybeFold(quick);
+    return;
+  }
   try {
     const r = await fetch('/api/ctx', { method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -15629,8 +15721,30 @@ function scheduleCtx(quick) {
   /* While typing, settle quickly but ask for the cheap estimate: an exact
      count costs two round-trips to the model server, and nobody needs that
      to be precise mid-word. The bar shows a ~ while it is a guess. */
-  ctxTimer = setTimeout(function () { refreshCtx(quick); }, quick ? 500 : 400);
+  ctxTimer = setTimeout(function () { refreshCtx(quick); }, quick ? 900 : 400);
 }
+/* Deleting a chat used to mean dropping it from the array and saving - and
+   the save merges, so the copy still sitting in storage was merged straight
+   back and the chat was there again on the next refresh. A merge can only ever
+   add, so a removal has to be said out loud: the id goes on this list, the
+   merge honours it, and the server is told so another browser cannot bring it
+   back either. */
+let deletedIds = loadDeletedIds();
+function loadDeletedIds() {
+  try {
+    const v = JSON.parse(localStorage.getItem('jarvis_chats_deleted') || '[]');
+    return Array.isArray(v) ? v : [];
+  } catch (e) { return []; }
+}
+function saveDeletedIds() {
+  try { localStorage.setItem('jarvis_chats_deleted', JSON.stringify(deletedIds)); } catch (e) {}
+}
+function noteDeleted(id) {
+  if (!id || deletedIds.indexOf(id) !== -1) return;
+  deletedIds.push(id);
+  saveDeletedIds();
+}
+function forgetDeleted() { deletedIds = []; saveDeletedIds(); }
 function queueNow() {
   const parts = buildUserMsg();
   if (!parts) return;
@@ -17794,7 +17908,46 @@ def _load_chats():
     return data if isinstance(data, list) else []
 
 
-def _merge_chats(old, new):
+_CHATS_DELETED_FILE = os.path.join(os.path.dirname(CHATS_FILE),
+                                   "chats.deleted.json")
+_CHATS_DELETED = set()
+
+
+def _load_chats_deleted():
+    """Ids of chats that were deleted, kept beside chats.json.
+
+    Deletion has to outlive the file it came from. A browser that still holds
+    the chat in its own storage will otherwise keep offering it, and its next
+    save would put it straight back into the history."""
+    global _CHATS_DELETED
+    try:
+        with open(_CHATS_DELETED_FILE, "r", encoding="utf-8") as f:
+            v = json.load(f)
+        if isinstance(v, list):
+            _CHATS_DELETED = set(str(x) for x in v if x)
+    except Exception:
+        _CHATS_DELETED = set()
+
+
+def _remember_chats_deleted(ids):
+    """Record deletions so no browser can resurrect them."""
+    global _CHATS_DELETED
+    added = [str(x) for x in (ids or []) if x and str(x) not in _CHATS_DELETED]
+    if not added:
+        return
+    _CHATS_DELETED.update(added)
+    try:
+        with open(_CHATS_DELETED_FILE, "w", encoding="utf-8") as f:
+            json.dump(sorted(_CHATS_DELETED), f)
+    except Exception:
+        pass
+
+
+def _chats_deleted_list():
+    return sorted(_CHATS_DELETED)
+
+
+def _merge_chats(old, new, deleted=()):
     """Union of two chat lists, keyed by id, keeping the longer history.
 
     More than one page can be open at once, each holding its own view of the
@@ -17827,7 +17980,9 @@ def _merge_chats(old, new):
         take(c)
     for c in (new or []):
         take(c)
-    return [by_id[cid] for cid in order] + anonymous
+    gone = set(deleted or ())
+    kept = [by_id[cid] for cid in order if cid not in gone]
+    return kept + anonymous
 
 
 def _save_chats(chats):
@@ -17839,7 +17994,8 @@ def _save_chats(chats):
     # read the same old file, merge their own view into it, and write; the
     # second write would then drop whatever only the first one knew about.
     with _CHATS_LOCK:
-        keep = _merge_chats(_read_chat_file(CHATS_FILE), chats)[-200:]
+        keep = _merge_chats(_read_chat_file(CHATS_FILE), chats,
+                        deleted=_CHATS_DELETED)[-200:]
         try:
             os.makedirs(os.path.dirname(CHATS_FILE), exist_ok=True)
             with open(tmp, "w", encoding="utf-8") as f:
@@ -17945,7 +18101,9 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/workdir":
             self._send(200, json.dumps({"workdir": WORKDIR}))
         elif path == "/api/chats":
-            self._send(200, json.dumps({"chats": _load_chats()}, default=str))
+            self._send(200, json.dumps(
+                {"chats": _load_chats(),
+                 "deleted": _chats_deleted_list()}, default=str))
         elif path == "/api/todos":
             with _TODOS_LOCK:
                 self._send(200, json.dumps({"todos": _TODOS}))
@@ -18007,6 +18165,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, json.dumps(_confirm_pick_workdir()))
                 return
             if path == "/api/chats":
+                _remember_chats_deleted(body.get("deleted"))
                 _save_chats(body.get("chats"))
                 self._send(200, json.dumps({"ok": True}))
                 return
@@ -18430,6 +18589,7 @@ def main():
     # copy of the app, or a test harness, has no use for it.
     if not os.environ.get("BONSAI_NO_BLENDER"):
         threading.Thread(target=_blender_kickoff, daemon=True).start()
+    _load_chats_deleted()
     _sched_load()
     print("BONSAI is READY on http://%s:%d" % (HOST, PORT), flush=True)
     if not os.environ.get("BONSAI_NO_BROWSER"):
