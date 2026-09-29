@@ -12218,6 +12218,7 @@ function stopRun() {
   if (abortCtrl) { const a = abortCtrl; abortCtrl = null; try { a.abort(); } catch (e) {} }
   if (thinkingRow) doneThinking('(stopped by user)');
   setBonsaiState('idle');
+  setTimeout(function () { sweepStaleThinking(); }, 0);
 }
 function drainQueue() {
   if (busy) return;
@@ -12285,6 +12286,7 @@ async function go(forcedParts, chat, alreadyAdded, askedMsg) {
   try { await streamRun(wireFor(target), target, asked); }
   catch (err) { doneThinking('Error: ' + err.message); setBonsaiState('idle'); }
   busy = false;
+  sweepStaleThinking();
   setSendUI();
   document.getElementById('user-input').focus();
   target.ts = Date.now();
@@ -12396,6 +12398,11 @@ function startWaitWatch() {
   }, 6000);
 }
 function addThinking() {
+  /* Two rows must never be live at once. The second overwrites the variable
+     holding the first, so nothing anywhere holds a reference to it and
+     nothing can ever finish it - its "Starting" then sat in the chat for
+     good, long after the work it was waiting for had been done. */
+  if (thinkingRow) doneThinking();
   liveCalls = [];
   const row = document.createElement('div'); row.className = 'msgrow bonsai';
   const av = document.createElement('div'); av.className = 'av bonsai'; av.textContent = 'B';
@@ -12512,6 +12519,20 @@ function onTool(call) {
     openPreviewStage(call.result.preview_url, call.result.path || '');
   }
   scrollBottom();
+}
+/* A turn that has finished must not leave a "Starting" bubble in the chat.
+   If one is still there, holding nothing, while no turn is running, it is
+   the remains of a turn that never reported finishing - so it is cleared
+   rather than left claiming to still be waiting. A row with real content
+   in it is never touched. */
+function sweepStaleThinking() {
+  if (busy || thinkingRow) return;
+  const rows = convEl().querySelectorAll('.msgrow.bonsai');
+  for (let i = 0; i < rows.length; i++) {
+    if (!rows[i].querySelector('.think')) continue;
+    if (rows[i].querySelector('.abody, .reasonbox, .toollog')) continue;
+    if (rows[i].parentNode) rows[i].parentNode.removeChild(rows[i]);
+  }
 }
 function doneThinking(errMsg) {
   clearWaitWatch();
@@ -15143,6 +15164,11 @@ function addAsst(text, calls, reason, stats, entry) {
   return inner;
 }
 function addThinking() {
+  /* Two rows must never be live at once. The second overwrites the variable
+     holding the first, so nothing anywhere holds a reference to it and
+     nothing can ever finish it - its "Starting" then sat in the chat for
+     good, long after the work it was waiting for had been done. */
+  if (thinkingRow) doneThinking();
   liveCalls = [];
   const row = document.createElement('div'); row.className = 'msgrow';
   const b = document.createElement('div');
@@ -15189,6 +15215,20 @@ function onTool(call) {
   const live = shotCardDom(call);
   if (live) thinkingRow.b.insertBefore(live, thinkingRow.tlog.d);
   scrollBottom();
+}
+/* A turn that has finished must not leave a "Starting" bubble in the chat.
+   If one is still there, holding nothing, while no turn is running, it is
+   the remains of a turn that never reported finishing - so it is cleared
+   rather than left claiming to still be waiting. A row with real content
+   in it is never touched. */
+function sweepStaleThinking() {
+  if (busy || thinkingRow) return;
+  const rows = convEl().querySelectorAll('.msgrow.bonsai');
+  for (let i = 0; i < rows.length; i++) {
+    if (!rows[i].querySelector('.think')) continue;
+    if (rows[i].querySelector('.abody, .reasonbox, .toollog')) continue;
+    if (rows[i].parentNode) rows[i].parentNode.removeChild(rows[i]);
+  }
 }
 function doneThinking(errMsg) {
   clearWaitWatch();
@@ -15623,6 +15663,7 @@ function stopRun() {
   if (abortCtrl) { const a = abortCtrl; abortCtrl = null; try { a.abort(); } catch (e) {} }
   if (thinkingRow) doneThinking('(stopped by user)');
   setState('idle');
+  setTimeout(function () { sweepStaleThinking(); }, 0);
 }
 function drainQueue() {
   if (busy) return;
@@ -15687,6 +15728,7 @@ async function go(forcedParts, chat, alreadyAdded, askedMsg) {
   try { await streamRun(wireFor(target), target, asked); }
   catch (err) { doneThinking('Error: ' + err.message); setState('idle'); }
   busy = false;
+  sweepStaleThinking();
   setSendUI();
   document.getElementById('user-input').focus();
   target.ts = Date.now();
@@ -16737,21 +16779,27 @@ _OC_JS = (
     '    var oldn = 0, newn = 0;\n'
     '    rows.forEach(function (r) {\n'
     "      if (r.c === 'h') {\n"
-    '        var m = /@@\\s*-(\\d+)/.exec(r.t), m2 = /@@.*\\+(\\d+)/.exec(r.t);\n'
-    '        oldn = m ? parseInt(m[1], 10) : 0;\n'
-    '        newn = m2 ? parseInt(m2[1], 10) : 0;\n'
-    "        var tr = el('tr', 'hunk');\n"
-    "        var td = el('td', 'octext', r.t);\n"
-    "        td.colSpan = 2; tr.appendChild(el('td', 'ocl', '')); tr.appendChild(td);\n"
-    '        tb.appendChild(tr);\n'
-    '        return;\n'
-    '      }\n'
-    "      if (r.c === 'a') newn++;\n"
-    "      else if (r.c === 'd') oldn++;\n"
-    '      else { oldn++; newn++; }\n'
-    "      var tr2 = el('tr', r.c === 'a' ? 'add' : (r.c === 'd' ? 'del' : 'ctx'));\n"
-    "      tr2.appendChild(el('td', 'ocl', r.c === 'a' ? String(newn) : String(oldn)));\n"
-    "      tr2.appendChild(el('td', 'octext', r.t));\n"
+     '        /* A hunk header names where its range *starts*, and the first row'
+     '           below it is that very line - so start one short and let the'
+     '           counter below land on it. Reading the start straight into the'
+     '           counter, then pre-incrementing before printing, put every line'
+     '           in every hunk one too high. */\n'
+     "        var m = /^@@ -(\\d+)(?:,\\d+)? \\+(\\d+)/.exec(r.t);\n"
+     '        oldn = m ? parseInt(m[1], 10) - 1 : 0;\n'
+     '        newn = m ? parseInt(m[2], 10) - 1 : 0;\n'
+     "        var tr = el('tr', 'hunk');\n"
+     "        var td = el('td', 'octext', r.t);\n"
+     "        td.colSpan = 2; tr.appendChild(el('td', 'ocl', '')); tr.appendChild(td);\n"
+     '        tb.appendChild(tr);\n'
+     '        return;\n'
+     '      }\n'
+     '      var shown;\n'
+     "      if (r.c === 'a') { shown = ++newn; }\n"
+     "      else if (r.c === 'd') { shown = ++oldn; }\n"
+     '      else { shown = ++oldn; newn++; }\n'
+     "      var tr2 = el('tr', r.c === 'a' ? 'add' : (r.c === 'd' ? 'del' : 'ctx'));\n"
+     "      tr2.appendChild(el('td', 'ocl', String(shown)));\n"
+     "      tr2.appendChild(el('td', 'octext', r.t));\n"
     '      tb.appendChild(tr2);\n'
     '    });\n'
     '    wrap.appendChild(tb);\n'
