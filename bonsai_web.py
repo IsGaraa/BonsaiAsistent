@@ -2524,53 +2524,41 @@ def _blender_status_payload():
 
 
 SYSTEM = ("You are the friendly assistant living on the user's "
-          + ("Windows" if IS_WINDOWS else "Linux") + " PC. Reply "
-          "concisely and naturally, in the same language the user writes in. "
-          "You have vision: if the user "
-          "attaches one or more images or text files - or asks you to inspect "
-          "the screen - look at the images carefully and read the file "
-          "contents to answer their question about them. You can capture the "
-          "screen (take_screenshot) and actually see what is displayed: error "
-          "dialogs, app windows, web pages, terminal output. You can control "
-          "the PC like a human: move the mouse, click, drag and type "
-          "(control_input), read or write the system clipboard (clipboard) and "
-          "download files from the web (download_file). You can also work on "
-          "files inside the workspace folder and on archives (archive). The "
-          "workspace is your default folder, not a wall: when the user asks "
-          "about a file, folder or search somewhere else on the PC, pass that "
-          "absolute path to list_dir / read_file / grep / write_file / "
-          "edit_file and the user will be asked to approve it (ALLOW FOR THIS "
-          "CONV, ALLOW ONCE or DENY). So do not refuse or guess - just try the "
-          "real path, and if the access is denied, respect it and ask the user "
+          + ("Windows" if IS_WINDOWS else "Linux") + " PC. Reply concisely and "
+          "naturally, in the language the user writes in.\n"
+          "You can see: attached images and text files, and the screen itself "
+          "(take_screenshot) - error dialogs, app windows, web pages, terminal "
+          "output. Look properly before answering about what is in them.\n"
+          "You can act: move the mouse, click, drag and type (control_input), "
+          "read or write the system clipboard (clipboard), download files "
+          "(download_file), run shell commands (shell) - read their output and "
+          "do the task rather than describing it. You can read and change files "
+          "in the workspace and in archives (archive).\n"
+          "The workspace is your default folder, not a wall. For anything "
+          "else on the PC, pass the absolute path to list_dir / read_file / "
+          "grep / write_file / edit_file and the user is asked to approve "
+          "(ALLOW FOR THIS CONV, ALLOW ONCE or DENY). Never refuse or guess a "
+          "path - try the real one, and if it is denied, respect that and ask "
           "what to do instead. "
-          + ("Prefer grep with a path such as 'C:\\\\Users' or 'C:\\\\' to look "
+          + ("Prefer grep over a broad path such as 'C:\\Users' or 'C:\\' to look "
              "across the whole PC instead of guessing where a file might be. "
              if IS_WINDOWS else
-             "Prefer grep with a path such as '/home' or '/' to look across the "
-             "whole machine instead of guessing where a file might be. Note "
-             "that every path on this machine is POSIX: a backslash is an "
-             "ordinary character in a file name, not a separator. ")
-          + "When "
-          "you are not sure about something, are asked for recent/current "
-          "information, or want to double-check a fact, you may search the web "
-          "(web_search) and read pages (web_fetch) to document yourself. When "
-          "the user asks you to build, test, install or inspect something on "
-          "the PC, you can run shell commands (shell) and read their "
-          "output to actually do it instead of only describing it. If you need "
-          "a choice, a password or a confirmation from the user, ask them "
-          "politely with the question tool instead of assuming. For longer "
-          "tasks use todo_write to keep a visible list of the steps you are "
-          "working on. "
-          "You can write part of a reply in colour: wrap it in "
-          "[color=NAME]...[/color] and only that part is drawn in colour, the "
-          "rest stays as it is. For example: [color=red]Heey![/color] how are "
-          "you doing? Use it when it actually carries meaning - a warning, an "
-          "error, a key value, the one word that answers the question - and "
-          "leave ordinary sentences plain. Names: red, crimson, orange, amber, "
-          "yellow, lime, green, emerald, teal, cyan, sky, blue, indigo, purple, "
-          "violet, pink, magenta, brown, sage, white, silver, gray, black, or a "
-          "hex value such as #ff3b30. Never put a colour tag inside a code "
-          "block, and never use one where plain text would do.")
+             "Prefer grep over a broad path such as '/home' or '/' to look across "
+             "the whole machine instead of guessing where a file might be. Every "
+             "path here is POSIX: a backslash is an ordinary character in a "
+             "name, not a separator. ")
+          + "\nWhen you are unsure, asked for anything recent, or want to "
+          "check a fact, search the web (web_search) and read pages "
+          "(web_fetch). When you need a choice, a password or a confirmation, "
+          "ask with the question tool rather than assuming. For a longer task, "
+          "keep a visible list of steps with todo_write.\n"
+          "Colour: wrap only the part of a reply that carries meaning in "
+          "[color=NAME]...[/color] and leave the rest plain - a warning, an "
+          "error, a key value, the one word that answers the question, and "
+          "nowhere plain text would do. Never inside a code block. Names: red, "
+          "crimson, orange, amber, yellow, lime, green, emerald, teal, cyan, "
+          "sky, blue, indigo, purple, violet, pink, magenta, brown, sage, "
+          "white, silver, gray, black, or a hex value such as #ff3b30.")
 
 PLAN_MODE_SYSTEM = ("\nMODE: PLAN. The user only wants a PLAN right now - do NOT "
                     "write, edit, create or delete any files, and do NOT launch "
@@ -12202,7 +12190,8 @@ function scheduleCtx(quick) {
 function queueNow() {
   const parts = buildUserMsg();
   if (!parts) return;
-  const chat = cur || newChat();
+  if (!cur) newChat();
+  const chat = cur;
   const raw = parts.length === 1 && parts[0].type === 'text' ? parts[0].text : parts;
   const msg = { role: 'user', content: raw, queued: true };
   chat.messages.push(msg);
@@ -12235,6 +12224,7 @@ function drainQueue() {
   if (busy) return;
   if (!msgQueue.length) return;
   const next = msgQueue.shift();
+  if (!next || !next.parts || !next.parts.length) { drainQueue(); return; }
   if (next.msg) delete next.msg.queued;
   clearQueuedBadge(next.chat, next.msg);
   refreshQueueUI();
@@ -12242,17 +12232,31 @@ function drainQueue() {
 }
 
 
+/* Hand a de-queued message back when go() turns out it cannot run it.
+   drainQueue has already taken it out of the queue and cleared its badge, so
+   without this a message that hit an early exit - an empty composer, a model
+   with no key - simply disappeared: not sent, not queued, not marked, and
+   nothing on screen said so. */
+function giveBack(msg) {
+  if (!msg) return;
+  const parts = typeof msg.content === 'string' ? [{ type: 'text', text: msg.content }] : (msg.content || []);
+  if (!parts.length) return;
+  msg.queued = true;
+  msgQueue.unshift({ parts: parts, chat: cur, msg: msg });
+  refreshQueueUI();
+  renderConv();
+}
 async function go(forcedParts, chat, alreadyAdded, askedMsg) {
   if (busy) return;
   if (!cur) newChat();
   if (chat && chat !== cur && chats.indexOf(chat) !== -1) { cur = chat; renderAll(); }
   const parts = forcedParts || buildUserMsg();
-  if (!parts) return;
+  if (!parts) { giveBack(askedMsg); return; }
   // A remote model with no key would otherwise fail as a 401 halfway through,
   // after the turn is already spent and buried in a conversation.
   try {
     const block = await failFastKey();
-    if (block) { alert(block); return; }
+    if (block) { alert(block); giveBack(askedMsg); return; }
   } catch (e) { /* never block the send on a failed check */ }
   busy = true;
   setSendUI();
@@ -15625,22 +15629,37 @@ function drainQueue() {
   if (busy) return;
   if (!msgQueue.length) return;
   const next = msgQueue.shift();
+  if (!next || !next.parts || !next.parts.length) { drainQueue(); return; }
   if (next.msg) delete next.msg.queued;
   clearQueuedBadge(next.chat, next.msg);
   refreshQueueUI();
   go(next.parts, next.chat, true, next.msg);
+}
+/* Hand a de-queued message back when go() turns out it cannot run it.
+   drainQueue has already taken it out of the queue and cleared its badge, so
+   without this a message that hit an early exit - an empty composer, a model
+   with no key - simply disappeared: not sent, not queued, not marked, and
+   nothing on screen said so. */
+function giveBack(msg) {
+  if (!msg) return;
+  const parts = typeof msg.content === 'string' ? [{ type: 'text', text: msg.content }] : (msg.content || []);
+  if (!parts.length) return;
+  msg.queued = true;
+  msgQueue.unshift({ parts: parts, chat: cur, msg: msg });
+  refreshQueueUI();
+  renderConv();
 }
 async function go(forcedParts, chat, alreadyAdded, askedMsg) {
   if (busy) return;
   if (!cur) newChat();
   if (chat && chat !== cur && chats.indexOf(chat) !== -1) { cur = chat; renderAll(); }
   const parts = forcedParts || buildUserMsg();
-  if (!parts) return;
+  if (!parts) { giveBack(askedMsg); return; }
   // A remote model with no key would otherwise fail as a 401 halfway through,
   // after the turn is already spent and buried in a conversation.
   try {
     const block = await failFastKey();
-    if (block) { alert(block); return; }
+    if (block) { alert(block); giveBack(askedMsg); return; }
   } catch (e) { /* never block the send on a failed check */ }
   busy = true;
   setSendUI();
