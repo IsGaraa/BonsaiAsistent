@@ -10821,6 +10821,16 @@ def _execute_tool_call(name, args, tc, hooks, image_uri):
         raw_result = _set_chat_title(args.get("title"), hooks)
     elif name == "generate_image":
         raw_result = _generate_image(args, hooks)
+        if isinstance(raw_result, dict) and raw_result.get("image_data"):
+            # The model is given the picture as its own image message further
+            # down, by _append_shot_image. Left in here it becomes part of the
+            # tool result *text*, which is megabytes, which some providers
+            # reject outright - and then the model describes a picture it never
+            # saw. Same shape as the Blender branch below.
+            image_uri = raw_result["image_data"]
+            raw_result = dict(raw_result)
+            raw_result.pop("image_data", None)
+            raw_result.pop("image_data_1080p", None)
     elif name == "execute":
         raw_result = _execute_js(args.get("code", ""), args.get("timeout"))
     elif name == "window_list":
@@ -19369,12 +19379,30 @@ def _strip_full(record):
     The big base64 image lives under `image_data` internally (so it is easy to
     pull out and feed to the model) but the UIs render a `preview` key, so
     expose it under that name too - that is what makes a screenshot appear in
-    the chat automatically, with no help from the model."""
+    the chat automatically, with no help from the model.
+
+    One exception: when the image has already been stored and carries a short
+    /att/ reference, send the browser that instead of the base64. A generated
+    picture is 2-3 MB, and pushing that through one SSE event is how a chat
+    ends up with no picture in it at all. A screenshot is small and still goes
+    the old way, since there is nothing shorter to send."""
     if isinstance(record, dict):
         out = dict(record)
         out.pop("full_result", None)
         img = out.get("image_data")
-        if img and not out.get("preview"):
+        prev = out.get("preview") or ""
+        if not prev.startswith("/att/"):
+            # A tool that stores its picture puts the short reference in its
+            # own result, not at the top of the record - so look there too.
+            # Missing this sent 2 MB of base64 per generated image.
+            inner = ""
+            if isinstance(out.get("result"), dict):
+                inner = out["result"].get("preview") or ""
+            if inner.startswith("/att/"):
+                out["preview"] = prev = inner
+        if prev.startswith("/att/"):
+            out.pop("image_data", None)
+        elif img and not prev:
             out["preview"] = img
         return out
     return record
