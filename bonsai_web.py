@@ -1095,11 +1095,11 @@ def _preview_url(rel):
     return None
 
 
-def _preview_html(path):
+def _preview_file(path):
     rel = str(path or "").strip()
     low = rel.lower()
     if not low.endswith((".html", ".htm") + _PREVIEW_IMAGE_EXT):
-        return {"error": "preview_html shows .html / .htm pages and images "
+        return {"error": "preview_file shows .html / .htm pages and images "
                          "(.png .jpg .jpeg .webp .gif .bmp .avif), not "
                          "%r" % os.path.basename(rel)}
     try:
@@ -2592,23 +2592,22 @@ def _blender_status_payload():
             "tools": names, "detail": detail}
 
 
+# Kept deliberately short. The tool schemas go out with every request and
+# already describe what each tool is for; naming them here as well only goes
+# stale, and it is the one thing in this string that has gone stale before
+# (grep was renamed from needle_search while this paragraph still said
+# "needle_search"). What belongs here is what no schema can say: the rules
+# about paths, about doing rather than describing, and about colour.
 SYSTEM = ("You are the friendly assistant living on the user's "
           + ("Windows" if IS_WINDOWS else "Linux") + " PC. Reply concisely and "
-          "naturally, in the language the user writes in.\n"
-          "You can see: attached images and text files, and the screen itself "
-          "(take_screenshot) - error dialogs, app windows, web pages, terminal "
-          "output. Look properly before answering about what is in them.\n"
-          "You can act: move the mouse, click, drag and type (control_input), "
-          "read or write the system clipboard (clipboard), download files "
-          "(download_file), run shell commands (shell) - read their output and "
-          "do the task rather than describing it. You can read and change files "
-          "in the workspace and in archives (archive).\n"
-          "The workspace is your default folder, not a wall. For anything "
-          "else on the PC, pass the absolute path to list_dir / read_file / "
-          "grep / write_file / edit_file and the user is asked to approve "
-          "(ALLOW FOR THIS CONV, ALLOW ONCE or DENY). Never refuse or guess a "
-          "path - try the real one, and if it is denied, respect that and ask "
-          "what to do instead. "
+          "naturally, in the language the user writes in. You can see attached "
+          "images and the screen itself - look properly before answering about "
+          "what is in them. Act on the machine rather than describing how you "
+          "would.\n"
+          "The workspace is your default folder, not a wall. For anything else "
+          "on the PC, pass the absolute path and the user is asked to approve. "
+          "Never refuse or guess a path - try the real one, and if it is "
+          "denied, respect that and ask what to do instead. "
           + ("Prefer grep over a broad path such as 'C:\\Users' or 'C:\\' to look "
              "across the whole PC instead of guessing where a file might be. "
              if IS_WINDOWS else
@@ -2616,18 +2615,8 @@ SYSTEM = ("You are the friendly assistant living on the user's "
              "the whole machine instead of guessing where a file might be. Every "
              "path here is POSIX: a backslash is an ordinary character in a "
              "name, not a separator. ")
-          + "\nWhen you are unsure, asked for anything recent, or want to "
-          "check a fact, search the web (web_search) and read pages "
-          "(web_fetch). When you need a choice, a password or a confirmation, "
-          "ask with the question tool rather than assuming. For a longer task, "
-          "keep a visible list of steps with todo_write.\n"
-          "Early in a conversation, once you know what it is about, name it with "
-          "set_chat_title - two to six words, so the user can find it again "
-          "later.\n"
-          "You can draw: when the user asks for a picture, an illustration or "
-          "an image, use generate_image and then look at what came back. It "
-          "runs a local model on the GPU, so an API model has to be the active "
-          "one.\n"
+          + "\nWhen you need a choice, a password or a confirmation, ask rather "
+          "than assuming. For a longer task keep a visible list of steps.\n"
           "Colour: wrap only the part of a reply that carries meaning in "
           "[color=NAME]...[/color] and leave the rest plain - a warning, an "
           "error, a key value, the one word that answers the question, and "
@@ -4429,7 +4418,92 @@ def _unload_bonsai():
                      "listening)" % port}
 
 
+# What each host will accept, as (value, label) pairs. Asked, not guessed:
+# OpenRouter's own 400 spells out max|xhigh|high|medium|low|minimal|none, and
+# Gemini rejects the whole field rather than any particular value, so it gets a
+# single entry saying so instead of a menu that would fail on use.
+#
+# "off" is one of these rather than a separate switch because it is a real
+# level that different hosts spell differently: OpenRouter calls it "none",
+# while a local llama-server wants enable_thinking: false. _effort_params
+# translates.
+EFFORT_LEVELS = {
+    "openrouter": [
+        ("max", "MAX"), ("xhigh", "X-HIGH"), ("high", "HIGH"),
+        ("medium", "MEDIUM"), ("low", "LOW"), ("minimal", "MINIMAL"),
+        ("none", "NONE - no thinking"),
+    ],
+    "local": [
+        ("xhigh", "X-HIGH"), ("high", "HIGH"), ("med", "MED"),
+        ("low", "LOW"), ("off", "OFF"),
+    ],
+    "none": [
+        ("off", "OFF - this model does not take a thinking setting"),
+    ],
+}
+# default per host, when that host's model has never set one
+EFFORT_DEFAULT = {"openrouter": "high", "local": "med", "none": "off"}
+_BONSAI_EFFORT_BY_HOST = {}
+
+
+def _effort_host(entry=None):
+    """Which vocabulary the active model speaks.
+
+    Read off the endpoint rather than off a list of model names: a dozen
+    providers all call their model "gpt", and any table keyed on the name is a
+    table that goes stale the moment a provider is added."""
+    e = entry if entry is not None else _active_model()
+    if not e or e.get("type") != "api" or _is_loopback(e):
+        return "local"
+    base = str(e.get("base_url") or "").lower()
+    if "openrouter" in base or "opencod" in base:
+        return "openrouter"
+    for frag in ("googleapis", "generativelanguage", "groq", "mistral",
+                 "cerebras", "nvidia", "anthropic", "openai", "azure"):
+        if frag in base:
+            return "none" if "google" in frag else "openrouter"
+    return "openrouter"
+
+
+def effort_levels_for(entry=None):
+    """The menu the active model should show, as [{value, label, note}]."""
+    host = _effort_host(entry)
+    levels = EFFORT_LEVELS.get(host, EFFORT_LEVELS["openrouter"])
+    out = []
+    for value, label in levels:
+        note = ""
+        if host == "none" and value == "off":
+            note = ("this endpoint rejects the reasoning field entirely, "
+                    "so there is no thinking setting to change")
+        out.append({"value": value, "label": label, "note": note,
+                    "host": host})
+    return out
+
+
 def set_bonsai_effort(effort):
+    global _BONSAI_EFFORT
+    val = str(effort or "").strip().lower()
+    host = _effort_host()
+    # keep only a level this host actually offers, so a stale value from
+    # another host cannot leak through and 400 the turn
+    allowed = [v for v, _ in EFFORT_LEVELS.get(host, [])]
+    if val not in allowed:
+        val = EFFORT_DEFAULT.get(host, "medium")
+    _BONSAI_EFFORT_BY_HOST[host] = val
+    _BONSAI_EFFORT = val
+    return _BONSAI_EFFORT
+
+
+def current_effort():
+    """The level for the active host, remembered separately per host."""
+    host = _effort_host()
+    with _EFFORT_LOCK:
+        val = _BONSAI_EFFORT_BY_HOST.get(host)
+    if val is None:
+        val = EFFORT_DEFAULT.get(host, "medium")
+        with _EFFORT_LOCK:
+            _BONSAI_EFFORT_BY_HOST[host] = val
+    return val
     global _BONSAI_EFFORT
     val = str(effort or "high").strip().lower()
     _BONSAI_EFFORT = {"off": "off", "low": "low", "med": "medium",
@@ -4457,25 +4531,24 @@ def _effort_params():
     A loopback llama-server takes chat_template_kwargs and calls the reasoning
     "reasoning_content". A hosted endpoint wants the OpenRouter/OpenAI unified
     `reasoning` object instead, and passes the text back as `reasoning`."""
-    with _EFFORT_LOCK:
-        eff = _BONSAI_EFFORT
     entry = _active_model()
     if _model_omits(entry, "reasoning"):
         return {}
-    if entry and entry.get("type") == "api" and not _is_loopback(entry):
-        # The effort knob is a short word in the UI; the unified field wants the
-        # provider's own spelling of it. OpenRouter accepts
-        # max|xhigh|high|medium|low|minimal|none, so the UI's "med" went out
-        # verbatim and every turn came back 400 "Invalid option: expected one
-        # of ... medium ...". The comment here claimed the values were already
-        # right, which is exactly why it was not noticed.
-        hosted = {"off": "none", "med": "medium", "minimal": "minimal",
-                  "low": "low", "medium": "medium", "high": "high",
-                  "xhigh": "xhigh", "max": "max"}
-        level = hosted.get(str(eff or "").strip().lower(), "medium")
-        if eff == "off":
+    host = _effort_host(entry)
+    eff = current_effort()
+    if host == "none":
+        # Sends its own thinking control, or has none. Either way the unified
+        # field is the wrong thing to send and it is not sent.
+        return {}
+    if host == "openrouter":
+        # Values are the host's own spelling, taken from the menu, so the
+        # translation that used to live here is no longer needed: "med" became
+        # "medium" here and a value the host does not know could still get
+        # through. Now the menu only ever offers what this host accepts.
+        if eff == "none":
             return {"reasoning": {"enabled": False}}
-        return {"reasoning": {"effort": level}}
+        return {"reasoning": {"effort": eff}}
+    # local: llama.cpp's own dialect, unchanged
     if eff == "off":
         return {"chat_template_kwargs": {"enable_thinking": False}}
     return {"chat_template_kwargs": {"enable_thinking": True,
@@ -4526,10 +4599,10 @@ WEB_SPECS = [WEB_TOOLS["web_search"], WEB_TOOLS["web_fetch"]]
 
 
 
-PREVIEW_HTML_TOOL = {
+PREVIEW_FILE_TOOL = {
     "type": "function",
     "function": {
-        "name": "preview_html",
+        "name": "preview_file",
         "description": "Show something in the big center stage - an HTML page "
                        "or an image. Call it after writing an .html/.htm file "
                        "(a chart, a report, a small web app) to live-preview it "
@@ -5734,7 +5807,7 @@ NEW_TOOLS = [WINDOW_LIST_TOOL, WINDOW_ACTION_TOOL,
              COPY_CLIPBOARD_TOOL, PASTE_CLIPBOARD_TOOL, CLICK_TEXT_TOOL,
              API_CALL_TOOL, WS_TEST_TOOL,
              SCHEDULE_TOOL, LIST_SCHEDULES_TOOL, UNSCHEDULE_TOOL,
-             TTS_VOICES_TOOL, TTS_SPEAK_TOOL, IMAGE_GEN_TOOL, PREVIEW_HTML_TOOL]
+             TTS_VOICES_TOOL, TTS_SPEAK_TOOL, IMAGE_GEN_TOOL, PREVIEW_FILE_TOOL]
 
 DOWNLOAD_TOOLS = [DOWNLOAD_STATUS_TOOL, DOWNLOAD_BATCH_TOOL,
                   DOWNLOAD_AUTHED_TOOL, DOWNLOAD_PAGE_TOOL,
@@ -10937,8 +11010,12 @@ def _execute_tool_call(name, args, tc, hooks, image_uri):
         # mouse and running shell commands to press its own interface. A tool
         # the model chose to call should just work.
         raw_result = _tts_speak(args)
-    elif name == "preview_html":
-        raw_result = _preview_html(args.get("path"))
+    elif name in ("preview_file", "preview_html"):
+        # preview_html is the name this tool had before it learned to display
+        # images as well as pages. Kept working on purpose: to a model, a rename
+        # with no alias is an unknown tool, and it would stop using something
+        # that still works perfectly well.
+        raw_result = _preview_file(args.get("path"))
     elif name == "glob":
         raw_result = _glob_search(args.get("pattern"), args.get("path"))
     elif name == "read":
@@ -12178,10 +12255,8 @@ PAGE = """<!doctype html>
           <div class="composerctl">
             <button type="button" class="modebtn" id="modebtn" title="Switch Plan / Build mode - Plan is read-only (no tools run)">BUILD</button>
             <select id="effort-sel" title="Thinking effort - how deeply BONSAI reasons (this can change the response quality)">
-              <option value="off">THINK: OFF</option>
-              <option value="low">THINK: LOW</option>
-              <option value="med" selected>THINK: MED</option>
-              <option value="high">THINK: HIGH</option>
+              <!-- filled from the active model: every host spells this
+                   differently and rejects the values it does not know -->
             </select>
             <div class="ctxmeter" id="ctxmeter" title="Context window in use - the system prompt and all tools are already counted, before you type">
               <span class="ctxbar"><span class="ctxfill" id="ctxfill"></span></span>
@@ -14367,6 +14442,72 @@ function setModelStatus(ready, loading) {
   t.title = loading ? 'The model is being loaded into RAM/VRAM - this only happens on your first message.'
     : (ready ? 'The model is resident in RAM/VRAM.' : 'The model is not loaded. It loads the first time you send a message.');
 }
+/* Tell the server which level is chosen, and take back the menu it answers
+   with. Going through the server rather than just posting the value is what
+   keeps one list of levels: it validates the choice against the active host
+   and can answer with a corrected set, so the menu on screen is always what
+   the server would actually send. */
+function pushEffort() {
+  const el = document.getElementById('effort-sel');
+  if (!el) return;
+  const v = effortValue();
+  try { localStorage.setItem('bonsai_effort', v); } catch (e) {}
+  fetch('/api/effort', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ effort: v }) })
+    .then(function (r) { return r.json(); })
+    .then(function (j) { if (j) renderEffortSel({ host: j.host, current: j.effort, levels: j.levels }); })
+    .catch(function () {});
+}
+
+/* The thinking menu belongs to whichever model is active, so it is built from
+   what that model says it accepts rather than from a list written here once.
+   Four hardcoded words were wrong for every provider but one: OpenRouter takes
+   max|xhigh|high|medium|low|minimal|none and answers 400 with that list in the
+   message, while Google rejects the whole field. The value is kept if the new
+   menu still offers it, so switching models does not silently move the knob. */
+let EFFORT_HOST = '';
+let EFFORT_WIRED = false;
+function renderEffortSel(info, wanted) {
+  const sel = document.getElementById('effort-sel');
+  if (!sel || !info || !Array.isArray(info.levels) || !info.levels.length) return;
+  const prev = wanted || sel.value;
+  sel.innerHTML = '';
+  info.levels.forEach(function (lv) {
+    const o = document.createElement('option');
+    o.value = lv.value;
+    o.textContent = 'THINK: ' + lv.label;
+    if (lv.note) o.title = lv.note;
+    if (lv.value === (info.current || prev)) o.selected = true;
+    sel.appendChild(o);
+  });
+  sel.title = info.host === 'none'
+    ? 'This model does not take a thinking setting.'
+    : 'How deeply ' + (info.host === 'local' ? 'the local model' : 'the model')
+      + ' reasons. The options are the ones this endpoint accepts.';
+  // one host's levels mean nothing on another, so say which is which
+  sel.setAttribute('data-host', info.host || '');
+  EFFORT_HOST = info.host || '';
+  if (info.current && sel.value !== info.current) {
+    for (let i = 0; i < sel.options.length; i++) {
+      if (sel.options[i].value === info.current) { sel.selectedIndex = i; break; }
+    }
+  }
+  if (info.host === 'none') sel.classList.add('locked');
+  else sel.classList.remove('locked');
+  /* one listener, added by the function that owns the element. Adding it at the
+     top level meant it ran before this element existed in one of the page
+     copies, and a second copy double-posted every change. */
+  if (!EFFORT_WIRED) {
+    EFFORT_WIRED = true;
+    sel.addEventListener('change', pushEffort);
+  }
+}
+function effortValue() {
+  const el = document.getElementById('effort-sel');
+  if (el && el.value) return el.value;
+  try { return localStorage.getItem('bonsai_effort') || 'high'; } catch (e) {}
+  return 'high';
+}
 function renderModels(j) {
   const sel = document.getElementById('modelsel');
   if (!sel) return;
@@ -14406,6 +14547,8 @@ function renderModels(j) {
   });
   sel.classList.toggle('off', !j.managed);
   sel.setAttribute('data-prev', j.active || '');
+  renderEffortSel(j.effort, sel.getAttribute('data-prev-effort'));
+  renderEffortSel(j.effort, sel.getAttribute('data-prev-effort'));
   const badge = document.getElementById('modelbadge');
   if (badge && j.active_label) badge.textContent = j.active_label;
   const vs = document.getElementById('visionbadge');
@@ -15428,12 +15571,7 @@ PAGE_GPT = """<!doctype html>
         <select class="pill" id="modelsel" title="Active AI model - pick a local .gguf or an external OpenAI-compatible endpoint" style="max-width:190px"></select>
         <button class="pill" id="addmodelbtn" title="Add a model (local .gguf file or an external API endpoint)">+</button>
         <button class="pill" id="cfgbtn" title="Model settings - context size, temperature, GPU layers">&#9881;</button>
-        <select class="pill" id="effort-sel" title="Thinking effort - how deeply BONSAI reasons">
-          <option value="off">Effort: off</option>
-          <option value="low">Effort: low</option>
-          <option value="med" selected>Effort: med</option>
-          <option value="high">Effort: high</option>
-        </select>
+        <select class="pill" id="effort-sel" title="Thinking effort - filled from the active model, see renderEffortSel()"></select>
         <span class="state" id="state-label">READY</span>
       </div>
     </header>
@@ -16541,7 +16679,16 @@ function doneThinking(errMsg) {
   }
   thinkingRow = null;
 }
-function effortValue() { return document.getElementById('effort-sel').value; }
+/* A host with no thinking setting still posts a level, and the server drops it
+   for that host, so the request shape stays the same. Falling back to the
+   window's stored value keeps the knob steady across a model switch. */
+function effortValue() {
+  const el = document.getElementById('effort-sel');
+  if (el && el.value) return el.value;
+  try { return localStorage.getItem('bonsai_effort') || 'high'; } catch (e) {}
+  return 'high';
+}
+
 function statLine() { return document.getElementById('statsline'); }
 function fmtMs(ms) { if (!ms && ms !== 0) return '--'; return (ms / 1000).toFixed(1) + 's'; }
 function runningStats() {
@@ -17612,6 +17759,72 @@ function setModelStatus(ready, loading) {
   t.title = loading ? 'The model is being loaded into RAM/VRAM - this only happens on your first message.'
     : (ready ? 'The model is resident in RAM/VRAM.' : 'The model is not loaded. It loads the first time you send a message.');
 }
+/* Tell the server which level is chosen, and take back the menu it answers
+   with. Going through the server rather than just posting the value is what
+   keeps one list of levels: it validates the choice against the active host
+   and can answer with a corrected set, so the menu on screen is always what
+   the server would actually send. */
+function pushEffort() {
+  const el = document.getElementById('effort-sel');
+  if (!el) return;
+  const v = effortValue();
+  try { localStorage.setItem('bonsai_effort', v); } catch (e) {}
+  fetch('/api/effort', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ effort: v }) })
+    .then(function (r) { return r.json(); })
+    .then(function (j) { if (j) renderEffortSel({ host: j.host, current: j.effort, levels: j.levels }); })
+    .catch(function () {});
+}
+
+/* The thinking menu belongs to whichever model is active, so it is built from
+   what that model says it accepts rather than from a list written here once.
+   Four hardcoded words were wrong for every provider but one: OpenRouter takes
+   max|xhigh|high|medium|low|minimal|none and answers 400 with that list in the
+   message, while Google rejects the whole field. The value is kept if the new
+   menu still offers it, so switching models does not silently move the knob. */
+let EFFORT_HOST = '';
+let EFFORT_WIRED = false;
+function renderEffortSel(info, wanted) {
+  const sel = document.getElementById('effort-sel');
+  if (!sel || !info || !Array.isArray(info.levels) || !info.levels.length) return;
+  const prev = wanted || sel.value;
+  sel.innerHTML = '';
+  info.levels.forEach(function (lv) {
+    const o = document.createElement('option');
+    o.value = lv.value;
+    o.textContent = 'THINK: ' + lv.label;
+    if (lv.note) o.title = lv.note;
+    if (lv.value === (info.current || prev)) o.selected = true;
+    sel.appendChild(o);
+  });
+  sel.title = info.host === 'none'
+    ? 'This model does not take a thinking setting.'
+    : 'How deeply ' + (info.host === 'local' ? 'the local model' : 'the model')
+      + ' reasons. The options are the ones this endpoint accepts.';
+  // one host's levels mean nothing on another, so say which is which
+  sel.setAttribute('data-host', info.host || '');
+  EFFORT_HOST = info.host || '';
+  if (info.current && sel.value !== info.current) {
+    for (let i = 0; i < sel.options.length; i++) {
+      if (sel.options[i].value === info.current) { sel.selectedIndex = i; break; }
+    }
+  }
+  if (info.host === 'none') sel.classList.add('locked');
+  else sel.classList.remove('locked');
+  /* one listener, added by the function that owns the element. Adding it at the
+     top level meant it ran before this element existed in one of the page
+     copies, and a second copy double-posted every change. */
+  if (!EFFORT_WIRED) {
+    EFFORT_WIRED = true;
+    sel.addEventListener('change', pushEffort);
+  }
+}
+function effortValue() {
+  const el = document.getElementById('effort-sel');
+  if (el && el.value) return el.value;
+  try { return localStorage.getItem('bonsai_effort') || 'high'; } catch (e) {}
+  return 'high';
+}
 function renderModels(j) {
   const sel = document.getElementById('modelsel');
   if (!sel) return;
@@ -17651,6 +17864,8 @@ function renderModels(j) {
   });
   sel.classList.toggle('off', !j.managed);
   sel.setAttribute('data-prev', j.active || '');
+  renderEffortSel(j.effort, sel.getAttribute('data-prev-effort'));
+  renderEffortSel(j.effort, sel.getAttribute('data-prev-effort'));
   const badge = document.getElementById('modelbadge');
   if (badge && j.active_label) badge.textContent = j.active_label;
   const vs = document.getElementById('visionbadge');
@@ -19873,7 +20088,15 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, json.dumps({"enabled": tts_enabled(),
                                         "folder": PIPER_DIR}))
         elif path == "/api/models":
-            self._send(200, json.dumps(_public_models(), default=str))
+            payload = _public_models()
+            # The thinking menu belongs to the active model, so it travels with
+            # it rather than being fetched separately and going stale.
+            payload["effort"] = {
+                "host": _effort_host(),
+                "current": current_effort(),
+                "levels": effort_levels_for(),
+            }
+            self._send(200, json.dumps(payload, default=str))
         elif path == "/api/path_policy":
             self._send(200, json.dumps(_path_state(), default=str))
         elif path == "/api/sched_results":
@@ -20008,7 +20231,10 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if path == "/api/effort":
                 effort = set_bonsai_effort(body.get("effort"))
-                self._send(200, json.dumps({"ok": True, "effort": effort}))
+                self._send(200, json.dumps(
+                    {"ok": True, "effort": effort,
+                     "host": _effort_host(),
+                     "levels": effort_levels_for()}, default=str))
                 return
             if path == "/api/tts":
                 enabled = set_tts_enabled(body.get("enabled"))
