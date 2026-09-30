@@ -4948,7 +4948,9 @@ TTS_SPEAK_TOOL = {
     "function": {
         "name": "tts_speak",
         "description": "Speak text aloud using the local neural Piper TTS "
-                       "engine (no cloud, no built-in system voices). Also "
+                       "engine (no cloud, no built-in system voices). It plays "
+                       "straight away - there is nothing to switch on first, so "
+                       "just call it, do not go looking for a TTS button. Also "
                        "saves the speech as a WAV file in the workspace. Use "
                        "this to give the user spoken feedback, alerts or TTS "
                        "output.",
@@ -10295,11 +10297,14 @@ def _execute_tool_call(name, args, tc, hooks, image_uri):
     elif name == "tts_voices":
         raw_result = _piper_voices()
     elif name == "tts_speak":
-        if not tts_enabled():
-            raw_result = {"error": "TTS is OFF - click the TTS button in the "
-                                   "header to enable spoken replies, then ask again"}
-        else:
-            raw_result = _tts_speak(args)
+        # Not gated on the header toggle. That toggle gates nothing else - it
+        # never made replies speak by themselves - so all it did was stop the
+        # model from using the one tool that speaks on request. Worse, the
+        # refusal told it to "click the TTS button in the header", and a model
+        # that took that literally went off taking screenshots, moving the
+        # mouse and running shell commands to press its own interface. A tool
+        # the model chose to call should just work.
+        raw_result = _tts_speak(args)
     elif name == "preview_html":
         raw_result = _preview_html(args.get("path"))
     elif name == "glob":
