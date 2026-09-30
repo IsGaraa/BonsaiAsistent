@@ -2594,6 +2594,10 @@ SYSTEM = ("You are the friendly assistant living on the user's "
           "Early in a conversation, once you know what it is about, name it with "
           "set_chat_title - two to six words, so the user can find it again "
           "later.\n"
+          "You can draw: when the user asks for a picture, an illustration or "
+          "an image, use generate_image and then look at what came back. It "
+          "runs a local model on the GPU, so an API model has to be the active "
+          "one.\n"
           "Colour: wrap only the part of a reply that carries meaning in "
           "[color=NAME]...[/color] and leave the rest plain - a warning, an "
           "error, a key value, the one word that answers the question, and "
@@ -3813,6 +3817,499 @@ def _port_listening(port=8080, host="127.0.0.1", timeout=1.5):
         return False
 
 
+# ---------------- Local image generation (Qwen-Image 2.1) ----------------
+#
+# Three files, because this architecture is not one model: a diffusion
+# transformer, a Qwen3-VL-8B text encoder, and its own VAE. The earlier Qwen
+# Image and Wan VAEs are not interchangeable with this one, which is the kind
+# of detail that produces a black picture and no error.
+IMAGE_MODEL_DIR = os.environ.get(
+    "PC_IMAGE_MODEL_DIR", os.path.join(BONSAI_DIR, "image_models"))
+SD_DIR = os.environ.get("PC_SD_DIR", os.path.join(BONSAI_DIR, "sd.cpp"))
+_SD_LOCK = threading.Lock()
+# Live previews, by job id. Kept in memory and written by the engine as it
+# samples; served by /imgpreview/<id> with no-store, because this file changes
+# every second and any cache at all would show a stale picture.
+_IMG_JOBS = {}
+_IMG_JOBS_LOCK = threading.Lock()
+
+# The engine wants both dimensions on a 32-pixel grid. True 16:9 is not on that
+# grid at any sane size - 720 and 1080 are both 22.5 and 33.75 steps - so these
+# are the nearest legal shapes, not exact ratios. The exact ratio arrives later,
+# in the upscale, where nothing has to be a multiple of anything.
+_IMG_ASPECTS = {
+    "16:9": (1280, 704),
+    "widescreen": (1280, 704),
+    "9:16": (704, 1280),
+    "portrait": (704, 1280),
+    "1:1": (1024, 1024),
+    "square": (1024, 1024),
+    "4:3": (1024, 768),
+    "3:4": (768, 1024),
+}
+
+
+_PREVIEW_CACHE = {}
+_PREVIEW_CACHE_LOCK = threading.Lock()
+_PREVIEW_MAX_EDGE = 720
+
+
+def _preview_jpeg(path):
+    """A small JPEG of the current preview, or None if it cannot be made.
+
+    The engine writes its TAE preview at the model's own resolution - about
+    2 MB at 1280px. Fine for looking at, absurd for a progress animation that
+    refetches it on every step, so it is resampled once per version and cached
+    against the file's mtime.
+    """
+    try:
+        mtime = os.path.getmtime(path)
+        size = os.path.getsize(path)
+    except OSError:
+        return None
+    key = (path, mtime, size)
+    with _PREVIEW_CACHE_LOCK:
+        hit = _PREVIEW_CACHE.get(key)
+    if hit is not None:
+        return hit
+    try:
+        from PIL import Image
+        import io as _io
+        with Image.open(path) as im:
+            im.load()
+            w, h = im.size
+            scale = min(1.0, _PREVIEW_MAX_EDGE / float(max(w, h)))
+            if scale < 1.0:
+                im = im.resize((max(1, int(w * scale)), max(1, int(h * scale))),
+                               getattr(getattr(Image, "Resampling", Image),
+                                       "LANCZOS"))
+            buf = _io.BytesIO()
+            im.convert("RGB").save(buf, "JPEG", quality=82)
+            data = buf.getvalue()
+    except Exception:
+        return None
+    with _PREVIEW_CACHE_LOCK:
+        if len(_PREVIEW_CACHE) > 64:
+            _PREVIEW_CACHE.clear()
+        _PREVIEW_CACHE[key] = data
+    return data
+
+
+def _img_job(job_id, **fields):
+    with _IMG_JOBS_LOCK:
+        job = _IMG_JOBS.setdefault(job_id, {})
+        job.update(fields)
+        return job
+
+
+def _img_job_get(job_id):
+    with _IMG_JOBS_LOCK:
+        return _IMG_JOBS.get(job_id) or {}
+
+
+def _upscale_png(src, dst, width, height):
+    """Resample to an exact size. Deliberately not an AI upscaler.
+
+    Pillow's Lanczos is a windowed sinc filter: no model, no extra VRAM, no
+    invented detail, and it runs in milliseconds. An AI upscaler would be a
+    second multi-gigabyte model to load on a card that has just given up 7 GB
+    to the diffusion model, to sharpen an image the user can sharpen in any
+    image editor. It is also the honest choice: resampling does not make a
+    704px image contain 1080px of real detail, and it should not pretend to.
+    """
+    try:
+        from PIL import Image
+    except ImportError:
+        return None, "Pillow is not installed (pip install pillow)"
+    try:
+        with Image.open(src) as im:
+            im.load()
+            resample = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
+            out = im.convert("RGB").resize((int(width), int(height)), resample)
+            out.save(dst, "PNG")
+        return dst, None
+    except Exception as exc:
+        return None, "upscale failed: %s" % exc
+
+
+def _sd_cli():
+    return os.path.join(SD_DIR, "sd-cli.exe")
+
+
+def _find_first(directory, *needles):
+    """First file in a folder whose name contains all of the needles.
+
+    The quantisation is a filename, not a directory, and the file that is here
+    is whichever one someone downloaded. Matching on the parts that matter
+    means swapping Q4_0 for Q4_K_M later is deleting a file, not editing code.
+    """
+    try:
+        names = sorted(os.listdir(directory))
+    except OSError:
+        return None
+    for n in names:
+        low = n.lower()
+        if all(x in low for x in needles) and low.endswith(
+                (".gguf", ".safetensors", ".onnx")):
+            return os.path.join(directory, n)
+    return None
+
+
+def _image_parts():
+    """The three weights, or a list of what is missing - named, so the fix is
+    obvious rather than a puzzle."""
+    found, missing = {}, []
+    wanted = (
+        ("diffusion", os.path.join(IMAGE_MODEL_DIR, "diffusion"), ("qwen-image",)),
+        ("vae", os.path.join(IMAGE_MODEL_DIR, "vae"), ("vae",)),
+        ("text_encoder", os.path.join(IMAGE_MODEL_DIR, "text_encoder"),
+         ("qwen3vl",)),
+    )
+    for key, folder, needles in wanted:
+        path = _find_first(folder, *needles)
+        if path:
+            found[key] = path
+        else:
+            missing.append(key)
+    return found, missing
+
+
+def _vram_used_mb():
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=20)
+        return int(out.stdout.strip().splitlines()[0])
+    except Exception:
+        return None
+
+
+def _generate_image(args, hooks=None, direct=False):
+    """Draw one picture with a local diffusion model.
+
+    Runs the engine as a child process and waits for it. The reason is the
+    VRAM: this card has 12 GB, the diffusion stack peaks around 7.6 GB of it,
+    and a resident language model is holding 11.4 GB. They cannot both be
+    loaded, so the language server is stopped first. Letting the child exit is
+    what releases the GPU afterwards - there is nothing left to unload, and
+    nothing that can leak if the request was cancelled.
+    """
+    prompt = str(args.get("prompt") or "").strip()
+    if not prompt:
+        return {"error": "prompt is required - describe what to draw"}
+    with _SD_LOCK:
+        exe = _sd_cli()
+        if not os.path.exists(exe):
+            return {"error": "the image engine is not installed: %s not found. "
+                             "Run tools/fetch_sd_cpp.py to download it."
+                             % exe}
+        found, missing = _image_parts()
+        if missing:
+            return {"error": "missing image model weight(s): %s. Expected under "
+                             "%s. Run tools/fetch_image_model.py."
+                             % (", ".join(missing), IMAGE_MODEL_DIR)}
+
+        # The caller's own turn must survive. If a local model is answering,
+        # stopping it here would kill the conversation mid-sentence - the tool
+        # would run and then there would be nobody left to reply. So say so
+        # plainly and let the user pick an API model, which needs no VRAM here.
+        entry = _active_model()
+        if entry and entry.get("type") != "api" and not direct:
+            return {"error": "switch the active model to one of the API models "
+                             "first (Gemini, OpenRouter, Space Bunny). This tool "
+                             "has to unload the local model to free the GPU, "
+                             "which would stop the very model that is asking "
+                             "for the picture."}
+
+        # free the card before the diffusion stack asks for it. Ask whether a
+        # server is listening on the port, not _bonsai_ready(): that answers
+        # "is there a model server worth waiting for", which is true for every
+        # API model by design, and a leftover local server from an earlier
+        # conversation still holds 11 GB of VRAM while looking perfectly ready.
+        port = int(entry.get("port") or 8080) if entry else 8080
+        if _port_listening(port):
+            try:
+                _stop_local_server(port)
+            except Exception:
+                pass
+            for _ in range(30):
+                used = _vram_used_mb()
+                if used is not None and used < 4000:
+                    break
+                time.sleep(1)
+
+        def dim(name, default, lo, hi):
+            try:
+                v = int(args.get(name) or default)
+            except (TypeError, ValueError):
+                v = default
+            v = max(lo, min(hi, v))
+            return v - (v % 32)          # the engine wants multiples of 32
+
+        # aspect first, then explicit dimensions override it
+        want = str(args.get("aspect") or "16:9").strip().lower()
+        aw, ah = _IMG_ASPECTS.get(want, _IMG_ASPECTS["16:9"])
+        width, height = dim("width", aw, 256, 2048), dim("height", ah, 256, 2048)
+        try:
+            steps = max(4, min(40, int(args.get("steps") or 24)))
+        except (TypeError, ValueError):
+            steps = 24
+        try:
+            seed = int(args.get("seed", -1))
+        except (TypeError, ValueError):
+            seed = -1
+        # A long generation is normal here, so give it room - but only here.
+        # Every other tool keeps its own much smaller ceiling, and this does
+        # not relax any of them.
+        timeout = max(120, min(1800, int(args.get("timeout") or 600)))
+
+        out_dir = os.path.join(WORKDIR, "out", "images")
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+        except OSError:
+            out_dir = os.path.join(WORKDIR, "out")
+        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        out_path = os.path.join(out_dir, "img_%s.png" % stamp)
+
+        job_id = "%s_%d" % (stamp, os.getpid())
+        preview_path = os.path.join(out_dir, "preview_%s.png" % job_id)
+        _img_job(job_id, prompt=prompt, steps=steps, width=width,
+                 height=height, started=time.time(), preview=preview_path,
+                 preview_url="/imgpreview/" + job_id, done=False, error=None,
+                 output=None)
+        on_prog = (hooks or {}).get("on_imgprog")
+
+        cmd = [exe,
+               "--diffusion-model", found["diffusion"],
+               "--vae", found["vae"],
+               "--llm", found["text_encoder"],
+               "-p", prompt,
+               "-H", str(height), "-W", str(width),
+               "--steps", str(steps),
+               "--cfg-scale", "6.0",
+               "--sampling-method", "euler",
+               "--offload-to-cpu", "--diffusion-fa",
+               # The prefix cache holds the text's keys and values for the whole
+               # sampling run. At its default of f16 that is 2 GiB per condition
+               # and positive and negative are counted separately - about 4 GiB,
+               # which a 7 GB model on a 12 GB card cannot spare. q4_0 keeps it
+               # near half a gigabyte each.
+               "--model-args", "qwen_image_2_1_prefix_cache_type=q4_0",
+               # TAE is the tiny autoencoder: a real decoded preview of what has
+               # been denoised so far, cheap enough to write every few steps.
+               # It is the picture forming, not an animation standing in for it.
+               "--preview", "tae", "--preview-interval", "2",
+               "--preview-path", preview_path,
+               "-o", out_path]
+        if args.get("negative_prompt"):
+            cmd += ["-n", str(args["negative_prompt"])]
+        if seed >= 0:
+            cmd += ["-s", str(seed)]
+
+        if on_prog:
+            on_prog({"id": job_id, "phase": "loading", "percent": 0,
+                     "step": 0, "steps": steps, "prompt": prompt,
+                     "width": width, "height": height,
+                     "preview_url": "/imgpreview/" + job_id})
+
+        # The engine draws a progress bar on one line using carriage returns, so
+        # the output is read as a stream and the "7/24" inside it is turned into
+        # an event. Without this the page can only show a spinner and has no
+        # idea whether anything is happening.
+        # The bar is printed as "|==>   | 7/24 - 2.5s/it" with a carriage
+        # return, so the same line arrives many times per step. Match the bar,
+        # and only report when the whole-percent number actually moves.
+        #
+        # The "sampling using ..." line is the gate. Without it the pattern also
+        # matches the tensor-loading bar ("loading 104/650"), which produced a
+        # progress bar that leapt to 45% while the model was still being read
+        # off the disk, then fell back to 4%. Nothing reaches sampling before
+        # that line is printed, and no sensible total for a diffusion run is
+        # anywhere near the 650-odd tensors the loader walks through.
+        step_re = re.compile(r"\|\s*(\d+)\s*/\s*(\d+)\s*-")
+        sampling_started = False
+        t0 = time.time()
+        tail_lines = []
+        timed_out = False
+        rc = None
+        try:
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, errors="replace", bufsize=1, cwd=SD_DIR,
+                encoding="utf-8", creationflags=CREATE_NO_WINDOW)
+        except Exception as exc:
+            _img_job(job_id, done=True, error=str(exc)[:200])
+            return {"error": "could not start the image engine: %s" % exc}
+
+        last_sent = -1
+        last_sent_at = 0.0
+        last_step = -1
+        deadline = t0 + timeout
+        try:
+            while True:
+                if time.time() > deadline:
+                    timed_out = True
+                    proc.kill()
+                    break
+                line = proc.stdout.readline()
+                if not line:
+                    break
+                line = line.rstrip()
+                if line:
+                    tail_lines.append(line)
+                    del tail_lines[:-25]
+                m = step_re.search(line)
+                if not sampling_started:
+                    if "sampling using" in line:
+                        sampling_started = True
+                    m = None
+                if m and sampling_started:
+                    cur, tot = int(m.group(1)), int(m.group(2))
+                    if tot > max(8, steps * 4):
+                        m = None          # not the sampling bar
+                        cur = tot = 0
+                if m and on_prog:
+                    cur, tot = int(m.group(1)), int(m.group(2))
+                    pct = int(cur * 100 / max(1, tot))
+                    now = time.time()
+                    # at most ~4 updates a second, and only on a change: a bar
+                    # that flickers is worse than one that moves a little late
+                    if pct != last_sent and now - last_sent_at >= 0.25:
+                        moved = cur != last_step
+                        last_sent, last_sent_at, last_step = pct, now, cur
+                        on_prog({"id": job_id, "phase": "sampling",
+                                 "percent": pct, "step": cur, "steps": tot,
+                                 "seconds": round(now - t0, 1),
+                                 # Only when the step itself moved. Every event
+                                 # carrying this makes the page re-download the
+                                 # picture, and the engine repaints the bar
+                                 # many times per step.
+                                 "preview_url": ("/imgpreview/" + job_id
+                                                 if moved else None),
+                                 "prompt": prompt})
+        except Exception as exc:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            _img_job(job_id, done=True, error=str(exc)[:200])
+            return {"error": "image generation failed: %s" % exc}
+        try:
+            rc = proc.wait(timeout=30)
+        except Exception:
+            rc = None
+        took = round(time.time() - t0, 1)
+        if on_prog and os.path.exists(out_path):
+            on_prog({"id": job_id, "phase": "sampling", "percent": 100,
+                     "step": steps, "steps": steps, "seconds": took,
+                     "preview_url": "/imgpreview/" + job_id,
+                     "prompt": prompt})
+        _img_job(job_id, done=True)
+        try:
+            os.remove(preview_path)
+        except OSError:
+            pass
+
+        if timed_out:
+            _img_job(job_id, error="timed out")
+            if on_prog:
+                on_prog({"id": job_id, "phase": "error", "percent": 100,
+                         "error": "gave up after %d seconds" % timeout})
+            return {"error": "image generation gave up after %d seconds. Try a "
+                             "smaller size or fewer steps." % timeout}
+        if not os.path.exists(out_path):
+            msg = " ".join(tail_lines[-4:])[-260:] or "nothing"
+            _img_job(job_id, error=msg)
+            if on_prog:
+                on_prog({"id": job_id, "phase": "error", "percent": 100,
+                         "error": "the engine produced no image"})
+            oom = ("out of memory" in msg.lower() or "alloc" in msg.lower()
+                   or "cuda" in msg.lower() or "failed to allocate" in msg.lower())
+            if oom and not args.get("_retried"):
+                # 900 MiB of headroom is not a margin. Come back once at 70% of
+                # the linear size rather than telling the user it did not work.
+                retry = dict(args)
+                retry["_retried"] = 1
+                retry["width"] = max(256, int(width * 0.7) // 32 * 32)
+                retry["height"] = max(256, int(height * 0.7) // 32 * 32)
+                retry["steps"] = max(4, int(steps * 0.7))
+                if on_prog:
+                    on_prog({"id": job_id, "phase": "retry",
+                             "percent": 0, "prompt": prompt,
+                             "note": "out of memory - retrying smaller"})
+                smaller = _generate_image(retry, hooks, direct)
+                if isinstance(smaller, dict) and not smaller.get("error"):
+                    smaller["retried_smaller"] = (
+                        "the GPU would not hold %dx%d, so this is %dx%d"
+                        % (width, height, retry["width"], retry["height"]))
+                    return smaller
+            return {"error": "the engine produced no image (exit %s). Last "
+                             "output: %s%s"
+                             % (rc, msg,
+                                " - this size is more than the GPU can hold "
+                                "right now. Try a smaller aspect, or close "
+                                "anything else using the graphics card."
+                                if oom else "")}
+
+        size = os.path.getsize(out_path)
+        out = {"result": "ok", "path": out_path, "saved": out_path,
+               "width": width, "height": height, "steps": steps,
+               "seed": seed, "seconds": took, "bytes": size,
+               "label": "generated image",
+               "engine": "Qwen-Image 2.1 (local, stable-diffusion.cpp)",
+               "vram_released": "yes - the engine process exited, so the GPU "
+                                "is free again",
+               "job": job_id}
+
+        # Resample to the exact delivery size. The engine could not be asked for
+        # 1920x1080 directly - neither number is a multiple of 32 - which is the
+        # other half of why this step exists. Lanczos, in Pillow, no model.
+        want_up = args.get("upscale", True)
+        if want_up not in (False, "false", "False", 0, "0"):
+            # Match the shape, do not stretch it. A square came out as
+            # 1920x1080 before, which is not an upscale, it is a distortion.
+            if width > height:
+                up_w, up_h = 1920, 1080
+            elif height > width:
+                up_w, up_h = 1080, 1920
+            else:
+                up_w = up_h = 1080
+            if (width, height) != (up_w, up_h):
+                up_path = os.path.join(out_dir, "img_%s_1080p.png" % stamp)
+                got, why = _upscale_png(out_path, up_path, up_w, up_h)
+                if got:
+                    out["upscaled_path"] = got
+                    out["upscaled_size"] = "%dx%d" % (up_w, up_h)
+                    out["upscaled_bytes"] = os.path.getsize(got)
+                    out["upscale_method"] = "Lanczos resampling, no AI upscaler"
+                else:
+                    out["upscale_error"] = why
+        _img_job(job_id, done=True, output=out_path)
+        # Hand the picture to the model, and to the chat, without making the
+        # stored message carry megabytes of base64: the file on disk is the
+        # truth and the /att/ reference is what gets remembered.
+        try:
+            with open(out_path, "rb") as fh:
+                raw = fh.read()
+            out["image_data"] = ("data:image/png;base64,"
+                                 + base64.b64encode(raw).decode("ascii"))
+            url = _store_attachment(out["image_data"])
+            if url:
+                out["preview"] = url
+            if out.get("upscaled_path"):
+                try:
+                    with open(out["upscaled_path"], "rb") as fh:
+                        raw2 = fh.read()
+                    out["image_data_1080p"] = (
+                        "data:image/png;base64,"
+                        + base64.b64encode(raw2).decode("ascii"))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return out
+
+
 def _unload_bonsai():
     """Free the model's RAM/VRAM now. Local models: stop the llama-server
     process (it is restarted automatically on the next message). External API
@@ -4943,6 +5440,50 @@ TTS_VOICES_TOOL = _pc_tool(
     []
 )
 
+IMAGE_GEN_TOOL = _pc_tool(
+    "generate_image",
+    "Generate an image from a text description, using a local Qwen-Image 2.1 "
+    "model on this PC. The picture comes back and you can see it. Takes about "
+    "half a minute to a few minutes. Use it when the user asks you to draw, "
+    "make, illustrate, design or render something, or to create a picture. "
+    "Describe the subject, the setting, the light and the style in the prompt "
+    "- it is a text-to-image model and it only knows what you tell it. Good at "
+    "rendering text inside images and following composition. Sizes must be "
+    "multiples of 32; 512 and 768 are the sensible ones. Note this loads a "
+    "second large model, so any local language model is unloaded first - use "
+    "it while an API model is the active one.",
+    {
+        "prompt": {"type": "string",
+                   "description": "What to draw. Be specific: subject, "
+                                  "setting, lighting, style, mood."},
+        "negative_prompt": {"type": "string",
+                            "description": "What to avoid, e.g. 'blurry, "
+                                           "text, watermark, extra fingers'."},
+        "aspect": {"type": "string",
+                   "description": "Shape of the picture: '16:9' (default), "
+                                  "'9:16' for a phone-shaped one, '1:1', '4:3' "
+                                  "or '3:4'. Use this rather than width and "
+                                  "height - the sizes are chosen so the shape "
+                                  "comes out right."},
+        "width": {"type": "integer",
+                  "description": "Exact width in pixels. Only if you need a "
+                                 "specific size; prefer aspect."},
+        "height": {"type": "integer",
+                   "description": "Exact height in pixels. Only if you need a "
+                                  "specific size; prefer aspect."},
+        "upscale": {"type": "boolean",
+                    "description": "True (default) to also save a 1920x1080 "
+                                   "version, resampled with Lanczos - no AI, "
+                                   "no extra model, instant."},
+        "steps": {"type": "integer",
+                  "description": "Denoising steps, 4-40 (default 20). More is "
+                                 "slower and only helps a little past ~24."},
+        "seed": {"type": "integer",
+                 "description": "Random seed (default -1, meaning pick one). "
+                                "Reuse a seed to get the same picture again."},
+    },
+    ["prompt"])
+
 TTS_SPEAK_TOOL = {
     "type": "function",
     "function": {
@@ -5114,7 +5655,7 @@ NEW_TOOLS = [WINDOW_LIST_TOOL, WINDOW_ACTION_TOOL,
              COPY_CLIPBOARD_TOOL, PASTE_CLIPBOARD_TOOL, CLICK_TEXT_TOOL,
              API_CALL_TOOL, WS_TEST_TOOL,
              SCHEDULE_TOOL, LIST_SCHEDULES_TOOL, UNSCHEDULE_TOOL,
-             TTS_VOICES_TOOL, TTS_SPEAK_TOOL, PREVIEW_HTML_TOOL]
+             TTS_VOICES_TOOL, TTS_SPEAK_TOOL, IMAGE_GEN_TOOL, PREVIEW_HTML_TOOL]
 
 DOWNLOAD_TOOLS = [DOWNLOAD_STATUS_TOOL, DOWNLOAD_BATCH_TOOL,
                   DOWNLOAD_AUTHED_TOOL, DOWNLOAD_PAGE_TOOL,
@@ -10278,6 +10819,8 @@ def _execute_tool_call(name, args, tc, hooks, image_uri):
         raw_result = {"result": "ok", "todos": items}
     elif name == "set_chat_title":
         raw_result = _set_chat_title(args.get("title"), hooks)
+    elif name == "generate_image":
+        raw_result = _generate_image(args, hooks)
     elif name == "execute":
         raw_result = _execute_js(args.get("code", ""), args.get("timeout"))
     elif name == "window_list":
@@ -11140,6 +11683,42 @@ PAGE = """<!doctype html>
   }
   .field:focus-within { border-color: var(--acc); }
   #filein { display: none; }
+  /* ---- image generation mode ---- */
+  #imgmode.on { border-color: var(--acc); color: var(--acc); background: rgba(0,0,0,.25); }
+  .composer.imgmode .field { border-color: var(--acc); }
+  .imgcard { margin: 10px 0 4px; border: 1px solid var(--bd2); border-radius: 10px;
+             overflow: hidden; background: var(--bg3); }
+  .imgcard .imgtop { display: flex; align-items: center; gap: 8px; padding: 7px 10px;
+                     border-bottom: 1px solid var(--bd2); font-size: 11.5px; color: var(--mut); }
+  .imgcard .imgtop b { color: var(--txt2); font-weight: 600; white-space: nowrap; }
+  .imgcard .imgtop span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .imgcard .imgstage { position: relative; aspect-ratio: 16 / 9; background: #0b0b10; overflow: hidden; }
+  .imgcard .imgstage.portrait { aspect-ratio: 9 / 16; }
+  .imgcard .imgstage.square { aspect-ratio: 1 / 1; }
+  .imgcard .imgstage img { position: absolute; inset: 0; width: 100%; height: 100%;
+                           object-fit: contain; opacity: 0; transition: opacity .45s ease; }
+  .imgcard .imgstage img.in { opacity: 1; }
+  /* stands in only until the engine's first real preview lands */
+  .imgcard .imgshimmer { position: absolute; inset: 0;
+      background: linear-gradient(115deg, #14141c 0%, #1f2131 28%, #14141c 52%, #1f2131 76%, #14141c 100%);
+      background-size: 300% 100%; animation: imgsh 2.1s linear infinite; }
+  @keyframes imgsh { from { background-position: 150% 0; } to { background-position: -150% 0; } }
+  .imgcard .imgshimmer.gone { opacity: 0; transition: opacity .4s ease; }
+  .imgcard .imgempty { position: absolute; inset: 0; display: flex; align-items: center;
+                       justify-content: center; font-size: 12px; color: var(--mut); padding: 0 16px;
+                       text-align: center; }
+  .imgcard .imgempty.gone { display: none; }
+  .imgcard .imgbar { height: 4px; background: #1b1b26; overflow: hidden; }
+  .imgcard .imgbar i { display: block; height: 100%; width: 0%;
+                       background: linear-gradient(90deg, var(--acc), #7ad);
+                       transition: width .35s ease; }
+  .imgcard.err .imgbar i { background: #e5534b; }
+  .imgcard .imgfoot { display: flex; align-items: center; justify-content: space-between;
+                      gap: 10px; padding: 6px 10px; font-size: 11px; color: var(--mut);
+                      font-family: Consolas, monospace; }
+  .imgcard .imgfoot .dim { color: var(--txt2); }
+  .imgcard .imgfoot a { color: var(--acc); }
+
   #user-input {
     flex: 1; background: transparent; border: none; outline: none; resize: none; color: var(--txt);
     font: inherit; font-size: 14.5px; padding: 8px 6px; max-height: 160px; min-width: 0;
@@ -11524,6 +12103,7 @@ PAGE = """<!doctype html>
           <form id="chat-form" class="composer" onsubmit="handleSubmit(event)">
             <div class="field">
               <textarea id="user-input" rows="1" placeholder="Type a command..." title="Ctrl+V also attaches an image from the clipboard"></textarea>
+              <button type="button" class="iconbtn" id="imgmode" title="IMAGE mode - describe a picture and the local model draws it">&#127912;</button>
               <button type="button" class="iconbtn" id="attach" title="Attach images / files">&#128206;</button>
               <button type="button" class="iconbtn" id="mic-btn" title="Microphone">&#127908;</button>
               <button type="submit" id="send">SEND</button>
@@ -12218,8 +12798,217 @@ function buildUserMsg() {
   return parts;
 }
 
+/* ---------- IMAGE mode ----------------------------------------------------
+   Typing in the composer with IMAGE mode on asks the local diffusion model to
+   draw, without going near a language model. That is not a shortcut: the
+   generator needs the whole GPU, so the language model that would be driving it
+   has to be off the card. Asking the engine directly means there is nothing to
+   unload mid-sentence, and no model turn to lose. */
+let imgMode = false;
+function setImgMode(on) {
+  imgMode = !!on;
+  const btn = document.getElementById('imgmode');
+  const ta = document.getElementById('user-input');
+  const form = document.getElementById('chat-form');
+  if (btn) btn.classList.toggle('on', imgMode);
+  if (form) form.classList.toggle('imgmode', imgMode);
+  if (ta) {
+    ta.placeholder = imgMode
+      ? 'Describe the image to draw... (16:9 by default, try "9:16" for a phone one)'
+      : 'Type a command...';
+  }
+  if (imgMode && ta) ta.focus();
+}
+function imgStageClass(w, h) {
+  if (!w || !h) return '';
+  const r = w / h;
+  if (r > 1.2) return '';
+  if (r < 0.85) return 'portrait';
+  return 'square';
+}
+const PAINT_ICON = String.fromCodePoint(0x1F5BC);
+const imgCards = {};
+function onImgProg(j) {
+  if (!j || !j.id) return;
+  let h = imgCards[j.id];
+  if (!h) {
+    h = addImageCard(j.prompt || '', j.width || 0, j.height || 0);
+    if (!h) return;
+    imgCards[j.id] = h;
+  }
+  if (j.phase === 'loading') { h.setPct(2); h.setNote('loading the model\u2026'); return; }
+  if (j.phase === 'error') { h.fail((j.error || 'failed').slice(0, 120)); return; }
+  h.setPct(Math.max(3, j.percent || 0));
+  h.setNote('step ' + (j.step || 0) + ' / ' + (j.steps || '?'));
+  h.setDim((j.seconds || 0) + 's');
+  if (j.preview_url) h.setPreview(j.preview_url + '?t=' + Date.now());
+}
+function addImageCard(prompt, width, height) {
+  const conv = document.getElementById('conv');
+  if (!conv) return null;
+  const hint = conv.querySelector('.emptyhint');
+  if (hint) hint.remove();
+  const row = document.createElement('div');
+  row.className = 'msgrow bonsai';
+  const av = document.createElement('div'); av.className = 'av bonsai'; av.textContent = 'B';
+  const bubble = document.createElement('div'); bubble.className = 'bubble';
+
+  const card = document.createElement('div'); card.className = 'imgcard';
+  const top = document.createElement('div'); top.className = 'imgtop';
+  const b = document.createElement('b'); b.textContent = PAINT_ICON + ' Drawing';
+  const st = document.createElement('span'); st.textContent = prompt;
+  top.appendChild(b); top.appendChild(st);
+
+  const stage = document.createElement('div');
+  stage.className = 'imgstage ' + imgStageClass(width, height);
+  const shim = document.createElement('div'); shim.className = 'imgshimmer';
+  const empty = document.createElement('div'); empty.className = 'imgempty';
+  empty.textContent = 'waking the model\u2026';
+  const im = document.createElement('img'); im.alt = 'image being generated';
+  stage.appendChild(shim); stage.appendChild(empty); stage.appendChild(im);
+
+  const bar = document.createElement('div'); bar.className = 'imgbar';
+  const fill = document.createElement('i'); bar.appendChild(fill);
+  const foot = document.createElement('div'); foot.className = 'imgfoot';
+  const left = document.createElement('span'); left.textContent = 'loading';
+  const right = document.createElement('span'); right.className = 'dim';
+  foot.appendChild(left); foot.appendChild(right);
+
+  card.appendChild(top); card.appendChild(stage);
+  card.appendChild(bar); card.appendChild(foot);
+  bubble.appendChild(card);
+  row.appendChild(bubble); row.appendChild(av);
+  conv.appendChild(row);
+  scrollBottom();
+
+  let lastUrl = '';
+  return {
+    card: card, stage: stage, fill: fill, left: left, right: right,
+    im: im, shim: shim, empty: empty,
+    setPct: function (p) { fill.style.width = Math.max(0, Math.min(100, p)) + '%'; },
+    setNote: function (t) { left.textContent = t; },
+    setDim: function (t) { right.textContent = t; },
+    setPreview: function (url) {
+      if (!url || url === lastUrl) return;
+      lastUrl = url;
+      im.onload = function () {
+        im.classList.add('in');
+        shim.classList.add('gone');
+        empty.classList.add('gone');
+      };
+      im.src = url;
+    },
+    fail: function (msg) {
+      card.classList.add('err');
+      shim.classList.add('gone');
+      empty.classList.remove('gone');
+      empty.textContent = msg;
+      setPct(100);
+    }
+  };
+}
+function finishImageCard(handles, result) {
+  const h = handles;
+  if (!h) return;
+  h.setPct(100);
+  h.setNote('done');
+  h.setDim((result.width || '?') + '\u00d7' + (result.height || '?') +
+           ' \u00b7 ' + (result.seconds || '?') + 's');
+  h.shim.classList.add('gone');
+  if (result.preview) {
+    h.im.onload = function () { h.im.classList.add('in'); h.empty.classList.add('gone'); };
+    h.im.src = result.preview;
+    h.im.classList.add('in');
+    h.empty.classList.add('gone');
+  }
+  h.card.querySelector('.imgtop b').textContent = PAINT_ICON + ' Painted';
+  const foot = h.card.querySelector('.imgfoot');
+  if (foot) {
+    foot.textContent = '';
+    const a = document.createElement('a');
+    a.href = '/previewfile/' + encodeURIComponent(String(result.path || '').split(String.fromCharCode(92)).join('/'));
+    a.target = '_blank';
+    a.textContent = 'open the file';
+    const note = document.createElement('span');
+    note.textContent = (result.upscaled_path ? 'also at ' + result.upscaled_size : '');
+    foot.appendChild(a);
+    if (result.upscaled_path) foot.appendChild(note);
+  }
+}
+/* Read the engine's own event stream. Same shape as the chat stream, so the
+   same progress events drive both the button and the tool. */
+async function runImage(prompt) {
+  const width = 0, height = 0;
+  const handles = addImageCard(prompt, 0, 0);
+  let result = null, failed = null;
+  try {
+    const r = await fetch('/api/image', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ prompt: prompt }) });
+    if (!r.ok || !r.body) throw new Error('the server said ' + r.status);
+    const reader = r.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '', ev = '';
+    for (;;) {
+      const part = await reader.read();
+      if (part.done) break;
+      buf += dec.decode(part.value, { stream: true });
+      let nl;
+      while ((nl = buf.indexOf('\\n')) >= 0) {
+        const line = buf.slice(0, nl).trim();
+        buf = buf.slice(nl + 1);
+        if (line.startsWith('event:')) { ev = line.slice(6).trim(); continue; }
+        if (!line.startsWith('data:')) continue;
+        let j = null;
+        try { j = JSON.parse(line.slice(5).trim()); } catch (e) { continue; }
+        if (ev === 'imgprog') {
+          if (j.width && j.height && !handles.stage.dataset.sized) {
+            handles.stage.className = 'imgstage ' + imgStageClass(j.width, j.height);
+            handles.stage.dataset.sized = '1';
+          }
+          if (j.phase === 'loading') { handles.setPct(2); handles.setNote('loading the model\u2026'); }
+          else if (j.phase === 'sampling') {
+            handles.setPct(Math.max(3, j.percent || 0));
+            handles.setNote('step ' + (j.step || 0) + ' / ' + (j.steps || '?'));
+            handles.setDim((j.seconds || 0) + 's');
+            if (j.preview_url) handles.setPreview(j.preview_url + '?t=' + Date.now());
+          }
+        } else if (ev === 'done') {
+          if (j && j.error) failed = j.error; else result = j;
+          ev = 'stop';
+        } else if (ev === 'error') {
+          failed = (j && j.text) || 'something went wrong';
+          ev = 'stop';
+        }
+        if (ev === 'stop') break;
+      }
+      if (ev === 'stop') { try { await reader.cancel(); } catch (e) {} break; }
+    }
+  } catch (err) {
+    failed = (err && err.message) || String(err);
+  }
+  if (failed) { if (handles) handles.fail(failed.slice(0, 120)); return; }
+  finishImageCard(handles, result || {});
+}
+function submitImage() {
+  const ta = document.getElementById('user-input');
+  const prompt = ta.value.trim();
+  if (!prompt) return;
+  if (!cur) newChat();
+  ta.value = '';
+  const label = prompt.slice(0, 60);
+  if (!cur.title || cur.title === 'New chat') {
+    cur.title = label;
+    if (chats.indexOf(cur) === -1) chats.push(cur);
+  }
+  addUser(prompt);
+  save();
+  renderList();
+  runImage(prompt);
+}
 function handleSubmit(e) {
   e.preventDefault();
+  if (imgMode) { submitImage(); return; }
   if (busy) { queueNow(); return; }
   go();
 }
@@ -12635,7 +13424,7 @@ function shotCardDom(call) {
   const box = document.createElement('div'); box.className = 'shotcard';
   const head = document.createElement('div'); head.className = 'shothd';
   const name = document.createElement('b');
-  name.textContent = String.fromCodePoint(0x1F4BE) + ' ' + (r.matched ? 'window: ' + r.matched : 'screenshot');
+  name.textContent = String.fromCodePoint(0x1F4BE) + ' ' + (r.label || (r.matched ? 'window: ' + r.matched : 'screenshot'));
   head.appendChild(name);
   if (r.width && r.height) {
     const d = document.createElement('span');
@@ -12644,7 +13433,7 @@ function shotCardDom(call) {
   }
   box.appendChild(head);
   const im = document.createElement('img'); im.className = 'shotimg';
-  im.src = src; im.alt = 'screenshot captured by Bonsai';
+  im.src = src; im.alt = r.label || 'screenshot captured by Bonsai';
   im.title = 'Click to open full size';
   im.onclick = function () { window.open(src, '_blank'); };
   box.appendChild(im);
@@ -13083,6 +13872,7 @@ async function streamRun(messages, chat, anchorMsg) {
         else if (ev === 'ask') { onAsk(j); setBonsaiState('thinking'); }
         else if (ev === 'todo') { renderTodo(j.todos); }
     else if (ev === 'title') { applyChatTitle(j.title); }
+    else if (ev === 'imgprog') { onImgProg(j); }
         else if (ev === 'error') { doneThinking('Error: ' + j.text); setBonsaiState('idle'); if (!modelUp) setModelStatus(false, false); stopStats(); throw new Error(j.text); }
         else if (ev === 'done') { gotEnd = true; doneThinking(); setBonsaiState('idle'); }
       }
@@ -13239,6 +14029,7 @@ function addFiles(files) {
 }
 
 document.getElementById('attach').onclick = function () { document.getElementById('filein').click(); };
+document.getElementById('imgmode').onclick = function () { setImgMode(!imgMode); };
 document.getElementById('filein').onchange = function () { addFiles(this.files); this.value = ''; };
 /* Ctrl+V with an image on the clipboard attaches it, instead of pasting
    nothing at all. The image goes through the same addFiles() the paperclip
@@ -14425,6 +15216,42 @@ PAGE_GPT = """<!doctype html>
   .todochip .st.run { color: var(--warn); }
   .fine { margin: 10px auto 0; font-size: 11px; color: var(--mut); text-align: center; }
   #filein { display: none; }
+  /* ---- image generation mode ---- */
+  #imgmode.on { border-color: var(--acc); color: var(--acc); background: rgba(0,0,0,.25); }
+  .composer.imgmode .field { border-color: var(--acc); }
+  .imgcard { margin: 10px 0 4px; border: 1px solid var(--bd2); border-radius: 10px;
+             overflow: hidden; background: var(--bg3); }
+  .imgcard .imgtop { display: flex; align-items: center; gap: 8px; padding: 7px 10px;
+                     border-bottom: 1px solid var(--bd2); font-size: 11.5px; color: var(--mut); }
+  .imgcard .imgtop b { color: var(--txt2); font-weight: 600; white-space: nowrap; }
+  .imgcard .imgtop span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .imgcard .imgstage { position: relative; aspect-ratio: 16 / 9; background: #0b0b10; overflow: hidden; }
+  .imgcard .imgstage.portrait { aspect-ratio: 9 / 16; }
+  .imgcard .imgstage.square { aspect-ratio: 1 / 1; }
+  .imgcard .imgstage img { position: absolute; inset: 0; width: 100%; height: 100%;
+                           object-fit: contain; opacity: 0; transition: opacity .45s ease; }
+  .imgcard .imgstage img.in { opacity: 1; }
+  /* stands in only until the engine's first real preview lands */
+  .imgcard .imgshimmer { position: absolute; inset: 0;
+      background: linear-gradient(115deg, #14141c 0%, #1f2131 28%, #14141c 52%, #1f2131 76%, #14141c 100%);
+      background-size: 300% 100%; animation: imgsh 2.1s linear infinite; }
+  @keyframes imgsh { from { background-position: 150% 0; } to { background-position: -150% 0; } }
+  .imgcard .imgshimmer.gone { opacity: 0; transition: opacity .4s ease; }
+  .imgcard .imgempty { position: absolute; inset: 0; display: flex; align-items: center;
+                       justify-content: center; font-size: 12px; color: var(--mut); padding: 0 16px;
+                       text-align: center; }
+  .imgcard .imgempty.gone { display: none; }
+  .imgcard .imgbar { height: 4px; background: #1b1b26; overflow: hidden; }
+  .imgcard .imgbar i { display: block; height: 100%; width: 0%;
+                       background: linear-gradient(90deg, var(--acc), #7ad);
+                       transition: width .35s ease; }
+  .imgcard.err .imgbar i { background: #e5534b; }
+  .imgcard .imgfoot { display: flex; align-items: center; justify-content: space-between;
+                      gap: 10px; padding: 6px 10px; font-size: 11px; color: var(--mut);
+                      font-family: Consolas, monospace; }
+  .imgcard .imgfoot .dim { color: var(--txt2); }
+  .imgcard .imgfoot a { color: var(--acc); }
+
   .askov { position: fixed; inset: 0; background: rgba(0,0,0,.45); display: flex; align-items: center; justify-content: center; z-index: 90; backdrop-filter: blur(3px); }
   .askbox { background: var(--bg); border: 1px solid var(--bd); border-radius: 16px; padding: 22px; width: min(460px, 90vw); box-shadow: 0 12px 40px rgba(0,0,0,.25); }
   .askbox h4 { margin: 0 0 12px; font-size: 12px; color: var(--mut); letter-spacing: 1px; }
@@ -14577,6 +15404,7 @@ PAGE_GPT = """<!doctype html>
         <div class="composer">
           <textarea id="user-input" rows="1" placeholder="Message BONSAI..."></textarea>
           <div style="display:flex;align-items:center;gap:2px">
+            <button class="ic" id="imgmode" title="IMAGE mode - describe a picture and the local model draws it">&#127912;</button>
             <button class="ic" id="attach" title="Attach images / files">&#128206;</button>
             <button class="ic" id="mic-btn" title="Microphone">&#127908;</button>
             <div class="ctxmeter" id="ctxmeter" title="Context window in use - the system prompt and all tools are already counted, before you type">
@@ -15413,7 +16241,7 @@ function shotCardDom(call) {
   const box = document.createElement('div'); box.className = 'shotcard';
   const head = document.createElement('div'); head.className = 'shothd';
   const name = document.createElement('b');
-  name.textContent = String.fromCodePoint(0x1F4BE) + ' ' + (r.matched ? 'window: ' + r.matched : 'screenshot');
+  name.textContent = String.fromCodePoint(0x1F4BE) + ' ' + (r.label || (r.matched ? 'window: ' + r.matched : 'screenshot'));
   head.appendChild(name);
   if (r.width && r.height) {
     const d = document.createElement('span');
@@ -15422,7 +16250,7 @@ function shotCardDom(call) {
   }
   box.appendChild(head);
   const im = document.createElement('img'); im.className = 'shotimg';
-  im.src = src; im.alt = 'screenshot captured by Bonsai';
+  im.src = src; im.alt = r.label || 'screenshot captured by Bonsai';
   im.title = 'Click to open full size';
   im.onclick = function () { window.open(src, '_blank'); };
   box.appendChild(im);
@@ -15838,6 +16666,7 @@ async function streamRun(messages, chat, anchorMsg) {
         else if (ev === 'ask') { onAsk(j); setState('thinking'); }
         else if (ev === 'todo') { renderTodo(j.todos); }
     else if (ev === 'title') { applyChatTitle(j.title); }
+    else if (ev === 'imgprog') { onImgProg(j); }
         else if (ev === 'error') { doneThinking('Error: ' + j.text); setState('idle'); stopStats(); throw new Error(j.text); }
         else if (ev === 'done') { gotEnd = true; }
       }
@@ -15893,8 +16722,217 @@ function buildUserMsg() {
   });
   return parts;
 }
+/* ---------- IMAGE mode ----------------------------------------------------
+   Typing in the composer with IMAGE mode on asks the local diffusion model to
+   draw, without going near a language model. That is not a shortcut: the
+   generator needs the whole GPU, so the language model that would be driving it
+   has to be off the card. Asking the engine directly means there is nothing to
+   unload mid-sentence, and no model turn to lose. */
+let imgMode = false;
+function setImgMode(on) {
+  imgMode = !!on;
+  const btn = document.getElementById('imgmode');
+  const ta = document.getElementById('user-input');
+  const form = document.getElementById('chat-form');
+  if (btn) btn.classList.toggle('on', imgMode);
+  if (form) form.classList.toggle('imgmode', imgMode);
+  if (ta) {
+    ta.placeholder = imgMode
+      ? 'Describe the image to draw... (16:9 by default, try "9:16" for a phone one)'
+      : 'Type a command...';
+  }
+  if (imgMode && ta) ta.focus();
+}
+function imgStageClass(w, h) {
+  if (!w || !h) return '';
+  const r = w / h;
+  if (r > 1.2) return '';
+  if (r < 0.85) return 'portrait';
+  return 'square';
+}
+const PAINT_ICON = String.fromCodePoint(0x1F5BC);
+const imgCards = {};
+function onImgProg(j) {
+  if (!j || !j.id) return;
+  let h = imgCards[j.id];
+  if (!h) {
+    h = addImageCard(j.prompt || '', j.width || 0, j.height || 0);
+    if (!h) return;
+    imgCards[j.id] = h;
+  }
+  if (j.phase === 'loading') { h.setPct(2); h.setNote('loading the model\u2026'); return; }
+  if (j.phase === 'error') { h.fail((j.error || 'failed').slice(0, 120)); return; }
+  h.setPct(Math.max(3, j.percent || 0));
+  h.setNote('step ' + (j.step || 0) + ' / ' + (j.steps || '?'));
+  h.setDim((j.seconds || 0) + 's');
+  if (j.preview_url) h.setPreview(j.preview_url + '?t=' + Date.now());
+}
+function addImageCard(prompt, width, height) {
+  const conv = document.getElementById('conv');
+  if (!conv) return null;
+  const hint = conv.querySelector('.emptyhint');
+  if (hint) hint.remove();
+  const row = document.createElement('div');
+  row.className = 'msgrow bonsai';
+  const av = document.createElement('div'); av.className = 'av bonsai'; av.textContent = 'B';
+  const bubble = document.createElement('div'); bubble.className = 'bubble';
+
+  const card = document.createElement('div'); card.className = 'imgcard';
+  const top = document.createElement('div'); top.className = 'imgtop';
+  const b = document.createElement('b'); b.textContent = PAINT_ICON + ' Drawing';
+  const st = document.createElement('span'); st.textContent = prompt;
+  top.appendChild(b); top.appendChild(st);
+
+  const stage = document.createElement('div');
+  stage.className = 'imgstage ' + imgStageClass(width, height);
+  const shim = document.createElement('div'); shim.className = 'imgshimmer';
+  const empty = document.createElement('div'); empty.className = 'imgempty';
+  empty.textContent = 'waking the model\u2026';
+  const im = document.createElement('img'); im.alt = 'image being generated';
+  stage.appendChild(shim); stage.appendChild(empty); stage.appendChild(im);
+
+  const bar = document.createElement('div'); bar.className = 'imgbar';
+  const fill = document.createElement('i'); bar.appendChild(fill);
+  const foot = document.createElement('div'); foot.className = 'imgfoot';
+  const left = document.createElement('span'); left.textContent = 'loading';
+  const right = document.createElement('span'); right.className = 'dim';
+  foot.appendChild(left); foot.appendChild(right);
+
+  card.appendChild(top); card.appendChild(stage);
+  card.appendChild(bar); card.appendChild(foot);
+  bubble.appendChild(card);
+  row.appendChild(bubble); row.appendChild(av);
+  conv.appendChild(row);
+  scrollBottom();
+
+  let lastUrl = '';
+  return {
+    card: card, stage: stage, fill: fill, left: left, right: right,
+    im: im, shim: shim, empty: empty,
+    setPct: function (p) { fill.style.width = Math.max(0, Math.min(100, p)) + '%'; },
+    setNote: function (t) { left.textContent = t; },
+    setDim: function (t) { right.textContent = t; },
+    setPreview: function (url) {
+      if (!url || url === lastUrl) return;
+      lastUrl = url;
+      im.onload = function () {
+        im.classList.add('in');
+        shim.classList.add('gone');
+        empty.classList.add('gone');
+      };
+      im.src = url;
+    },
+    fail: function (msg) {
+      card.classList.add('err');
+      shim.classList.add('gone');
+      empty.classList.remove('gone');
+      empty.textContent = msg;
+      setPct(100);
+    }
+  };
+}
+function finishImageCard(handles, result) {
+  const h = handles;
+  if (!h) return;
+  h.setPct(100);
+  h.setNote('done');
+  h.setDim((result.width || '?') + '\u00d7' + (result.height || '?') +
+           ' \u00b7 ' + (result.seconds || '?') + 's');
+  h.shim.classList.add('gone');
+  if (result.preview) {
+    h.im.onload = function () { h.im.classList.add('in'); h.empty.classList.add('gone'); };
+    h.im.src = result.preview;
+    h.im.classList.add('in');
+    h.empty.classList.add('gone');
+  }
+  h.card.querySelector('.imgtop b').textContent = PAINT_ICON + ' Painted';
+  const foot = h.card.querySelector('.imgfoot');
+  if (foot) {
+    foot.textContent = '';
+    const a = document.createElement('a');
+    a.href = '/previewfile/' + encodeURIComponent(String(result.path || '').split(String.fromCharCode(92)).join('/'));
+    a.target = '_blank';
+    a.textContent = 'open the file';
+    const note = document.createElement('span');
+    note.textContent = (result.upscaled_path ? 'also at ' + result.upscaled_size : '');
+    foot.appendChild(a);
+    if (result.upscaled_path) foot.appendChild(note);
+  }
+}
+/* Read the engine's own event stream. Same shape as the chat stream, so the
+   same progress events drive both the button and the tool. */
+async function runImage(prompt) {
+  const width = 0, height = 0;
+  const handles = addImageCard(prompt, 0, 0);
+  let result = null, failed = null;
+  try {
+    const r = await fetch('/api/image', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ prompt: prompt }) });
+    if (!r.ok || !r.body) throw new Error('the server said ' + r.status);
+    const reader = r.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '', ev = '';
+    for (;;) {
+      const part = await reader.read();
+      if (part.done) break;
+      buf += dec.decode(part.value, { stream: true });
+      let nl;
+      while ((nl = buf.indexOf('\\n')) >= 0) {
+        const line = buf.slice(0, nl).trim();
+        buf = buf.slice(nl + 1);
+        if (line.startsWith('event:')) { ev = line.slice(6).trim(); continue; }
+        if (!line.startsWith('data:')) continue;
+        let j = null;
+        try { j = JSON.parse(line.slice(5).trim()); } catch (e) { continue; }
+        if (ev === 'imgprog') {
+          if (j.width && j.height && !handles.stage.dataset.sized) {
+            handles.stage.className = 'imgstage ' + imgStageClass(j.width, j.height);
+            handles.stage.dataset.sized = '1';
+          }
+          if (j.phase === 'loading') { handles.setPct(2); handles.setNote('loading the model\u2026'); }
+          else if (j.phase === 'sampling') {
+            handles.setPct(Math.max(3, j.percent || 0));
+            handles.setNote('step ' + (j.step || 0) + ' / ' + (j.steps || '?'));
+            handles.setDim((j.seconds || 0) + 's');
+            if (j.preview_url) handles.setPreview(j.preview_url + '?t=' + Date.now());
+          }
+        } else if (ev === 'done') {
+          if (j && j.error) failed = j.error; else result = j;
+          ev = 'stop';
+        } else if (ev === 'error') {
+          failed = (j && j.text) || 'something went wrong';
+          ev = 'stop';
+        }
+        if (ev === 'stop') break;
+      }
+      if (ev === 'stop') { try { await reader.cancel(); } catch (e) {} break; }
+    }
+  } catch (err) {
+    failed = (err && err.message) || String(err);
+  }
+  if (failed) { if (handles) handles.fail(failed.slice(0, 120)); return; }
+  finishImageCard(handles, result || {});
+}
+function submitImage() {
+  const ta = document.getElementById('user-input');
+  const prompt = ta.value.trim();
+  if (!prompt) return;
+  if (!cur) newChat();
+  ta.value = '';
+  const label = prompt.slice(0, 60);
+  if (!cur.title || cur.title === 'New chat') {
+    cur.title = label;
+    if (chats.indexOf(cur) === -1) chats.push(cur);
+  }
+  addUser(prompt);
+  save();
+  renderList();
+  runImage(prompt);
+}
 function handleSubmit(e) {
   e.preventDefault();
+  if (imgMode) { submitImage(); return; }
   if (busy) { queueNow(); return; }
   go();
 }
@@ -16254,6 +17292,7 @@ function addFiles(files) {
   });
 }
 document.getElementById('attach').onclick = function () { document.getElementById('filein').click(); };
+document.getElementById('imgmode').onclick = function () { setImgMode(!imgMode); };
 document.getElementById('filein').onchange = function () { addFiles(this.files); this.value = ''; };
 /* Ctrl+V with an image on the clipboard attaches it, instead of pasting
    nothing at all. The image goes through the same addFiles() the paperclip
@@ -18588,6 +19627,54 @@ class Handler(BaseHTTPRequestHandler):
             pass
         self._send(200, data, "text/html; charset=utf-8")
 
+    def _image_stream(self, body):
+        """SSE for the IMAGE button: same worker, same events, no model.
+
+        A tool call reports its progress through hooks into the chat stream.
+        This has no chat stream to report into, so it writes the same
+        event/frame shape itself - which is why one card can serve both.
+        """
+        prompt = str((body or {}).get("prompt") or "").strip()
+        if not prompt:
+            self._send(400, json.dumps({"error": "prompt is required"}))
+            return
+        args = {"prompt": prompt}
+        for k in ("negative_prompt", "aspect", "width", "height", "steps",
+                  "seed", "upscale"):
+            if body.get(k) is not None:
+                args[k] = body[k]
+        wlock = threading.Lock()
+
+        def emit(ev, data):
+            with wlock:
+                self.wfile.write(("event: %s\ndata: %s\n\n"
+                                  % (ev, json.dumps(data, default=str))
+                                  ).encode("utf-8"))
+                self.wfile.flush()
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+        try:
+            # The worker reports progress as a single info dict; emit() is the
+            # two-argument SSE writer. Wrap rather than change either signature.
+            out = _generate_image(args, direct=True,
+                                  hooks={"on_imgprog":
+                                         lambda info: emit("imgprog", info)})
+        except Exception as exc:
+            emit("error", {"text": str(exc)[:200]})
+            return
+        if isinstance(out, dict) and out.get("error"):
+            emit("done", {"error": str(out["error"])[:400]})
+        else:
+            # the data URL is megabytes; the card fetches the file by path
+            out = dict(out or {})
+            out.pop("image_data", None)
+            out.pop("image_data_1080p", None)
+            emit("done", out)
+
     def _serve_preview_asset(self, rel):
         """Serve a non-HTML file from the workspace for a previewed page."""
         rel = urllib.parse.unquote(rel or "").lstrip("/")
@@ -18678,6 +19765,31 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, json.dumps(_dl_state(), default=str))
         elif path == "/preview":
             self._serve_preview()
+        elif path.startswith("/imgpreview/"):
+            job = _img_job_get(path[len("/imgpreview/"):])
+            src = job.get("preview")
+            if not src or not os.path.isfile(src):
+                self._send(404, "no preview yet", "text/plain")
+                return
+            data = _preview_jpeg(src)
+            if data is None:
+                # no Pillow, or the file was mid-write: send the original
+                try:
+                    with open(src, "rb") as fh:
+                        data = fh.read()
+                except OSError:
+                    self._send(404, "no preview yet", "text/plain")
+                    return
+            self.send_response(200)
+            self.send_header("Content-Type",
+                             "image/jpeg" if data[:2] == b"\xff\xd8" else "image/png")
+            self.send_header("Content-Length", str(len(data)))
+            # The whole point is that this changes constantly.
+            self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+            self.send_header("Pragma", "no-cache")
+            self.end_headers()
+            self.wfile.write(data)
+            return
         elif path.startswith("/previewfile/"):
             self._serve_preview_asset(path[len("/previewfile/"):])
         else:
@@ -18692,7 +19804,7 @@ class Handler(BaseHTTPRequestHandler):
                             "/api/answer", "/api/effort", "/api/eject",
                             "/api/tts", "/api/models", "/api/pick_model",
                             "/api/ctx", "/api/revert", "/api/forget_changes",
-                            "/api/compact", "/api/attach",
+                            "/api/compact", "/api/attach", "/api/image",
                             "/api/path_policy", "/api/dl_pause",
                             "/api/dl_resume", "/api/dl_cancel",
                             "/api/dl_retry", "/api/dl_clear"):
@@ -18722,6 +19834,9 @@ class Handler(BaseHTTPRequestHandler):
                 _remember_chats_deleted(body.get("deleted"))
                 _save_chats(body.get("chats"))
                 self._send(200, json.dumps({"ok": True}))
+                return
+            if path == "/api/image":
+                self._image_stream(body)
                 return
             if path == "/api/attach":
                 url = _store_attachment(body.get("data"))
@@ -18996,6 +20111,9 @@ class Handler(BaseHTTPRequestHandler):
                 def do_title(text):
                     emit("title", {"title": text})
 
+                def do_imgprog(info):
+                    emit("imgprog", info)
+
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream; charset=utf-8")
                 self.send_header("Cache-Control", "no-cache")
@@ -19040,7 +20158,8 @@ class Handler(BaseHTTPRequestHandler):
                                     on_tool=lambda c: emit("tool", {"call": _strip_full(c)}),
                                     on_stats=lambda s: emit("stats", s),
                                     hooks={"on_ask": do_ask, "on_todo": do_todo,
-                                           "on_title": do_title})
+                                           "on_title": do_title,
+                                           "on_imgprog": do_imgprog})
                     except CLIENT_GONE:
                         # browser closed the tab mid-response: normal, not an error
                         client_gone = True

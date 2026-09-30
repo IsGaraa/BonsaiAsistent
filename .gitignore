@@ -33,6 +33,13 @@ piper/*.onnx
 piper/*.onnx.json
 piper/*.wav
 
+# Local image generation (Qwen-Image 2.1) - 13.2 GB of weights fetched by
+# tools/fetch_image_model.py. *.gguf already covers the diffusion model, but
+# the text encoder and VAE are safetensors and would otherwise be committed.
+image_models/
+*.safetensors
+sd.cpp/
+
 # Model selector config (per-machine model list + active choice)
 models.json
 models.json.bak
