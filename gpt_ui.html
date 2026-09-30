@@ -1,5 +1,5 @@
 <!-- GPT UI (PAGE_GPT) - the page served at /chat, copied verbatim from a
-     running bonsai_web.py at commit 9356a26.
+     running bonsai_web.py at commit d85686c.
 
      bonsai_web.py is the source of truth. This file is a read-only copy so
      the UI can be opened in an editor without wading through the Python;
@@ -20,11 +20,13 @@
     --bg: #ffffff; --bg2: #f7f7f9; --bg3: #ededf0; --bd: #e3e3e7;
     --txt: #111214; --mut: #71717a; --acc: #19191c; --acc-txt: #fafafa;
     --ok: #16a34a; --warn: #d97706; --err: #dc2626;
+    --violet: #7c3aed; --violet-soft: rgba(124,58,237,.10);
   }
   html.dark {
     color-scheme: dark;
     --bg: #212121; --bg2: #171717; --bg3: #2f2f2f; --bd: #303030;
     --txt: #ececec; --mut: #9b9ba3; --acc: #e4e4e7; --acc-txt: #18181b;
+    --violet: #a78bfa; --violet-soft: rgba(167,139,250,.08);
   }
   * { box-sizing: border-box; }
   html, body { height: 100%; margin: 0; }
@@ -44,6 +46,65 @@
   .chat-item .del { background: none; border: none; color: var(--mut); cursor: pointer; font-size: 14px; opacity: 0; padding: 0 4px; }
   .chat-item:hover .del { opacity: 1; }
   .side-foot { padding: 10px 12px; border-top: 1px solid var(--bd); display: flex; flex-direction: column; gap: 8px; }
+
+  /* ---- polish ---------------------------------------------------------- */
+  /* keyboard focus, which was the browser default on a dark background */
+  .pill:focus-visible, .act:focus-visible, .btn-ghost:focus-visible,
+  .btn-new:focus-visible, .send:focus-visible, .ic:focus-visible,
+  .dlclear:focus-visible, input:focus-visible, select:focus-visible,
+  textarea:focus-visible {
+    outline: 2px solid var(--violet); outline-offset: 1px;
+  }
+  /* one easing for every control, so nothing feels pasted on */
+  .pill, .btn-ghost, .act, .btn-new, .dlclear, .ibtn, .ic {
+    transition: background .15s ease, color .15s ease,
+                border-color .15s ease, opacity .15s ease;
+  }
+  /* the composer is the point of the page */
+  .composer { border-color: var(--bd); box-shadow: 0 1px 2px rgba(0,0,0,.04); }
+  .composer:focus-within { border-color: var(--violet);
+                           box-shadow: 0 0 0 3px var(--violet-soft); }
+  /* the model is what gets changed most, so it carries the accent */
+  select.pill.acc { border-color: var(--violet); }
+  /* longer replies are easier to read with a touch more line height */
+  .abody { line-height: 1.62; }
+  /* the thinking box: violet edge, so it reads as reasoning at a glance */
+  .reasonbox { border-color: var(--violet-soft); }
+  /* scrollbars that do not shout on a light background */
+  * { scrollbar-width: thin; scrollbar-color: var(--bd) transparent; }
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-thumb { background: var(--bd); border-radius: 6px;
+                              border: 2px solid transparent;
+                              background-clip: content-box; }
+  ::-webkit-scrollbar-thumb:hover { background: var(--mut); }
+  ::-webkit-scrollbar-track { background: transparent; }
+  /* ---- icon button rail ---------------------------------------------- */
+  .rail { display: flex; align-items: center; gap: 4px; }
+  .grp { display: inline-flex; align-items: center; gap: 2px; padding: 2px;
+         border: 1px solid var(--bd); border-radius: 9px; background: var(--bg2); }
+  .ibtn { position: relative; width: 32px; height: 32px; display: inline-flex;
+          align-items: center; justify-content: center; border: 1px solid transparent;
+          border-radius: 8px; background: transparent; color: var(--mut);
+          cursor: pointer; padding: 0; transition: background .15s, color .15s,
+          border-color .15s; }
+  .ibtn:hover { background: var(--bg3); color: var(--txt); border-color: var(--bd); }
+  .ibtn:focus-visible { outline: 2px solid var(--violet); outline-offset: 1px; }
+  .ibtn svg { width: 16px; height: 16px; fill: none; stroke: currentColor;
+              stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+  /* on-state: the dot is the state, the tint is the colour */
+  .ibtn.on { color: var(--violet); background: var(--violet-soft);
+             border-color: var(--violet-soft); }
+  .ibtn.on::after { content: ''; position: absolute; right: 5px; bottom: 5px;
+                    width: 4px; height: 4px; border-radius: 50%;
+                    background: var(--violet); }
+  .ibtn[disabled] { opacity: .45; cursor: default; }
+  .ibtn[disabled]:hover { background: transparent; border-color: transparent; }
+  .ibtn.warn:hover { color: var(--warn); border-color: var(--warn); }
+  .sr { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+        overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
+  /* the model picker reads as a control, with the accent it acts on */
+  #modelsel { max-width: 210px; }
+  #modelsel.acc { border-color: var(--violet); }
   .blrow { display: flex; align-items: center; gap: 7px; font-size: 11.5px; color: var(--mut); }
   .blrow b { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #8b8b8b; }
   .blrow.ok b { background: var(--ok); }
@@ -123,10 +184,18 @@
   .dots i:nth-child(2) { animation-delay: .15s; }
   .dots i:nth-child(3) { animation-delay: .3s; }
   @keyframes puls { 0%, 100% { opacity: .25; } 50% { opacity: 1; } }
-  .reasonbox, .tlog { margin: 2px 0 6px; }
-  .reasonbox > summary, .tlog > summary { cursor: pointer; list-style: none; user-select: none; display: inline-flex; align-items: center; gap: 6px; font-size: 11.5px; color: var(--mut); font-weight: 600; padding: 5px 11px; border-radius: 999px; background: var(--bg2); border: 1px solid var(--bd); }
-  .reasonbox > summary::-webkit-details-marker, .tlog > summary::-webkit-details-marker { display: none; }
+  /* The thinking box keeps its violet on both themes - the one thing here the
+     user was clear about wanting kept. --violet is defined in :root and in
+     html.dark, so it resolves whichever is active. */
+  .reasonbox { margin: 2px 0 6px; }
+  .reasonbox > summary { cursor: pointer; list-style: none; user-select: none; display: inline-flex; align-items: center; gap: 6px; font-size: 11.5px; color: var(--violet); font-weight: 600; padding: 5px 11px; border-radius: 999px; background: var(--violet-soft); border: 1px solid var(--violet-soft); }
+  .reasonbox > summary::-webkit-details-marker { display: none; }
   .reasonbox > summary::before { content: ''; }
+  .reasonbox.live > summary::after { content: 'CF'; color: var(--violet); animation: bl 1.2s infinite; display: inline-block; }
+  .reasonbox .rc { border-color: var(--violet-soft); background: var(--violet-soft); }
+  .reasonbox.errtitle > summary { color: var(--err); }
+  .tlog { margin: 2px 0 6px; }
+  .tlog > summary { cursor: pointer; list-style: none; user-select: none; display: inline-flex; align-items: center; gap: 6px; font-size: 11.5px; color: var(--mut); font-weight: 600; padding: 5px 11px; border-radius: 999px; background: var(--bg2); border: 1px solid var(--bd); }
   .rc { margin-top: 6px; font-size: 12.5px; line-height: 1.55; color: var(--mut); background: var(--bg2); border: 1px solid var(--bd); border-radius: 10px; padding: 10px; white-space: pre-wrap; max-height: 220px; overflow-y: auto; }
   .tl { margin-top: 6px; display: flex; flex-direction: column; gap: 6px; max-height: 260px; overflow-y: auto; }
   .tlitem { font-family: Consolas, monospace; font-size: 11.5px; background: var(--bg2); border: 1px solid var(--bd); border-radius: 8px; padding: 8px 10px; white-space: pre-wrap; word-break: break-word; }
@@ -241,6 +310,42 @@
   .todochip .st.run { color: var(--warn); }
   .fine { margin: 10px auto 0; font-size: 11px; color: var(--mut); text-align: center; }
   #filein { display: none; }
+  /* ---- image generation mode ---- */
+  #imgmode.on { border-color: var(--acc); color: var(--acc); background: rgba(0,0,0,.25); }
+  .composer.imgmode .field { border-color: var(--acc); }
+  .imgcard { margin: 10px 0 4px; border: 1px solid var(--bd2); border-radius: 10px;
+             overflow: hidden; background: var(--bg3); }
+  .imgcard .imgtop { display: flex; align-items: center; gap: 8px; padding: 7px 10px;
+                     border-bottom: 1px solid var(--bd2); font-size: 11.5px; color: var(--mut); }
+  .imgcard .imgtop b { color: var(--txt2); font-weight: 600; white-space: nowrap; }
+  .imgcard .imgtop span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .imgcard .imgstage { position: relative; aspect-ratio: 16 / 9; background: #0b0b10; overflow: hidden; }
+  .imgcard .imgstage.portrait { aspect-ratio: 9 / 16; }
+  .imgcard .imgstage.square { aspect-ratio: 1 / 1; }
+  .imgcard .imgstage img { position: absolute; inset: 0; width: 100%; height: 100%;
+                           object-fit: contain; opacity: 0; transition: opacity .45s ease; }
+  .imgcard .imgstage img.in { opacity: 1; }
+  /* stands in only until the engine's first real preview lands */
+  .imgcard .imgshimmer { position: absolute; inset: 0;
+      background: linear-gradient(115deg, #14141c 0%, #1f2131 28%, #14141c 52%, #1f2131 76%, #14141c 100%);
+      background-size: 300% 100%; animation: imgsh 2.1s linear infinite; }
+  @keyframes imgsh { from { background-position: 150% 0; } to { background-position: -150% 0; } }
+  .imgcard .imgshimmer.gone { opacity: 0; transition: opacity .4s ease; }
+  .imgcard .imgempty { position: absolute; inset: 0; display: flex; align-items: center;
+                       justify-content: center; font-size: 12px; color: var(--mut); padding: 0 16px;
+                       text-align: center; }
+  .imgcard .imgempty.gone { display: none; }
+  .imgcard .imgbar { height: 4px; background: #1b1b26; overflow: hidden; }
+  .imgcard .imgbar i { display: block; height: 100%; width: 0%;
+                       background: linear-gradient(90deg, var(--acc), #7ad);
+                       transition: width .35s ease; }
+  .imgcard.err .imgbar i { background: #e5534b; }
+  .imgcard .imgfoot { display: flex; align-items: center; justify-content: space-between;
+                      gap: 10px; padding: 6px 10px; font-size: 11px; color: var(--mut);
+                      font-family: Consolas, monospace; }
+  .imgcard .imgfoot .dim { color: var(--txt2); }
+  .imgcard .imgfoot a { color: var(--acc); }
+
   .askov { position: fixed; inset: 0; background: rgba(0,0,0,.45); display: flex; align-items: center; justify-content: center; z-index: 90; backdrop-filter: blur(3px); }
   .askbox { background: var(--bg); border: 1px solid var(--bd); border-radius: 16px; padding: 22px; width: min(460px, 90vw); box-shadow: 0 12px 40px rgba(0,0,0,.25); }
   .askbox h4 { margin: 0 0 12px; font-size: 12px; color: var(--mut); letter-spacing: 1px; }
@@ -346,6 +451,7 @@
     .ocbody pre:last-child { margin-bottom: 0; }
     .ocbody .oclab { color: var(--mut); font-size: 10.5px; letter-spacing: 1px; margin-bottom: 3px; }
     .ocargs { color: var(--mut); font-size: 11.5px; }
+    .ocargnote { color: var(--mut); font-size: 11.5px; opacity: .85; }
     .ocprev { color: var(--acc); text-decoration: none; }
     .ocprev:hover { text-decoration: underline; }
   
@@ -428,12 +534,11 @@
       <button class="btn-ghost scopebtn" id="scopebtn" title="How far Bonsai may reach outside the workspace. Click to switch: WORKSPACE (hard sandbox) / ASK (ask me every time) / SYSTEM (no prompts).">SCOPE: ...</button>
       <div class="scopelist" id="scopelist"></div>
       <button class="btn-ghost scopeclear" id="scopeclear" title="Forget every approved and denied path">CLEAR APPROVALS</button>
-      <div class="foot-row">
-        <a href="/" title="Classic UI">Classic UI</a>
-        <button class="btn-ghost" id="ttsbtn" title="Text-to-speech (Piper) - speak replies aloud. Off by default.">TTS: OFF</button>
-        <button class="btn-ghost" id="detailbtn" title="Show each step in the chat as one collapsed line, or fully expanded">DETAIL: BRIEF</button>
-        <button class="btn-ghost" id="themebtn" title="Toggle theme"></button>
-        <button class="btn-ghost" id="ejectbtn" title="Stop the model server now and free its RAM/VRAM (it restarts automatically on the next message)">EJECT</button>
+      <div class="foot-row rail">
+        <button class="ibtn" id="ttsbtn" aria-label="Text to speech" title="Text-to-speech (Piper) - speak replies aloud. Off by default."><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9v6h4l5 4V5L8 9H4z"/><path d="M17 8.5a5 5 0 0 1 0 7"/><path d="M19.5 6a8.5 8.5 0 0 1 0 12"/></svg></button>
+        <button class="ibtn" id="detailbtn" aria-label="Detail level" title="Show each step in the chat as one collapsed line, or fully expanded"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h10"/></svg></button>
+        <button class="ibtn" id="themebtn" aria-label="Toggle theme" title="Switch between the light and dark theme"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4.2"/><path d="M12 2.6v2.2M12 19.2v2.2M2.6 12h2.2M19.2 12h2.2M5.4 5.4l1.6 1.6M17 17l1.6 1.6M18.6 5.4L17 7M7 17l-1.6 1.6"/></svg></button>
+        <button class="ibtn warn" id="ejectbtn" aria-label="Eject the model" title="Stop the model server now and free its RAM/VRAM (it restarts automatically on the next message)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3.5v8"/><path d="M6.6 7.2a7.5 7.5 0 1 0 10.8 0"/></svg></button>
       </div>
     </div>
   </nav>
@@ -441,15 +546,12 @@
     <header class="topbar">
       <div class="tb-r" style="display:flex;align-items:center;gap:10px">
         <button class="pill" id="modebtn" title="Plan = pure reasoning without tools">BUILD</button>
-        <select class="pill" id="modelsel" title="Active AI model - pick a local .gguf or an external OpenAI-compatible endpoint" style="max-width:190px"></select>
-        <button class="pill" id="addmodelbtn" title="Add a model (local .gguf file or an external API endpoint)">+</button>
-        <button class="pill" id="cfgbtn" title="Model settings - context size, temperature, GPU layers">&#9881;</button>
-        <select class="pill" id="effort-sel" title="Thinking effort - how deeply BONSAI reasons">
-          <option value="off">Effort: off</option>
-          <option value="low">Effort: low</option>
-          <option value="med" selected>Effort: med</option>
-          <option value="high">Effort: high</option>
-        </select>
+        <select class="pill acc" id="modelsel" title="Active AI model - pick a local .gguf or an external OpenAI-compatible endpoint"></select>
+        <span class="grp">
+          <button class="ibtn" id="addmodelbtn" aria-label="Add a model" title="Add a model (local .gguf file or an external API endpoint)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5.5v13M5.5 12h13"/></svg></button>
+          <button class="ibtn" id="cfgbtn" aria-label="Model settings" title="Model settings - context size, temperature, GPU layers"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3.1"/><path d="M12 3.2v2.1M12 18.7v2.1M20.8 12h-2.1M5.3 12H3.2M18.2 5.8l-1.5 1.5M7.3 16.7l-1.5 1.5M18.2 18.2l-1.5-1.5M7.3 7.3L5.8 5.8"/></svg></button>
+        </span>
+        <select class="pill" id="effort-sel" title="Thinking effort - filled from the active model, see renderEffortSel()"></select>
         <span class="state" id="state-label">READY</span>
       </div>
     </header>
@@ -514,6 +616,7 @@
         <div class="composer">
           <textarea id="user-input" rows="1" placeholder="Message BONSAI..."></textarea>
           <div style="display:flex;align-items:center;gap:2px">
+            <button class="ic" id="imgmode" title="IMAGE mode - describe a picture and the local model draws it">&#127912;</button>
             <button class="ic" id="attach" title="Attach images / files">&#128206;</button>
             <button class="ic" id="mic-btn" title="Microphone">&#127908;</button>
             <div class="ctxmeter" id="ctxmeter" title="Context window in use - the system prompt and all tools are already counted, before you type">
@@ -597,7 +700,11 @@ function mergeChats(older, newer) {
   };
   (older || []).forEach(take);
   (newer || []).forEach(take);
-  return order.map(function (id) { return byId[id]; }).concat(anonymous);
+  /* a chat someone deleted is never brought back by a save */
+  const gone = {};
+  (typeof deletedIds !== 'undefined' ? deletedIds : []).forEach(function (id) { gone[id] = 1; });
+  return order.filter(function (id) { return !gone[id]; })
+              .map(function (id) { return byId[id]; }).concat(anonymous);
 }
 function save() {
   try {
@@ -607,7 +714,7 @@ function save() {
   } catch (e) {}
   try {
     fetch('/api/chats', { method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chats: buildPersist(true) }) }).catch(function () {});
+      body: JSON.stringify({ chats: buildPersist(true), deleted: deletedIds }) }).catch(function () {});
   } catch (e) {}
 }
 /* pull the server's copy in and merge it with what this browser has, keeping
@@ -616,6 +723,16 @@ async function serverLoad() {
   try {
     const r = await fetch('/api/chats');
     const j = await r.json();
+    if (j && Array.isArray(j.deleted) && j.deleted.length) {
+      let grew = false;
+      j.deleted.forEach(function (id) {
+        if (deletedIds.indexOf(id) === -1) { deletedIds.push(id); grew = true; }
+      });
+      if (grew) {
+        saveDeletedIds();
+        chats = chats.filter(function (c) { return deletedIds.indexOf(c.id) === -1; });
+      }
+    }
     if (j && Array.isArray(j.chats) && j.chats.length) {
       const byId = {};
       chats.forEach(function (c, i) { byId[c.id] = i; });
@@ -893,7 +1010,16 @@ function bindModeBtn() {
 }
 function bindTheme() {
   const b = document.getElementById('themebtn');
-  const apply = function (d) { document.documentElement.classList.toggle('dark', d); b.textContent = d ? '☀️' : '☾'; };
+  /* two svgs rather than two glyphs, so the theme control matches the other
+     icons in the rail instead of standing out as a text character */
+  const SUN = '<svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4.2"/><path d="M12 2.6v2.2M12 19.2v2.2M2.6 12h2.2M19.2 12h2.2M5.4 5.4l1.6 1.6M17 17l1.6 1.6M18.6 5.4L17 7M7 17l-1.6 1.6"/></svg>';
+  const MOON = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 14.2A8.2 8.2 0 0 1 9.8 4a8.4 8.4 0 1 0 10.2 10.2z"/></svg>';
+  const apply = function (d) {
+    document.documentElement.classList.toggle('dark', d);
+    b.innerHTML = d ? MOON : SUN;
+    b.title = d ? 'Dark theme - click for light' : 'Light theme - click for dark';
+    b.setAttribute('aria-label', d ? 'Dark theme' : 'Light theme');
+  };
   const saved = localStorage.getItem('bonsai_gpt_theme');
   apply(saved ? saved === 'dark' : true);
   b.onclick = function () {
@@ -946,6 +1072,7 @@ function renderList() {
     d.onclick = function (e) {
       e.stopPropagation();
       chats = chats.filter(function (x) { return x.id !== c.id; });
+    noteDeleted(c.id);
       if (!chats.length) { cur = null; newChat(); }
       else { if (cur && cur.id === c.id) cur = chats[chats.length - 1]; save(); renderAll(); }
     };
@@ -955,7 +1082,20 @@ function renderList() {
   });
 }
 function convInner() { return document.querySelector('#messages .inner'); }
-function scrollBottom() { const c = document.getElementById('messages'); c.scrollTop = c.scrollHeight; }
+/* Same rule as the front page: follow only while already at the bottom, and
+   let a reader who scrolls up stay where they are. */
+let followBottom = true;
+function atBottom(c) { return c.scrollHeight - c.scrollTop - c.clientHeight < 40; }
+function scrollBottom() {
+  const c = document.getElementById('messages');
+  if (!c || !followBottom) return;
+  c.scrollTop = c.scrollHeight;
+}
+(function () {
+  const c = document.getElementById('messages');
+  if (!c) return;
+  c.addEventListener('scroll', function () { followBottom = atBottom(c); });
+})();
 function renderConv() {
   const conv = convInner();
   const empty = document.getElementById('empty');
@@ -1039,7 +1179,7 @@ async function foldChat(chat, msgs) {
   try {
     const r = await fetch('/api/compact', { method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ messages: msgs, mode: chatMode }) });
+      body: JSON.stringify({ messages: await hydrateAtt(msgs), mode: chatMode }) });
     const j = await r.json();
     doneThinking(null);
     if (!j || !j.ok || !j.summary) return;
@@ -1271,7 +1411,9 @@ function previewIframeDom(r) {
   w.className = 'tlprev';
   const a = document.createElement('a');
   a.href = url; a.target = '_blank'; a.rel = 'noreferrer';
-  a.textContent = 'preview shown in the center stage — click to open in a new tab';
+    a.textContent = (r && r.kind === 'image'
+      ? 'image shown in the center stage — click to open in a new tab'
+      : 'preview shown in the center stage — click to open in a new tab');
   a.onclick = function () { openPreviewStage(url, r && (r.path || '')); };
   const b2 = document.createElement('button');
   b2.className = 'tlprevbtn';
@@ -1322,7 +1464,7 @@ function shotCardDom(call) {
   const box = document.createElement('div'); box.className = 'shotcard';
   const head = document.createElement('div'); head.className = 'shothd';
   const name = document.createElement('b');
-  name.textContent = String.fromCodePoint(0x1F4BE) + ' ' + (r.matched ? 'window: ' + r.matched : 'screenshot');
+  name.textContent = String.fromCodePoint(0x1F4BE) + ' ' + (r.label || (r.matched ? 'window: ' + r.matched : 'screenshot'));
   head.appendChild(name);
   if (r.width && r.height) {
     const d = document.createElement('span');
@@ -1331,7 +1473,7 @@ function shotCardDom(call) {
   }
   box.appendChild(head);
   const im = document.createElement('img'); im.className = 'shotimg';
-  im.src = src; im.alt = 'screenshot captured by Bonsai';
+  im.src = src; im.alt = r.label || 'screenshot captured by Bonsai';
   im.title = 'Click to open full size';
   im.onclick = function () { window.open(src, '_blank'); };
   box.appendChild(im);
@@ -1441,6 +1583,11 @@ function addAsst(text, calls, reason, stats, entry) {
   return inner;
 }
 function addThinking() {
+  /* Two rows must never be live at once. The second overwrites the variable
+     holding the first, so nothing anywhere holds a reference to it and
+     nothing can ever finish it - its "Starting" then sat in the chat for
+     good, long after the work it was waiting for had been done. */
+  if (thinkingRow) doneThinking();
   liveCalls = [];
   const row = document.createElement('div'); row.className = 'msgrow';
   const b = document.createElement('div');
@@ -1488,6 +1635,20 @@ function onTool(call) {
   if (live) thinkingRow.b.insertBefore(live, thinkingRow.tlog.d);
   scrollBottom();
 }
+/* A turn that has finished must not leave a "Starting" bubble in the chat.
+   If one is still there, holding nothing, while no turn is running, it is
+   the remains of a turn that never reported finishing - so it is cleared
+   rather than left claiming to still be waiting. A row with real content
+   in it is never touched. */
+function sweepStaleThinking() {
+  if (busy || thinkingRow) return;
+  const rows = convEl().querySelectorAll('.msgrow.bonsai');
+  for (let i = 0; i < rows.length; i++) {
+    if (!rows[i].querySelector('.think')) continue;
+    if (rows[i].querySelector('.abody, .reasonbox, .toollog')) continue;
+    if (rows[i].parentNode) rows[i].parentNode.removeChild(rows[i]);
+  }
+}
 function doneThinking(errMsg) {
   clearWaitWatch();
   if (!thinkingRow) return;
@@ -1507,7 +1668,16 @@ function doneThinking(errMsg) {
   }
   thinkingRow = null;
 }
-function effortValue() { return document.getElementById('effort-sel').value; }
+/* A host with no thinking setting still posts a level, and the server drops it
+   for that host, so the request shape stays the same. Falling back to the
+   window's stored value keeps the knob steady across a model switch. */
+function effortValue() {
+  const el = document.getElementById('effort-sel');
+  if (el && el.value) return el.value;
+  try { return localStorage.getItem('bonsai_effort') || 'high'; } catch (e) {}
+  return 'high';
+}
+
 function statLine() { return document.getElementById('statsline'); }
 function fmtMs(ms) { if (!ms && ms !== 0) return '--'; return (ms / 1000).toFixed(1) + 's'; }
 function runningStats() {
@@ -1727,6 +1897,8 @@ async function streamRun(messages, chat, anchorMsg) {
         else if (ev === 'stats') { onStats(j); }
         else if (ev === 'ask') { onAsk(j); setState('thinking'); }
         else if (ev === 'todo') { renderTodo(j.todos); }
+    else if (ev === 'title') { applyChatTitle(j.title); }
+    else if (ev === 'imgprog') { onImgProg(j); }
         else if (ev === 'error') { doneThinking('Error: ' + j.text); setState('idle'); stopStats(); throw new Error(j.text); }
         else if (ev === 'done') { gotEnd = true; }
       }
@@ -1782,8 +1954,220 @@ function buildUserMsg() {
   });
   return parts;
 }
+/* ---------- IMAGE mode ----------------------------------------------------
+   Typing in the composer with IMAGE mode on asks the local diffusion model to
+   draw, without going near a language model. That is not a shortcut: the
+   generator needs the whole GPU, so the language model that would be driving it
+   has to be off the card. Asking the engine directly means there is nothing to
+   unload mid-sentence, and no model turn to lose. */
+let imgMode = false;
+function setImgMode(on) {
+  imgMode = !!on;
+  const btn = document.getElementById('imgmode');
+  const ta = document.getElementById('user-input');
+  const form = document.getElementById('chat-form');
+  if (btn) btn.classList.toggle('on', imgMode);
+  if (form) form.classList.toggle('imgmode', imgMode);
+  if (ta) {
+    ta.placeholder = imgMode
+      ? 'Describe the image to draw... (16:9 by default, try "9:16" for a phone one)'
+      : 'Type a command...';
+  }
+  if (imgMode && ta) ta.focus();
+}
+function imgStageClass(w, h) {
+  if (!w || !h) return '';
+  const r = w / h;
+  if (r > 1.2) return '';
+  if (r < 0.85) return 'portrait';
+  return 'square';
+}
+const PAINT_ICON = String.fromCodePoint(0x1F5BC);
+const imgCards = {};
+function onImgProg(j) {
+  if (!j || !j.id) return;
+  let h = imgCards[j.id];
+  if (!h) {
+    h = addImageCard(j.prompt || '', j.width || 0, j.height || 0);
+    if (!h) return;
+    imgCards[j.id] = h;
+  }
+  if (j.phase === 'loading') { h.setPct(2); h.setNote('loading the model…'); return; }
+  if (j.phase === 'error') { h.fail((j.error || 'failed').slice(0, 120)); return; }
+  h.setPct(Math.max(3, j.percent || 0));
+  h.setNote('step ' + (j.step || 0) + ' / ' + (j.steps || '?'));
+  h.setDim((j.seconds || 0) + 's');
+  if (j.preview_url) h.setPreview(j.preview_url + '?t=' + Date.now());
+}
+function addImageCard(prompt, width, height) {
+  const conv = document.getElementById('conv');
+  if (!conv) return null;
+  const hint = conv.querySelector('.emptyhint');
+  if (hint) hint.remove();
+  const row = document.createElement('div');
+  row.className = 'msgrow bonsai';
+  const av = document.createElement('div'); av.className = 'av bonsai'; av.textContent = 'B';
+  const bubble = document.createElement('div'); bubble.className = 'bubble';
+
+  const card = document.createElement('div'); card.className = 'imgcard';
+  const top = document.createElement('div'); top.className = 'imgtop';
+  const b = document.createElement('b'); b.textContent = PAINT_ICON + ' Drawing';
+  const st = document.createElement('span'); st.textContent = prompt;
+  top.appendChild(b); top.appendChild(st);
+
+  const stage = document.createElement('div');
+  stage.className = 'imgstage ' + imgStageClass(width, height);
+  const shim = document.createElement('div'); shim.className = 'imgshimmer';
+  const empty = document.createElement('div'); empty.className = 'imgempty';
+  empty.textContent = 'waking the model…';
+  const im = document.createElement('img'); im.alt = 'image being generated';
+  stage.appendChild(shim); stage.appendChild(empty); stage.appendChild(im);
+
+  const bar = document.createElement('div'); bar.className = 'imgbar';
+  const fill = document.createElement('i'); bar.appendChild(fill);
+  const foot = document.createElement('div'); foot.className = 'imgfoot';
+  const left = document.createElement('span'); left.textContent = 'loading';
+  const right = document.createElement('span'); right.className = 'dim';
+  foot.appendChild(left); foot.appendChild(right);
+
+  card.appendChild(top); card.appendChild(stage);
+  card.appendChild(bar); card.appendChild(foot);
+  bubble.appendChild(card);
+  row.appendChild(bubble); row.appendChild(av);
+  conv.appendChild(row);
+  scrollBottom();
+
+  let lastUrl = '';
+  return {
+    card: card, stage: stage, fill: fill, left: left, right: right,
+    im: im, shim: shim, empty: empty,
+    setPct: function (p) { fill.style.width = Math.max(0, Math.min(100, p)) + '%'; },
+    setNote: function (t) { left.textContent = t; },
+    setDim: function (t) { right.textContent = t; },
+    setPreview: function (url) {
+      if (!url || url === lastUrl) return;
+      lastUrl = url;
+      im.onload = function () {
+        im.classList.add('in');
+        shim.classList.add('gone');
+        empty.classList.add('gone');
+      };
+      im.src = url;
+    },
+    fail: function (msg) {
+      card.classList.add('err');
+      shim.classList.add('gone');
+      empty.classList.remove('gone');
+      empty.textContent = msg;
+      setPct(100);
+    }
+  };
+}
+function finishImageCard(handles, result) {
+  const h = handles;
+  if (!h) return;
+  h.setPct(100);
+  h.setNote('done');
+  h.setDim((result.width || '?') + '×' + (result.height || '?') +
+           ' · ' + (result.seconds || '?') + 's');
+  h.shim.classList.add('gone');
+  if (result.preview) {
+    h.im.onload = function () { h.im.classList.add('in'); h.empty.classList.add('gone'); };
+    h.im.src = result.preview;
+    h.im.classList.add('in');
+    h.empty.classList.add('gone');
+  }
+  h.card.querySelector('.imgtop b').textContent = PAINT_ICON + ' Painted';
+  const dims = h.card.querySelector('.imgfoot .dim');
+  if (dims) dims.textContent = (result.width || '?') + '×' + (result.height || '?') +
+    (result.delivery ? ' · delivered ' + result.upscaled_size : '');
+  const foot = h.card.querySelector('.imgfoot');
+  if (foot) {
+    foot.textContent = '';
+    const a = document.createElement('a');
+    a.href = '/previewfile/' + encodeURIComponent(String(result.path || '').split(String.fromCharCode(92)).join('/'));
+    a.target = '_blank';
+    a.textContent = 'open the file';
+    const note = document.createElement('span');
+    note.textContent = (result.upscaled_path ? 'also at ' + result.upscaled_size : '');
+    foot.appendChild(a);
+    if (result.upscaled_path) foot.appendChild(note);
+  }
+}
+/* Read the engine's own event stream. Same shape as the chat stream, so the
+   same progress events drive both the button and the tool. */
+async function runImage(prompt) {
+  const width = 0, height = 0;
+  const handles = addImageCard(prompt, 0, 0);
+  let result = null, failed = null;
+  try {
+    const r = await fetch('/api/image', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ prompt: prompt }) });
+    if (!r.ok || !r.body) throw new Error('the server said ' + r.status);
+    const reader = r.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '', ev = '';
+    for (;;) {
+      const part = await reader.read();
+      if (part.done) break;
+      buf += dec.decode(part.value, { stream: true });
+      let nl;
+      while ((nl = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, nl).trim();
+        buf = buf.slice(nl + 1);
+        if (line.startsWith('event:')) { ev = line.slice(6).trim(); continue; }
+        if (!line.startsWith('data:')) continue;
+        let j = null;
+        try { j = JSON.parse(line.slice(5).trim()); } catch (e) { continue; }
+        if (ev === 'imgprog') {
+          if (j.width && j.height && !handles.stage.dataset.sized) {
+            handles.stage.className = 'imgstage ' + imgStageClass(j.width, j.height);
+            handles.stage.dataset.sized = '1';
+          }
+          if (j.phase === 'loading') { handles.setPct(2); handles.setNote('loading the model…'); }
+          else if (j.phase === 'sampling') {
+            handles.setPct(Math.max(3, j.percent || 0));
+            handles.setNote('step ' + (j.step || 0) + ' / ' + (j.steps || '?'));
+            handles.setDim((j.seconds || 0) + 's');
+            if (j.preview_url) handles.setPreview(j.preview_url + '?t=' + Date.now());
+          }
+        } else if (ev === 'done') {
+          if (j && j.error) failed = j.error; else result = j;
+          ev = 'stop';
+        } else if (ev === 'error') {
+          failed = (j && j.text) || 'something went wrong';
+          ev = 'stop';
+        }
+        if (ev === 'stop') break;
+      }
+      if (ev === 'stop') { try { await reader.cancel(); } catch (e) {} break; }
+    }
+  } catch (err) {
+    failed = (err && err.message) || String(err);
+  }
+  if (failed) { if (handles) handles.fail(failed.slice(0, 120)); return; }
+  finishImageCard(handles, result || {});
+}
+function submitImage() {
+  const ta = document.getElementById('user-input');
+  const prompt = ta.value.trim();
+  if (!prompt) return;
+  if (!cur) newChat();
+  ta.value = '';
+  const label = prompt.slice(0, 60);
+  if (!cur.title || cur.title === 'New chat') {
+    cur.title = label;
+    if (chats.indexOf(cur) === -1) chats.push(cur);
+  }
+  addUser(prompt);
+  save();
+  renderList();
+  runImage(prompt);
+}
 function handleSubmit(e) {
   e.preventDefault();
+  if (imgMode) { submitImage(); return; }
   if (busy) { queueNow(); return; }
   go();
 }
@@ -1873,6 +2257,26 @@ async function refreshCtx(quick) {
     const draft = (typeof buildUserMsg === 'function') ? buildUserMsg() : null;
     if (draft) msgs.push({ role: 'user', content: draft });
   } catch (e) { /* no composer on this view */ }
+  /* A long chat was re-serialised and re-shipped to the server after every
+     pause in typing - a few hundred kilobytes of JSON built on the main
+     thread, which is what made the composer unusable in a big conversation.
+     Past the point where the round trip earns its keep, count it here. The
+     number is an estimate while you are typing either way, and the end of a
+     turn still asks the server for the real one. */
+  let tooBig = false;
+  try { tooBig = JSON.stringify(msgs).length > 120000; } catch (e) { tooBig = false; }
+  if (tooBig) {
+    let chars = 0;
+    msgs.forEach(function (m) {
+      chars += typeof m.content === 'string' ? m.content.length
+              : (JSON.stringify(m.content || '').length);
+    });
+    ctxLast = { ok: true, used: Math.max(1, Math.round(chars / 4)),
+                total: (typeof BONSAI_CTX !== 'undefined' && BONSAI_CTX) || 0 };
+    ctxPaint();
+    maybeFold(quick);
+    return;
+  }
   try {
     const r = await fetch('/api/ctx', { method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -1887,8 +2291,30 @@ function scheduleCtx(quick) {
   /* While typing, settle quickly but ask for the cheap estimate: an exact
      count costs two round-trips to the model server, and nobody needs that
      to be precise mid-word. The bar shows a ~ while it is a guess. */
-  ctxTimer = setTimeout(function () { refreshCtx(quick); }, quick ? 500 : 400);
+  ctxTimer = setTimeout(function () { refreshCtx(quick); }, quick ? 900 : 400);
 }
+/* Deleting a chat used to mean dropping it from the array and saving - and
+   the save merges, so the copy still sitting in storage was merged straight
+   back and the chat was there again on the next refresh. A merge can only ever
+   add, so a removal has to be said out loud: the id goes on this list, the
+   merge honours it, and the server is told so another browser cannot bring it
+   back either. */
+let deletedIds = loadDeletedIds();
+function loadDeletedIds() {
+  try {
+    const v = JSON.parse(localStorage.getItem('jarvis_chats_deleted') || '[]');
+    return Array.isArray(v) ? v : [];
+  } catch (e) { return []; }
+}
+function saveDeletedIds() {
+  try { localStorage.setItem('jarvis_chats_deleted', JSON.stringify(deletedIds)); } catch (e) {}
+}
+function noteDeleted(id) {
+  if (!id || deletedIds.indexOf(id) !== -1) return;
+  deletedIds.push(id);
+  saveDeletedIds();
+}
+function forgetDeleted() { deletedIds = []; saveDeletedIds(); }
 function queueNow() {
   const parts = buildUserMsg();
   if (!parts) return;
@@ -1921,27 +2347,43 @@ function stopRun() {
   if (abortCtrl) { const a = abortCtrl; abortCtrl = null; try { a.abort(); } catch (e) {} }
   if (thinkingRow) doneThinking('(stopped by user)');
   setState('idle');
+  setTimeout(function () { sweepStaleThinking(); }, 0);
 }
 function drainQueue() {
   if (busy) return;
   if (!msgQueue.length) return;
   const next = msgQueue.shift();
+  if (!next || !next.parts || !next.parts.length) { drainQueue(); return; }
   if (next.msg) delete next.msg.queued;
   clearQueuedBadge(next.chat, next.msg);
   refreshQueueUI();
   go(next.parts, next.chat, true, next.msg);
+}
+/* Hand a de-queued message back when go() turns out it cannot run it.
+   drainQueue has already taken it out of the queue and cleared its badge, so
+   without this a message that hit an early exit - an empty composer, a model
+   with no key - simply disappeared: not sent, not queued, not marked, and
+   nothing on screen said so. */
+function giveBack(msg) {
+  if (!msg) return;
+  const parts = typeof msg.content === 'string' ? [{ type: 'text', text: msg.content }] : (msg.content || []);
+  if (!parts.length) return;
+  msg.queued = true;
+  msgQueue.unshift({ parts: parts, chat: cur, msg: msg });
+  refreshQueueUI();
+  renderConv();
 }
 async function go(forcedParts, chat, alreadyAdded, askedMsg) {
   if (busy) return;
   if (!cur) newChat();
   if (chat && chat !== cur && chats.indexOf(chat) !== -1) { cur = chat; renderAll(); }
   const parts = forcedParts || buildUserMsg();
-  if (!parts) return;
+  if (!parts) { giveBack(askedMsg); return; }
   // A remote model with no key would otherwise fail as a 401 halfway through,
   // after the turn is already spent and buried in a conversation.
   try {
     const block = await failFastKey();
-    if (block) { alert(block); return; }
+    if (block) { alert(block); giveBack(askedMsg); return; }
   } catch (e) { /* never block the send on a failed check */ }
   busy = true;
   setSendUI();
@@ -1967,9 +2409,10 @@ async function go(forcedParts, chat, alreadyAdded, askedMsg) {
   pendingAtt = [];
   renderPreview();
   document.getElementById('user-input').value = '';
-  try { await streamRun(wireFor(target), target, asked); }
+  try { await streamRun(await hydrateAtt(wireFor(target)), target, asked); }
   catch (err) { doneThinking('Error: ' + err.message); setState('idle'); }
   busy = false;
+  sweepStaleThinking();
   setSendUI();
   document.getElementById('user-input').focus();
   target.ts = Date.now();
@@ -1997,6 +2440,53 @@ function renderPreview() {
     }
   });
 }
+/* An image is kept on the server as a file and referred to as /att/<hash>.
+   The message that gets stored - in localStorage and in chats.json - then holds
+   a short path instead of megabytes of base64, which is what made attachments
+   quietly break history saving: localStorage has one small quota for the whole
+   app, so a couple of screenshots filled it and the whole save was thrown away.
+   ATT_DATA is the bytes for this session, so a picture is uploaded once and
+   never re-read. */
+const ATT_DATA = {};
+async function storeAtt(dataUrl) {
+  try {
+    const r = await fetch('/api/attach', { method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ data: dataUrl }) });
+    const j = await r.json();
+    if (j && j.ok && j.url) { ATT_DATA[j.url] = dataUrl; return j.url; }
+  } catch (e) { /* fall through: the picture is still usable this session */ }
+  return null;
+}
+function isAttUrl(u) { return typeof u === 'string' && u.indexOf('/att/') === 0; }
+function attToDataUrl(url) {
+  return new Promise(function (res) {
+    fetch(url).then(function (r) { return r.blob(); })
+      .then(function (b) { const fr = new FileReader(); fr.onload = function () { res(fr.result); }; fr.readAsDataURL(b); })
+      .catch(function () { res(null); });
+  });
+}
+/* Put the real bytes back in before a request goes to a model. Returns a copy;
+   what is stored in the conversation keeps the short reference. */
+async function hydrateAtt(msgs) {
+  const out = [];
+  for (const m of (msgs || [])) {
+    const content = m.content;
+    if (!Array.isArray(content)) { out.push(m); continue; }
+    let changed = false;
+    const parts = [];
+    for (const p of content) {
+      if (p.type === 'image_url' && p.image_url && isAttUrl(p.image_url.url)) {
+        const u = p.image_url.url;
+        const data = ATT_DATA[u] || await attToDataUrl(u);
+        if (data) { ATT_DATA[u] = data; parts.push({ type: 'image_url', image_url: { url: data } }); changed = true; continue; }
+      }
+      parts.push(p);
+    }
+    out.push(changed ? Object.assign({}, m, { content: parts }) : m);
+  }
+  return out;
+}
 function addFiles(files) {
   const arr = Array.from(files || []);
   if (!arr.length) return;
@@ -2007,7 +2497,21 @@ function addFiles(files) {
     if (isImg) {
       if (f.size > 10 * 1024 * 1024) return;
       const r = new FileReader();
-      r.onload = function () { pendingAtt.push({ type: 'img', src: r.result }); renderPreview(); };
+      r.onload = function () {
+        const dataUrl = r.result;
+        /* Show it right away, then swap in the stored reference once the
+           server has it. The preview works either way, so there is no wait. */
+        const a = { type: 'img', src: dataUrl };
+        pendingAtt.push(a);
+        renderPreview();
+        storeAtt(dataUrl).then(function (url) {
+          if (!url) return;
+          ATT_DATA[url] = dataUrl;
+          a.stored = url;
+          a.src = url;
+          renderPreview();
+        });
+      };
       r.readAsDataURL(f);
     } else {
       if (f.size > 200 * 1024) { pendingAtt.push({ type: 'file', name: f.name, text: '[file too large for direct read]' }); renderPreview(); return; }
@@ -2023,7 +2527,49 @@ function addFiles(files) {
   });
 }
 document.getElementById('attach').onclick = function () { document.getElementById('filein').click(); };
+document.getElementById('imgmode').onclick = function () { setImgMode(!imgMode); };
 document.getElementById('filein').onchange = function () { addFiles(this.files); this.value = ''; };
+/* Ctrl+V with an image on the clipboard attaches it, instead of pasting
+   nothing at all. The image goes through the same addFiles() the paperclip
+   uses, so it lands in the same preview, obeys the same four-attachment cap
+   and the same 10 MB limit, and is sent the same way.
+   The guard is the important part: the paste is only taken over when the
+   clipboard really does hold an image. Ordinary text - a snippet of code, a
+   path, a sentence - has to keep pasting as text exactly as the browser
+   would, and this returns without touching the event when it does. */
+/* Above this many characters a pasted text is treated as a file to read
+   rather than something to type. Deliberately generous - an ordinary sentence,
+   a path, a short snippet still pastes as text. */
+const LONG_PASTE_CHARS = 2000;
+function addTextAttachment(text) {
+  const slots = 4 - pendingAtt.length;
+  if (slots <= 0) { alert('Too many attachments (max 4) - remove one first'); return; }
+  const d = new Date();
+  const pad = function (n) { return (n < 10 ? '0' : '') + n; };
+  const name = 'pasted-' + pad(d.getHours()) + pad(d.getMinutes()) + pad(d.getSeconds()) + '.txt';
+  let body = text;
+  if (body.length > 60000) body = body.slice(0, 60000) + '\n[... paste truncated at 60000 characters ...]';
+  pendingAtt.push({ type: 'file', name: name, text: body });
+  renderPreview();
+}
+document.getElementById('user-input').addEventListener('paste', function (e) {
+  var cd = e.clipboardData;
+  if (!cd) return;
+  var isImg = function (f) { return (f.type || '').indexOf('image/') === 0; };
+  var items = cd.items ? Array.from(cd.items) : [];
+  if (!items.some(function (it) { return it.kind === 'file' && isImg(it); })) return;
+  var files = cd.files ? Array.from(cd.files).filter(isImg) : [];
+  if (files.length) { e.preventDefault(); addFiles(files); return; }
+  /* No image on the clipboard, so it is a normal text paste - unless it is a
+     lot of text. A pasted file, a stack trace or a long log is far more useful
+     as something the model can be told to read than as a wall of text in the
+     box, and the composer should not fill up with it either. Short pastes are
+     left completely alone; only real blocks of text are caught. */
+  var text = cd.getData ? (cd.getData('text/plain') || '') : '';
+  if (text.length < LONG_PASTE_CHARS) return;
+  e.preventDefault();
+  addTextAttachment(text);
+});
 (function () {
   const wrap = document.getElementById('messages');
   const ov = document.createElement('div');
@@ -2089,7 +2635,8 @@ document.getElementById('ejectbtn').onclick = function () {
   const btn = document.getElementById('ejectbtn');
   if (btn.disabled) return;
   btn.disabled = true;
-  btn.textContent = 'EJECTING...';
+  btn.classList.add('on');
+  btn.title = 'Stopping the model server...';
   btn.style.opacity = '0.5';
   fetch('/api/eject', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
     .then(function (r) { return r.json(); })
@@ -2109,9 +2656,13 @@ document.getElementById('ejectbtn').onclick = function () {
 function renderTtsBtn(j) {
   const el = document.getElementById('ttsbtn');
   if (!el) return;
-  el.textContent = j.enabled ? 'TTS: ON' : 'TTS: OFF';
-  el.classList.toggle('on', !!j.enabled);
-  el.title = 'Text-to-speech (Piper) - ' + (j.enabled ? 'speech enabled' : 'off, click to enable');
+  /* the button is an icon now, so the state lives in the dot, the title and
+     the accessible name rather than in a word that would replace the icon */
+  const on = !!j.enabled;
+  el.classList.toggle('on', on);
+  const what = on ? 'speech is on' : 'speech is off';
+  el.title = 'Text-to-speech (Piper) - ' + what + ', click to change';
+  el.setAttribute('aria-label', 'Text to speech (' + what + ')');
 }
 function refreshTts() {
   fetch('/api/tts')
@@ -2133,6 +2684,44 @@ refreshTts();
 function modelLabel(m) {
   return (m.type === 'api' ? '☁ ' : '◉ ') + (m.label || m.id);
 }
+/* Which service a model actually comes from, read off its own base_url rather
+   than guessed from the name. A dozen providers all call themselves "gpt", and
+   a hand-kept table of them is a table that goes stale. Anything we cannot
+   place is filed under its host, so a new gateway still groups sensibly
+   instead of vanishing into a flat list. */
+function modelProvider(m) {
+  if (m.type !== 'api') return 'Local';
+  var base = String(m.base_url || '').toLowerCase();
+  var host = base.split('://')[1] ? base.split('://')[1].split('/')[0] : base;
+  var known = [
+    ['openrouter', 'OpenRouter'],
+    ['googleapis', 'Google Gemini'],
+    ['generativelanguage', 'Google Gemini'],
+    ['api.groq.com', 'Groq'],
+    ['api.mistral.ai', 'Mistral'],
+    ['api.openai.com', 'OpenAI'],
+    ['azure.com', 'OpenAI'],
+    ['anthropic.com', 'Anthropic'],
+    ['api.cerebras.ai', 'Cerebras'],
+    ['nvidia.com', 'NVIDIA'],
+    ['ollama', 'Ollama'],
+    ['lmstudio', 'LM Studio'],
+    ['lm-studio', 'LM Studio'],
+    ['opencod', 'OpenCode'],
+    ['127.0.0.1', 'On this PC'],
+    ['localhost', 'On this PC']
+  ];
+  for (var i = 0; i < known.length; i++) {
+    if (base.indexOf(known[i][0]) >= 0) return known[i][1];
+  }
+  if (m.provider) return m.provider;
+  return host || 'Other';
+}
+function providerOrder(p) {
+  if (p === 'Local') return 0;
+  if (p === 'On this PC') return 1;
+  return 10;
+}
 function fmtCtx(c) {
   c = Number(c) || 0;
   if (c >= 1000000) { const t = c / 1000000; return (t >= 10 ? Math.round(t) : Math.round(t * 10) / 10) + 'M'; }
@@ -2141,6 +2730,19 @@ function fmtCtx(c) {
 }
 function modelCtxLabel(m) {
   return m.ctx ? ' · ' + fmtCtx(m.ctx) + ' ctx' : '';
+}
+/* The model named the conversation. This replaces the placeholder title the app
+   made from the opening words. The sidebar row, the header and the stored chat
+   are three different things showing the same name, so all three are updated
+   and the change is saved - the whole point of the tool is being able to find
+   this conversation again in the list later. */
+function applyChatTitle(t) {
+  if (!t) return;
+  t = String(t).replace(/&#\d+;/g, '').trim();
+  if (!t) return;
+  if (cur) { cur.title = t; cur.titled_by = 'ai'; }
+  renderList();
+  save();
 }
 function setModelStatus(ready, loading) {
   const t = document.getElementById('system-status-text');
@@ -2151,6 +2753,72 @@ function setModelStatus(ready, loading) {
   t.title = loading ? 'The model is being loaded into RAM/VRAM - this only happens on your first message.'
     : (ready ? 'The model is resident in RAM/VRAM.' : 'The model is not loaded. It loads the first time you send a message.');
 }
+/* Tell the server which level is chosen, and take back the menu it answers
+   with. Going through the server rather than just posting the value is what
+   keeps one list of levels: it validates the choice against the active host
+   and can answer with a corrected set, so the menu on screen is always what
+   the server would actually send. */
+function pushEffort() {
+  const el = document.getElementById('effort-sel');
+  if (!el) return;
+  const v = effortValue();
+  try { localStorage.setItem('bonsai_effort', v); } catch (e) {}
+  fetch('/api/effort', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ effort: v }) })
+    .then(function (r) { return r.json(); })
+    .then(function (j) { if (j) renderEffortSel({ host: j.host, current: j.effort, levels: j.levels }); })
+    .catch(function () {});
+}
+
+/* The thinking menu belongs to whichever model is active, so it is built from
+   what that model says it accepts rather than from a list written here once.
+   Four hardcoded words were wrong for every provider but one: OpenRouter takes
+   max|xhigh|high|medium|low|minimal|none and answers 400 with that list in the
+   message, while Google rejects the whole field. The value is kept if the new
+   menu still offers it, so switching models does not silently move the knob. */
+let EFFORT_HOST = '';
+let EFFORT_WIRED = false;
+function renderEffortSel(info, wanted) {
+  const sel = document.getElementById('effort-sel');
+  if (!sel || !info || !Array.isArray(info.levels) || !info.levels.length) return;
+  const prev = wanted || sel.value;
+  sel.innerHTML = '';
+  info.levels.forEach(function (lv) {
+    const o = document.createElement('option');
+    o.value = lv.value;
+    o.textContent = 'THINK: ' + lv.label;
+    if (lv.note) o.title = lv.note;
+    if (lv.value === (info.current || prev)) o.selected = true;
+    sel.appendChild(o);
+  });
+  sel.title = info.host === 'none'
+    ? 'This model does not take a thinking setting.'
+    : 'How deeply ' + (info.host === 'local' ? 'the local model' : 'the model')
+      + ' reasons. The options are the ones this endpoint accepts.';
+  // one host's levels mean nothing on another, so say which is which
+  sel.setAttribute('data-host', info.host || '');
+  EFFORT_HOST = info.host || '';
+  if (info.current && sel.value !== info.current) {
+    for (let i = 0; i < sel.options.length; i++) {
+      if (sel.options[i].value === info.current) { sel.selectedIndex = i; break; }
+    }
+  }
+  if (info.host === 'none') sel.classList.add('locked');
+  else sel.classList.remove('locked');
+  /* one listener, added by the function that owns the element. Adding it at the
+     top level meant it ran before this element existed in one of the page
+     copies, and a second copy double-posted every change. */
+  if (!EFFORT_WIRED) {
+    EFFORT_WIRED = true;
+    sel.addEventListener('change', pushEffort);
+  }
+}
+function effortValue() {
+  const el = document.getElementById('effort-sel');
+  if (el && el.value) return el.value;
+  try { return localStorage.getItem('bonsai_effort') || 'high'; } catch (e) {}
+  return 'high';
+}
 function renderModels(j) {
   const sel = document.getElementById('modelsel');
   if (!sel) return;
@@ -2158,17 +2826,40 @@ function renderModels(j) {
   if (_am && _am.ctx) BONSAI_CTX = _am.ctx;
   scheduleCtx();
   sel.innerHTML = '';
+  /* Grouped by who serves the model, so OpenRouter's pile, Google's pile and
+     the local weights are separate things you can actually see. A plain
+     <select> cannot hold headings, so they come from optgroup - which is what
+     a select is for when the list has structure. One group per provider, local
+     first because it is the one that needs no key and no network. */
+  var groups = {};
+  var order = [];
   (j.models || []).forEach(function (m) {
-    const o = document.createElement('option');
-    o.value = m.id;
-    o.textContent = modelLabel(m) + modelCtxLabel(m) + (m.type === 'local' && m.vision ? ' · vision' : '') +
-      (m.type === 'local' && m.available === false ? ' (missing)' : '') +
-      (m.type === 'api' ? ' · ' + (m.needs_key ? 'NO KEY' : (m.api_key_set ? 'key ok' : 'no key needed')) : '');
-    if (m.id === j.active) o.selected = true;
-    sel.appendChild(o);
+    var p = modelProvider(m);
+    if (!groups[p]) { groups[p] = []; order.push(p); }
+    groups[p].push(m);
+  });
+  order.sort(function (a, b) {
+    var d = providerOrder(a) - providerOrder(b);
+    return d !== 0 ? d : a.localeCompare(b);
+  });
+  order.forEach(function (p) {
+    var g = document.createElement('optgroup');
+    g.label = p;
+    groups[p].forEach(function (m) {
+      const o = document.createElement('option');
+      o.value = m.id;
+      o.textContent = modelLabel(m) + modelCtxLabel(m) + (m.type === 'local' && m.vision ? ' · vision' : '') +
+        (m.type === 'local' && m.available === false ? ' (missing)' : '') +
+        (m.type === 'api' ? ' · ' + (m.needs_key ? 'NO KEY' : (m.api_key_set ? 'key ok' : 'no key needed')) : '');
+      if (m.id === j.active) o.selected = true;
+      g.appendChild(o);
+    });
+    sel.appendChild(g);
   });
   sel.classList.toggle('off', !j.managed);
   sel.setAttribute('data-prev', j.active || '');
+  renderEffortSel(j.effort, sel.getAttribute('data-prev-effort'));
+  renderEffortSel(j.effort, sel.getAttribute('data-prev-effort'));
   const badge = document.getElementById('modelbadge');
   if (badge && j.active_label) badge.textContent = j.active_label;
   const vs = document.getElementById('visionbadge');
@@ -2630,17 +3321,27 @@ init();
   }
   function renderStepBtn() {
     var b = document.getElementById('detailbtn');
-    if (b) b.textContent = 'DETAIL: ' + (ocFull() ? 'FULL' : 'BRIEF');
+    if (!b) return;
+    var full = ocFull();
+    /* an icon button has no word to rewrite, so the state goes in the
+       dot, the title and the accessible name instead */
+    b.classList.toggle('on', full);
+    b.title = 'Steps shown ' + (full ? 'fully expanded' : 'as one collapsed line') + ' - click to change. Steps that show code always stay expanded.';
+    b.setAttribute('aria-label', 'Detail level (' + (full ? 'full' : 'brief') + ')');
   }
   function applyDetail() {
     var on = ocFull();
     var all = document.querySelectorAll('.ocstep');
-    for (var i = 0; i < all.length; i++) all[i].open = on;
+    for (var i = 0; i < all.length; i++) {
+      /* DETAIL never closes a step that shows code */
+      if (all[i].querySelector('.ocdiff')) { all[i].open = true; continue; }
+      all[i].open = on;
+    }
   }
   document.addEventListener('DOMContentLoaded', function () {
     renderStepBtn();
     var b = document.getElementById('detailbtn');
-    if (b) b.onclick = function () {
+  if (b) b.onclick = function () {
       try { localStorage.setItem('bonsai_stepdetail', ocFull() ? 'brief' : 'full'); } catch (e) {}
       renderStepBtn(); applyDetail();
     };
@@ -2871,20 +3572,22 @@ init();
     var oldn = 0, newn = 0;
     rows.forEach(function (r) {
       if (r.c === 'h') {
-        var m = /@@\s*-(\d+)/.exec(r.t), m2 = /@@.*\+(\d+)/.exec(r.t);
-        oldn = m ? parseInt(m[1], 10) : 0;
-        newn = m2 ? parseInt(m2[1], 10) : 0;
+        /* A hunk header names where its range *starts*, and the first row           below it is that very line - so start one short and let the           counter below land on it. Reading the start straight into the           counter, then pre-incrementing before printing, put every line           in every hunk one too high. */
+        var m = /^@@ -(\d+)(?:,\d+)? \+(\d+)/.exec(r.t);
+        oldn = m ? parseInt(m[1], 10) - 1 : 0;
+        newn = m ? parseInt(m[2], 10) - 1 : 0;
         var tr = el('tr', 'hunk');
         var td = el('td', 'octext', r.t);
         td.colSpan = 2; tr.appendChild(el('td', 'ocl', '')); tr.appendChild(td);
         tb.appendChild(tr);
         return;
       }
-      if (r.c === 'a') newn++;
-      else if (r.c === 'd') oldn++;
-      else { oldn++; newn++; }
+      var shown;
+      if (r.c === 'a') { shown = ++newn; }
+      else if (r.c === 'd') { shown = ++oldn; }
+      else { shown = ++oldn; newn++; }
       var tr2 = el('tr', r.c === 'a' ? 'add' : (r.c === 'd' ? 'del' : 'ctx'));
-      tr2.appendChild(el('td', 'ocl', r.c === 'a' ? String(newn) : String(oldn)));
+      tr2.appendChild(el('td', 'ocl', String(shown)));
       tr2.appendChild(el('td', 'octext', r.t));
       tb.appendChild(tr2);
     });
@@ -2920,14 +3623,38 @@ init();
     w.appendChild(a);
     return w;
   }
-  function argsBlock(call) {
+  function argsBlock(call, hasDiff) {
     var a = call.arguments || {};
     var keys = Object.keys(a);
     if (!keys.length) return null;
+    /* A file's whole contents as escaped JSON is unreadable, and it is not
+       news: the diff right above it shows exactly what changed. So a long
+       value is named and measured rather than printed. Short arguments -
+       a path, a flag, a search term - are still shown as they were. */
+    var LIMIT = 200;
+    var size = function (v) {
+      var s = typeof v === 'string' ? v : JSON.stringify(v);
+      return s ? s.length : 0;
+    };
+    var shown = {}, big = [];
+    keys.forEach(function (k) {
+      var n = size(a[k]);
+      if (n > LIMIT) { big.push({ k: k, n: n }); return; }
+      shown[k] = a[k];
+    });
     var box = el('div');
-    box.appendChild(el('div', 'oclab', 'ARGUMENTS'));
-    var pre = el('pre', 'ocargs', JSON.stringify(a, null, 2));
-    box.appendChild(pre);
+    if (Object.keys(shown).length) {
+      box.appendChild(el('div', 'oclab', 'ARGUMENTS'));
+      box.appendChild(el('pre', 'ocargs', JSON.stringify(shown, null, 2)));
+    }
+    if (big.length) {
+      var t = big.map(function (h) {
+        return h.k + '  ' + h.n.toLocaleString() + ' characters';
+      }).join('  \u00b7  ');
+      box.appendChild(el('div', 'ocargnote', t
+        + (hasDiff ? '  \u2014 shown in the diff above' : '')));
+    }
+    if (!box.childNodes.length) return null;
     return box;
   }
 
@@ -2939,6 +3666,11 @@ init();
     var bad = !!(res && res.error);
     var d = el('details', 'ocstep' + (bad ? ' err' : ''));
     if (ocFull()) d.open = true;
+    var hasDiff = !!(chg && chg.diff && String(chg.diff).indexOf('@@') >= 0);
+    /* A step carrying a diff is showing you what it changed to the disk.
+       That is the only reason to open it, so it is never folded away -
+       otherwise the lines it removed are the one thing you cannot see. */
+    if (hasDiff) d.open = true;
     var s = el('summary');
     s.appendChild(el('span', 'occaret', '›'));
     s.appendChild(el('span', 'ocg', kind.spec.g));
@@ -2959,7 +3691,7 @@ init();
       body.appendChild(el('div', 'oclab', 'DIFF'));
       body.appendChild(diffTable(chg.diff));
     }
-    var ab = argsBlock(call);
+    var ab = argsBlock(call, hasDiff);
     if (ab) body.appendChild(ab);
     if (!(chg && chg.diff && String(chg.diff).indexOf('@@') >= 0)) {
       var txt = resultText(res);
@@ -3120,7 +3852,7 @@ init();
   function clearChips() {
     if (!OCS.bubble) return;
     /* the two consoles spell their legacy tool UI differently:
-       PAGE uses .toolchip/.pills/.toollog, PAGE_GPT uses .toolsline/.tlog.
+       The page uses .toolsline/.tlog.
        .reasonbox is the old "Thinking (BONSAI) - N chars" box: its text now
        lives inside the "+ Thought" step, so it goes away too. */
     var junk = OCS.bubble.querySelectorAll(
@@ -3576,11 +4308,12 @@ init();
     if (!b) return;
     var s = lastSnap || { files: 0, added: 0, removed: 0 };
     if (!s.files) {
-      b.textContent = 'CHANGES 0';
-      b.className = 'ocbarbtn';
-      b.title = 'No file changes tracked yet';
+      /* nothing tracked, so nothing to clear either - this was two dead
+         buttons sitting at the top of every empty chat */
+      bar.style.display = 'none';
       return;
     }
+    bar.style.display = 'flex';
     b.innerHTML = '';
     b.appendChild(el('span', null, 'CHANGES ' + s.files + ' file' + (s.files === 1 ? '' : 's') + '  '));
     b.appendChild(el('span', 'ocadd', '+' + (s.added || 0)));
@@ -3624,6 +4357,9 @@ init();
     };
     head.appendChild(rev);
     head.onclick = function () { wrap.classList.toggle('open'); };
+    /* open by default: the point of this panel is to see what changed, and
+       what changed includes the lines that went away */
+    if (c.diff && String(c.diff).indexOf('@@') >= 0) wrap.classList.add('open');
     wrap.appendChild(head);
     wrap.appendChild(body);
     body.appendChild(el('div', 'oclab', 'DIFF  ' + (c.tool || '') + '  ' + new Date((c.ts || 0) * 1000).toLocaleString()));

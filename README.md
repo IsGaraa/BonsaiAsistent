@@ -80,10 +80,10 @@ and the next message brings it back. On Windows the model server is
 model server manually, double-click `stop.cmd` on Windows or run `./stop.sh` on
 Linux.
 
-A second, cleaner chat UI is available at **http://localhost:8081/chat**
-(GPT-style look, same backend and features: tools, thinking, streaming, plan/build
-mode, effort, attachments, mic, workdir, EJECT and Blender status). The two UIs
-keep separate chat histories (the GPT UI stores its history in the browser).
+The whole app is at **http://localhost:8081**. (The old `/chat` address redirects there, so older links still land in the right place.)
+Sidebars carry chats, downloads and the tool rail; the top bar carries mode,
+model, thinking effort and the model controls.
+
 
 Once the UI is open, try a few commands:
 
@@ -134,7 +134,7 @@ clears it, and a queued message survives a page reload.
 | **Shell + sandbox** | `run_command` executes real shell commands - PowerShell/cmd on Windows, `sh` on Linux (configurable timeout, up to 600s); `run_code` runs snippets in an isolated temp folder (auto-detects what's installed on the PC: Python + Node by default, plus Go/Lua/PHP/Ruby/Perl/Bash when present; timeouts up to 600s) |
 | **Asks you questions** | `ask_user` pauses and asks you a question (with optional clickable options) exactly like a human would - just like opencode |
 | **Todo list** | `todo_write` shows a live, visible checklist on the left panel as it works through longer tasks |
-| **Live HTML preview** | any `.html` page Bonsai writes (or `preview_html` explicitly) takes over the **center stage** - the arc reactor slides away and the page is shown full-panel, with a name and an **X** to bring the reactor back. Served from this PC, so JavaScript and local assets (CSS/JS/images next to the page) work. In the GPT-style chat (`/chat`) the same page opens as a full-screen lightbox |
+| **Live HTML preview** | any `.html` page Bonsai writes (or `preview_file` explicitly) takes over the **center stage** - the arc reactor slides away and the page is shown full-panel, with a name and an **X** to bring the reactor back. Served from this PC, so JavaScript and local assets (CSS/JS/images next to the page) work. An image opens in the same stage, full size |
 | **Screenshots appear in the chat** | every `take_screenshot` / `screenshot_window` / `click_text` result is drawn as a labelled card (dimensions + saved path, click to open full size) **above** the collapsed tool log - no need to expand anything |
 | **Not locked to one folder** | with the default `ASK` scope Bonsai can read, write and **search the whole PC** (`C:\`, `/home/...`), and you approve each new folder - so "find my tax PDF" works outside the workspace too. The **PATH SCOPE** control in the sidebar switches between `WORKSPACE` / `ASK` / `SYSTEM` (§4.1) |
 | **Real system meters** | live CPU / RAM / GPU usage under the reactor, read from `psutil` + `nvidia-smi` instead of placeholder numbers |
@@ -195,7 +195,7 @@ always produced at the end.
 | `web_search` / `web_fetch` | Look up current information online when it's not sure | `web_search` returns **structured** results (title, url, domain, snippet, source) plus `did_you_mean` and `related_searches`, so a typo like `serach` recovers in one call; `action="suggest"` is the cheap autocomplete-only check. `web_fetch` reads a page |
 | `run_command` | Runs a real shell command (cmd/PowerShell on Windows, `sh` on Linux) | timeout default 45s, configurable up to 600s, output capped to ~8 KB |
 | `run_code` | Runs a snippet in any installed language (see §2) | isolated temp folder, deleted afterwards; timeout default 30s, up to 600s; ~8 KB output cap |
-| `preview_html` | Live-preview an `.html` page from the workspace: it takes over the center stage (reactor hidden, **X** restores it), or opens as a lightbox in `/chat` | also auto-suggested when `write_file` targets an `.html`/`.htm` file (returns a `preview_url`) |
+| `preview_file` | Show an `.html` page or an image in the center stage: it takes over the stage (reactor hidden, **X** restores it), or opens as a lightbox in `/chat` | also auto-suggested when `write_file` targets an `.html`/`.htm` file (returns a `preview_url`) |
 | `get_scene_info` | Lists the open Blender scene: objects, types, locations (Mesh, Camera, Light, ...) | requires Blender running with the *MCP for Blender* addon enabled |
 | `get_object_info` | Details on one object (location, rotation, scale, ...) | |
 | `execute_blender_code` | Runs real Python inside Blender's `bpy` context | add cubes, move them, re-parent, set materials - always step by step |
@@ -216,9 +216,9 @@ The **workspace** is the default area for the file tools, and (with
 
 ### 4.1 Path scope - reaching the rest of the PC
 
-The **PATH SCOPE** button in the sidebar (classic UI: under the TODO list;
-GPT UI: above the footer links) has three modes. Click it to cycle:
+The **PATH SCOPE** button at the bottom of the sidebar has three modes.
 
+Click it to cycle:
 | Mode | Behaviour |
 |---|---|
 | `WORKSPACE` | hard sandbox - only the workspace, no prompts (the old behaviour) |
@@ -249,8 +249,8 @@ GPT UI: above the footer links) has three modes. Click it to cycle:
 ### 4.2 The DOWNLOADS panel
 
 Every download runs as a background job, so a big file no longer freezes the
-chat. The **DOWNLOADS** panel (classic UI: under the TODO list; GPT UI: in the
-sidebar) refreshes about once a second and shows, per transfer:
+chat. The **DOWNLOADS** panel in the sidebar refreshes about once a
+second and shows, per transfer:
 
 - a progress bar with **bytes / total**, **%**, current **speed** and **ETA**,
   plus `4 conn` when the file is split across parallel connections and
@@ -311,9 +311,9 @@ decoration: CPU and RAM come from `psutil`, GPU utilisation from `nvidia-smi`
 (sampled every 1.5 s on a dedicated thread, cached, and shown as `n/a` when
 `nvidia-smi` isn't available - e.g. no NVIDIA GPU).
 
-Both UIs use a dark theme. The classic HUD console (`/`) has a clean near-black
-palette with a single accent colour; the GPT-style UI (`/chat`) has its own
-light/dark toggle (the sun/moon button in the top bar).
+The page has a dark theme by default and a light one, toggled by the
+sun/moon button at the bottom of the sidebar. Both themes use the same
+palette, so only the values change.
 
 ## 6. Live token stats & memory relief
 
@@ -340,13 +340,12 @@ next message, no restart needed.
 
 ## 7. Chat history
 
-The two UIs keep **separate** histories (as designed - the classic HUD console
-and the GPT-style UI never mix):
+History is kept in two places and merged on load: the browser (instant,
+no round trip) and a file on disk, which is the durable one.
 
-| UI | Browser (`localStorage`) | Disk |
+| Where | Browser (`localStorage`) | Disk |
 |---|---|---|
-| Classic (`/`) | `jarvis_chats` - instant load | `%APPDATA%\BonsaiAsistent\chats.json` (Linux: `$XDG_CONFIG_HOME`/`~/.config`) |
-| GPT (`/chat`) | `bonsai_gpt_chats` - the **only** copy | - |
+| The page (`/`) | `jarvis_chats` - instant load | `%APPDATA%\BonsaiAsistent\chats.json` (Linux: `$XDG_CONFIG_HOME`/`~/.config`) |
 
 How it behaves:
 
@@ -354,7 +353,7 @@ How it behaves:
   and when the title is first set. The title becomes your first message
   (truncated to 34 chars, plus `+ files` / `+ images`).
 - **Capped at the newest 200 conversations** in both places.
-- **The disk copy is the durable one** for the classic UI: the browser copy is
+- **The disk copy is the durable one**: the browser copy is
   only a fast local mirror/fallback, and the two are *merged* on startup (the
   richer copy of a chat wins) so a failed or stale save can never hide newer
   messages. If the disk file is unreadable, `chats.json.bak` is used instead.
@@ -364,11 +363,11 @@ How it behaves:
   file.
 - **Attachments are size-capped in storage.** Tool screenshots (base64 previews)
   are never persisted. Large images you attach are kept for the 5 most recent
-  conversations in the classic UI's disk copy; older ones are replaced with a
+  conversations on disk; older ones are replaced with a
   placeholder so history cannot grow without limit. Images are still sent to the
   model for the current conversation.
-- **GPT UI history is browser-only.** Clearing site data, using another browser
-  or a private window loses it - copy anything you want to keep. The classic
+
+
   UI is the one that survives a wiped browser.
 - **Scheduled tasks are persisted separately** in `schedules.json` in the same
   BONSAI folder (`%APPDATA%\BonsaiAsistent` on Windows, `$XDG_CONFIG_HOME` or
@@ -514,7 +513,7 @@ Useful links (the model files themselves are in the table above):
   `.html`/`.htm`, and its companion `/previewfile/…` route serves the page's
   **non-HTML** assets (CSS/JS/images/fonts, with a fixed MIME allow-list) so
   local assets resolve. Both are confined to the workspace, both preview
-  `<iframe>`s (the center stage and the `/chat` lightbox) run with
+  `<iframe>`s (the center stage and the image lightbox) run with
   `sandbox="allow-scripts"` (so a previewed page is in an opaque origin and
   cannot touch the rest of the UI), and the file is never executed on the
   server.
@@ -553,7 +552,7 @@ requirements.md        # full dependency list (required vs optional)
 requirements.txt       # pip installs for the extended tools (pywin32 is Windows-only)
 tools/                 # optional helper scripts (screenshot, clipboard, scraper, OCR) - the same capabilities are also built into bonsai_web.py
 tools.json             # tool-call spec reference (auto-generated from code)
-gpt_ui.html            # read-only copy of the /chat UI. bonsai_web.py is the source of truth; refresh it with `python tools\dump_gpt_ui.py`
+gpt_ui.html            # read-only copy of the served page, kept for reference. bonsai_web.py is the source of truth; refresh it with `python tools\dump_gpt_ui.py`
 instructions.txt       # quick-start guide (English)
 piper/                 # Piper TTS: tts.py + download_voices.py; voice .onnx models are git-ignored (fetch with `python piper\download_voices.py`)
 *.gguf                 # the model weights (local only, not in git)
