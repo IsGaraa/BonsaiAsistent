@@ -1072,17 +1072,36 @@ def _edit_file(path, old_text, new_text, replace_all):
     return {"result": "ok", "path": target, "replaced": count}
 
 
+_PREVIEW_IMAGE_EXT = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp",
+                       ".avif")
+
+
 def _preview_url(rel):
+    """A stage URL for a page or an image.
+
+    Pages are served by /preview, which can read a directory listing and rewrite
+    relative asset paths. Images need none of that, and /previewfile/ serves
+    them directly - after the same workspace path check every other file goes
+    through, so this is not a way around the approval rules.
+    """
     rel = str(rel or "").strip().replace("\\", "/").lstrip("/")
-    if not rel.lower().endswith((".html", ".htm")):
-        return None
-    return "http://127.0.0.1:%d/preview?path=%s" % (PORT, urllib.parse.quote(rel))
+    low = rel.lower()
+    if low.endswith((".html", ".htm")):
+        return "http://127.0.0.1:%d/preview?path=%s" % (PORT,
+                                                       urllib.parse.quote(rel))
+    if low.endswith(_PREVIEW_IMAGE_EXT):
+        return "http://127.0.0.1:%d/previewfile/%s" % (
+            PORT, urllib.parse.quote(rel))
+    return None
 
 
 def _preview_html(path):
     rel = str(path or "").strip()
-    if not rel.lower().endswith((".html", ".htm")):
-        return {"error": "preview_html only works with .html / .htm files"}
+    low = rel.lower()
+    if not low.endswith((".html", ".htm") + _PREVIEW_IMAGE_EXT):
+        return {"error": "preview_html shows .html / .htm pages and images "
+                         "(.png .jpg .jpeg .webp .gif .bmp .avif), not "
+                         "%r" % os.path.basename(rel)}
     try:
         target = _safe_path(rel)
     except ValueError as exc:
@@ -1090,8 +1109,19 @@ def _preview_html(path):
     if not os.path.isfile(target):
         return {"error": f"file not found: {target}"}
     relpath = os.path.relpath(target, os.path.realpath(WORKDIR))
-    return {"result": "ok", "path": target,
-            "preview_url": _preview_url(relpath)}
+    url = _preview_url(relpath)
+    out = {"result": "ok", "path": target, "preview_url": url}
+    if low.endswith(_PREVIEW_IMAGE_EXT):
+        out["kind"] = "image"
+        try:
+            from PIL import Image
+            with Image.open(target) as im:
+                out["width"], out["height"] = im.size
+        except Exception:
+            pass
+    else:
+        out["kind"] = "page"
+    return out
 
 
 _PREVIEW_MIME = {
@@ -3837,16 +3867,29 @@ _IMG_JOBS_LOCK = threading.Lock()
 # grid at any sane size - 720 and 1080 are both 22.5 and 33.75 steps - so these
 # are the nearest legal shapes, not exact ratios. The exact ratio arrives later,
 # in the upscale, where nothing has to be a multiple of anything.
+# 16:9 is 1536x864 rather than 1920x1088 and it is a VRAM decision, not an
+# aesthetic one. At 1280x704 this card already peaked at 9 GB, and 1920x1088 is
+# 2.3x those pixels on a GPU with 12 GB total and the language model wanting
+# 11.4 of them. 1536x864 is 1.85x what has been measured rather than 2.3x, and
+# every shape here lands within 1.35 Mpx so no single aspect gets a surprise.
+# The delivered file is a full 2560x1440 either way - the resample is the same
+# operation at a different source size.
 _IMG_ASPECTS = {
-    "16:9": (1280, 704),
-    "widescreen": (1280, 704),
-    "9:16": (704, 1280),
-    "portrait": (704, 1280),
+    "16:9": (1536, 864),
+    "widescreen": (1536, 864),
+    "9:16": (864, 1536),
+    "portrait": (864, 1536),
     "1:1": (1024, 1024),
     "square": (1024, 1024),
-    "4:3": (1024, 768),
-    "3:4": (768, 1024),
+    "4:3": (1344, 992),
+    "3:4": (992, 1344),
 }
+# The delivered size: 1440p on the short edge, so 16:9 is 2560x1440. The
+# per-aspect frames live in _IMG_ASPECTS above and are derived from the
+# source ratio at upscale time rather than from a table here, because a table
+# of frame sizes is a table that can disagree with the shape it claims to
+# describe - and it did.
+_IMG_UPSCALE_TO = 1440
 
 
 _PREVIEW_CACHE = {}
@@ -4072,7 +4115,14 @@ def _generate_image(args, hooks=None, direct=False):
         out_path = os.path.join(out_dir, "img_%s.png" % stamp)
 
         job_id = "%s_%d" % (stamp, os.getpid())
-        preview_path = os.path.join(out_dir, "preview_%s.png" % job_id)
+        # A temp directory, not the images folder. A TAE preview is a noisy
+        # half-finished decode and does not belong beside the pictures the user
+        # asked for; this is removed when the job ends either way.
+        try:
+            preview_dir = tempfile.mkdtemp(prefix="bonsai_imgprev_")
+        except Exception:
+            preview_dir = tempfile.gettempdir()
+        preview_path = os.path.join(preview_dir, "preview_%s.png" % job_id)
         _img_job(job_id, prompt=prompt, steps=steps, width=width,
                  height=height, started=time.time(), preview=preview_path,
                  preview_url="/imgpreview/" + job_id, done=False, error=None,
@@ -4098,7 +4148,9 @@ def _generate_image(args, hooks=None, direct=False):
                # TAE is the tiny autoencoder: a real decoded preview of what has
                # been denoised so far, cheap enough to write every few steps.
                # It is the picture forming, not an animation standing in for it.
-               "--preview", "tae", "--preview-interval", "2",
+               # four beats - 25, 50, 75 and the finish - rather than a
+               # continuous flicker the eye reads as noise
+               "--preview", "tae", "--preview-interval", str(max(1, steps // 4)),
                "--preview-path", preview_path,
                "-o", out_path]
         if args.get("negative_prompt"):
@@ -4206,9 +4258,12 @@ def _generate_image(args, hooks=None, direct=False):
                      "prompt": prompt})
         _img_job(job_id, done=True)
         try:
-            os.remove(preview_path)
-        except OSError:
-            pass
+            shutil.rmtree(preview_dir, ignore_errors=True)
+        except Exception:
+            try:
+                os.remove(preview_path)
+            except OSError:
+                pass
 
         if timed_out:
             _img_job(job_id, error="timed out")
@@ -4266,22 +4321,40 @@ def _generate_image(args, hooks=None, direct=False):
         # other half of why this step exists. Lanczos, in Pillow, no model.
         want_up = args.get("upscale", True)
         if want_up not in (False, "false", "False", 0, "0"):
-            # Match the shape, do not stretch it. A square came out as
-            # 1920x1080 before, which is not an upscale, it is a distortion.
+            # 1440p on the SHORT edge, with the source's own ratio, which is
+            # what the user asked for and what "1440p" means to most people:
+            # 16:9 becomes 2560x1440, 9:16 becomes 1440x2560.
+            #
+            # This went wrong twice. A first version scaled the delivery frame's
+            # own height, which turned 16:9 into 1920x1440 - a 24% change of
+            # shape, a crop wearing a disguise. A second read the condition as
+            # "portrait" instead of "taller than wide", so every portrait and
+            # every square collapsed to a single 1440x1440. One test, two
+            # branches, and both were wrong in a way that only shows in the
+            # arithmetic - which is why the shape check is a separate script.
+            long_edge = _IMG_UPSCALE_TO
             if width > height:
-                up_w, up_h = 1920, 1080
+                up_h = long_edge
+                up_w = int(round(long_edge * width / float(height)))
             elif height > width:
-                up_w, up_h = 1080, 1920
+                up_w = long_edge
+                up_h = int(round(long_edge * height / float(width)))
             else:
-                up_w = up_h = 1080
+                up_w = up_h = long_edge
             if (width, height) != (up_w, up_h):
-                up_path = os.path.join(out_dir, "img_%s_1080p.png" % stamp)
+                up_path = os.path.join(out_dir, "img_%s_%dp.png"
+                                       % (stamp, _IMG_UPSCALE_TO))
                 got, why = _upscale_png(out_path, up_path, up_w, up_h)
                 if got:
                     out["upscaled_path"] = got
                     out["upscaled_size"] = "%dx%d" % (up_w, up_h)
+                    out["delivery"] = "%dp" % _IMG_UPSCALE_TO
                     out["upscaled_bytes"] = os.path.getsize(got)
-                    out["upscale_method"] = "Lanczos resampling, no AI upscaler"
+                    out["upscale_method"] = ("Lanczos resampling, no AI "
+                                             "upscaler")
+                    out["note"] = ("generated at %dx%d, delivered at %s"
+                                   % (width, height,
+                                      "%dx%d" % (up_w, up_h)))
                 else:
                     out["upscale_error"] = why
         _img_job(job_id, done=True, output=out_path)
@@ -4297,10 +4370,12 @@ def _generate_image(args, hooks=None, direct=False):
             if url:
                 out["preview"] = url
             if out.get("upscaled_path"):
+                # the delivered 1440p file is what the user will look at, so
+                # that is the one the model should describe if it says anything
                 try:
                     with open(out["upscaled_path"], "rb") as fh:
                         raw2 = fh.read()
-                    out["image_data_1080p"] = (
+                    out["image_data_full"] = (
                         "data:image/png;base64,"
                         + base64.b64encode(raw2).decode("ascii"))
                 except Exception:
@@ -4455,12 +4530,16 @@ PREVIEW_HTML_TOOL = {
     "type": "function",
     "function": {
         "name": "preview_html",
-        "description": "Live-preview an HTML page you created in the workspace. "
-                       "Call it after writing an .html/.htm file (e.g. a chart, "
-                       "a report or a small web app) - the UI will show a live "
-                       "iframe of the page. The page is served from this PC, so "
-                       "JavaScript and local assets work. Returns the preview "
-                       "URL.",
+        "description": "Show something in the big center stage - an HTML page "
+                       "or an image. Call it after writing an .html/.htm file "
+                       "(a chart, a report, a small web app) to live-preview it "
+                       "with JavaScript and local assets working, or with a "
+                       "path to a picture to display it full size. Use it to "
+                       "show the user a picture you generated with "
+                       "generate_image: the finished file is in the workspace "
+                       "under out/images/, and previewing it puts it on the "
+                       "stage where they can actually look at it. Returns the "
+                       "preview URL.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -10830,7 +10909,7 @@ def _execute_tool_call(name, args, tc, hooks, image_uri):
             image_uri = raw_result["image_data"]
             raw_result = dict(raw_result)
             raw_result.pop("image_data", None)
-            raw_result.pop("image_data_1080p", None)
+            raw_result.pop("image_data_full", None)
     elif name == "execute":
         raw_result = _execute_js(args.get("code", ""), args.get("timeout"))
     elif name == "window_list":
@@ -12756,7 +12835,9 @@ function previewIframeDom(r) {
   w.className = 'tlprev';
   const a = document.createElement('a');
   a.href = url; a.target = '_blank'; a.rel = 'noreferrer';
-  a.textContent = 'preview shown in the center stage \u2014 click to open in a new tab';
+    a.textContent = (r && r.kind === 'image'
+      ? 'image shown in the center stage \u2014 click to open in a new tab'
+      : 'preview shown in the center stage \u2014 click to open in a new tab');
   a.onclick = function () { openPreviewStage(url, r && (r.path || '')); };
   const b2 = document.createElement('button');
   b2.className = 'tlprevbtn';
@@ -12932,6 +13013,9 @@ function finishImageCard(handles, result) {
     h.empty.classList.add('gone');
   }
   h.card.querySelector('.imgtop b').textContent = PAINT_ICON + ' Painted';
+  const dims = h.card.querySelector('.imgfoot .dim');
+  if (dims) dims.textContent = (result.width || '?') + '\u00d7' + (result.height || '?') +
+    (result.delivery ? ' \u00b7 delivered ' + result.upscaled_size : '');
   const foot = h.card.querySelector('.imgfoot');
   if (foot) {
     foot.textContent = '';
@@ -16200,7 +16284,9 @@ function previewIframeDom(r) {
   w.className = 'tlprev';
   const a = document.createElement('a');
   a.href = url; a.target = '_blank'; a.rel = 'noreferrer';
-  a.textContent = 'preview shown in the center stage \u2014 click to open in a new tab';
+    a.textContent = (r && r.kind === 'image'
+      ? 'image shown in the center stage \u2014 click to open in a new tab'
+      : 'preview shown in the center stage \u2014 click to open in a new tab');
   a.onclick = function () { openPreviewStage(url, r && (r.path || '')); };
   const b2 = document.createElement('button');
   b2.className = 'tlprevbtn';
@@ -16856,6 +16942,9 @@ function finishImageCard(handles, result) {
     h.empty.classList.add('gone');
   }
   h.card.querySelector('.imgtop b').textContent = PAINT_ICON + ' Painted';
+  const dims = h.card.querySelector('.imgfoot .dim');
+  if (dims) dims.textContent = (result.width || '?') + '\u00d7' + (result.height || '?') +
+    (result.delivery ? ' \u00b7 delivered ' + result.upscaled_size : '');
   const foot = h.card.querySelector('.imgfoot');
   if (foot) {
     foot.textContent = '';
@@ -19700,7 +19789,7 @@ class Handler(BaseHTTPRequestHandler):
             # the data URL is megabytes; the card fetches the file by path
             out = dict(out or {})
             out.pop("image_data", None)
-            out.pop("image_data_1080p", None)
+            out.pop("image_data_full", None)
             emit("done", out)
 
     def _serve_preview_asset(self, rel):
