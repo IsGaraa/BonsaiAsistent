@@ -13259,7 +13259,7 @@ function addTextAttachment(text) {
   const pad = function (n) { return (n < 10 ? '0' : '') + n; };
   const name = 'pasted-' + pad(d.getHours()) + pad(d.getMinutes()) + pad(d.getSeconds()) + '.txt';
   let body = text;
-  if (body.length > 60000) body = body.slice(0, 60000) + '\n[... paste truncated at 60000 characters ...]';
+  if (body.length > 60000) body = body.slice(0, 60000) + '\\n[... paste truncated at 60000 characters ...]';
   pendingAtt.push({ type: 'file', name: name, text: body });
   renderPreview();
 }
@@ -16274,7 +16274,7 @@ function addTextAttachment(text) {
   const pad = function (n) { return (n < 10 ? '0' : '') + n; };
   const name = 'pasted-' + pad(d.getHours()) + pad(d.getMinutes()) + pad(d.getSeconds()) + '.txt';
   let body = text;
-  if (body.length > 60000) body = body.slice(0, 60000) + '\n[... paste truncated at 60000 characters ...]';
+  if (body.length > 60000) body = body.slice(0, 60000) + '\\n[... paste truncated at 60000 characters ...]';
   pendingAtt.push({ type: 'file', name: name, text: body });
   renderPreview();
 }
