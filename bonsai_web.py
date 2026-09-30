@@ -12752,7 +12752,7 @@ function inkOf(spec) {
   return '#' + full;
 }
 function colourise(t) {
-  return t.replace(
+  const out = t.replace(
     /\\[color=([^\\]\\n]{1,24})\\]([\\s\\S]*?)\\[\\/color\\]/gi,
     function (m, spec, body) {
       const ink = inkOf(spec);
@@ -12761,6 +12761,14 @@ function colourise(t) {
       if (!body) return m;
       return '<span style="color:' + ink + '">' + body + '</span>';
     });
+  /* A run of colours arrives back to back with nothing between the pairs, so
+     the last word of one span butts into the first word of the next and it
+     reads as one word. A span is not a separator: adjacent inline elements
+     touch whatever they are set to, so no margin can open a gap the markup
+     does not contain. Only at a seam, and only where word characters sit on
+     both sides - existing spaces and punctuation joins are left alone. */
+  return out.replace(/(<\\/span>)(?=(?:<span style="color:|[A-Za-z0-9]))/g,
+                     '$1 ');
 }
 function fmt(s) {
   /* Block-level markdown, then the inline marks. Models reach for headings
@@ -13907,6 +13915,17 @@ function stopRun() {
   if (abortCtrl) { const a = abortCtrl; abortCtrl = null; try { a.abort(); } catch (e) {} }
   if (thinkingRow) doneThinking('(stopped by user)');
   setState('idle');
+  /* The button is repainted here rather than left for the tail of go(). go()
+     only reaches that tail if the abort actually unwinds the fetch, and when
+     it does not - a body still delivering after the abort, or a queued turn
+     starting as this one unwinds - busy stays true with nothing behind it and
+     the button sits on Stop until something unrelated resets it. Pressing it
+     again does nothing either, because abortCtrl is already null, so a stuck
+     button is indistinguishable from an idle one.
+     Clearing it twice is harmless: go() converges on the same state, and it
+     is go() that drains a queued turn and re-arms the button if work remains. */
+  busy = false;
+  setSendUI();
   setTimeout(function () { sweepStaleThinking(); }, 0);
 }
 function drainQueue() {
