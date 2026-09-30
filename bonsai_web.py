@@ -11610,14 +11610,20 @@ PAGE = """<!doctype html>
   :root {
     color-scheme: light;
     --bg: #ffffff; --bg2: #f7f7f9; --bg3: #ededf0; --bd: #e3e3e7;
+    --bg4: #e4e4ea; --bd2: #cfcfd8;
+    --bub: #efeafd; --bub-bd: #ddd3f7;   /* your bubble: violet surface */
     --txt: #111214; --mut: #71717a; --acc: #19191c; --acc-txt: #fafafa;
+    --txt2: #4a4a52; --dim: #9a9aa3;
     --ok: #16a34a; --warn: #d97706; --err: #dc2626;
     --violet: #7c3aed; --violet-soft: rgba(124,58,237,.10);
   }
   html.dark {
     color-scheme: dark;
     --bg: #212121; --bg2: #171717; --bg3: #2f2f2f; --bd: #303030;
+    --bg4: #3a3a3a; --bd2: #424242;
+    --bub: #2c2440; --bub-bd: #3d3358;
     --txt: #ececec; --mut: #9b9ba3; --acc: #e4e4e7; --acc-txt: #18181b;
+    --txt2: #c9c9d1; --dim: #76767e;
     --violet: #a78bfa; --violet-soft: rgba(167,139,250,.08);
   }
   * { box-sizing: border-box; }
@@ -11663,6 +11669,48 @@ PAGE = """<!doctype html>
   /* the model is what gets changed most, so it carries the accent */
   select.pill.acc { border-color: var(--violet); }
   /* longer replies are easier to read with a touch more line height */
+  /* ---- message bubbles ------------------------------------------------ */
+  /* the user's bubble already had a class; the assistant's was an unclassed
+     div, so a reply had nothing separating it from the next message */
+  .msgrow.bonsai { flex-direction: row; align-items: flex-start; gap: 9px; }
+  .bbub { flex: 1; min-width: 0; background: var(--bg2);
+          border: 1px solid var(--bd2); border-radius: 4px 16px 16px 16px;
+          padding: 11px 15px; font-size: 14px;
+          box-shadow: 0 1px 2px rgba(0,0,0,.05); }
+  /* the assistant keeps a neutral surface: it is the one carrying formatted
+     prose, code and tables, and a tint behind all that reads as noise */
+  .ubub { border: 1px solid var(--bub-bd); box-shadow: 0 1px 2px rgba(0,0,0,.05); }
+  /* sized here rather than left to .mark's 100% resolving against an
+     auto-width parent, which is circular and engine-dependent */
+  .msgrow.bonsai .av { flex: none; width: 26px; height: 26px;
+                       padding-top: 4px; opacity: .85; }
+  /* tool steps sit after the row as siblings, so they are indented to line up
+     under the bubble rather than under the avatar */
+
+  /* ---- markdown, which was parsed but never styled ---------------------- */
+  .abody b, .abody strong { font-weight: 700; color: var(--txt); }
+  .abody i, .abody em { font-style: italic; }
+  .abody b code, .abody strong code { font-weight: 700; }
+  .abody h1, .abody h2, .abody h3, .abody h4 {
+    margin: 14px 0 6px; font-weight: 700; line-height: 1.3; color: var(--txt); }
+  .abody > *:first-child { margin-top: 0; }
+  .abody h1 { font-size: 19px; }
+  .abody h2 { font-size: 17px; }
+  .abody h3 { font-size: 15px; }
+  .abody h4 { font-size: 14px; color: var(--txt2); }
+  .abody ul, .abody ol { margin: 8px 0; padding-left: 22px; }
+  .abody li { margin: 3px 0; }
+  .abody li::marker { color: var(--mut); }
+  .abody blockquote { margin: 10px 0; padding: 4px 0 4px 12px;
+                      border-left: 3px solid var(--violet);
+                      color: var(--mut); }
+  .abody hr { border: 0; border-top: 1px solid var(--bd); margin: 14px 0; }
+  .abody table { border-collapse: collapse; margin: 10px 0; width: 100%;
+                font-size: 13px; display: block; overflow-x: auto; }
+  .abody th, .abody td { border: 1px solid var(--bd); padding: 6px 10px;
+                        text-align: left; }
+  .abody th { background: var(--bg3); font-weight: 600; }
+  .abody del { color: var(--mut); }
   .abody { line-height: 1.62; }
   /* the thinking box: violet edge, so it reads as reasoning at a glance */
   .reasonbox { border-color: var(--violet-soft); }
@@ -11763,7 +11811,7 @@ PAGE = """<!doctype html>
                font-style: italic; font-family: Consolas, monospace; }
   .msgrow { display: flex; flex-direction: column; }
   .msgrow.user { align-items: flex-end; }
-  .ubub { background: var(--bg3); border-radius: 16px 16px 4px 16px; padding: 10px 14px; max-width: 80%; font-size: 14px; white-space: pre-wrap; word-break: break-word; line-height: 1.5; }
+  .ubub { background: var(--bub); border-radius: 16px 16px 4px 16px; padding: 10px 14px; max-width: 80%; font-size: 14px; white-space: pre-wrap; word-break: break-word; line-height: 1.5; }
   .ubub .thumbs { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 6px; }
   .ubub .thumb { width: 60px; height: 60px; border-radius: 10px; overflow: hidden; border: 1px solid var(--bd); }
   .ubub .thumb img { width: 100%; height: 100%; object-fit: cover; }
@@ -12772,6 +12820,7 @@ function fmt(s) {
 
   const out = [];
   let para = [], list = null, quote = [];
+  let tbl = false, inHead = false;   /* inside a markdown table? */
   const flushPara = function () {
     /* no <p> wrapper: a paragraph of prose is just this, as before, so the
        spacing inside a bubble does not change */
@@ -12797,6 +12846,30 @@ function fmt(s) {
     flushQuote();
     m = ln.match(/^\\s*[-*+]\\s+(.*)$/);
     if (m) { flushPara(); if (!list || list.tag !== 'ul') { flushList(); list = { tag: 'ul', items: [] }; } list.items.push(m[1]); return; }
+    /* a markdown table: pipe-delimited rows, separator under the header */
+    if (/^\\s*\\|.*\\|\\s*$/.test(ln)) {
+      flushPara(); flushList();
+      const cells = ln.trim().replace(/^\\|/, '').replace(/\\|$/, '')
+        .split('|').map(function (c) { return c.trim(); });
+      if (!tbl) { tbl = true; inHead = true; out.push('<table><thead>'); }
+      const isSep = cells.every(function (c) { return /^:?-{2,}:?$/.test(c); });
+      if (isSep) {
+        /* the separator is what ends the header; without closing it here
+           every body row below rendered as <th> too */
+        inHead = false; out.push('</thead><tbody>');
+        return;
+      }
+      /* the separator line closes the header; every row after it is a body
+         cell, which is why the header is not simply the first row */
+      const tag = inHead ? 'th' : 'td';
+      out.push('<tr>' + cells.map(function (c) {
+        return '<' + tag + '>' + inline(c) + '</' + tag + '>';
+      }).join('') + '</tr>');
+      return;
+    }
+    /* the pipes stopped, so the table is finished */
+    if (tbl) { tbl = false; if (inHead) { inHead = false; out.push('</thead><tbody>'); }
+      out.push('</tbody></table>'); }
     m = ln.match(/^\\s*\\d+[.)]\\s+(.*)$/);
     if (m) { flushPara(); if (!list || list.tag !== 'ol') { flushList(); list = { tag: 'ol', items: [] }; } list.items.push(m[1]); return; }
     flushList();
@@ -12804,6 +12877,9 @@ function fmt(s) {
     para.push(ln);
   });
   flushAll();
+  /* a table still open when the text ends */
+  if (tbl) out.push(inHead ? '</thead><tbody></tbody></table>'
+                          : '</tbody></table>');
 
   return out.join('');
 }
@@ -13039,8 +13115,13 @@ function addReasonBox(container, text, live) {
   return { d: d, s: s, c: c };
 }
 function addAsst(text, calls, reason, stats, entry) {
-  const row = document.createElement('div'); row.className = 'msgrow';
-  const b = document.createElement('div');
+  const row = document.createElement('div'); row.className = 'msgrow bonsai';
+  /* the mark, so a reply is visibly from Bonsai rather than more text on the
+     page. It was on the user's side only, which read as a branding detail
+     rather than as who is speaking. */
+  const av = document.createElement('div'); av.className = 'av bonsai';
+  av.innerHTML = BONSAI_MARK;
+  const b = document.createElement('div'); b.className = 'bbub';
   if (reason) addReasonBox(b, reason, false);
   if (calls && calls.length) {
     const pills = document.createElement('div'); pills.className = 'toolsline';
@@ -13057,7 +13138,8 @@ function addAsst(text, calls, reason, stats, entry) {
     b.appendChild(e);
   }
   /* no stats chip: see the note in the other page copy */
-  row.appendChild(b); convInner().appendChild(row); scrollBottom();
+  row.appendChild(b); row.appendChild(av);
+  convInner().appendChild(row); scrollBottom();
   return inner;
 }
 function addThinking() {
@@ -14788,7 +14870,12 @@ _OC_CSS = (
     '  .ocsteps:empty { display: none; }\n'
     '  /* the steps are chat entries in their own right now, not part of a\n'
     '     bubble, so they need their own spacing and indent */\n'
-    '  .ocsteps { margin: 4px 0 8px 30px; }\n'
+    '  .ocsteps { margin: 4px 0 8px; }\n'
+    '  /* While streaming, placeSteps puts the steps before the row, so they\n'
+    '     sit as a sibling and must clear the avatar themselves. Reloading a\n'
+    '     chat nests them inside the bubble instead, where this must not\n'
+    '     apply - hence the child-of-column test. */\n'
+    '  .inner > .ocsteps { margin-left: 35px; }   /* 26px avatar + 9px gap */\n'
     '  .msgrow.bonsai + .ocsteps, .msgrow + .ocsteps { clear: both; }\n'
     "  /* the model's own words sit between the steps: prose, not code */\n"
     '  .ocpara { margin: 4px 0 8px; font-family: inherit; font-size: inherit;\n'
