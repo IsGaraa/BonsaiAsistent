@@ -11627,6 +11627,10 @@ PAGE = """<!doctype html>
   .side { width: 264px; flex: none; background: var(--bg2); border-right: 1px solid var(--bd); display: flex; flex-direction: column; min-height: 0; }
   .side-head { padding: 12px 14px; border-bottom: 1px solid var(--bd); }
   .brand { display: flex; align-items: center; gap: 9px; font-weight: 600; letter-spacing: .3px; }
+  /* the mark, defined once and shared by the sidebar logo, the empty state
+     and every message avatar */
+  .mark { width: 100%; height: 100%; display: block; }
+  .av.bonsai { color: var(--violet); }
   .logo { width: 26px; height: 26px; border-radius: 7px; background: var(--acc); color: var(--acc-txt); display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 14px; }
   .btn-new { width: 100%; margin-top: 12px; border: 1px solid var(--bd); background: transparent; color: var(--txt); border-radius: 10px; padding: 9px 12px; cursor: pointer; font-weight: 600; text-align: left; }
   .btn-new:hover { border-color: var(--mut); }
@@ -11988,7 +11992,7 @@ PAGE = """<!doctype html>
 <div class="app">
   <nav class="side">
     <div class="side-head">
-      <div class="brand"><div class="logo">B</div><div>BONSAI</div></div>
+      <div class="brand"><div class="logo"><svg class="mark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><ellipse cx="8.4" cy="11.6" rx="4.7" ry="2.5"/><ellipse cx="15" cy="8.1" rx="4.1" ry="2.2"/><path d="M12 21v-3.4"/><path d="M12 17.6c-1.5-1-2.1-2.5-2.1-4.1"/><path d="M12 17.6c1.4-.8 2.1-2 2.3-3.5"/><path d="M6.8 21h10.4l-1.3 2.2H8.1z"/></svg></div><div>BONSAI</div></div>
       <button class="btn-new" id="newchat">+ New chat</button>
     </div>
     <div class="chatlist" id="chatlist"></div>
@@ -12073,7 +12077,7 @@ PAGE = """<!doctype html>
     <div class="messages" id="messages">
       <div class="inner">
         <div class="empty" id="empty">
-          <div class="logo">B</div>
+          <div class="logo"><svg class="mark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><ellipse cx="8.4" cy="11.6" rx="4.7" ry="2.5"/><ellipse cx="15" cy="8.1" rx="4.1" ry="2.2"/><path d="M12 21v-3.4"/><path d="M12 17.6c-1.5-1-2.1-2.5-2.1-4.1"/><path d="M12 17.6c1.4-.8 2.1-2 2.3-3.5"/><path d="M6.8 21h10.4l-1.3 2.2H8.1z"/></svg></div>
           <h1>BONSAI</h1>
           <p>Your local PC assistant. Ask anything - I can search, read files, run commands and see your screen. Everything runs on this PC.</p>
         </div>
@@ -12107,6 +12111,10 @@ PAGE = """<!doctype html>
 <input type="file" id="filein" accept="image/*,.txt,.md,.py,.js,.ts,.json,.csv,.log,.ini,.cfg,.xml,.html,.css,.bat,.ps1,.sh,.yml,.yaml,.sql,.java,.cpp,.c,.h,.cs,.go,.rb,.php,.toml,.env,.gitignore" multiple>
 <script>
 let BONSAI_CTX = 0;
+
+/* the bonsai mark, declared first so no call site can
+   reach it before it exists */
+const BONSAI_MARK = '<svg class="mark" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><ellipse cx="8.4" cy="11.6" rx="4.7" ry="2.5"/><ellipse cx="15" cy="8.1" rx="4.1" ry="2.2"/><path d="M12 21v-3.4"/><path d="M12 17.6c-1.5-1-2.1-2.5-2.1-4.1"/><path d="M12 17.6c1.4-.8 2.1-2 2.3-3.5"/><path d="M6.8 21h10.4l-1.3 2.2H8.1z"/></svg>';
 let chats = load();
 let cur = null, busy = false, pendingAtt = [], started = false, abortCtrl = null, msgQueue = [];
 let chatMode = localStorage.getItem('jarvis_mode') === 'plan' ? 'plan' : 'build';
@@ -13476,7 +13484,7 @@ function addImageCard(prompt, width, height) {
   if (hint) hint.remove();
   const row = document.createElement('div');
   row.className = 'msgrow bonsai';
-  const av = document.createElement('div'); av.className = 'av bonsai'; av.textContent = 'B';
+  const av = document.createElement('div'); av.className = 'av bonsai'; av.innerHTML = BONSAI_MARK;
   const bubble = document.createElement('div'); bubble.className = 'bubble';
 
   const card = document.createElement('div'); card.className = 'imgcard';
@@ -14965,7 +14973,7 @@ _OC_JS = (
     '     and before the ones that follow. */\n'
     '  function textRow() {\n'
     '    var bub = el(\'div\', \'bubble ocpara-bubble\');\n'
-    '    var av = el(\'div\', \'av bonsai\'); av.textContent = \'B\';\n'
+    '    var av = el(\'div\', \'av bonsai\'); av.innerHTML = BONSAI_MARK;\n'
     '    var row = el(\'div\', \'msgrow bonsai\');\n'
     '    var p = el(\'div\', \'ocpara\'); p.textContent = \'\';\n'
     '    bub.appendChild(p);\n'
@@ -15733,7 +15741,7 @@ _OC_JS = (
     '        var n = el(\'div\', \'ocpara\');\n'
     "        n.innerHTML = (typeof fmt === 'function') ? fmt(p.v) : String(p.v);\n"
     "        var rb = el('div', 'bubble ocpara-bubble');\n"
-    "        var ra = el('div', 'av bonsai'); ra.textContent = 'B';\n"
+    "        var ra = el('div', 'av bonsai'); ra.innerHTML = BONSAI_MARK;\n"
     "        var rr = el('div', 'msgrow bonsai');\n"
     '        rb.appendChild(n); rr.appendChild(ra); rr.appendChild(rb);\n'
     '        if (anchor && anchor.parentNode) {\n'
