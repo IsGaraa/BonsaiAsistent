@@ -1952,8 +1952,11 @@ def _glob_search(pattern, path=None):
     import glob as glob_mod
     if not pattern:
         return {"error": "pattern is required"}
-    search_dir = path or WORKDIR
-    search_dir = os.path.realpath(search_dir)
+    # walked whatever directory it was handed. Same guard as its siblings.
+    try:
+        search_dir = _safe_path(path) if path else os.path.realpath(WORKDIR)
+    except PermissionError as exc:
+        return {"error": str(exc)}
     if not os.path.isdir(search_dir):
         return {"error": f"glob path must be a directory: {search_dir}"}
     results = []
@@ -2079,9 +2082,15 @@ def _read_image_attachment(file_path):
 def _read_oc(file_path, offset=None, limit=None):
     if not file_path:
         return {"error": "filePath is required"}
-    if not os.path.isabs(file_path):
-        file_path = os.path.join(WORKDIR, file_path)
-    file_path = os.path.realpath(file_path)
+    # The model-facing tools went around the guard their siblings use, so the
+    # SCOPE setting was enforced on tools the model never called. _safe_path is
+    # the same one _read_file uses. A refusal comes back as this tool's own
+    # error rather than a raise: the model has to be able to read it and pick a
+    # different file, and a traceback tells it nothing.
+    try:
+        file_path = _safe_path(file_path)
+    except PermissionError as exc:
+        return {"error": str(exc)}
     if not os.path.exists(file_path):
         # Suggest similar files
         parent = os.path.dirname(file_path)
@@ -2177,9 +2186,14 @@ def _read_oc(file_path, offset=None, limit=None):
 def _edit_oc(file_path, old_string, new_string, replace_all=False):
     if not file_path:
         return {"error": "filePath is required"}
-    if not os.path.isabs(file_path):
-        file_path = os.path.join(WORKDIR, file_path)
-    file_path = os.path.realpath(file_path)
+    # This one writes. It resolved the path and used it, so an absolute path or
+    # a relative one with enough ".." edited anything on the disk - realpath
+    # resolves what it is given, it does not refuse it. Same guard, same
+    # treatment, as the read tool above.
+    try:
+        file_path = _safe_path(file_path)
+    except PermissionError as exc:
+        return {"error": str(exc)}
     if old_string is None or new_string is None:
         return {"error": "oldString and newString are both required"}
     if not isinstance(old_string, str) or not isinstance(new_string, str):
@@ -2205,7 +2219,7 @@ def _edit_oc(file_path, old_string, new_string, replace_all=False):
             idx = content.find(old_string)
             new_content = content[:idx] + new_string + content[idx + len(old_string):]
         try:
-            with open(file_path, "w", encoding="utf-8") as f:
+            with open(file_path, "w", encoding="utf-8", newline="\n") as f:
                 f.write(new_content)
         except Exception as e:
             return {"error": f"Cannot write file: {e}"}
@@ -2266,7 +2280,7 @@ def _edit_oc(file_path, old_string, new_string, replace_all=False):
             idx = content.find(matched)
             new_content = content[:idx] + new_string + content[idx + len(matched):]
             try:
-                with open(file_path, "w", encoding="utf-8") as f:
+                with open(file_path, "w", encoding="utf-8", newline="\n") as f:
                     f.write(new_content)
             except Exception as e:
                 return {"error": f"Cannot write file: {e}"}
