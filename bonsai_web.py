@@ -11798,7 +11798,7 @@ PAGE = """<!doctype html>
   /* the user's bubble already had a class; the assistant's was an unclassed
      div, so a reply had nothing separating it from the next message */
   .msgrow.bonsai { flex-direction: row; align-items: flex-start; gap: 9px; }
-  .bbub { flex: 1; min-width: 0; background: var(--bg2);
+  .bbub { flex: 1; min-width: 0; max-width: 100%; background: var(--bg2);
           border: 1px solid var(--bd2); border-radius: 4px 16px 16px 16px;
           padding: 11px 15px; font-size: 14px;
           box-shadow: 0 1px 2px rgba(0,0,0,.05); }
@@ -11958,8 +11958,12 @@ PAGE = """<!doctype html>
      this asks for. Inline code keeps a tint - one identifier in a sentence
      should not become a slab. */
   .abody pre { background: #0d1117; color: #e6edf3; border: 1px solid #30363d;
-               border-radius: 10px; padding: 12px 14px; overflow-x: auto;
-               font-size: 12.5px; line-height: 1.55; }
+               border-radius: 10px; padding: 12px 14px;
+               font-size: 12.5px; line-height: 1.55;
+               /* max-width and overflow-x on both pre rules, not one: the
+                  two renderers disagreed and the same code escaped the bubble
+                  on one of them */
+               max-width: 100%; overflow-x: auto; }
   .abody code { background: var(--bg3); border-radius: 5px; padding: 1px 5px; font-size: 12.5px; }
   .abody pre code { background: none; padding: 0; color: inherit; }
   .abody a { color: var(--acc); }
@@ -15439,7 +15443,7 @@ _OC_CSS = (
     '     container had no background, no border and no padding, and the reply\n'
     '     sat bare on the page. Aliased to .bbub rather than restyled: two rules\n'
     '     for one thing is how they drifted apart in the first place. */\n'
-    '  .bubble { flex: 1; min-width: 0; background: var(--bg2);\n'
+    '  .bubble { flex: 1; min-width: 0; max-width: 100%; background: var(--bg2);\n'
     '            border: 1px solid var(--bd2); border-radius: 4px 16px 16px 16px;\n'
     '            padding: 11px 15px; font-size: 14px;\n'
     '            box-shadow: 0 1px 2px rgba(0,0,0,.05); }\n'
@@ -15495,8 +15499,16 @@ _OC_CSS = (
     '  .ocstep .occaret { font-size: 9px; color: var(--mut); transition: transform .12s; }\n'
     '  .ocstep[open] .occaret { transform: rotate(90deg); }\n'
     '  .ocbody { margin: 2px 0 6px 12px; padding: 7px 9px; background: var(--bg2);\n'
+    '            /* min-width 0 is what lets the contents shrink instead of\n'
+    '               pushing the bubble wider; a block with no constraint of\n'
+    '               its own lets anything inside be as wide as it likes. */\n'
+    '            min-width: 0; max-width: 100%;\n'
     '            border: 1px solid var(--bd); border-radius: 8px; }\n'
     '  .ocbody pre { margin: 0 0 6px; white-space: pre-wrap; word-break: break-word;\n'
+    '                /* overflow set on both pre rules, not one: the two\n'
+    '                   renderers disagreed, and the same code escaped the\n'
+    '                   bubble on one of them */\n'
+    '                max-width: 100%; overflow-x: auto;\n'
     '                color: var(--txt2); font-size: 12px; max-height: 320px; overflow: auto; }\n'
     '  .ocbody pre:last-child { margin-bottom: 0; }\n'
     '  .ocbody .oclab { color: var(--mut); font-size: 10.5px; letter-spacing: 1px; margin-bottom: 3px; }\n'
