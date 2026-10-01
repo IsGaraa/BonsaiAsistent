@@ -11880,6 +11880,15 @@ PAGE = """<!doctype html>
   .tlitem .rs { color: var(--mut); margin-top: 4px; white-space: pre-wrap; overflow-wrap: anywhere; }
   .tlitem .rs img.tthumb { max-width: 240px; border-radius: 8px; margin-top: 6px; cursor: zoom-in; display: block; }
   .tlprev { margin-top: 8px; }
+  /* the Show button in a tool-log preview row: set on a real button,
+     with no rule anywhere, so it rendered as a raw browser button in an
+     otherwise styled row. Quiet border, small type, violet on hover -
+     the accent the page already uses, not a new colour. */
+  .tlprevbtn { border: 1px solid var(--bd); background: var(--bg2);
+                color: var(--txt2); border-radius: 7px; padding: 3px 10px;
+                font-size: 11px; font-family: Consolas, monospace;
+                cursor: pointer; min-width: 56px; }
+  .tlprevbtn:hover { border-color: var(--violet); color: var(--txt); }
   .tlprev a { font-size: 11px; color: var(--acc); }
   .tlprev .tlframe { width: 100%; height: 280px; border: 1px dashed var(--bd); border-radius: 8px; background: var(--bg2); margin-top: 6px; }
   .toolsline { margin: 2px 0 8px; display: flex; flex-wrap: wrap; gap: 6px; }
@@ -12134,7 +12143,12 @@ PAGE = """<!doctype html>
   }
   .ctxmeter:hover .ctxhint { display: block; }
   .ctxmeter .ctxhint b { color: var(--acc); }
-</style>
+
+/* the waiting row: the same surface as the reply, a little tighter. No
+   avatar - it is a placeholder for the reply that is coming, and a mark
+   beside it competes with that reply. */
+.thinkrow .bubble { padding: 9px 14px; }
+.thinkrow .thinkstub { color: var(--mut); }</style>
 </head>
 <body>
 <div class="app">
@@ -12715,6 +12729,14 @@ function renderList() {
   });
 }
 function convInner() { return document.querySelector('#messages .inner'); }
+  /* convEl is the column itself, which is what sweepStaleThinking wants: it
+     was called and never defined, so the sweep threw a ReferenceError on its
+     first line every time it ran. Because it is called from go()'s finally
+     immediately before setSendUI(), that throw skipped the repaint - the
+     stuck stop button, still stuck after the fix meant to remove it. The
+     finally guarded against doneThinking throwing, not against the next
+     statement throwing. */
+  function convEl() { return document.getElementById('messages'); }
 /* Same rule as the front page: follow only while already at the bottom, and
    let a reader who scrolls up stay where they are. */
 let followBottom = true;
@@ -13807,10 +13829,13 @@ function onImgProg(j) {
   if (j.preview_url) h.setPreview(j.preview_url + '?t=' + Date.now());
 }
 function addImageCard(prompt, width, height) {
-  const conv = document.getElementById('conv');
+  /* getElementById('conv') returns null - the column has been #messages since
+     the two pages were merged - so this function returned null and a generated
+     image appeared nowhere at all, not even as a failure. The other two
+     renderers already use convInner(); same bug, one call site left behind by
+     the merge. */
+  const conv = convInner();
   if (!conv) return null;
-  const hint = conv.querySelector('.emptyhint');
-  if (hint) hint.remove();
   const row = document.createElement('div');
   row.className = 'msgrow bonsai';
   const av = document.createElement('div'); av.className = 'av bonsai'; av.innerHTML = BONSAI_MARK;
