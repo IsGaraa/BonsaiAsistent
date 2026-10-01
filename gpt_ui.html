@@ -1,5 +1,5 @@
 <!-- GPT UI (PAGE_GPT) - the page served at /chat, copied verbatim from a
-     running bonsai_web.py at commit ba5e618.
+     running bonsai_web.py at commit 54bf55e.
 
      bonsai_web.py is the source of truth. This file is a read-only copy so
      the UI can be opened in an editor without wading through the Python;
@@ -555,13 +555,11 @@
    beside it competes with that reply. */
 .thinkrow .bubble { padding: 9px 14px; }
 .thinkrow .thinkstub { color: var(--mut); }
-/* the placeholder is hidden until there is something in it. It used to
-   sit under the streamed prose doing nothing, which read as a second
-   copy of something already on screen. The row cannot be removed - the
-   wait-watch polls its stub, and thinkingRow.b is where tool steps are
-   placed - so it waits invisible and is revealed the moment it has
-   content. */
-.thinkrow.waiting { display: none; }
+  /* Shown only while the bubble holds something. Measured from the DOM by
+     syncThinking rather than set on the way in: the reasoning box is taken
+     back out mid-turn when the model starts writing, so the row has to hide
+     again rather than sit there empty under the reply. */
+  .thinkrow:not(.has-content) { display: none; }
 /* The rate, beside CTX in the same box. It needs its own tag and a
    divider: a second bare figure inside a bordered pill reads as one
    wider number rather than two. Same shape CTX already uses. */
@@ -1882,14 +1880,42 @@ function addThinking() {
      .thinkstub itself must stay for the same reason: the sweep finds stale
      rows by it. */
   const row = document.createElement('div');
-  row.className = 'msgrow thinkrow waiting';
+  row.className = 'msgrow thinkrow';
   const b = document.createElement('div'); b.className = 'bubble';
   const t = document.createElement('div'); t.className = 'thinkstub';
   t.innerHTML = '<span class="dots"><i></i><i></i><i></i></span> thinking...';
   b.appendChild(t);
   row.appendChild(b); convInner().appendChild(row); scrollBottom();
-  thinkingRow = { row: row, b: b, body: null, pills: null, tlog: null, reasonD: null, think: t };
+  thinkingRow = { row: row, b: b, body: null, pills: null, tlog: null,
+                  reasonD: null, think: t, obs: null };
+  /* One observer rather than a call in every place content can leave. The
+     reasoning box is removed again by stripReasonBox the moment the model
+     starts writing - the text goes into its own row - so the bubble empties
+     mid-turn and has to hide again. stripReasonBox, clearChips and stripLegacy
+     are three separate routes for that to happen, and an explicit sync in each
+     is three chances to miss the next one. */
+  try {
+    thinkingRow.obs = new MutationObserver(syncThinking);
+    thinkingRow.obs.observe(b, { childList: true });
+  } catch (e) { thinkingRow.obs = null; }
+  syncThinking();
   startWaitWatch();
+}
+
+/* Show the row only when its bubble holds something other than the
+   placeholder. Measured from the DOM rather than from a class set on the way
+   in, because content is taken back out again during the turn. */
+function syncThinking() {
+  if (!thinkingRow || !thinkingRow.row || !thinkingRow.b) return;
+  const kids = thinkingRow.b.children || [];
+  let has = false;
+  for (let i = 0; i < kids.length; i++) {
+    const c = kids[i];
+    if (c && c.className && c.className.indexOf('thinkstub') >= 0) continue;
+    has = true;
+    break;
+  }
+  thinkingRow.row.classList.toggle('has-content', has);
 }
 
 /* Show the waiting row. Called from each place that puts real content into it,
@@ -1912,6 +1938,7 @@ function revealThinking() {
     try { thinkingRow.think.remove(); } catch (e) {}
     thinkingRow.think = null;
   }
+  syncThinking();
 }
 function onDelta(txt) {
   if (!thinkingRow) return;
@@ -1927,8 +1954,16 @@ function onDelta(txt) {
 }
 function onReason(txt) {
   if (!thinkingRow) return;
-  revealThinking();
   if (!thinkingRow.reasonD) thinkingRow.reasonD = addReasonBox(thinkingRow.b, '', true);
+  /* Both calls, in this order. revealThinking takes the placeholder out -
+     dropping it puts "thinking..." and its dots back beside the reasoning box,
+     which is a complaint already on record - and then syncs, which at that
+     point finds nothing else and hides the row. The second sync is what shows
+     it now the box exists. One call is wrong in one direction or the other.
+     Neither is left to the observer: one that fails to construct must not cost
+     the reasoning box its visibility. */
+  revealThinking();
+  syncThinking();
   thinkingRow.reasonD.c.textContent += txt;
   thinkingRow.reasonD.c.scrollTop = thinkingRow.reasonD.c.scrollHeight;
   scrollBottom();
@@ -1946,6 +1981,7 @@ function onTool(call) {
     thinkingRow.tlog = { d: d, s: s, l: l };
     thinkingRow.b.appendChild(d);
     revealThinking();
+    syncThinking();
   }
   thinkingRow.tlog.s.textContent = 'Tool log · ' + liveCalls.length + ' running...';
   thinkingRow.tlog.l.appendChild(toolItemDom(call));
@@ -1976,6 +2012,7 @@ function sweepStaleThinking() {
 function doneThinking(errMsg) {
   clearWaitWatch();
   if (!thinkingRow) return;
+  if (thinkingRow.obs) { try { thinkingRow.obs.disconnect(); } catch (e) {} }
   if (thinkingRow.think) thinkingRow.think.remove();
   if (thinkingRow.reasonD) {
     const txt = (thinkingRow.reasonD.c.textContent || '').trim();
@@ -1984,10 +2021,21 @@ function doneThinking(errMsg) {
   if (thinkingRow.tlog) thinkingRow.tlog.s.textContent = 'Tool log · ' + liveCalls.length + ' call' + (liveCalls.length === 1 ? '' : 's');
   if (thinkingRow.body) { thinkingRow.body.classList.remove('caret'); }
   if (errMsg) { const e = document.createElement('div'); e.style.color = 'var(--err)'; e.style.fontSize = '13px'; e.textContent = errMsg; thinkingRow.b.appendChild(e); }
-  /* The ordered renderer draws the reply in its own bubble, so this waiting
-     row is often never written to at all. It used to be left behind as an
-     empty bubble with an avatar under every single answer. */
-  if (!errMsg && !thinkingRow.body && !thinkingRow.reasonD && !thinkingRow.tlog) {
+  /* Removed on what the bubble actually holds, not on the references. The old
+     test was !body && !reasonD && !tlog, and stripLegacy removes the .tlog
+     element without clearing thinkingRow.tlog - so that reference stays truthy
+     and an empty row is kept. The comment above this used to claim the row was
+     no longer left behind under every answer; it was, for that reason. */
+  const kids = thinkingRow.b.children || [];
+  let held = false;
+  for (let i = 0; i < kids.length; i++) {
+    const c = kids[i];
+    if (c && c.className && c.className.indexOf('thinkstub') >= 0) continue;
+    if (c && c.style && c.style.color) continue;   /* the error line */
+    held = true;
+    break;
+  }
+  if (!errMsg && !held) {
     if (thinkingRow.row.parentNode) thinkingRow.row.parentNode.removeChild(thinkingRow.row);
   }
   thinkingRow = null;
