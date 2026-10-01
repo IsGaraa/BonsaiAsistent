@@ -11980,6 +11980,49 @@ PAGE = """<!doctype html>
   .ic { border: none; background: transparent; color: var(--mut); cursor: pointer; font-size: 15px; width: 32px; height: 32px; border-radius: 8px; display: flex; align-items: center; justify-content: center; }
   .ic:hover { background: var(--bg3); color: var(--txt); }
   .ic.err { color: var(--err); }
+    /* The plan, as a third column of .app: nav left, chat middle, plan
+       right. It was a 290px strip beside the composer holding wrapped
+       pills, which squeezed the chat and read as debris. Nothing gives up
+       width now - the chat keeps its 780px and the composer keeps all of
+       it. Hidden until there is a plan: an empty rail is a grey stripe
+       down the edge of the window. */
+    .torail { display: none; flex: none; width: 300px;
+              border-left: 1px solid var(--bd); background: var(--bg2);
+              flex-direction: column; min-height: 0; padding: 14px 0 10px; }
+    .torail.on { display: flex; }
+    .torail-head { display: flex; align-items: baseline;
+                   justify-content: space-between; padding: 0 16px 8px; }
+    .torail-title { font-size: 10.5px; font-weight: 700; letter-spacing: 1.2px;
+                     color: var(--mut); }
+    .torail-count { font-size: 10.5px; font-weight: 700; color: var(--txt2);
+                     font-family: Consolas, monospace; }
+    .torail-bar { height: 3px; background: var(--bd); margin: 0 16px 12px;
+                   border-radius: 2px; overflow: hidden; }
+    .torail-fill { display: block; height: 100%; width: 0;
+                    background: var(--ok); border-radius: 2px;
+                    transition: width .25s ease; }
+    .tolist { list-style: none; margin: 0; padding: 0 16px 4px;
+              overflow-y: auto; flex: 1; min-height: 0; }
+    .toitem { display: grid; grid-template-columns: 18px 14px 1fr; gap: 6px;
+               align-items: start; padding: 5px 0; line-height: 1.45;
+               border-bottom: 1px solid var(--bd); }
+    .toitem:last-child { border-bottom: none; }
+    .tonum { font-size: 10.5px; color: var(--dim); padding-top: 1px;
+             text-align: right; font-family: Consolas, monospace; }
+    .tomark { font-size: 11px; line-height: 1.5; color: var(--dim); }
+    .totext { font-size: 12.5px; color: var(--txt); }
+    /* done: dimmed and struck, but still there - the shape of the plan is
+       worth keeping while it is worked through */
+    .toitem.done .totext { color: var(--dim); text-decoration: line-through; }
+    .toitem.done .tomark { color: var(--ok); }
+    .toitem.done .tonum { color: var(--bd2); }
+    /* doing: the one item being worked on, findable without reading */
+    .toitem.doing .totext { color: var(--txt); font-weight: 600; }
+    .toitem.doing .tomark { color: var(--warn);
+                             animation: topulse 1.4s ease-in-out infinite; }
+    @keyframes topulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
+    /* the rail needs 300px it cannot take from the chat on a small window */
+    @media (max-width: 1080px) { .torail { display: none !important; } }
   .send { width: 34px; height: 34px; border: none; border-radius: 50%; background: var(--acc); color: var(--acc-txt); cursor: pointer; display: flex; align-items: center; justify-content: center; flex: none; }
   .send:hover { opacity: .85; }
   .send.busy { background: var(--err); }
@@ -11991,20 +12034,8 @@ PAGE = """<!doctype html>
        list, not over it, since the box you are typing in stays the last thing\n  
        you look at. The preview deliberately stays above: attachments belong\n  
        with the box they attach to. */\n  
-    .todoline { display: flex; align-items: flex-end; gap: 12px; }\n  
-    .todoline .composer { flex: 1; min-width: 0; }\n  
-    .todoline .todo-panel { width: 290px; flex: none; margin: 0;\n  
-                            max-height: 190px; overflow-y: auto;\n  
-                            align-content: flex-start; }\n  
-    .todo-panel { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }\n  
     @media (max-width: 1000px) {\n  
-      .todoline { flex-direction: column; align-items: stretch; gap: 8px; }\n  
-      .todoline .todo-panel { width: 100%; max-height: 128px; }\n  
     }\n  
-  .todo-panel:empty { display: none; }
-  .todochip { font-size: 11.5px; padding: 4px 10px; border-radius: 999px; background: var(--bg2); border: 1px solid var(--bd); color: var(--mut); }
-  .todochip .st.ok { color: var(--ok); }
-  .todochip .st.run { color: var(--warn); }
   .fine { margin: 10px auto 0; font-size: 11px; color: var(--mut); text-align: center; }
   #filein { display: none; }
   /* ---- image generation mode ---- */
@@ -12203,7 +12234,6 @@ PAGE = """<!doctype html>
     <div class="inputzone">
       <div class="innerc">
         <div class="preview" id="preview"></div>
-        <div class="todoline">
         <div class="composer">
           <textarea id="user-input" rows="1" placeholder="Message BONSAI..."></textarea>
           <div style="display:flex;align-items:center;gap:2px">
@@ -12219,13 +12249,19 @@ PAGE = """<!doctype html>
             <button class="send" id="send" title="Send"></button>
           </div>
         </div>
-        <div class="todo-panel" id="todopanel"></div>
-        </div>
         <div class="stats" id="statsline"></div>
         <div class="fine">BONSAI 2 27B local &middot; tools + vision &middot; your data stays on this PC</div>
       </div>
     </div>
   </main>
+  <aside class="torail" id="torail">
+    <div class="torail-head">
+      <span class="torail-title">PLAN</span>
+      <span class="torail-count" id="torailcount"></span>
+    </div>
+    <div class="torail-bar"><span class="torail-fill" id="torailfill"></span></div>
+    <ol class="tolist" id="todopanel"></ol>
+  </aside>
 </div>
 <input type="file" id="filein" accept="image/*,.txt,.md,.py,.js,.ts,.json,.csv,.log,.ini,.cfg,.xml,.html,.css,.bat,.ps1,.sh,.yml,.yaml,.sql,.java,.cpp,.c,.h,.cs,.go,.rb,.php,.toml,.env,.gitignore" multiple>
 <script>
@@ -13547,18 +13583,49 @@ function onAsk(j) {
   document.body.appendChild(ov);
   inp.focus();
 }
+/* The plan is a list, not a row of pills. A task description is a sentence
+   and a pill with border-radius 999px cannot hold one, so five of them arrived
+   as wrapped lozenges ragged on both edges - debris beside the input box
+   rather than a plan. Now: a numbered gutter, a status mark, and text
+   wrapping against a real left edge.
+
+   Completed items dim and strike through instead of disappearing, so the
+   shape of the plan stays readable while it is worked through. The bar and
+   "2 / 5" are there because counting ticks by eye is the actual job a plan is
+   for, and the one in-progress item pulses so it can be found without
+   reading. */
 function renderTodo(items) {
-  const el = document.getElementById('todopanel');
-  if (!el) return;
-  el.innerHTML = '';
-  if (!items || !items.length) return;
-  items.forEach(function (t) {
-    const d = document.createElement('span'); d.className = 'todochip';
-    const st = document.createElement('span'); st.className = 'st ' + (t.status === 'completed' ? 'ok' : (t.status === 'in_progress' ? 'run' : ''));
-    st.textContent = t.status === 'completed' ? '\u2713' : (t.status === 'in_progress' ? '\u25cf' : '\u25cb');
-    const tx = document.createElement('span'); tx.textContent = ' ' + (t.description || '');
-    d.appendChild(st); d.appendChild(tx); el.appendChild(d);
+  const list = document.getElementById('todopanel');
+  const rail = document.getElementById('torail');
+  const count = document.getElementById('torailcount');
+  const fill = document.getElementById('torailfill');
+  if (!list) return;
+  list.innerHTML = '';
+  const todo = items || [];
+  /* an empty rail is just a grey stripe down the edge of the window */
+  if (rail) rail.classList.toggle('on', todo.length > 0);
+  if (!todo.length) { if (count) count.textContent = ''; return; }
+
+  let done = 0;
+  todo.forEach(function (t, i) {
+    const st = t.status || 'pending';
+    if (st === 'completed') done++;
+    const li = document.createElement('li');
+    li.className = 'toitem ' + (st === 'completed' ? 'done'
+                          : (st === 'in_progress' ? 'doing' : 'todo'));
+    const n = document.createElement('span'); n.className = 'tonum';
+    n.textContent = (i + 1) + '.';
+    const mark = document.createElement('span'); mark.className = 'tomark';
+    mark.textContent = st === 'completed' ? '✓'
+                     : (st === 'in_progress' ? '●' : '○');
+    const tx = document.createElement('span'); tx.className = 'totext';
+    tx.textContent = t.description || '';
+    li.appendChild(n); li.appendChild(mark); li.appendChild(tx);
+    list.appendChild(li);
   });
+
+  if (count) count.textContent = done + ' / ' + todo.length;
+  if (fill) fill.style.width = Math.round(100 * done / todo.length) + '%';
 }
 
 
