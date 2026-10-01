@@ -12054,7 +12054,6 @@ PAGE = """<!doctype html>
   .send { width: 34px; height: 34px; border: none; border-radius: 50%; background: var(--acc); color: var(--acc-txt); cursor: pointer; display: flex; align-items: center; justify-content: center; flex: none; }
   .send:hover { opacity: .85; }
   .send.busy { background: var(--err); }
-  .stats { margin: 8px auto 0; font-size: 11px; color: var(--mut); text-align: center; }
     /* The todo list sits beside the composer rather than above it. It was\n  
        inside .innerc, which is already the chat's own 780px column, so it read\n  
        as another band of the conversation. Stacks below 1000px, where a 290px\n  
@@ -12064,7 +12063,6 @@ PAGE = """<!doctype html>
        with the box they attach to. */\n  
     @media (max-width: 1000px) {\n  
     }\n  
-  .fine { margin: 10px auto 0; font-size: 11px; color: var(--mut); text-align: center; }
   #filein { display: none; }
   /* ---- image generation mode ---- */
   #imgmode.on { border-color: var(--acc); color: var(--acc); background: rgba(0,0,0,.25); }
@@ -12174,7 +12172,17 @@ PAGE = """<!doctype html>
    wait-watch polls its stub, and thinkingRow.b is where tool steps are
    placed - so it waits invisible and is revealed the moment it has
    content. */
-.thinkrow.waiting { display: none; }</style>
+.thinkrow.waiting { display: none; }
+/* The rate, beside CTX in the same box. It needs its own tag and a
+   divider: a second bare figure inside a bordered pill reads as one
+   wider number rather than two. Same shape CTX already uses. */
+.ctxmeter .tokmeter { display: flex; align-items: center; gap: 5px;
+                      padding-left: 7px; margin-left: 1px;
+                      border-left: 1px solid var(--bd); }
+.ctxmeter .toktag { color: var(--mut); font-weight: 700;
+                    letter-spacing: .5px; }
+.ctxmeter .toknum { color: var(--txt2); font-variant-numeric: tabular-nums; }
+.ctxmeter .toknum.live { color: var(--violet); }</style>
 </head>
 <body>
 <div class="app">
@@ -12284,13 +12292,12 @@ PAGE = """<!doctype html>
               <span class="ctxtag">CTX</span>
               <span class="ctxbar"><span class="ctxfill" id="ctxfill"></span></span>
               <span class="ctxnum" id="ctxnum">--</span>
+              <span class="tokmeter" id="tokmeter" title="How fast the model is generating, and how many tokens this reply has produced"><span class="toktag">RATE</span><span class="toknum" id="toknum">--</span></span>
               <span class="ctxhint" id="ctxhint"></span>
             </div>
             <button class="send" id="send" title="Send"></button>
           </div>
         </div>
-        <div class="stats" id="statsline"></div>
-        <div class="fine">BONSAI 2 27B local &middot; tools + vision &middot; your data stays on this PC</div>
       </div>
     </div>
   </main>
@@ -13129,10 +13136,25 @@ function closePreviewStage() {
     box.classList.remove('on');
   }
 }
-const _stageClose = document.getElementById('stageclose');
-if (_stageClose) _stageClose.onclick = closePreviewStage;
-const _pvClose = document.getElementById('pvclose');
-if (_pvClose) _pvClose.onclick = closePreviewStage;
+/* Delegated, not looked up. The lookups ran before the buttons existed: this
+   script block ends at offset 243450 and #pvclose sits at 243596, 146
+   characters later, so getElementById returned null, the guard skipped it, and
+   the X was never wired - pressing it did nothing, silently. #stageclose is not
+   in the markup at all, a leftover of the merge, and its guard skipped for the
+   same reason and always will.
+   One listener on document catches the same clicks whatever the order, and picks
+   up any close button added later. The backdrop and Escape are the same request
+   - stop showing me this - so they are handled here too. */
+document.addEventListener('click', function (e) {
+  const t = e.target;
+  if (!t || typeof t.closest !== 'function') return;
+  if (t.closest('#pvclose, #stageclose, .pvboxx')) { closePreviewStage(); return; }
+  /* a click on the backdrop itself, not on the frame or the header */
+  if (t.id === 'pvbox') closePreviewStage();
+});
+document.addEventListener('keydown', function (e) {
+  if (e.key === 'Escape') closePreviewStage();
+});
 function previewIframeDom(r) {
   const url = r && typeof r === 'object' ? (r.preview_url || '') : '';
   if (!url) return null;
@@ -13349,6 +13371,20 @@ function addThinking() {
 function revealThinking() {
   if (!thinkingRow || !thinkingRow.row) return;
   thinkingRow.row.classList.remove('waiting');
+  /* Take the placeholder out with the reveal. The page's onDelta used to do
+     this, by looking the .thinkstub up and removing it - but the streaming
+     module overrides onDelta and never calls the page's version, so it did not
+     run during a real turn. The stub survived until doneThinking at the very
+     end, so the reader saw the reasoning box and "thinking..." together for the
+     whole turn.
+     Removing it also ends the wait: startWaitWatch clears itself once the stub
+     is no longer connected, which is right the moment content starts arriving.
+     And the status line the streaming module keeps already says what is
+     happening - "Writing the answer", "Executing shell" - so nothing is lost. */
+  if (thinkingRow.think) {
+    try { thinkingRow.think.remove(); } catch (e) {}
+    thinkingRow.think = null;
+  }
 }
 function onDelta(txt) {
   if (!thinkingRow) return;
@@ -13439,13 +13475,28 @@ function effortValue() {
   return 'high';
 }
 
-function statLine() { return document.getElementById('statsline'); }
 function fmtMs(ms) { if (!ms && ms !== 0) return '--'; return (ms / 1000).toFixed(1) + 's'; }
+/* The stats line under the composer is gone. It ended "ctx used / total",
+   which is the same number the context meter beside the composer already shows
+   as a bar and a figure, and the fine print above it was a static sentence
+   about a 27B model that was never true of the other twenty-odd in the
+   picker.
+   The rate is the one part worth keeping, so it lives in the meter now. This
+   still runs on a 250ms tick because nothing else redraws it - tok/s only
+   means anything while the model is generating.
+   The think and speak timings are dropped rather than moved: they are readable
+   in the tool log and the reasoning box, and three numbers in the toolbar
+   makes it crowded. */
 function runningStats() {
-  const el = statLine(); if (!el) return;
   const v = statsVals;
-  const ctx = v.ctx_left ? (v.ctx_used) + ' / ' + (v.ctx_used + v.ctx_left) : '--';
-  el.textContent = 'THINK ' + fmtMs(v.think_ms || 0) + ' \u00b7 SPEAK ' + fmtMs(v.respond_ms || 0) + ' \u00b7 ' + (v.tok_s ? v.tok_s.toFixed(1) : '--') + ' tok/s \u00b7 ' + (v.completion_tokens || 0) + ' tok \u00b7 ctx ' + ctx;
+  const num = document.getElementById('toknum');
+  if (!num) return;
+  const rate = v.tok_s ? v.tok_s.toFixed(1) : '--';
+  const made = v.completion_tokens || 0;
+  num.textContent = made ? (rate + ' \u00b7 ' + made) : rate;
+  /* violet while the model is actually generating, plain once it is not - the
+     number means nothing at rest, and this says which of the two it is */
+  if (num.classList) num.classList.toggle('live', !!v.tok_s);
 }
 function startStats() {
   statsVals = { think_ms: 0, respond_ms: 0, tok_s: 0, ctx_used: 0, ctx_left: 0, prompt_tokens: 0, completion_tokens: 0 };
@@ -13453,7 +13504,11 @@ function startStats() {
   statsTimer = setInterval(runningStats, 250);
 }
 function stopStats() { if (statsTimer) { clearInterval(statsTimer); statsTimer = null; } runningStats(); }
-function clearStats() { if (statsTimer) { clearInterval(statsTimer); statsTimer = null; } const el = statLine(); if (el) el.textContent = ''; }
+function clearStats() {
+  if (statsTimer) { clearInterval(statsTimer); statsTimer = null; }
+  const num = document.getElementById('toknum');
+  if (num) num.textContent = '--';
+}
 function onStats(j) {
   if (!j) return;
   statsVals.think_ms = j.think_ms || 0;
