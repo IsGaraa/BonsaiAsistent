@@ -4235,11 +4235,18 @@ def _generate_image(args, hooks=None, direct=False):
                # near half a gigabyte each.
                "--model-args", "qwen_image_2_1_prefix_cache_type=q4_0",
                # TAE is the tiny autoencoder: a real decoded preview of what has
-               # been denoised so far, cheap enough to write every few steps.
-               # It is the picture forming, not an animation standing in for it.
-               # four beats - 25, 50, 75 and the finish - rather than a
-               # continuous flicker the eye reads as noise
-               "--preview", "tae", "--preview-interval", str(max(1, steps // 4)),
+               # been denoised so far. It is the picture forming, not an
+               # animation standing in for it.
+               #
+               # One preview per step, whatever the step count. This used to be
+               # steps//4, and the 25/50/75/100 the page showed was never a
+               # choice - it only happened because the old checkpoint ran 24
+               # steps and 24//4 is 6. Swap the model and the same expression
+               # quietly means something else: 6//4 is 1, so a 6-step model
+               # wrote a preview every step, while 12//4 is 3 and a 12-step
+               # run wrote four. An interval of 1 is that rule stated
+               # outright, and it holds for every step count.
+               "--preview", "tae", "--preview-interval", "1",
                "--preview-path", preview_path,
                "-o", out_path]
         if args.get("negative_prompt"):
@@ -4282,8 +4289,6 @@ def _generate_image(args, hooks=None, direct=False):
             _img_job(job_id, done=True, error=str(exc)[:200])
             return {"error": "could not start the image engine: %s" % exc}
 
-        last_sent = -1
-        last_sent_at = 0.0
         last_step = -1
         deadline = t0 + timeout
         try:
@@ -4313,20 +4318,25 @@ def _generate_image(args, hooks=None, direct=False):
                     cur, tot = int(m.group(1)), int(m.group(2))
                     pct = int(cur * 100 / max(1, tot))
                     now = time.time()
-                    # at most ~4 updates a second, and only on a change: a bar
-                    # that flickers is worse than one that moves a little late
-                    if pct != last_sent and now - last_sent_at >= 0.25:
-                        moved = cur != last_step
-                        last_sent, last_sent_at, last_step = pct, now, cur
+                    # Exactly one event per step, every one of them carrying the
+                    # preview. This was gated on the percent changing and on a
+                    # quarter of a second having passed, so a step that finished
+                    # inside 0.25s was dropped and its picture never reached the
+                    # page. That throttle made sense when a preview was a rare
+                    # event worth spacing out; with one wanted on every step,
+                    # dropping one is the whole difference. The engine repaints
+                    # the same bar many times within a single step, so keying on
+                    # the step is what holds this to one event per step.
+                    if cur != last_step:
+                        last_step = cur
                         on_prog({"id": job_id, "phase": "sampling",
                                  "percent": pct, "step": cur, "steps": tot,
                                  "seconds": round(now - t0, 1),
-                                 # Only when the step itself moved. Every event
-                                 # carrying this makes the page re-download the
-                                 # picture, and the engine repaints the bar
-                                 # many times per step.
-                                 "preview_url": ("/imgpreview/" + job_id
-                                                 if moved else None),
+                                 # A preview per step is the point, so this is
+                                 # no longer conditional on the step having
+                                 # moved: every event reaching here is a new
+                                 # step, and each one brings its picture.
+                                 "preview_url": "/imgpreview/" + job_id,
                                  "prompt": prompt})
         except Exception as exc:
             try:
