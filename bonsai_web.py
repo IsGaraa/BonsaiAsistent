@@ -12162,7 +12162,14 @@ PAGE = """<!doctype html>
    avatar - it is a placeholder for the reply that is coming, and a mark
    beside it competes with that reply. */
 .thinkrow .bubble { padding: 9px 14px; }
-.thinkrow .thinkstub { color: var(--mut); }</style>
+.thinkrow .thinkstub { color: var(--mut); }
+/* the placeholder is hidden until there is something in it. It used to
+   sit under the streamed prose doing nothing, which read as a second
+   copy of something already on screen. The row cannot be removed - the
+   wait-watch polls its stub, and thinkingRow.b is where tool steps are
+   placed - so it waits invisible and is revealed the moment it has
+   content. */
+.thinkrow.waiting { display: none; }</style>
 </head>
 <body>
 <div class="app">
@@ -13312,11 +13319,16 @@ function addThinking() {
      good, long after the work it was waiting for had been done. */
   if (thinkingRow) doneThinking();
   liveCalls = [];
-  /* .thinkrow so the waiting state is a surface like the reply's rather than
-     prose on the page background. No avatar: this is a placeholder for the
-     reply that is coming, and a mark beside it competes with that reply.
-     .thinkstub has to stay - the sweep finds stale rows by it. */
-  const row = document.createElement('div'); row.className = 'msgrow thinkrow';
+  /* Hidden until it holds something. The row cannot be removed: it is the
+     witness the wait-watch polls - startWaitWatch clears itself when
+     thinkingRow.think is no longer connected - one path rewrites the stub to
+     "Summarising the earlier turns", and thinkingRow.b is the anchor the
+     streaming module places tool steps against. So it stays, and reveal()
+     shows it the moment there is anything in it worth seeing.
+     .thinkstub itself must stay for the same reason: the sweep finds stale
+     rows by it. */
+  const row = document.createElement('div');
+  row.className = 'msgrow thinkrow waiting';
   const b = document.createElement('div'); b.className = 'bubble';
   const t = document.createElement('div'); t.className = 'thinkstub';
   t.innerHTML = '<span class="dots"><i></i><i></i><i></i></span> thinking...';
@@ -13325,12 +13337,21 @@ function addThinking() {
   thinkingRow = { row: row, b: b, body: null, pills: null, tlog: null, reasonD: null, think: t };
   startWaitWatch();
 }
+
+/* Show the waiting row. Called from each place that puts real content into it,
+   so the bubble appears with the reasoning box or the tool log rather than as
+   an empty box that is there in anticipation of one. */
+function revealThinking() {
+  if (!thinkingRow || !thinkingRow.row) return;
+  thinkingRow.row.classList.remove('waiting');
+}
 function onDelta(txt) {
   if (!thinkingRow) return;
   if (!thinkingRow.body) {
     const t = thinkingRow.row.querySelector('.thinkstub');
     if (t) t.remove();
-    thinkingRow.body = document.createElement('div'); thinkingRow.body.className = 'abody caret';
+    revealThinking();
+  thinkingRow.body = document.createElement('div'); thinkingRow.body.className = 'abody caret';
     thinkingRow.b.appendChild(thinkingRow.body);
   }
   thinkingRow.body.textContent += txt;
@@ -13338,6 +13359,7 @@ function onDelta(txt) {
 }
 function onReason(txt) {
   if (!thinkingRow) return;
+  revealThinking();
   if (!thinkingRow.reasonD) thinkingRow.reasonD = addReasonBox(thinkingRow.b, '', true);
   thinkingRow.reasonD.c.textContent += txt;
   thinkingRow.reasonD.c.scrollTop = thinkingRow.reasonD.c.scrollHeight;
@@ -13355,6 +13377,7 @@ function onTool(call) {
     d.appendChild(s); d.appendChild(l);
     thinkingRow.tlog = { d: d, s: s, l: l };
     thinkingRow.b.appendChild(d);
+    revealThinking();
   }
   thinkingRow.tlog.s.textContent = 'Tool log \u00b7 ' + liveCalls.length + ' running...';
   thinkingRow.tlog.l.appendChild(toolItemDom(call));
