@@ -4433,16 +4433,34 @@ EFFORT_LEVELS = {
         ("medium", "MEDIUM"), ("low", "LOW"), ("minimal", "MINIMAL"),
         ("none", "NONE - no thinking"),
     ],
+    # Read out of the models' own chat templates, which say
+    #   if resolved_reasoning_effort not in ('xhigh', 'medium', 'low'):
+    #     raise_exception('Unexpected reasoning effort ' ~ ...)
+    # and that raise happens while rendering the prompt: an HTTP 500 before a
+    # single token, for a setting nobody asked to change. "off" is not an
+    # effort at all - it sends enable_thinking=False.
+    # "med" and "high" were here before and are gone, because the templates
+    # reject both. The default was "med", which is why every local model
+    # failed to load rather than only the two levels being wrong.
     "local": [
-        ("xhigh", "X-HIGH"), ("high", "HIGH"), ("med", "MED"),
-        ("low", "LOW"), ("off", "OFF"),
+        ("xhigh", "X-HIGH"), ("medium", "MEDIUM"), ("low", "LOW"),
+        ("off", "OFF"),
     ],
     "none": [
         ("off", "OFF - this model does not take a thinking setting"),
     ],
 }
 # default per host, when that host's model has never set one
-EFFORT_DEFAULT = {"openrouter": "high", "local": "med", "none": "off"}
+# "medium", not the old "med": the same intent, spelled the way the local
+# templates spell it. This is what a fresh install sends before anyone touches
+# the menu, so it is the difference between working and a 500 on the first
+# local turn.
+# what the local chat templates accept, taken from EFFORT_LEVELS itself so the
+# menu and the guard can never disagree again
+LOCAL_EFFORT_VALUES = frozenset(
+    v for v, _ in EFFORT_LEVELS["local"] if v != "off")
+
+EFFORT_DEFAULT = {"openrouter": "high", "local": "medium", "none": "off"}
 _BONSAI_EFFORT_BY_HOST = {}
 
 
@@ -4548,11 +4566,17 @@ def _effort_params():
         if eff == "none":
             return {"reasoning": {"enabled": False}}
         return {"reasoning": {"effort": eff}}
-    # local: llama.cpp's own dialect, unchanged
+    # Local: llama.cpp's own dialect, but only a level its chat template
+    # accepts. An unrecognised level raises inside Jinja while rendering the
+    # prompt - a 500 before any token, for a thinking setting that was never
+    # worth failing a turn over. Omitted, the model uses its own default,
+    # which is xhigh anyway.
     if eff == "off":
         return {"chat_template_kwargs": {"enable_thinking": False}}
-    return {"chat_template_kwargs": {"enable_thinking": True,
-                                     "reasoning_effort": eff}}
+    if eff in LOCAL_EFFORT_VALUES:
+        return {"chat_template_kwargs": {"enable_thinking": True,
+                                         "reasoning_effort": eff}}
+    return {"chat_template_kwargs": {"enable_thinking": True}}
 
 
 def _model_headers(extra=None):
@@ -11859,7 +11883,11 @@ PAGE = """<!doctype html>
   .tlprev a { font-size: 11px; color: var(--acc); }
   .tlprev .tlframe { width: 100%; height: 280px; border: 1px dashed var(--bd); border-radius: 8px; background: var(--bg2); margin-top: 6px; }
   .toolsline { margin: 2px 0 8px; display: flex; flex-wrap: wrap; gap: 6px; }
-  .msgrow.user.queued .bubble { border-color: var(--warn); opacity: .92; }
+    '  /* the queued marker. Both spellings are listed because addUser builds\n'
+    '     .ubub and the streaming renderer builds .bubble; only the former had\n'
+    '     a rule here, so a queued row was never marked at all. */\n'
+    '  .msgrow.user.queued .ubub,\n'
+    '  .msgrow.user.queued .bubble { border-color: var(--warn); opacity: .92; }\n'
   .qbadge { display: inline-block; font-size: 9.5px; letter-spacing: 1.1px; color: var(--warn); border: 1px dashed var(--warn); border-radius: 999px; padding: 2px 9px; margin-bottom: 6px; animation: qpulse 1.6s ease-in-out infinite; }
   @keyframes qpulse { 0%, 100% { opacity: .55; } 50% { opacity: 1; } }
   .scopebtn { width: 100%; text-align: left; font-size: 11px; letter-spacing: 1px; color: var(--acc); background: transparent; border: 1px solid var(--bd); border-radius: 8px; padding: 7px 10px; cursor: pointer; }
@@ -11956,7 +11984,23 @@ PAGE = """<!doctype html>
   .send:hover { opacity: .85; }
   .send.busy { background: var(--err); }
   .stats { margin: 8px auto 0; font-size: 11px; color: var(--mut); text-align: center; }
-  .todo-panel { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+    /* The todo list sits beside the composer rather than above it. It was\n  
+       inside .innerc, which is already the chat's own 780px column, so it read\n  
+       as another band of the conversation. Stacks below 1000px, where a 290px\n  
+       list beside a text box is unreadable - and the composer goes under the\n  
+       list, not over it, since the box you are typing in stays the last thing\n  
+       you look at. The preview deliberately stays above: attachments belong\n  
+       with the box they attach to. */\n  
+    .todoline { display: flex; align-items: flex-end; gap: 12px; }\n  
+    .todoline .composer { flex: 1; min-width: 0; }\n  
+    .todoline .todo-panel { width: 290px; flex: none; margin: 0;\n  
+                            max-height: 190px; overflow-y: auto;\n  
+                            align-content: flex-start; }\n  
+    .todo-panel { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }\n  
+    @media (max-width: 1000px) {\n  
+      .todoline { flex-direction: column; align-items: stretch; gap: 8px; }\n  
+      .todoline .todo-panel { width: 100%; max-height: 128px; }\n  
+    }\n  
   .todo-panel:empty { display: none; }
   .todochip { font-size: 11.5px; padding: 4px 10px; border-radius: 999px; background: var(--bg2); border: 1px solid var(--bd); color: var(--mut); }
   .todochip .st.ok { color: var(--ok); }
@@ -12005,7 +12049,11 @@ PAGE = """<!doctype html>
   .aq { margin-bottom: 14px; font-size: 15px; line-height: 1.5; }
   .opts { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
   .opt, .afree button { border: 1px solid var(--bd); background: var(--bg2); color: var(--txt); border-radius: 999px; padding: 8px 14px; font-size: 13px; cursor: pointer; }
-  .opt:hover { border-color: var(--mut); }
+    .opt:hover { border-color: var(--mut); }\n'
+    /* the chosen option, so a partly-answered batch shows what it has so far */\n'
+    .opt.picked { border-color: var(--violet); background: var(--violet-soft);\n'
+                  color: var(--txt); }\n'
+    .opt.picked .optd { color: var(--txt2); }\n'
   /* An option with a description is two lines, and a two-line pill is a
      lozenge with the text running toward the curve at both ends. It becomes a
      card instead: near-square corners, label above, explanation below. */
@@ -12155,7 +12203,7 @@ PAGE = """<!doctype html>
     <div class="inputzone">
       <div class="innerc">
         <div class="preview" id="preview"></div>
-        <div class="todo-panel" id="todopanel"></div>
+        <div class="todoline">
         <div class="composer">
           <textarea id="user-input" rows="1" placeholder="Message BONSAI..."></textarea>
           <div style="display:flex;align-items:center;gap:2px">
@@ -12170,6 +12218,8 @@ PAGE = """<!doctype html>
             </div>
             <button class="send" id="send" title="Send"></button>
           </div>
+        </div>
+        <div class="todo-panel" id="todopanel"></div>
         </div>
         <div class="stats" id="statsline"></div>
         <div class="fine">BONSAI 2 27B local &middot; tools + vision &middot; your data stays on this PC</div>
@@ -12912,8 +12962,14 @@ function fmt(s) {
 
   return out.join('');
 }
-function addUser(content) {
-  const row = document.createElement('div'); row.className = 'msgrow user';
+function addUser(content, queued) {
+  /* queued was a parameter nobody read: queueNow calls addUser(parts, true) to
+     mark a message as waiting, and the row came out identical to one already
+     answered. clearQueuedBadge was written correctly against a .qbadge child
+     and a .queued class, so it had nothing to clear - two halves of one
+     feature with the half that creates the marker never wired up. */
+  const row = document.createElement('div');
+  row.className = 'msgrow user' + (queued ? ' queued' : '');
   const b = document.createElement('div'); b.className = 'ubub';
   const parts = typeof content === 'string' ? [{ type: 'text', text: content }] : content;
   const arr = parts || [];
@@ -12936,6 +12992,12 @@ function addUser(content) {
     if (sp.textContent) { sp.style.marginTop = '6px'; b.appendChild(sp); }
   } else {
     b.textContent = text;
+  }
+  if (queued) {
+    const badge = document.createElement('span');
+    badge.className = 'qbadge';
+    badge.textContent = 'QUEUED';
+    b.appendChild(badge);
   }
   row.appendChild(b); convInner().appendChild(row); scrollBottom();
 }
@@ -13178,8 +13240,12 @@ function addThinking() {
      good, long after the work it was waiting for had been done. */
   if (thinkingRow) doneThinking();
   liveCalls = [];
-  const row = document.createElement('div'); row.className = 'msgrow';
-  const b = document.createElement('div');
+  /* .thinkrow so the waiting state is a surface like the reply's rather than
+     prose on the page background. No avatar: this is a placeholder for the
+     reply that is coming, and a mark beside it competes with that reply.
+     .thinkstub has to stay - the sweep finds stale rows by it. */
+  const row = document.createElement('div'); row.className = 'msgrow thinkrow';
+  const b = document.createElement('div'); b.className = 'bubble';
   const t = document.createElement('div'); t.className = 'thinkstub';
   t.innerHTML = '<span class="dots"><i></i><i></i><i></i></span> thinking...';
   b.appendChild(t);
@@ -13230,12 +13296,18 @@ function onTool(call) {
    rather than left claiming to still be waiting. A row with real content
    in it is never touched. */
 function sweepStaleThinking() {
+  /* Only ever after a turn has finished. stopRun clears busy before the
+     stream has finished unwinding, so busy alone is not proof that nothing is
+     live - and during that window this sweep ran against a row still being
+     written to. It also has to recognise the reply's prose as content: that
+     lands in .bubble, which the old list of names did not include. */
   if (busy || thinkingRow) return;
-  const rows = convEl().querySelectorAll('.msgrow.bonsai');
+  const rows = convEl().querySelectorAll('.msgrow.thinkrow');
   for (let i = 0; i < rows.length; i++) {
-    if (!rows[i].querySelector('.think')) continue;
-    if (rows[i].querySelector('.abody, .reasonbox, .toollog')) continue;
-    if (rows[i].parentNode) rows[i].parentNode.removeChild(rows[i]);
+    const row = rows[i];
+    if (!row.querySelector('.thinkstub')) continue;
+    if (row.querySelector('.abody, .reasonbox, .toollog, .ocsteps, .bubble p, .bubble pre')) continue;
+    if (row.parentNode) row.parentNode.removeChild(row);
   }
 }
 function doneThinking(errMsg) {
@@ -13439,17 +13511,20 @@ function onAsk(j) {
       } else {
         b.textContent = o.label;
       }
+      b.setAttribute('data-q', String(qi));
       b.onclick = function () {
         answers[qi] = o.label;
-        /* A single click must not be a dead click. Requiring every question
-           answered before anything was sent meant answering one of two posted
-           nothing at all, with nothing on screen to say the answer was held. */
-        if (Object.keys(answers).length < qs.length) {
-          b.classList.add('picked');
-          commit();
-          return;
-        }
-        commit();
+        /* A click records the answer and marks the button. It does NOT send:
+           submitting on the first click of a two-question ask is the original
+           complaint, and a batch must be answerable one question at a time
+           before it goes. Sending happens when the last question is answered,
+           or when SEND is pressed - which also covers a question deliberately
+           left alone. */
+        row.querySelectorAll('.' + 'opt' + '[data-q="' + qi + '"]')
+            .forEach(function (n) { n.classList.remove('picked'); });
+        b.classList.add('picked');
+        b.setAttribute('data-q', String(qi));
+        if (Object.keys(answers).length >= qs.length) commit();
       };
       row.appendChild(b);
     });
@@ -14023,7 +14098,11 @@ function stopRun() {
      is go() that drains a queued turn and re-arms the button if work remains. */
   busy = false;
   setSendUI();
-  setTimeout(function () { sweepStaleThinking(); }, 0);
+  /* a beat, not a tick: the stream is still unwinding here, and a turn that
+     has not yet written anything would otherwise be tidied out from under
+     itself. The sweep only removes rows that are still empty placeholders, so
+     the delay is belt and braces rather than the whole protection. */
+  setTimeout(function () { sweepStaleThinking(); }, 250);
 }
 function drainQueue() {
   if (busy) return;
@@ -14087,9 +14166,18 @@ async function go(forcedParts, chat, alreadyAdded, askedMsg) {
   document.getElementById('user-input').value = '';
   try { await streamRun(await hydrateAtt(wireFor(target)), target, asked); }
   catch (err) { doneThinking('Error: ' + err.message); setState('idle'); }
-  busy = false;
-  sweepStaleThinking();
-  setSendUI();
+  finally {
+    /* Releasing the button cannot live on a path that can be skipped. The
+       catch handler calls doneThinking, which by now is the streaming
+       module's rewritten version, touching a reasoning box, a tool log and a
+       row it may have already removed. If that throws, control never reached
+       busy = false: the turn was over, nothing was running, and the button
+       stayed red. Guarding doneThinking would not be the right answer either
+       - a renderer is allowed to throw. */
+    busy = false;
+    sweepStaleThinking();
+    setSendUI();
+  }
   document.getElementById('user-input').focus();
   target.ts = Date.now();
   save();
@@ -14992,6 +15080,19 @@ _OC_CSS = (
     '     chat nests them inside the bubble instead, where this must not\n'
     '     apply - hence the child-of-column test. */\n'
     '  .inner > .ocsteps { margin-left: 35px; }   /* 26px avatar + 9px gap */\n'
+    '  /* The streaming renderer builds .bubble for the prose it writes and for\n'
+    '     image cards, and there was no rule for .bubble at all - so the\n'
+    '     container had no background, no border and no padding, and the reply\n'
+    '     sat bare on the page. Aliased to .bbub rather than restyled: two rules\n'
+    '     for one thing is how they drifted apart in the first place. */\n'
+    '  .bubble { flex: 1; min-width: 0; background: var(--bg2);\n'
+    '            border: 1px solid var(--bd2); border-radius: 4px 16px 16px 16px;\n'
+    '            padding: 11px 15px; font-size: 14px;\n'
+    '            box-shadow: 0 1px 2px rgba(0,0,0,.05); }\n'
+    ''
+    '  /* the waiting row: same surface as the reply, no avatar */\n'
+    '  .thinkrow .bubble { padding: 9px 14px; }\n'
+    ''
     '  .msgrow.bonsai + .ocsteps, .msgrow + .ocsteps { clear: both; }\n'
     "  /* the model's own words sit between the steps: prose, not code */\n"
     '  .ocpara { margin: 4px 0 8px; font-family: inherit; font-size: inherit;\n'
@@ -15180,7 +15281,11 @@ _OC_JS = (
     '    var row = el(\'div\', \'msgrow bonsai\');\n'
     '    var p = el(\'div\', \'ocpara\'); p.textContent = \'\';\n'
     '    bub.appendChild(p);\n'
-    '    row.appendChild(av); row.appendChild(bub);\n'
+    '    /* bubble then avatar: addAsst appends in this order, and\n'
+    '       .msgrow.bonsai is styled for it. The other order put the mark to\n'
+    '       the LEFT of the prose, so a reply read as a mark followed by\n'
+    '       run-on text. */\n'
+    '    row.appendChild(bub); row.appendChild(av);\n'
     '    var host = OCS.bubble && OCS.bubble.parentNode\n'
     '             ? OCS.bubble.parentNode.parentNode : null;\n'
     '    var answerRow = OCS.bubble ? OCS.bubble.parentNode : null;\n'
