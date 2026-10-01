@@ -11368,30 +11368,59 @@ def run_agent(messages, on_tool=None, mode=MODE_BUILD, on_stats=None, hooks=None
             # losing the turn - see _blind_turn. And a tool result too large
             # for the provider fails the whole request: shorten it and retry -
             # see _oversize_turn. Neither is a reason to discard the work.
-            if not _is_blind():
-                fixed = _blind_turn(msgs, exc)
-                if fixed is not None:
-                    _remember_blind()
-                    msgs[:] = fixed
-                    if on_tool:
-                        on_tool(_blind_record())
-                    message = _bonsai_chat(msgs, tools)
-                else:
-                    fixed = _oversize_turn(msgs, exc)
-                    if fixed is None:
-                        raise
-                    msgs[:] = fixed
-                    if on_tool:
-                        on_tool(_oversize_record())
-                    message = _bonsai_chat(msgs, tools)
-            else:
-                fixed = _oversize_turn(msgs, exc)
+            #
+            # This used to retry exactly once, outside any try, so a second
+            # refusal escaped run_agent and killed the turn outright. It is now
+            # a bounded loop that cuts more aggressively each time and gives up
+            # by returning what it has instead of raising, because a provider
+            # that will not take the request is not a reason to lose the rest
+            # of the conversation.
+            budget = _OVERSIZE_TOOL_CHARS
+            message = None
+            for attempt in range(_OVERSIZE_RETRIES):
+                if not _is_blind() and attempt == 0:
+                    fixed = _blind_turn(msgs, exc)
+                    if fixed is not None:
+                        _remember_blind()
+                        msgs[:] = fixed
+                        if on_tool:
+                            on_tool(_blind_record())
+                        try:
+                            message = _bonsai_chat(msgs, tools)
+                        except Exception:
+                            message = None
+                        if message is not None:
+                            break
+                        continue
+                fixed = _oversize_turn(msgs, exc, budget)
                 if fixed is None:
-                    raise
+                    break
                 msgs[:] = fixed
                 if on_tool:
                     on_tool(_oversize_record())
-                message = _bonsai_chat(msgs, tools)
+                budget = max(4000, budget // 3)
+                try:
+                    message = _bonsai_chat(msgs, tools)
+                except Exception as retry_exc:
+                    exc = retry_exc
+                    message = None
+                if message is not None:
+                    break
+            if message is None:
+                if on_tool:
+                    on_tool({"name": "oversize_result",
+                             "label": "Result too large",
+                             "result": {"ok": False, "stopped": True},
+                             "full_result": {
+                                 "ok": False, "stopped": True,
+                                 "note": "the provider would not accept this "
+                                         "request even after shortening the "
+                                         "tool output, so the turn was stopped"},
+                             "ms": 1})
+                if on_stats:
+                    on_stats(total)
+                return {"reply": "", "calls": calls, "_stats": total,
+                        "stopped": "oversize"}
         total = _merge_stats(total, _stats_from(message.get("_usage") or {},
                                                 message.get("_timings") or {}))
         tool_calls = message.get("tool_calls") or []
@@ -11581,39 +11610,88 @@ _INVALID_REQUEST_MARKERS = (
 # refuse the whole request. Anything larger is trimmed rather than fatal.
 _OVERSIZE_TOOL_CHARS = 60000
 
+# How many times one round may be re-sent with the tool output shortened.
+# Each attempt cuts the budget to a third of the last, so three is enough to
+# go 60000 -> 20000 -> 6666 without ever giving up on the first refusal.
+_OVERSIZE_RETRIES = 3
 
-def _oversize_turn(msgs, exc):
-    """A copy of `msgs` with any bloated tool output cut down, or None.
+
+def _oversize_turn(msgs, exc, budget=None):
+    """A copy of `msgs` with bloated tool output cut down, or None.
 
     "invalid_request_error / invalid request" says nothing about which part of
-    the request was wrong, and the usual cause is size: one tool result - a
-    whole file, a directory listing, a page of scraped text - grew past what
-    the provider will accept and took the entire conversation down with it. The
-    work already done is not lost, the offending text is just too big, so it is
-    replaced with a note saying so and the turn is retried once. The model can
-    always ask for a slice of it back."""
+    the request was wrong, and the usual cause is size: tool output - a whole
+    file, a directory listing, a page of scraped text - grew past what the
+    provider will accept and took the entire conversation down with it. The
+    work already done is not lost, the text is just too big, so it is replaced
+    with a note saying so and the turn is retried. The model can always ask for
+    a slice of it back.
+
+    The limit the provider enforces is on the whole request, not on any one
+    message, so this trims to a cumulative `budget` over the tool messages
+    rather than only to any single oversized one. Six results of 50k are each
+    under the per-message limit and together are not, and that case - which is
+    what a tool returning several pages, or several tools in one round,
+    produces - was previously not trimmed at all, so the request was refused
+    again and the turn died. Newest results are cut first: the most recent
+    output is the one the model is most likely to be reasoning about.
+
+    `budget` shrinks on each retry so a second refusal gets a stricter cut
+    rather than the same one refused again."""
     try:
         blob = ("%s %s" % (_model_error_text(exc), exc)).lower()
     except Exception:
         return None
     if not any(m in blob for m in _INVALID_REQUEST_MARKERS):
         return None
-    fixed, trimmed = [], 0
-    for m in msgs:
-        content = m.get("content")
-        if m.get("role") == "tool" and isinstance(content, str) \
-                and len(content) > _OVERSIZE_TOOL_CHARS:
-            head = content[:_OVERSIZE_TOOL_CHARS // 2]
-            tail = content[-_OVERSIZE_TOOL_CHARS // 4:]
-            fixed.append(dict(m, content=(
-                head + "\n\n... [%d characters of this result were removed - it "
-                "was too large for the provider. Ask for a specific slice if you "
-                "need the middle.] ...\n\n" % (len(content) - len(head) - len(tail))
-                + tail)))
-            trimmed += 1
+
+    if budget is None:
+        budget = _OVERSIZE_TOOL_CHARS
+    budget = max(4000, int(budget))
+    keep = budget // 4
+
+    # Every trimmed message keeps a head and a tail even once the budget is
+    # gone, so with many results that floor is n * keep and the cut stops
+    # converging: sixty messages stayed near a megabyte however hard the
+    # budget was squeezed. The per-message keep is therefore capped, so the
+    # floor cannot grow past a small multiple of the budget no matter how many
+    # tool results a round produced.
+    big = [m for m in msgs
+           if m.get("role") == "tool" and isinstance(m.get("content"), str)
+           and len(m["content"]) > 2000]
+    if big:
+        keep = min(keep, max(1000, budget // max(4, len(big))))
+
+    # Oldest first, so the tail of the list is the newest tool output.
+    order = [i for i, m in enumerate(msgs)
+             if m.get("role") == "tool" and isinstance(m.get("content"), str)
+             and len(m["content"]) > keep]
+    if not order:
+        return None
+
+    # Newest first: keep the earliest results whole as long as they fit.
+    order.reverse()
+    out, left, trimmed = list(msgs), budget, 0
+    for i in order:
+        content = msgs[i]["content"]
+        size = len(content)
+        if left <= keep:
+            room = keep
         else:
-            fixed.append(m)
-    return fixed if trimmed else None
+            room = min(left, size - keep)
+        if room >= size:
+            left -= size
+            continue
+        head = content[:int(room * 2 / 3)]
+        tail = content[-int(room / 3):]
+        out[i] = dict(msgs[i], content=(
+            head + "\n\n... [%d characters of this result were removed - it "
+            "was too large for the provider. Ask for a specific slice if you "
+            "need the middle.] ...\n\n" % (size - len(head) - len(tail))
+            + tail))
+        left -= len(head) + len(tail)
+        trimmed += 1
+    return out if trimmed else None
 
 
 def _oversize_record():
@@ -11707,16 +11785,29 @@ def stream_agent(messages, on_reason=None, on_delta=None, on_tool=None,
                             tool_calls = ev["tool_calls"]
                         emit(ev)
                     return tool_calls or []
-            fixed = _oversize_turn(msgs, exc)
-            if fixed is None:
-                raise
-            msgs[:] = fixed
-            if on_tool:
-                on_tool(_oversize_record())
-            for ev in _bonsai_stream(msgs, tools_for_round):
-                if ev["kind"] == "end":
-                    tool_calls = ev["tool_calls"]
-                emit(ev)
+            # Same bounded loop as run_agent above, for the same reason: a
+            # single unguarded retry turned a second refusal into a dead turn.
+            budget = _OVERSIZE_TOOL_CHARS
+            recovered = False
+            for _attempt in range(_OVERSIZE_RETRIES):
+                fixed = _oversize_turn(msgs, exc, budget)
+                if fixed is None:
+                    break
+                msgs[:] = fixed
+                if on_tool:
+                    on_tool(_oversize_record())
+                budget = max(4000, budget // 3)
+                try:
+                    for ev in _bonsai_stream(msgs, tools_for_round):
+                        if ev["kind"] == "end":
+                            tool_calls = ev["tool_calls"]
+                        emit(ev)
+                    recovered = True
+                    break
+                except Exception as retry_exc:
+                    exc = retry_exc
+            if not recovered:
+                return None
         return tool_calls or []
 
     for _round in range(MAX_TOOL_ROUNDS):
