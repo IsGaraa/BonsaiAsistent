@@ -4487,6 +4487,10 @@ def _generate_image(args, hooks=None, direct=False):
         # Resample to the exact delivery size. The engine could not be asked for
         # 1920x1080 directly - neither number is a multiple of 32 - which is the
         # other half of why this step exists. Lanczos, in Pillow, no model.
+        # The file that is kept and the one everything else points at. The
+        # engine's own output is the fallback, for when the delivery is turned
+        # off or fails, in which case it is the only file there is.
+        final = out_path
         want_up = args.get("upscale", True)
         if want_up not in (False, "false", "False", 0, "0"):
             # 1440p on the SHORT edge, with the source's own ratio, which is
@@ -4512,42 +4516,53 @@ def _generate_image(args, hooks=None, direct=False):
             if (width, height) != (up_w, up_h):
                 up_path = os.path.join(out_dir, "img_%s_%dp.png"
                                        % (stamp, _IMG_UPSCALE_TO))
+                # This is the file that survives, so the name says what it
+                # is rather than what it was made from.
                 got, why = _upscale_png(out_path, up_path, up_w, up_h)
                 if got:
                     out["upscaled_path"] = got
                     out["upscaled_size"] = "%dx%d" % (up_w, up_h)
                     out["delivery"] = "%dp" % _IMG_UPSCALE_TO
-                    out["upscaled_bytes"] = os.path.getsize(got)
                     out["upscale_method"] = ("Lanczos resampling, no AI "
                                              "upscaler")
                     out["note"] = ("generated at %dx%d, delivered at %s"
                                    % (width, height,
                                       "%dx%d" % (up_w, up_h)))
+                    # The delivered frame is the image, so the engine's own
+                    # output is not kept beside it. Two files per request, one
+                    # of them a near-duplicate nobody opens, doubled the disk
+                    # cost of every generation and left two entries in the
+                    # folder for each picture. The raw file is only removed
+                    # once the delivery has been written successfully, so a
+                    # failed upscale still leaves the original intact.
+                    try:
+                        os.remove(out_path)
+                    except OSError:
+                        pass
+                    final = got
+                    out["path"] = final
+                    out["saved"] = final
+                    out["bytes"] = os.path.getsize(got)
                 else:
                     out["upscale_error"] = why
-        _img_job(job_id, done=True, output=out_path)
+        _img_job(job_id, done=True, output=final)
         # Hand the picture to the model, and to the chat, without making the
         # stored message carry megabytes of base64: the file on disk is the
         # truth and the /att/ reference is what gets remembered.
+        #
+        # Read the delivered frame, not the engine's raw output, because the
+        # raw one may no longer exist. This used to also build a second
+        # base64 blob in image_data_full, which nothing ever read: both
+        # consumers popped it unread (11196 and 17349), so a multi-megabyte
+        # file was read and encoded on every generation for no effect.
         try:
-            with open(out_path, "rb") as fh:
+            with open(final, "rb") as fh:
                 raw = fh.read()
             out["image_data"] = ("data:image/png;base64,"
                                  + base64.b64encode(raw).decode("ascii"))
             url = _store_attachment(out["image_data"])
             if url:
                 out["preview"] = url
-            if out.get("upscaled_path"):
-                # the delivered 1440p file is what the user will look at, so
-                # that is the one the model should describe if it says anything
-                try:
-                    with open(out["upscaled_path"], "rb") as fh:
-                        raw2 = fh.read()
-                    out["image_data_full"] = (
-                        "data:image/png;base64,"
-                        + base64.b64encode(raw2).decode("ascii"))
-                except Exception:
-                    pass
         except Exception:
             pass
         return out
@@ -14339,8 +14354,12 @@ function finishImageCard(handles, result) {
   }
   h.card.querySelector('.imgtop b').textContent = PAINT_ICON + ' Painted';
   const dims = h.card.querySelector('.imgfoot .dim');
-  if (dims) dims.textContent = (result.width || '?') + '\u00d7' + (result.height || '?') +
-    (result.delivery ? ' \u00b7 delivered ' + result.upscaled_size : '');
+  // The delivered frame is the only file, so it is what the size line leads
+  // with; the generated size is context for it rather than a second copy.
+  const gen = (result.width || '?') + '\u00d7' + (result.height || '?');
+  if (dims) dims.textContent = result.upscaled_size
+    ? result.upscaled_size + ' delivered (generated at ' + gen + ')'
+    : gen;
   const foot = h.card.querySelector('.imgfoot');
   if (foot) {
     foot.textContent = '';
@@ -14348,10 +14367,7 @@ function finishImageCard(handles, result) {
     a.href = '/previewfile/' + encodeURIComponent(String(result.path || '').split(String.fromCharCode(92)).join('/'));
     a.target = '_blank';
     a.textContent = 'open the file';
-    const note = document.createElement('span');
-    note.textContent = (result.upscaled_path ? 'also at ' + result.upscaled_size : '');
     foot.appendChild(a);
-    if (result.upscaled_path) foot.appendChild(note);
   }
 }
 /* Read the engine's own event stream. Same shape as the chat stream, so the
