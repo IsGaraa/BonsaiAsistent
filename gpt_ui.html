@@ -1,5 +1,5 @@
 <!-- GPT UI (PAGE_GPT) - the page served at /chat, copied verbatim from a
-     running bonsai_web.py at commit 1ed829d.
+     running bonsai_web.py at commit e47df78.
 
      bonsai_web.py is the source of truth. This file is a read-only copy so
      the UI can be opened in an editor without wading through the Python;
@@ -24,6 +24,7 @@
     --txt2: #4a4a52; --dim: #9a9aa3;
     --ok: #16a34a; --warn: #d97706; --err: #dc2626;
     --violet: #7c3aed; --violet-soft: rgba(124,58,237,.10);
+    --gap-above-input: 5px;   /* space between the last message and the composer */
   }
   html.dark {
     color-scheme: dark;
@@ -363,7 +364,11 @@
   .chip.ok { color: var(--ok); }
   .chip.err { color: var(--err); border-color: var(--err); }
   .statschip { display: block; margin-top: 8px; font-size: 11px; color: var(--mut); }
-  .inputzone { flex: none; padding: 0 0 16px; }
+  /* The composer sat flush against the bottom of the message list - the
+     two borders touched and the whole bottom of the window read as one
+     block. Padded here rather than on the composer so the plan rail lifts
+     by the same amount and the two stay aligned. */
+  .inputzone { flex: none; padding: var(--gap-above-input) 0 16px; }
   .innerc { max-width: 780px; margin: 0 auto; padding: 0 24px; }
   .preview { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 8px; }
   .preview:empty { display: none; }
