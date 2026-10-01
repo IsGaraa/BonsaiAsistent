@@ -2680,6 +2680,13 @@ SYSTEM = ("You are the friendly assistant living on the user's "
              "name, not a separator. ")
           + "\nWhen you need a choice, a password or a confirmation, ask rather "
           "than assuming. For a longer task keep a visible list of steps.\n"
+          "Image generation: the local model is a distilled turbo checkpoint "
+          "trained for 6 denoising steps, so ask generate_image for at most 6 "
+          "steps and leave 'steps' out entirely unless the user explicitly "
+          "wants a different number. Going past 6 oversamples the model and "
+          "makes the picture worse, not better, so more steps is never the way "
+          "to improve a result - reword the prompt instead. Anything over 12 is "
+          "clamped server-side regardless of what you send.\n"
           "Colour: wrap only the part of a reply that carries meaning in "
           "[color=NAME]...[/color] and leave the rest plain - a warning, an "
           "error, a key value, the one word that answers the question, and "
@@ -5762,8 +5769,12 @@ IMAGE_GEN_TOOL = _pc_tool(
                                    "version, resampled with Lanczos - no AI, "
                                    "no extra model, instant."},
         "steps": {"type": "integer",
-                  "description": "Denoising steps, 4-40 (default 20). More is "
-                                 "slower and only helps a little past ~24."},
+                  "description": "Denoising steps, 4-12, default 6 - and 6 is "
+                                 "what this distilled turbo model was trained "
+                                 "for, so leave it out unless the user asks "
+                                 "for a specific number. Asking for more "
+                                 "oversamples the model and gives a worse "
+                                 "picture, not a better one."},
         "seed": {"type": "integer",
                  "description": "Random seed (default -1, meaning pick one). "
                                 "Reuse a seed to get the same picture again."},
