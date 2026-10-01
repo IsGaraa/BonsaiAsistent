@@ -2412,6 +2412,42 @@ BLENDER_OFFLINE_MSG = ("Blender tools are not reachable. Open Blender and make s
 _BLENDER_MCP = None
 _BLENDER_GUARD = threading.Lock()
 _BLENDER_PROBE = {"at": 0.0, "state": "unknown"}
+# Off unless asked. The bridge was always live: a thread at launch spawned the
+# MCP subprocess and every request carried eight blender tool schemas whether or
+# not Blender was running - which is usually not, so the model was reading
+# prompts for a program that was not there. Set with PC_BLENDER=1 to have it on
+# from the start.
+_BLENDER_ENABLED = str(os.environ.get("PC_BLENDER") or "").strip().lower() in (
+    "1", "on", "true", "yes")
+_BLENDER_FLAG_LOCK = threading.Lock()
+
+
+def _blender_enabled():
+    return _BLENDER_ENABLED
+
+
+def set_blender_enabled(value):
+    """Turn the bridge on or off. Returns the state, like the other toggles."""
+    global _BLENDER_ENABLED
+    want = value if isinstance(value, bool) else str(
+        value or "").strip().lower() in ("1", "on", "true", "yes", "enable",
+                                         "enabled")
+    with _BLENDER_FLAG_LOCK:
+        _BLENDER_ENABLED = want
+    if want:
+        # in the background, so the click returns at once and the status dot
+        # fills in when the bridge is actually ready
+        threading.Thread(target=_blender_kickoff, daemon=True).start()
+    else:
+        try:
+            bridge = _blender_mcp_bridge()
+            with bridge._lock:
+                loop = bridge._loop
+            if loop is not None and loop.is_running():
+                loop.call_soon_threadsafe(loop.stop)
+        except Exception:
+            pass
+    return _blender_enabled()
 
 
 class _BlenderMcp:
@@ -2533,7 +2569,9 @@ def _blender_mcp_bridge():
 
 
 def _blender_tool_schemas():
-    if not MCP_AVAILABLE:
+    # off means off: nothing reaches the prompt, and the bridge is not even
+    # touched, so no subprocess is started just to answer this
+    if not MCP_AVAILABLE or not _blender_enabled():
         return []
     bridge = _blender_mcp_bridge()
     with bridge._lock:
@@ -2549,12 +2587,17 @@ def _blender_tool_schemas():
 
 
 def _blender_tool_names():
-    if not MCP_AVAILABLE:
+    # empty when off, so a blender tool name cannot reach the dispatcher even if
+    # the model hallucinated one out of an old conversation
+    if not MCP_AVAILABLE or not _blender_enabled():
         return set()
     return set(_blender_mcp_bridge()._tools)
 
 
 def _blender_tool_call(name, args):
+    if not _blender_enabled():
+        return {"error": "the Blender bridge is switched off. Turn it on in the "
+                         "sidebar to use Blender tools."}
     try:
         bridge = _blender_mcp_bridge()
         if not bridge.ensure(timeout=45):
@@ -2572,8 +2615,14 @@ def _blender_kickoff():
 
 
 def _blender_status_payload():
+    if not _blender_enabled():
+        # answered without touching the bridge: probing it here would start the
+        # subprocess just to draw a dot, which is what the switch is for
+        return {"ok": False, "state": "off", "enabled": False, "tool_count": 0,
+                "detail": "off - the Blender bridge is not running and its tools "
+                          "are not in the model's tool list"}
     if not MCP_AVAILABLE:
-        return {"ok": False, "state": "missing", "tool_count": 0,
+        return {"ok": False, "state": "missing", "enabled": True, "tool_count": 0,
                 "detail": "Python package 'mcp-for-blender' is not installed"}
     bridge = _blender_mcp_bridge()
     try:
@@ -4001,12 +4050,41 @@ def _find_first(directory, *needles):
     return None
 
 
+# Stated, not inferred. The weights were found by looking for "qwen-image" in
+# the folder, sorted - and this file happens to win that on ASCII collation
+# because its Q is uppercase. Relying on collation to choose between 6 GB files
+# is not a plan, so it is named here and the fuzzy match stays as the fallback.
+IMAGE_DIFFUSION_FILE = "Qwen-Image-2.1-viggle-turbo-v0.3-6step-Q6_K.gguf"
+# Distilled turbo: six steps is what it was trained for, and asking for the
+# default 24 gives a worse picture rather than a better one.
+IMAGE_DEFAULT_STEPS = 6
+IMAGE_MAX_STEPS = 12
+
+
+def _image_named_steps(path):
+    """Steps stated in the filename, if the filename states them.
+
+    '...6step...' or '...-6-step...' - so a turbo checkpoint carries its own
+    sampling budget with it and the caller does not have to know which model is
+    installed."""
+    name = os.path.basename(path or "").lower()
+    m = re.search(r"(\d+)[-_.]?step", name)
+    return int(m.group(1)) if m else 0
+
+
 def _image_parts():
     """The three weights, or a list of what is missing - named, so the fix is
     obvious rather than a puzzle."""
     found, missing = {}, []
+    diffusion = os.path.join(IMAGE_MODEL_DIR, "diffusion")
+    preferred = os.path.join(diffusion, IMAGE_DIFFUSION_FILE)
+    # lowercased, because _find_first lowercases the filename and compares
+    # against the needle as given - so a mixed-case needle never matches and the
+    # engine reports the weight missing when it is sitting right there
+    preferred_needle = IMAGE_DIFFUSION_FILE.lower()
     wanted = (
-        ("diffusion", os.path.join(IMAGE_MODEL_DIR, "diffusion"), ("qwen-image",)),
+        ("diffusion", diffusion,
+         (preferred_needle,) if os.path.isfile(preferred) else ("qwen-image",)),
         ("vae", os.path.join(IMAGE_MODEL_DIR, "vae"), ("vae",)),
         ("text_encoder", os.path.join(IMAGE_MODEL_DIR, "text_encoder"),
          ("qwen3vl",)),
@@ -4097,7 +4175,15 @@ def _generate_image(args, hooks=None, direct=False):
         aw, ah = _IMG_ASPECTS.get(want, _IMG_ASPECTS["16:9"])
         width, height = dim("width", aw, 256, 2048), dim("height", ah, 256, 2048)
         try:
-            steps = max(4, min(40, int(args.get("steps") or 24)))
+            # default and ceiling both follow the installed checkpoint: a
+            # distilled turbo model sampled at the old default of 24 is
+            # oversampled into a worse picture, and the ceiling keeps a
+            # caller from asking for 40 steps of a 6-step model
+            want = int(args.get("steps") or 0)
+            if want <= 0:
+                want = (_image_named_steps(found.get("diffusion"))
+                        or IMAGE_DEFAULT_STEPS)
+            steps = max(4, min(IMAGE_MAX_STEPS, want))
         except (TypeError, ValueError):
             steps = 24
         try:
@@ -4314,7 +4400,7 @@ def _generate_image(args, hooks=None, direct=False):
                "width": width, "height": height, "steps": steps,
                "seed": seed, "seconds": took, "bytes": size,
                "label": "generated image",
-               "engine": "Qwen-Image 2.1 (local, stable-diffusion.cpp)",
+               "engine": "Qwen-Image 2.1 Viggle turbo, 6-step (local, stable-diffusion.cpp)",
                "vram_released": "yes - the engine process exited, so the GPU "
                                 "is free again",
                "job": job_id}
@@ -11788,6 +11874,14 @@ PAGE = """<!doctype html>
   /* the model picker reads as a control, with the accent it acts on */
   #modelsel { max-width: 210px; }
   #modelsel.acc { border-color: var(--violet); }
+  /* The Blender switch. Same shape as the other sidebar buttons, with the
+     on-state in the accent so it is readable at a glance from across a room -
+     and "off" is the default, which is why it is spelled out rather than shown
+     as a bare toggle. */
+  .blswitch { width: 100%; text-align: left; font-size: 11px; letter-spacing: 1px;
+              color: var(--mut); border-color: var(--bd); }
+  .blswitch:hover { border-color: var(--acc); color: var(--acc); }
+  .blswitch.on { color: var(--violet); border-color: var(--violet); }
   .blrow { display: flex; align-items: center; gap: 7px; font-size: 11.5px; color: var(--mut); }
   .blrow b { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #8b8b8b; }
   .blrow.ok b { background: var(--ok); }
@@ -12197,6 +12291,7 @@ PAGE = """<!doctype html>
       <button class="dlclear danger" id="dlclearall" title="Cancel anything still running and remove every download from the list">CLEAR ALL</button>
     </div>
     <div class="side-foot">
+      <button class="btn-ghost blswitch" id="blswitch" title="Blender MCP bridge. Off means its tools are not in the model's tool list and no Blender process is started. Click to switch on.">BLENDER: OFF</button>
       <div class="blrow" id="blstatus" title="Blender MCP status"><svg class="blicon" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 1.6C7.4 1.6 3.7 3.9 3.7 6.9c0 1.6 1.1 3 2.8 3.9-2.1.9-3.5 2.4-3.5 4.2 0 3.2 4 5.8 9 5.8 2.4 0 4.6-.7 6.2-1.8l3.4 2.8 1.7-2-3.3-2.7c.6-.9.9-1.9.9-3 0-1.9-1-3.6-2.6-4.9.3-.5.4-1.1.4-1.7 0-3-3.7-5.3-8.3-5.3Z"/><ellipse cx="12" cy="6.9" rx="4.2" ry="2.5" fill="#18181b"/></svg><span class="bldot off" id="bldot"></span></div>
       <button class="btn-ghost wd" id="workbtn"></button>
       <button class="btn-ghost scopebtn" id="scopebtn" title="How far Bonsai may reach outside the workspace. Click to switch: WORKSPACE (hard sandbox) / ASK (ask me every time) / SYSTEM (no prompts).">SCOPE: ...</button>
@@ -14615,7 +14710,18 @@ document.getElementById('workbtn').onclick = async function () {
 function renderBlenderStatus(j) {
   const el = document.getElementById('blstatus');
   if (!el) return;
+  /* the switch follows the state, whichever way it changed */
+  const sw = document.getElementById('blswitch');
+  if (sw) {
+    const on = !!j.enabled;
+    sw.textContent = on ? 'BLENDER: ON' : 'BLENDER: OFF';
+    sw.classList.toggle('on', on);
+  }
   const map = {
+    /* off is not the same as down: down means the bridge tried and Blender was
+       not there, which sends the user off to enable an addon. off means it was
+       never asked to try, and the switch above is where that changes. */
+    off: ['off', 'Blender MCP: switched off. Its tools are not in the tool list.'],
     ok: ['ok', 'Blender MCP: connected - the Blender tools are available.'],
     bridge: ['mid', 'Blender MCP: bridge is up, but the addon is not enabled.'],
     down: ['off', 'Blender MCP: not connected. Open Blender with the addon enabled.'],
@@ -14632,6 +14738,17 @@ function refreshBlender() {
     .then(renderBlenderStatus)
     .catch(function () { renderBlenderStatus({ state: 'down' }); });
 }
+const _blSwitch = document.getElementById('blswitch');
+if (_blSwitch) _blSwitch.onclick = function () {
+  const want = !(_blSwitch.className.indexOf('on') >= 0);
+  _blSwitch.textContent = want ? 'BLENDER: \u2026' : 'BLENDER: OFF';
+  fetch('/api/blender', { method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ enabled: want }) })
+    .then(function (r) { return r.json(); })
+    .then(renderBlenderStatus)
+    .catch(function () { renderBlenderStatus({ state: 'down' }); });
+};
 document.getElementById('ejectbtn').onclick = function () {
   const btn = document.getElementById('ejectbtn');
   if (btn.disabled) return;
@@ -17170,7 +17287,8 @@ class Handler(BaseHTTPRequestHandler):
                             "/api/tts", "/api/models", "/api/pick_model",
                             "/api/ctx", "/api/revert", "/api/forget_changes",
                             "/api/compact", "/api/attach", "/api/image",
-                            "/api/path_policy", "/api/dl_pause",
+                            "/api/path_policy", "/api/blender",
+                            "/api/dl_pause",
                             "/api/dl_resume", "/api/dl_cancel",
                             "/api/dl_retry", "/api/dl_clear"):
                 self._send(404, "not found", "text/plain")
@@ -17202,6 +17320,13 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if path == "/api/image":
                 self._image_stream(body)
+                return
+            if path == "/api/blender":
+                on = set_blender_enabled(body.get("enabled", True))
+                # the whole payload rather than a bare flag, so the page
+                # learns the state from the same call that changed it
+                self._send(200, json.dumps(dict(_blender_status_payload(),
+                                                enabled=on), default=str))
                 return
             if path == "/api/attach":
                 url = _store_attachment(body.get("data"))
@@ -17642,7 +17767,10 @@ def main():
     # The Blender bridge is a daemon thread, but it spawns a Python process of
     # its own and that work lands in the same interpreter as startup. A second
     # copy of the app, or a test harness, has no use for it.
-    if not os.environ.get("BONSAI_NO_BLENDER"):
+    # Off unless asked for. Starting this unconditionally spawned a Python
+    # process of its own on every launch, for a bridge that then answered with
+    # "not connected" because Blender was not open.
+    if _blender_enabled() and not os.environ.get("BONSAI_NO_BLENDER"):
         threading.Thread(target=_blender_kickoff, daemon=True).start()
     _load_chats_deleted()
     _sched_load()
