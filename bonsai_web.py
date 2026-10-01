@@ -4086,7 +4086,20 @@ def _viggle_sigmas(steps):
 
     Returns a comma-separated string for --sigmas. The engine's own default
     schedule is evenly spaced, and feeding a distilled model that instead of
-    its trained one is what leaves it looking flat and over-contrasted."""
+    its trained one is what leaves it looking flat and over-contrasted.
+
+    The trailing 0 is not in the model card's list and is the one thing that
+    must be added here. The card gives six nodes for six steps because
+    diffusers counts differently: it treats the last node as the sigma the
+    final step starts from and descends to zero itself. The engine wants the
+    descent to be spelled out - its own help shows "14.61,7.8,3.5,0.0" for
+    three steps, that is n+1 values - so a card list passed straight through
+    is read as one step short. It then warns "total_steps !=
+    custom_sigmas_count - 1, set total_steps to 5" and quietly samples five
+    steps ending at sigma 0.25, never reaching clean noise. The result is not
+    a slightly worse picture, it is unusable: confirmed by rendering the same
+    prompt and seed both ways, the truncated schedule gave an image of pure
+    high-frequency noise."""
     steps = max(VIGGLE_SIGMA_FLOOR, int(steps))
     head = steps - len(VIGGLE_SIGMA_TAIL)
     top = 1.0
@@ -4094,6 +4107,8 @@ def _viggle_sigmas(steps):
     vals = [top - k * ((top - first_tail) / head)
             for k in range(head)]
     vals = [round(v, 6) for v in vals] + list(VIGGLE_SIGMA_TAIL)
+    # The descent to clean, spelled out for the engine: n+1 values for n steps.
+    vals.append(0.0)
     return ",".join(("%g" % v) for v in vals)
 
 
