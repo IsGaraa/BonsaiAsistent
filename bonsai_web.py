@@ -11817,9 +11817,18 @@ PAGE = """<!doctype html>
   .ubub .thumb img { width: 100%; height: 100%; object-fit: cover; }
   .ubub .pf { display: inline-block; background: var(--bg2); border: 1px solid var(--bd); border-radius: 999px; padding: 4px 10px; font-size: 12px; }
   .abody { font-size: 14px; line-height: 1.65; word-break: break-word; }
-  .abody pre { background: var(--bg2); border: 1px solid var(--bd); border-radius: 10px; padding: 10px 12px; overflow-x: auto; font-size: 12.5px; line-height: 1.5; }
+  /* A fenced block is code, and code reads as code on a dark ground. One
+     rule, both themes, so a snippet does not change meaning when the theme
+     flips. The old background was var(--bg2), which made a Python function
+     look like a paragraph in a pale box. No syntax colours are forced: there
+     is no highlighter here, and writing one is a much larger change than
+     this asks for. Inline code keeps a tint - one identifier in a sentence
+     should not become a slab. */
+  .abody pre { background: #0d1117; color: #e6edf3; border: 1px solid #30363d;
+               border-radius: 10px; padding: 12px 14px; overflow-x: auto;
+               font-size: 12.5px; line-height: 1.55; }
   .abody code { background: var(--bg3); border-radius: 5px; padding: 1px 5px; font-size: 12.5px; }
-  .abody pre code { background: none; padding: 0; }
+  .abody pre code { background: none; padding: 0; color: inherit; }
   .abody a { color: var(--acc); }
   .abody.caret::after { content: ''; display: inline-block; width: 7px; height: 14px; background: var(--acc); margin-left: 3px; vertical-align: text-bottom; animation: blk .8s steps(1) infinite; }
   @keyframes blk { 50% { opacity: 0; } }
@@ -11997,6 +12006,18 @@ PAGE = """<!doctype html>
   .opts { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
   .opt, .afree button { border: 1px solid var(--bd); background: var(--bg2); color: var(--txt); border-radius: 999px; padding: 8px 14px; font-size: 13px; cursor: pointer; }
   .opt:hover { border-color: var(--mut); }
+  /* An option with a description is two lines, and a two-line pill is a
+     lozenge with the text running toward the curve at both ends. It becomes a
+     card instead: near-square corners, label above, explanation below. */
+  .opt.withdesc { border-radius: 10px; padding: 8px 12px; text-align: left;
+                  display: flex; flex-direction: column; gap: 2px;
+                  align-items: flex-start; width: 100%; }
+  .optl { font-weight: 600; font-size: 13.5px; line-height: 1.35; }
+  .optd { font-weight: 400; font-size: 11.5px; line-height: 1.4; color: var(--mut); }
+  .opt.withdesc:hover .optd { color: var(--txt2); }
+  .opts.stack { flex-direction: column; align-items: stretch; }
+  .aqnum { font-size: 10.5px; font-weight: 700; letter-spacing: .8px;
+           color: var(--violet); margin: 12px 0 4px; }
   .afree { display: flex; gap: 8px; }
   .afree input { flex: 1; border: 1px solid var(--bd); border-radius: 10px; padding: 9px 12px; background: var(--bg2); color: var(--txt); font: inherit; outline: none; }
   .afree button { padding: 8px 18px; }
@@ -13342,22 +13363,98 @@ function onAsk(j) {
     const q = document.createElement('div'); q.className = 'aq'; q.textContent = j.question || 'What should I do?';
     box.appendChild(q);
   }
+  /* a list of {question, answer} for a batch, a bare string for a single
+     question or a permission prompt - the shapes /api/answer reads */
   const say = function (ans) {
     ov.remove();
     if (perm) loadPathPolicy();
     fetch('/api/answer', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: j.id, answer: ans }) }).catch(function () {});
   };
-  if (j.options && j.options.length) {
-    const opts = document.createElement('div'); opts.className = 'opts';
-    (j.options).forEach(function (o) {
+  /* The server sends an option as an object when any of them carries a
+     description, and as a bare string otherwise. Assigning the object
+     straight to textContent is what printed "[object Object]" on every button
+     of an ask whose options had descriptions - conditional, which is why it
+     only ever showed up for some asks.
+     Every question in the batch is drawn, not just the first: the server
+     sends the whole batch, and the Python comment beside do_ask() says
+     exactly why taking only questions[0] is wrong. Answers are collected per
+     question and sent as a list of plain strings, one per question, which
+     is the shape /api/answer reads positionally. */
+  const qs = (j.questions && j.questions.length) ? j.questions : [{
+    question: j.question || 'What should I do?',
+    options: j.options || [], kind: j.kind || 'question',
+  }];
+  const answers = {};
+  /* One commit path for both the option buttons and the free-text box, so a
+     choice can never be dropped on the way out. Sends a bare list of one
+     string per question, in order: that is what /api/answer reads, matched
+     positionally against the cards the server already holds. Objects here
+     would be stringified into a Python dict repr - the same mistake as the
+     [object Object] this replaces, one hop further from the eye.
+     freeText fills the first question still unanswered, which is what typing
+     into the box reads as; anything already chosen is kept. */
+  const commit = function (freeText) {
+    const picked = qs.map(function (one, i) { return answers[i] || ''; });
+    if (freeText) {
+      const first = picked.indexOf('');
+      if (first >= 0) picked[first] = freeText;
+    }
+    if (!picked.some(Boolean)) return;
+    say(picked.length === 1 ? picked[0] : picked);
+  };
+  qs.forEach(function (one, qi) {
+    if (qs.length > 1) {
+      const n = document.createElement('div'); n.className = 'aqnum';
+      n.textContent = 'Question ' + (qi + 1) + ' of ' + qs.length;
+      box.appendChild(n);
+    }
+    if (qi > 0) {
+      const q2 = document.createElement('div'); q2.className = 'aq';
+      q2.textContent = one.question || '';
+      box.appendChild(q2);
+    }
+    const opts = (one.options || []).map(function (o) {
+      return (o && typeof o === 'object')
+        ? { label: String(o.label || o.text || o.value || ''),
+            description: String(o.description || '') }
+        : { label: String(o), description: '' };
+    }).filter(function (o) { return o.label; });
+    if (!opts.length) return;
+    const row = document.createElement('div');
+    /* described options are wider than a pill and read worse side by side at
+       this width, so they stack. An explicit class rather than :has() - the
+       page already knows the answer, and this works in any browser. */
+    row.className = opts.some(o => o.description) ? 'opts stack' : 'opts';
+    opts.forEach(function (o) {
       const b = document.createElement('button');
-      b.className = 'opt' + (/^ALLOW/.test(o) ? ' allow' : (/^DENY/.test(o) ? ' deny' : ''));
-      b.textContent = o;
-      b.onclick = function () { say(o); };
-      opts.appendChild(b);
+      b.className = 'opt' + (/^ALLOW/i.test(o.label) ? ' allow'
+                            : (/^DENY/i.test(o.label) ? ' deny' : ''));
+      if (o.description) {
+        const t = document.createElement('span'); t.className = 'optl';
+        t.textContent = o.label;
+        const d = document.createElement('span'); d.className = 'optd';
+        d.textContent = o.description;
+        b.appendChild(t); b.appendChild(d);
+        b.classList.add('withdesc');
+      } else {
+        b.textContent = o.label;
+      }
+      b.onclick = function () {
+        answers[qi] = o.label;
+        /* A single click must not be a dead click. Requiring every question
+           answered before anything was sent meant answering one of two posted
+           nothing at all, with nothing on screen to say the answer was held. */
+        if (Object.keys(answers).length < qs.length) {
+          b.classList.add('picked');
+          commit();
+          return;
+        }
+        commit();
+      };
+      row.appendChild(b);
     });
-    box.appendChild(opts);
-  }
+    box.appendChild(row);
+  });
   if (perm) {
     ov.appendChild(box);
     document.body.appendChild(ov);
@@ -13366,7 +13463,7 @@ function onAsk(j) {
   const free = document.createElement('div'); free.className = 'afree';
   const inp = document.createElement('input'); inp.placeholder = 'Type your answer...';
   const btn = document.createElement('button'); btn.textContent = 'SEND';
-  const submit = function () { const v = inp.value.trim(); if (v) say(v); };
+  const submit = function () { const v = inp.value.trim(); if (v) commit(v); };
   btn.onclick = submit;
   inp.onkeydown = function (e) { if (e.key === 'Enter') { e.preventDefault(); submit(); } };
   free.appendChild(inp); free.appendChild(btn);
