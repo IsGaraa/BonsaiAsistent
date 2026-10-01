@@ -1,5 +1,5 @@
 <!-- GPT UI (PAGE_GPT) - the page served at /chat, copied verbatim from a
-     running bonsai_web.py at commit a8f8c1b.
+     running bonsai_web.py at commit 2649494.
 
      bonsai_web.py is the source of truth. This file is a read-only copy so
      the UI can be opened in an editor without wading through the Python;
@@ -82,7 +82,7 @@
   /* the user's bubble already had a class; the assistant's was an unclassed
      div, so a reply had nothing separating it from the next message */
   .msgrow.bonsai { flex-direction: row; align-items: flex-start; gap: 9px; }
-  .bbub { flex: 1; min-width: 0; background: var(--bg2);
+  .bbub { flex: 1; min-width: 0; max-width: 100%; background: var(--bg2);
           border: 1px solid var(--bd2); border-radius: 4px 16px 16px 16px;
           padding: 11px 15px; font-size: 14px;
           box-shadow: 0 1px 2px rgba(0,0,0,.05); }
@@ -241,9 +241,19 @@
      is no highlighter here, and writing one is a much larger change than
      this asks for. Inline code keeps a tint - one identifier in a sentence
      should not become a slab. */
+  /* Belt and braces. Every code block in the conversation gets a width cap
+     and an overflow from one rule, whatever class its renderer gave it.
+     Three pre rules had to be found and fixed individually once already;
+     a fourth renderer would be free to break it again, and this cannot. */
+  #messages pre { max-width: 100%; overflow-x: auto; }
+  #messages pre, #messages pre code { min-width: 0; max-width: 100%; }
   .abody pre { background: #0d1117; color: #e6edf3; border: 1px solid #30363d;
-               border-radius: 10px; padding: 12px 14px; overflow-x: auto;
-               font-size: 12.5px; line-height: 1.55; }
+               border-radius: 10px; padding: 12px 14px;
+               font-size: 12.5px; line-height: 1.55;
+               /* max-width and overflow-x on both pre rules, not one: the
+                  two renderers disagreed and the same code escaped the bubble
+                  on one of them */
+               max-width: 100%; overflow-x: auto; }
   .abody code { background: var(--bg3); border-radius: 5px; padding: 1px 5px; font-size: 12.5px; }
   .abody pre code { background: none; padding: 0; color: inherit; }
   .abody a { color: var(--acc); }
@@ -594,7 +604,7 @@
        container had no background, no border and no padding, and the reply
        sat bare on the page. Aliased to .bbub rather than restyled: two rules
        for one thing is how they drifted apart in the first place. */
-    .bubble { flex: 1; min-width: 0; background: var(--bg2);
+    .bubble { flex: 1; min-width: 0; max-width: 100%; background: var(--bg2);
               border: 1px solid var(--bd2); border-radius: 4px 16px 16px 16px;
               padding: 11px 15px; font-size: 14px;
               box-shadow: 0 1px 2px rgba(0,0,0,.05); }
@@ -608,6 +618,15 @@
     .ocpara > :first-child { margin-top: 0; }
     .ocpara > :last-child { margin-bottom: 0; }
     .ocpara pre, .ocpara code { font-family: Consolas, "Courier New", monospace; }
+    /* THIS is the rule that styles code in a streamed reply, and it had a
+       font-family and nothing else. A pre defaults to white-space:pre and
+       overflow:visible, so a long line paints straight out of its block
+       parent and past the bubble. The other two pre rules - .abody pre
+       for a finished reply and .ocbody pre for a thought - already
+       constrained their lines, which is why the two renderers behaved
+       differently and only the streamed one escaped. */
+    .ocpara pre { max-width: 100%; overflow-x: auto;
+                  white-space: pre-wrap; word-break: break-word; }
     .ocstep { border-left: 2px solid var(--bd); margin: 0 0 1px; }
     .ocstep.err { border-left-color: var(--err); }
     .ocstep.thought { border-left-color: var(--violet); }
@@ -648,8 +667,16 @@
     .ocstep .occaret { font-size: 9px; color: var(--mut); transition: transform .12s; }
     .ocstep[open] .occaret { transform: rotate(90deg); }
     .ocbody { margin: 2px 0 6px 12px; padding: 7px 9px; background: var(--bg2);
+              /* min-width 0 is what lets the contents shrink instead of
+                 pushing the bubble wider; a block with no constraint of
+                 its own lets anything inside be as wide as it likes. */
+              min-width: 0; max-width: 100%;
               border: 1px solid var(--bd); border-radius: 8px; }
     .ocbody pre { margin: 0 0 6px; white-space: pre-wrap; word-break: break-word;
+                  /* overflow set on both pre rules, not one: the two
+                     renderers disagreed, and the same code escaped the
+                     bubble on one of them */
+                  max-width: 100%; overflow-x: auto;
                   color: var(--txt2); font-size: 12px; max-height: 320px; overflow: auto; }
     .ocbody pre:last-child { margin-bottom: 0; }
     .ocbody .oclab { color: var(--mut); font-size: 10.5px; letter-spacing: 1px; margin-bottom: 3px; }

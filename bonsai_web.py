@@ -11957,6 +11957,12 @@ PAGE = """<!doctype html>
      is no highlighter here, and writing one is a much larger change than
      this asks for. Inline code keeps a tint - one identifier in a sentence
      should not become a slab. */
+  /* Belt and braces. Every code block in the conversation gets a width cap
+     and an overflow from one rule, whatever class its renderer gave it.
+     Three pre rules had to be found and fixed individually once already;
+     a fourth renderer would be free to break it again, and this cannot. */
+  #messages pre { max-width: 100%; overflow-x: auto; }
+  #messages pre, #messages pre code { min-width: 0; max-width: 100%; }
   .abody pre { background: #0d1117; color: #e6edf3; border: 1px solid #30363d;
                border-radius: 10px; padding: 12px 14px;
                font-size: 12.5px; line-height: 1.55;
@@ -15459,6 +15465,15 @@ _OC_CSS = (
     '  .ocpara > :first-child { margin-top: 0; }\n'
     '  .ocpara > :last-child { margin-bottom: 0; }\n'
     '  .ocpara pre, .ocpara code { font-family: Consolas, "Courier New", monospace; }\n'
+    '  /* THIS is the rule that styles code in a streamed reply, and it had a\n'
+    '     font-family and nothing else. A pre defaults to white-space:pre and\n'
+    '     overflow:visible, so a long line paints straight out of its block\n'
+    '     parent and past the bubble. The other two pre rules - .abody pre\n'
+    '     for a finished reply and .ocbody pre for a thought - already\n'
+    '     constrained their lines, which is why the two renderers behaved\n'
+    '     differently and only the streamed one escaped. */\n'
+    '  .ocpara pre { max-width: 100%; overflow-x: auto;\n'
+    '                white-space: pre-wrap; word-break: break-word; }\n'
     '  .ocstep { border-left: 2px solid var(--bd); margin: 0 0 1px; }\n'
     '  .ocstep.err { border-left-color: var(--err); }\n'
     '  .ocstep.thought { border-left-color: var(--violet); }\n'
