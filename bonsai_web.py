@@ -3915,7 +3915,15 @@ def _port_listening(port=8080, host="127.0.0.1", timeout=1.5):
 IMAGE_MODEL_DIR = os.environ.get(
     "PC_IMAGE_MODEL_DIR", os.path.join(BONSAI_DIR, "image_models"))
 SD_DIR = os.environ.get("PC_SD_DIR", os.path.join(BONSAI_DIR, "sd.cpp"))
-_SD_LOCK = threading.Lock()
+# Reentrant on purpose. The out-of-memory retry at the end of _generate_image
+# calls _generate_image again, on the same thread, while the `with _SD_LOCK`
+# that wraps the whole function is still held. A plain Lock blocks forever
+# there, so the one path meant to rescue a VRAM failure instead parked the
+# calling thread permanently and left the lock held - which blocked every
+# later generate_image too, from the chat tool and the Image button alike, and
+# never released. The page simply stopped. RLock keeps the serialisation that
+# the lock is for (one generation at a time) while letting that retry through.
+_SD_LOCK = threading.RLock()
 # Live previews, by job id. Kept in memory and written by the engine as it
 # samples; served by /imgpreview/<id> with no-store, because this file changes
 # every second and any cache at all would show a stale picture.
@@ -3926,22 +3934,31 @@ _IMG_JOBS_LOCK = threading.Lock()
 # grid at any sane size - 720 and 1080 are both 22.5 and 33.75 steps - so these
 # are the nearest legal shapes, not exact ratios. The exact ratio arrives later,
 # in the upscale, where nothing has to be a multiple of anything.
-# 16:9 is 1536x864 rather than 1920x1088 and it is a VRAM decision, not an
-# aesthetic one. At 1280x704 this card already peaked at 9 GB, and 1920x1088 is
-# 2.3x those pixels on a GPU with 12 GB total and the language model wanting
-# 11.4 of them. 1536x864 is 1.85x what has been measured rather than 2.3x, and
-# every shape here lands within 1.35 Mpx so no single aspect gets a surprise.
+# 1080p on the short edge, upscaled to 1440p afterwards. These are the nearest
+# legal shapes rather than exact ratios: the engine wants multiples of 32, and
+# 1080 is not one, so 16:9 is 1920x1088 and 4:3 is 1440x1088. The exact ratio
+# arrives in the upscale, where nothing has to be a multiple of anything.
+#
+# This was 1536x864 (1.33 Mpx) and is now 2.09 Mpx, about 1.57x the pixels.
+# That is a deliberate move back towards a size this code previously backed
+# away from for VRAM reasons: at 1280x704 the card peaked at 9 GB, and
+# 1920x1088 was 2.3x that. 1.57x is inside what has been measured, but it is
+# no longer the comfortable margin it was, and a game holding VRAM will make
+# the difference. If a generation reports out of memory, the automatic retry
+# now drops a step lower and comes back with a smaller frame rather than
+# wedging the feature.
+#
 # The delivered file is a full 2560x1440 either way - the resample is the same
 # operation at a different source size.
 _IMG_ASPECTS = {
-    "16:9": (1536, 864),
-    "widescreen": (1536, 864),
-    "9:16": (864, 1536),
-    "portrait": (864, 1536),
-    "1:1": (1024, 1024),
-    "square": (1024, 1024),
-    "4:3": (1344, 992),
-    "3:4": (992, 1344),
+    "16:9": (1920, 1088),
+    "widescreen": (1920, 1088),
+    "9:16": (1088, 1920),
+    "portrait": (1088, 1920),
+    "1:1": (1088, 1088),
+    "square": (1088, 1088),
+    "4:3": (1440, 1088),
+    "3:4": (1088, 1440),
 }
 # The delivered size: 1440p on the short edge, so 16:9 is 2560x1440. The
 # per-aspect frames live in _IMG_ASPECTS above and are derived from the
@@ -4238,7 +4255,13 @@ def _generate_image(args, hooks=None, direct=False):
             # checkpoint. v0.3 has no published 4-step schedule.
             steps = max(VIGGLE_SIGMA_FLOOR, min(IMAGE_MAX_STEPS, want))
         except (TypeError, ValueError):
-            steps = 24
+            # This was a bare 24 - the old default, and double the ceiling -
+            # so a non-numeric "steps" was the one path that could still
+            # sample a 6-step distilled checkpoint 24 times over. Clamped like
+            # every other route, and the seed fallback below is the right
+            # shape to copy.
+            steps = max(VIGGLE_SIGMA_FLOOR, min(IMAGE_MAX_STEPS,
+                                                IMAGE_DEFAULT_STEPS))
         try:
             seed = int(args.get("seed", -1))
         except (TypeError, ValueError):
@@ -4455,7 +4478,12 @@ def _generate_image(args, hooks=None, direct=False):
                 retry["_retried"] = 1
                 retry["width"] = max(256, int(width * 0.7) // 32 * 32)
                 retry["height"] = max(256, int(height * 0.7) // 32 * 32)
-                retry["steps"] = max(4, int(steps * 0.7))
+                # VIGGLE_SIGMA_FLOOR, not a literal 4: four steps was the
+                # superseded v0.1 checkpoint and this one publishes no
+                # 4-step schedule, so a literal here would quietly ask for a
+                # run the model was never trained for.
+                retry["steps"] = max(VIGGLE_SIGMA_FLOOR,
+                                    int(steps * 0.7))
                 if on_prog:
                     on_prog({"id": job_id, "phase": "retry",
                              "percent": 0, "prompt": prompt,
@@ -11437,6 +11465,12 @@ def run_agent(messages, on_tool=None, mode=MODE_BUILD, on_stats=None, hooks=None
                 if message is not None:
                     break
             if message is None:
+                # Only a size refusal ends the turn quietly. Anything else -
+                # a bad key, a rate limit, a server fault, a dropped socket -
+                # is re-raised so handle_chat can name it. Swallowing those
+                # is what turned a rejected credential into an empty bubble.
+                if not _is_oversize_error(exc):
+                    raise exc
                 if on_tool:
                     on_tool({"name": "oversize_result",
                              "label": "Result too large",
@@ -11629,11 +11663,19 @@ def _vision_error_text(exc):
             % (name, refused))
 
 
+# Providers say "the request was refused" in a lot of ways, and not all of
+# them mean it was too big. "upstream request failed" is in here because some
+# endpoints emit it for an oversized body, but it is also the prefix of an
+# authentication failure - "Upstream request failed: Invalid credential" - so
+# a bad key used to be trimmed and retried as though it were a long tool
+# result. Anything that fails on a status code is now settled by the code
+# first; these markers only classify what arrives without one.
 _INVALID_REQUEST_MARKERS = (
     "invalid_request", "invalid request", "invalid_request_error",
-    "upstream request failed", "context length", "context_length_exceeded",
+    "context length", "context_length_exceeded",
     "too many tokens", "request too large", "payload too large",
     "reduce the length", "string too long", "too many images",
+    "maximum context length", "input is too long",
 )
 
 # One tool result is allowed to be this big before a provider is likely to
@@ -11644,6 +11686,34 @@ _OVERSIZE_TOOL_CHARS = 60000
 # Each attempt cuts the budget to a third of the last, so three is enough to
 # go 60000 -> 20000 -> 6666 without ever giving up on the first refusal.
 _OVERSIZE_RETRIES = 3
+
+
+def _is_oversize_error(exc):
+    """True when the provider refused the request for being too big.
+
+    The give-up path is only allowed for this. Every other refusal - a 401, a
+    429, a 500, a dead socket - has to keep propagating, or the turn ends
+    quietly and the user is shown an empty bubble instead of the reason. That
+    is what happened: a rejected API key reported an HTTP 401, the retry loop
+    gave up, and the page drew a blank assistant bubble and a green tick as
+    though the model had simply said nothing.
+    """
+    # An authentication failure is never a size problem, whatever its text
+    # says. The 401 from this provider reads "Upstream request failed:
+    # Invalid credential", and "upstream request failed" is in the marker
+    # list, so a rejected key was being classified as an oversized request -
+    # trimmed, retried, then abandoned quietly, which is what drew a blank
+    # assistant bubble instead of an error. The status code settles it.
+    try:
+        if int(getattr(exc, "code", 0) or 0) in (401, 403):
+            return False
+    except (TypeError, ValueError):
+        pass
+    try:
+        blob = ("%s %s" % (_model_error_text(exc), exc)).lower()
+    except Exception:
+        return False
+    return any(m in blob for m in _INVALID_REQUEST_MARKERS)
 
 
 def _oversize_turn(msgs, exc, budget=None):
@@ -11668,6 +11738,13 @@ def _oversize_turn(msgs, exc, budget=None):
 
     `budget` shrinks on each retry so a second refusal gets a stricter cut
     rather than the same one refused again."""
+    # Same reasoning as _is_oversize_error: 401 and 403 are credential
+    # failures, not oversized requests, and trimming cannot fix either.
+    try:
+        if int(getattr(exc, "code", 0) or 0) in (401, 403):
+            return None
+    except (TypeError, ValueError):
+        pass
     try:
         blob = ("%s %s" % (_model_error_text(exc), exc)).lower()
     except Exception:
@@ -11837,6 +11914,12 @@ def stream_agent(messages, on_reason=None, on_delta=None, on_tool=None,
                 except Exception as retry_exc:
                     exc = retry_exc
             if not recovered:
+                # As above: a size refusal ends quietly, anything else is
+                # re-raised so the page shows the reason instead of a blank
+                # bubble. This path is the one the browser uses, and it was
+                # the one reporting success for a 401.
+                if not _is_oversize_error(exc):
+                    raise exc
                 return None
         return tool_calls or []
 
@@ -11900,6 +11983,36 @@ def _ctx_overflow_text(exc):
             % (name, "{:,}".format(size) if size else "unknown"))
 
 
+def _auth_error_text(exc):
+    """Say what a rejected key actually is.
+
+    A 401 used to reach the user as an empty assistant bubble, because the
+    streaming retry gave up quietly and the page treated silence as a reply.
+    It is worth naming: the fix is a working credential, and nothing else in
+    the app will help."""
+    try:
+        code = int(getattr(exc, "code", 0) or 0)
+    except (TypeError, ValueError):
+        code = 0
+    if code not in (401, 403):
+        return None
+    try:
+        blob = ("%s %s" % (_model_error_text(exc), exc)).lower()
+    except Exception:
+        blob = ""
+    entry = _active_model() or {}
+    name = entry.get("name") or entry.get("id") or "the active model"
+    if "invalid credential" in blob or "unauthorized" in blob or code == 401:
+        return ("The model rejected the API key for **%s** (%s).\n\n"
+                "Nothing was wrong with your message or the app - the provider "
+                "answered `Invalid credential`, so the key has expired, been "
+                "revoked, or is a placeholder rather than a real one. Replace it "
+                "in API KEYS.txt and try again."
+                % (name, entry.get("base") or "no base url recorded"))
+    return ("The model refused the request for **%s** - the credential was not "
+            "accepted (HTTP %d)." % (name, code))
+
+
 def handle_chat(messages, on_reason=None, on_delta=None, on_tool=None,
                 stream=False, mode=MODE_BUILD, on_stats=None, hooks=None):
     msgs = build_messages(messages, mode=mode)
@@ -11911,7 +12024,8 @@ def handle_chat(messages, on_reason=None, on_delta=None, on_tool=None,
         return run_agent(msgs, on_tool=on_tool, mode=mode, on_stats=on_stats,
                          hooks=hooks)
     except Exception as exc:
-        friendly = _ctx_overflow_text(exc) or _vision_error_text(exc)
+        friendly = (_auth_error_text(exc) or _ctx_overflow_text(exc)
+                    or _vision_error_text(exc))
         if friendly:
             raise RuntimeError(friendly) from exc
         raise
@@ -17487,6 +17601,11 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Type",
                              "image/jpeg" if data[:2] == b"\xff\xd8" else "image/png")
             self.send_header("Content-Length", str(len(data)))
+            # This URL is the same for every step of a run - the page adds its
+            # own cache-buster - so anything that keys on the URL alone would
+            # hand back the first frame for the whole generation.
+            self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+            self.send_header("Pragma", "no-cache")
             # The whole point is that this changes constantly.
             self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
             self.send_header("Pragma", "no-cache")
