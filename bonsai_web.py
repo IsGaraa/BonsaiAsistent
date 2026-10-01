@@ -4068,6 +4068,35 @@ IMAGE_DEFAULT_STEPS = 6
 IMAGE_MAX_STEPS = 12
 
 
+# The 6-step schedule from the Viggle model card, verbatim. Not a linear ramp:
+# the nodes bunch up at the low-noise end, which is where a distilled few-step
+# model spends its remaining detail.
+VIGGLE_SIGMA_TAIL = (0.875, 0.75, 0.5, 0.25)
+
+# The card's rule for any other step count: "add or remove steps at the
+# high-noise end only, and keep 0.875, 0.75, 0.5, 0.25". The head fills the
+# slots between 1.0 and the first tail node, which reproduces the published
+# 5-, 6- and 7-step schedules exactly.
+VIGGLE_SIGMA_FLOOR = 5          # 4 steps was the old v0.1 model, not this one
+VIGGLE_CFG = 1.0                # distilled with no classifier-free guidance
+
+
+def _viggle_sigmas(steps):
+    """Sigma schedule for the installed turbo checkpoint.
+
+    Returns a comma-separated string for --sigmas. The engine's own default
+    schedule is evenly spaced, and feeding a distilled model that instead of
+    its trained one is what leaves it looking flat and over-contrasted."""
+    steps = max(VIGGLE_SIGMA_FLOOR, int(steps))
+    head = steps - len(VIGGLE_SIGMA_TAIL)
+    top = 1.0
+    first_tail = VIGGLE_SIGMA_TAIL[0]
+    vals = [top - k * ((top - first_tail) / head)
+            for k in range(head)]
+    vals = [round(v, 6) for v in vals] + list(VIGGLE_SIGMA_TAIL)
+    return ",".join(("%g" % v) for v in vals)
+
+
 def _image_named_steps(path):
     """Steps stated in the filename, if the filename states them.
 
@@ -4190,7 +4219,9 @@ def _generate_image(args, hooks=None, direct=False):
             if want <= 0:
                 want = (_image_named_steps(found.get("diffusion"))
                         or IMAGE_DEFAULT_STEPS)
-            steps = max(4, min(IMAGE_MAX_STEPS, want))
+            # 5 is the floor, not 4: four steps was the superseded v0.1
+            # checkpoint. v0.3 has no published 4-step schedule.
+            steps = max(VIGGLE_SIGMA_FLOOR, min(IMAGE_MAX_STEPS, want))
         except (TypeError, ValueError):
             steps = 24
         try:
@@ -4232,7 +4263,18 @@ def _generate_image(args, hooks=None, direct=False):
                "-p", prompt,
                "-H", str(height), "-W", str(width),
                "--steps", str(steps),
-               "--cfg-scale", "6.0",
+               # The card: 6 steps "with no classifier-free guidance",
+               # true_cfg_scale=1.0. This was 6.0, left over from the 40-step
+               # base model, and guiding a no-CFG distilled model six times over
+               # pushes the sample off the conditional mean - clipped white
+               # skies, crushed black trees, over-saturated water. That is the
+               # overcooked look, and it varies by seed because it depends on
+               # where a particular sample lands.
+               "--cfg-scale", str(VIGGLE_CFG),
+               # Also from the card: pass the schedule rather than trusting the
+               # engine's default sigmas. Plain --steps without --sigmas "does
+               # not help" on this model.
+               "--sigmas", _viggle_sigmas(steps),
                "--sampling-method", "euler",
                "--offload-to-cpu", "--diffusion-fa",
                # The prefix cache holds the text's keys and values for the whole
@@ -4256,8 +4298,13 @@ def _generate_image(args, hooks=None, direct=False):
                "--preview", "tae", "--preview-interval", "1",
                "--preview-path", preview_path,
                "-o", out_path]
+        # A negative prompt is deliberately not passed. The card is explicit
+        # about "no CFG, no negative prompt", and at cfg 1.0 there is no
+        # negative branch to steer anyway, so sending one could only spend
+        # time encoding it for nothing.
         if args.get("negative_prompt"):
-            cmd += ["-n", str(args["negative_prompt"])]
+            _img_job(job_id, negative_prompt_ignored=
+                     str(args["negative_prompt"])[:200])
         if seed >= 0:
             cmd += ["-s", str(seed)]
 
@@ -5750,8 +5797,12 @@ IMAGE_GEN_TOOL = _pc_tool(
                    "description": "What to draw. Be specific: subject, "
                                   "setting, lighting, style, mood."},
         "negative_prompt": {"type": "string",
-                            "description": "What to avoid, e.g. 'blurry, "
-                                           "text, watermark, extra fingers'."},
+                            "description": "Ignored. This model is distilled "
+                                           "to run with no classifier-free "
+                                           "guidance and no negative prompt, "
+                                           "so there is nothing for one to "
+                                           "steer. Say what you do not want "
+                                           "in the prompt instead."},
         "aspect": {"type": "string",
                    "description": "Shape of the picture: '16:9' (default), "
                                   "'9:16' for a phone-shaped one, '1:1', '4:3' "
