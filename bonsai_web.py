@@ -4333,6 +4333,22 @@ def _generate_image(args, hooks=None, direct=False):
                # wrote a preview every step, while 12//4 is 3 and a 12-step
                # run wrote four. An interval of 1 is that rule stated
                # outright, and it holds for every step count.
+               # Tiled decode, and it is what makes the per-step preview exist
+               # at all at this size. The preview decode runs while the
+               # diffusion transformer is still resident, so it has less memory
+               # to work with than the final decode does - which is why the
+               # final image comes out fine while every preview fails. Measured
+               # with --preview tae at this base: without tiling the engine logs
+               # "preview decode failed at step 1" through 6 and writes no file
+               # at all, so the card sits on its placeholder for the whole run.
+               # Tiling cuts the peak and every step previews.
+               #
+               # The cost is real: about 240s for a 6-step image at 1920x1088,
+               # roughly 28s per preview, against about 95s with no preview at
+               # all. At the old 1536x864 base tiling is about 155s with a
+               # preview every ~15s. A preview on every step was the ask, and
+               # that is what this buys.
+               "--vae-tiling",
                "--preview", "tae", "--preview-interval", "1",
                "--preview-path", preview_path,
                "-o", out_path]
@@ -14422,6 +14438,12 @@ function onImgProg(j) {
   h.setPct(Math.max(3, j.percent || 0));
   h.setNote('step ' + (j.step || 0) + ' / ' + (j.steps || '?'));
   h.setDim((j.seconds || 0) + 's');
+  if (h.empty) {
+    const bits = [];
+    if (j.step) bits.push('step ' + j.step + ' / ' + (j.steps || '?'));
+    if (j.seconds) bits.push(j.seconds + 's');
+    h.empty.textContent = bits.length ? bits.join(' \u00b7 ') : 'painting\u2026';
+  }
   if (j.preview_url) h.setPreview(j.preview_url + '?t=' + Date.now());
 }
 function addImageCard(prompt, width, height) {
@@ -14447,6 +14469,12 @@ function addImageCard(prompt, width, height) {
   stage.className = 'imgstage ' + imgStageClass(width, height);
   const shim = document.createElement('div'); shim.className = 'imgshimmer';
   const empty = document.createElement('div'); empty.className = 'imgempty';
+  /* Correct while loading, and a lie the moment sampling starts. The card
+     used to keep saying this through step 6 of 6 while the bar was full and
+     no picture had ever appeared, because the placeholder is only hidden when
+     an image actually loads - and at 1080p the preview decode was failing, so
+     it never did. onImgProg rewrites this as soon as there is a step to
+     report, so what is on screen always matches what is happening. */
   empty.textContent = 'waking the model\u2026';
   const im = document.createElement('img'); im.alt = 'image being generated';
   stage.appendChild(shim); stage.appendChild(empty); stage.appendChild(im);
@@ -14559,6 +14587,12 @@ async function runImage(prompt) {
             handles.setPct(Math.max(3, j.percent || 0));
             handles.setNote('step ' + (j.step || 0) + ' / ' + (j.steps || '?'));
             handles.setDim((j.seconds || 0) + 's');
+            if (handles.empty) {
+              var b2 = [];
+              if (j.step) b2.push('step ' + j.step + ' / ' + (j.steps || '?'));
+              if (j.seconds) b2.push(j.seconds + 's');
+              handles.empty.textContent = b2.length ? b2.join(' \u00b7 ') : 'painting\u2026';
+            }
             if (j.preview_url) handles.setPreview(j.preview_url + '?t=' + Date.now());
           }
         } else if (ev === 'done') {

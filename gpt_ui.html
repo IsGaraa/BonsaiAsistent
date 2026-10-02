@@ -1,5 +1,5 @@
 <!-- GPT UI (PAGE_GPT) - the page served at /chat, copied verbatim from a
-     running bonsai_web.py at commit cd63676.
+     running bonsai_web.py at commit 59cda1e.
 
      bonsai_web.py is the source of truth. This file is a read-only copy so
      the UI can be opened in an editor without wading through the Python;
@@ -2561,6 +2561,12 @@ function onImgProg(j) {
   h.setPct(Math.max(3, j.percent || 0));
   h.setNote('step ' + (j.step || 0) + ' / ' + (j.steps || '?'));
   h.setDim((j.seconds || 0) + 's');
+  if (h.empty) {
+    const bits = [];
+    if (j.step) bits.push('step ' + j.step + ' / ' + (j.steps || '?'));
+    if (j.seconds) bits.push(j.seconds + 's');
+    h.empty.textContent = bits.length ? bits.join(' · ') : 'painting…';
+  }
   if (j.preview_url) h.setPreview(j.preview_url + '?t=' + Date.now());
 }
 function addImageCard(prompt, width, height) {
@@ -2586,6 +2592,12 @@ function addImageCard(prompt, width, height) {
   stage.className = 'imgstage ' + imgStageClass(width, height);
   const shim = document.createElement('div'); shim.className = 'imgshimmer';
   const empty = document.createElement('div'); empty.className = 'imgempty';
+  /* Correct while loading, and a lie the moment sampling starts. The card
+     used to keep saying this through step 6 of 6 while the bar was full and
+     no picture had ever appeared, because the placeholder is only hidden when
+     an image actually loads - and at 1080p the preview decode was failing, so
+     it never did. onImgProg rewrites this as soon as there is a step to
+     report, so what is on screen always matches what is happening. */
   empty.textContent = 'waking the model…';
   const im = document.createElement('img'); im.alt = 'image being generated';
   stage.appendChild(shim); stage.appendChild(empty); stage.appendChild(im);
@@ -2698,6 +2710,12 @@ async function runImage(prompt) {
             handles.setPct(Math.max(3, j.percent || 0));
             handles.setNote('step ' + (j.step || 0) + ' / ' + (j.steps || '?'));
             handles.setDim((j.seconds || 0) + 's');
+            if (handles.empty) {
+              var b2 = [];
+              if (j.step) b2.push('step ' + j.step + ' / ' + (j.steps || '?'));
+              if (j.seconds) b2.push(j.seconds + 's');
+              handles.empty.textContent = b2.length ? b2.join(' · ') : 'painting…';
+            }
             if (j.preview_url) handles.setPreview(j.preview_url + '?t=' + Date.now());
           }
         } else if (ev === 'done') {
