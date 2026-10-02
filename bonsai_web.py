@@ -11350,6 +11350,17 @@ def _execute_tool_call(name, args, tc, hooks, image_uri):
         record["change"] = change
     if image_uri:
         record["image_data"] = image_uri
+        # A picture the tool received - a screenshot, a window grab, a paste -
+        # arrives as a base64 data URL. It renders, and then it is gone: either
+        # the saved conversation carries megabytes of it or the save strips it
+        # out. Store the bytes once and hand back the same durable
+        # "/att/<sha>" reference the image generator already uses, so that a
+        # received picture is in the chat after a reload as well. The base64
+        # stays on the record for the live view and for what the model is
+        # shown; only the reference is what gets persisted.
+        stored = _store_attachment(image_uri)
+        if stored:
+            record["preview"] = stored
     return record
 
 
@@ -12768,7 +12779,17 @@ function buildPersist(keepRecentImages) {
   return chats.slice(-200).map(function (ch) {
     const copy = JSON.parse(JSON.stringify(ch));
     (copy.messages || []).forEach(function (m) {
-      if (m.calls) (m.calls).forEach(function (cl) { if (cl.preview) delete cl.preview; });
+      /* This deleted `preview` from every call on every save. It was there to
+         keep a multi-megabyte data URL out of chats.json - and it did that by
+         also deleting the one field that survives a reload, since the durable
+         "/att/<sha>.png" reference the server returns lives in the result.
+         So saving a conversation removed its pictures from it. Now only a
+         base64 blob is dropped; a 73-character reference costs nothing and is
+         the whole reason the picture can come back. */
+      if (m.calls) (m.calls).forEach(function (cl) {
+        if (cl.preview && String(cl.preview).indexOf('data:') === 0) delete cl.preview;
+        if (cl.image_data) delete cl.image_data;
+      });
       if (!ids || !ids[ch.id]) stripHeavyImages(m);
     });
     return copy;
@@ -13617,9 +13638,26 @@ function renderLivePills(container, calls) {
     container.appendChild(chip);
   });
 }
+/* Where a tool's picture actually is.
+   Live, a tool record carries `preview`. Once the chat is saved, that field
+   was being deleted and the only thing left was `result.preview` - the
+   durable "/att/<sha>.png" reference the server hands back. Every renderer
+   below used to look at the first two fields only, so a saved conversation
+   reloaded with the picture gone even though the bytes and the reference
+   were both still on disk. This is the single place that knows all four,
+   so a renderer cannot miss one again. */
+function callImageSrc(c) {
+  if (!c) return '';
+  if (c.preview) return c.preview;
+  if (c.image_data) return c.image_data;
+  const r = c.result || {};
+  if (r.preview) return r.preview;
+  if (r.image_data) return r.image_data;
+  return '';
+}
 function shotCardDom(call) {
   if (!call) return null;
-  const src = call.preview || call.image_data || '';
+  const src = callImageSrc(call);
   if (!src) return null;
   const r = call.result || {};
   const saved = r.saved || r.path || '';
@@ -13656,7 +13694,7 @@ function addToolLog(container, calls) {
   const shots = document.createElement('div'); shots.className = 'shots';
   let shotCount = 0;
   (calls).forEach(function (c) {
-    if (!(c.preview || c.image_data)) return;
+    if (!callImageSrc(c)) return;
     shots.appendChild(shotCardDom(c));
     shotCount++;
   });
@@ -14539,6 +14577,31 @@ async function runImage(prompt) {
   }
   if (failed) { if (handles) handles.fail(failed.slice(0, 120)); return; }
   finishImageCard(handles, result || {});
+  /* The card above is a live DOM node with no message behind it. Saving the
+     conversation therefore saved the prompt and nothing else, so a reload
+     came back with the words and no picture - the one image path that never
+     reached the chat at all. Record the result the way a tool call is
+     recorded, which puts the durable /att/ reference in the saved history and
+     lets the ordinary re-renderer draw it next time.
+
+     Deliberately not re-rendered: the card is already on screen, and drawing
+     the message now would show the same picture twice. `result` is safe to
+     keep as-is because the server strips image_data and image_data_full
+     before the event is sent. */
+  if (result && result.preview) {
+    cur.messages.push({
+      role: 'assistant', content: '',
+      calls: [{
+        name: 'generate_image',
+        arguments: { prompt: prompt },
+        result: result,
+        label: result.label || 'generated image',
+        ms: Math.round((result.seconds || 0) * 1000),
+        tool_call_id: 'img_' + Date.now()
+      }]
+    });
+    save();
+  }
 }
 function submitImage() {
   const ta = document.getElementById('user-input');
@@ -16755,7 +16818,7 @@ _OC_JS = (
     '    var shots = el(\'div\', \'shots\');\n'
     '    var nshot = 0;\n'
     '    (calls || []).forEach(function (c) {\n'
-    '      if (!c || !(c.preview || c.image_data)) return;\n'
+    '      if (!c || !callImageSrc(c)) return;\n'
     '      var sc = shotOf(c);\n'
     '      if (sc) { shots.appendChild(sc); nshot++; }\n'
     '    });\n'
@@ -16804,7 +16867,7 @@ _OC_JS = (
     "    var shots = el('div', 'shots');\n"
     '    var n = 0;\n'
     '    calls.forEach(function (c) {\n'
-    '      if (!c || !(c.preview || c.image_data)) return;\n'
+    '      if (!c || !callImageSrc(c)) return;\n'
     '      var sc = shotOf(c);\n'
     '      if (sc) { shots.appendChild(sc); n++; }\n'
     '    });\n'
