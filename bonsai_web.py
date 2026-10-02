@@ -1366,7 +1366,35 @@ _SEARCH_CACHE = {}
 _SEARCH_CACHE_MAX = 64
 _SEARCH_TTL = 900
 _SEARCH_LAST = [0.0]
+# How long to stay off DuckDuckGo once it answers with a CAPTCHA. Kept out of
+# the way after one, because asking a source that has already refused is the
+# fastest way to make the refusal last: while the block is live the search
+# falls back to Bing and says so, and the source is retried only when the
+# cooldown is over.
+_SEARCH_BLOCKED_UNTIL = [0.0]
+_SEARCH_COOLDOWN = 900
 _SEARCH_LOCK = threading.Lock()
+
+
+def _ddg_is_blocked():
+    return time.time() < _SEARCH_BLOCKED_UNTIL[0]
+
+
+def _ddg_blocked_message():
+    left = int(_SEARCH_BLOCKED_UNTIL[0] - time.time())
+    return ("DuckDuckGo is refusing requests from this machine right now - it "
+            "answers automated queries with a CAPTCHA. It is left alone for "
+            "another %d minute(s) rather than asked again, since retrying "
+            "makes the block last longer. Bing was tried instead; its results "
+            "are filtered for relevance, so fewer results is expected."
+            % max(1, left // 60 + 1))
+
+
+def _ddg_detect_block(markup):
+    """A challenge page is a 14 KB captcha and no results. Recognise it."""
+    low = markup[:20000].lower()
+    return ("challenge" in low or "bots use duckduckgo" in low
+            or "confirm this search was made by a human" in low)
 
 
 def _search_cache_get(key):
@@ -1396,6 +1424,8 @@ def _search_ddg(query, limit):
     The lite layout is the second attempt because the html one is the one that
     gets rate limited.
     """
+    if _ddg_is_blocked():
+        return []
     for url in ("https://html.duckduckgo.com/html/",
                 "https://lite.duckduckgo.com/lite/"):
         try:
@@ -1409,6 +1439,10 @@ def _search_ddg(query, limit):
             markup = _search_post(url, {"q": query})
         except Exception:
             continue
+        if _ddg_detect_block(markup):
+            with _SEARCH_LOCK:
+                _SEARCH_BLOCKED_UNTIL[0] = time.time() + _SEARCH_COOLDOWN
+            return []
         results = _parse_duckduckgo(markup, limit)
         if results:
             for r in results:
@@ -1756,13 +1790,17 @@ def _web_search(query, max_results=6, suggest_only=False):
                 out["dropped_irrelevant"] = len(results) - len(kept)
             return out
     out = dict(base)
+    if _ddg_is_blocked():
+        out.update({"results": [], "source": "none",
+                    "duckduckgo_blocked": True,
+                    "hint": _ddg_blocked_message()})
+        return out
     out.update({"results": [], "source": "none",
-                "hint": ("nothing relevant found%s. DuckDuckGo did not answer "
-                         "for this query%s - it rate limits by IP, so a short "
-                         "wait usually fixes it."
-                         % (("; try %r instead" % correction) if correction else "",
-                            " at all" if not results_seen else " with anything "
-                            "relevant"))})
+                "hint": ("nothing relevant found%s. DuckDuckGo answered but "
+                         "nothing it returned was about this question, and "
+                         "Bing's results did not match either."
+                         % (("; try %r instead" % correction)
+                            if correction else ""))})
     return out
 
 
