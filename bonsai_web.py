@@ -1323,6 +1323,163 @@ def _grep_out(mode, target, hits, files_hit, counts, scanned, truncated, note=No
 
 _WEB_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) BonsaiAsistent/1.0"
 
+# Search engines answer a bot UA with a degraded page. Asking for
+# "Battlefield 6 Fort Lyndon" returned Facebook logins and WhatsApp Web,
+# because this request looked like a scraper and Bing served whatever it
+# felt like. A browser UA plus an explicit language gets real results; the
+# language header is why the same query had been answered with Wikipedia in
+# French, Portuguese and Hungarian.
+_SEARCH_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/131.0 Safari/537.36"),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+
+def _search_html(url, timeout=20):
+    """Fetch a search results page the way a browser would ask for it."""
+    req = urllib.request.Request(url, headers=dict(_SEARCH_HEADERS))
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        data = resp.read(600000)
+        enc = (resp.headers.get_content_charset() or "utf-8")
+    return data.decode(enc, errors="replace")
+
+
+def _search_post(url, params, timeout=20):
+    """Same, but POST the query - which is how DuckDuckGo actually wants it."""
+    body = urllib.parse.urlencode(params).encode()
+    req = urllib.request.Request(url, data=body, headers=dict(_SEARCH_HEADERS))
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        data = resp.read(600000)
+        enc = (resp.headers.get_content_charset() or "utf-8")
+    return data.decode(enc, errors="replace")
+
+
+# DuckDuckGo rate limits by IP, and a burst of searches - which is exactly
+# what the model does while it is iterating on a question - gets the whole
+# source to answer with a challenge page. So requests are spaced, and answers
+# are remembered for a while: the model often re-searches nearly the same
+# thing, and a repeat costs nothing and asks for nothing.
+_SEARCH_GAP = 2.5
+_SEARCH_CACHE = {}
+_SEARCH_CACHE_MAX = 64
+_SEARCH_TTL = 900
+_SEARCH_LAST = [0.0]
+_SEARCH_LOCK = threading.Lock()
+
+
+def _search_cache_get(key):
+    hit = _SEARCH_CACHE.get(key)
+    if hit and (time.time() - hit[0]) < _SEARCH_TTL:
+        return hit[1]
+    return None
+
+
+def _search_cache_put(key, value):
+    if len(_SEARCH_CACHE) > _SEARCH_CACHE_MAX:
+        _SEARCH_CACHE.clear()
+    _SEARCH_CACHE[key] = (time.time(), value)
+
+
+def _search_ddg(query, limit):
+    """DuckDuckGo, which is the primary source.
+
+    It has to be a POST. A GET to the same URL - html or lite, browser or bot
+    User-Agent - is answered with a "select all squares containing a duck"
+    CAPTCHA page, which is 14 KB of challenge and zero results. Posting the
+    query returns real ones: a search for the Battlefield question came back
+    with the Fort Lyndon interactive map, the Battlefield wiki page for it, and
+    three other map guides, where the previous path returned Facebook logins
+    and WhatsApp Web.
+
+    The lite layout is the second attempt because the html one is the one that
+    gets rate limited.
+    """
+    for url in ("https://html.duckduckgo.com/html/",
+                "https://lite.duckduckgo.com/lite/"):
+        try:
+            # Space the requests out. Asking twice inside the gap is what gets
+            # the next one answered with a CAPTCHA.
+            with _SEARCH_LOCK:
+                wait = _SEARCH_GAP - (time.time() - _SEARCH_LAST[0])
+                if wait > 0:
+                    time.sleep(wait)
+                _SEARCH_LAST[0] = time.time()
+            markup = _search_post(url, {"q": query})
+        except Exception:
+            continue
+        results = _parse_duckduckgo(markup, limit)
+        if results:
+            for r in results:
+                r["source"] = "duckduckgo"
+            return results
+    return []
+
+
+# Bing does not link out directly. Every result is
+# /ck/a?...&u=a1<base64url>, so the real target has to be decoded out of it.
+# Without this every result carried the url bing.com/ck/a..., the domain came
+# back as www.bing.com for all of them, and fetching a "result" fetched Bing.
+def _bing_real_url(href):
+    # The href comes straight out of the markup, where every & is &amp;. The
+    # u=a1 parameter therefore sits behind "&amp;u=a1", and a regex looking
+    # for a bare &[?] never matched - which is why every Bing result kept its
+    # /ck/a redirect, reported its domain as www.bing.com, and resolved to
+    # Bing itself when fetched. Unescape first, then decode.
+    raw_href = html.unescape(href or "")
+    m = re.search(r"[?&]u=a1([^&]+)", raw_href)
+    if not m:
+        return href
+    raw = urllib.parse.unquote(m.group(1))
+    padded = raw + "=" * (-len(raw) % 4)
+    try:
+        out = base64.b64decode(padded).decode("utf-8", "replace")
+    except Exception:
+        return href
+    return out if out.startswith("http") else href
+
+
+# Words that carry no signal about what a page is about.
+_SEARCH_STOP = {
+    "the", "and", "for", "with", "what", "when", "where", "which", "who",
+    "how", "why", "does", "did", "are", "was", "you", "your", "from", "that",
+    "this", "have", "has", "been", "about", "into", "over", "than", "then",
+    "them", "they", "there", "here", "some", "more", "most", "such", "only",
+    "also", "just", "like", "make", "made", "many", "much", "will", "would",
+}
+
+
+def _search_terms(query):
+    """The distinctive words of a query - the ones a real result must have."""
+    return [t for t in re.findall(r"[a-z0-9]+", str(query).lower())
+            if len(t) >= 4 and t not in _SEARCH_STOP]
+
+
+def _search_relevant(query, rec, got=None):
+    """True when a result plausibly answers the query.
+
+    This is what stops a search for a game returning Facebook. The engine
+    returned results; they were simply not about the question, and nothing
+    downstream could tell the difference, so the model read "search results"
+    as "the web says" and drew a conclusion from Facebook logins. A result has
+    to carry at least half of the query's distinctive words - enough that
+    "how tall is the eiffel tower" cannot be satisfied by a dictionary page
+    that only happens to contain the word "tall".
+    """
+    terms = _search_terms(query)
+    if not terms:
+        return True
+    hay = " ".join([str(rec.get("title") or ""), str(rec.get("snippet") or ""),
+                    str(rec.get("url") or "")]).lower()
+    hits = sum(1 for t in terms if t in hay)
+    need = max(1, (len(terms) + 1) // 2)
+    if hits < need:
+        return False
+    if got is not None:
+        got[0] += 1
+    return True
+
 
 def _fetch_html(url, max_bytes=400000, timeout=20):
     req = urllib.request.Request(url, headers={"User-Agent": _WEB_UA})
@@ -1354,8 +1511,47 @@ def _parse_bing(markup, limit):
             continue
         sm = re.search(r'(?is)<p[^>]*>(.*?)</p>', block)
         snip = html.unescape(re.sub(r"(?is)<[^>]+>", "", sm.group(1))).strip() if sm else ""
+        href = _bing_real_url(href)
         if href.startswith("http"):
             results.append({"title": title, "url": href, "snippet": snip})
+    return results
+
+
+def _parse_duckduckgo(markup, limit):
+    """DuckDuckGo results, from either the html or the lite layout."""
+    results, seen = [], set()
+
+    def add(href, title, snippet):
+        title = html.unescape(re.sub(r"(?is)<[^>]+>", "", title or "")).strip()
+        snippet = html.unescape(re.sub(r"(?is)<[^>]+>", "", snippet or "")).strip()
+        if not title or not href:
+            return
+        m = re.search(r"uddg=([^&]+)", href)
+        real = urllib.parse.unquote(m.group(1)) if m else href
+        if not real.startswith("http") or real in seen:
+            return
+        seen.add(real)
+        results.append({"title": title, "url": real, "snippet": snippet})
+
+    # the html layout
+    for m in re.finditer(
+            r'(?is)<a[^>]*class="result__a"[^>]*href="([^"]*)"[^>]*>(.*?)</a>'
+            r'(?:.*?class="result__snippet"[^>]*>(.*?)</a>)?', markup):
+        add(m.group(1), m.group(2), m.group(3))
+        if len(results) >= limit:
+            return results
+    # the lite layout: a table of links, snippet in the next row
+    rows = re.findall(r'(?is)<tr[^>]*>(.*?)</tr>', markup)
+    for i, row in enumerate(rows):
+        a = re.search(r'(?is)<a[^>]*href="([^"]+)"[^>]*>(.*?)</a>', row)
+        if not a:
+            continue
+        snip = ""
+        if i + 1 < len(rows):
+            snip = " ".join(re.findall(r"(?is)<td[^>]*>(.*?)</td>", rows[i + 1]))
+        add(a.group(1), a.group(2), snip)
+        if len(results) >= limit:
+            break
     return results
 
 
@@ -1517,45 +1713,56 @@ def _web_search(query, max_results=6, suggest_only=False):
         out = dict(base)
         out.update({"results": _trim_results(results), "source": "wikipedia"})
         return out
-    urls = [
-        "https://html.duckduckgo.com/html/?q=" + urllib.parse.quote(q),
-        "https://www.bing.com/search?q=" + urllib.parse.quote(q) + "&count=10&setlang=en",
-    ]
-    for target in urls:
-        try:
-            markup = _fetch_html(target)
-        except Exception:
-            continue
-        if "duckduckgo.com" in target:
-            results = []
-            anchors = re.findall(r'(?is)<a[^>]*class="result__a"[^>]*href="([^"]*)"[^>]*>(.*?)</a>', markup)
-            snippets = re.findall(r'(?is)<a[^>]*class="result__snippet"[^>]*>(.*?)</a>', markup)
-            for i, (href, atext) in enumerate(anchors[:max_results]):
-                title = html.unescape(re.sub(r"(?is)<[^>]+>", "", atext)).strip()
-                mm = re.search(r"uddg=([^&]+)", href)
-                real = urllib.parse.unquote(mm.group(1)) if mm else href
-                snip = ""
-                if i < len(snippets):
-                    snip = html.unescape(re.sub(r"(?is)<[^>]+>", "", snippets[i])).strip()
-                if real.startswith("http") and title:
-                    results.append({"title": title, "url": real, "snippet": snip,
-                                    "source": "duckduckgo"})
+    # DuckDuckGo first, Bing only if it could not answer. Every result is
+    # scored for relevance whatever the source, so a source that answers with
+    # something unrelated is filtered rather than handed on - that is what
+    # stops a search engine returning junk and the model reading it as fact.
+    # A repeat of a recent query, answered from memory. A model working
+    # through one question will ask the same thing several times, and each ask
+    # used to be a fresh request at a rate-limited source.
+    cache_key = (q.lower().strip(), int(max_results))
+    cached = _search_cache_get(cache_key)
+
+    for kind in ("duckduckgo", "bing"):
+        results_seen = 0
+        if cached is not None and kind == "duckduckgo":
+            results = list(cached)
+        elif kind == "duckduckgo":
+            results = _search_ddg(q, max_results)
+            # Only a real answer is worth remembering. Caching an empty result
+            # would pin the "rate limited" answer in place for the whole TTL,
+            # long after the limit had passed.
+            if results:
+                _search_cache_put(cache_key, list(results))
         else:
-            results = _parse_bing(markup, max_results)
-            for r in results:
-                r.setdefault("source", "bing")
-        if results:
+            try:
+                markup = _search_html(
+                    "https://www.bing.com/search?q=" + urllib.parse.quote(q)
+                    + "&count=10&setlang=en")
+            except Exception:
+                results = []
+            results = _parse_bing(markup, max_results) if markup else []
+        results_seen = len(results)
+        for r in results:
+            r.setdefault("source", kind)
+            r["url"] = _bing_real_url(r.get("url"))
+            r["domain"] = urllib.parse.urlparse(r["url"]).netloc.lower()
+        kept = [r for r in results if _search_relevant(q, r)]
+        if kept:
             out = dict(base)
-            out.update({"results": _trim_results(results, limit=max_results),
-                        "source": results[0].get("source", "web")})
-            if not out["results"] and correction:
-                out["hint"] = ("no results for the query as typed; a likely "
-                                "correction is %r - retry with it" % correction)
+            out.update({"results": _trim_results(kept, limit=max_results),
+                        "source": kept[0].get("source", "web")})
+            if len(kept) < len(results):
+                out["dropped_irrelevant"] = len(results) - len(kept)
             return out
     out = dict(base)
     out.update({"results": [], "source": "none",
-                "hint": ("no results found%s" %
-                         (("; try %r instead" % correction) if correction else ""))})
+                "hint": ("nothing relevant found%s. DuckDuckGo did not answer "
+                         "for this query%s - it rate limits by IP, so a short "
+                         "wait usually fixes it."
+                         % (("; try %r instead" % correction) if correction else "",
+                            " at all" if not results_seen else " with anything "
+                            "relevant"))})
     return out
 
 
