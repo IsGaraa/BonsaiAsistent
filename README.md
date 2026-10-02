@@ -1,618 +1,507 @@
 # Bonsai PC Assistant
 
-Self-contained, 100% offline **local AI assistant** built around the **Bonsai 2
-27B** ternary model. Multi-turn text chat (with optional microphone input), live
-"thinking" display, real
-tool calls (open apps, open websites, work on your files), vision, optional web
-lookup, a shell runner and a code sandbox - all in one Python file, no cloud, no
-API keys, nothing leaves your machine.
+A local-first AI assistant that runs on your own machine, can see your screen, and
+actually does things — files, screenshots, windows, clipboard, browser automation,
+Docker, Blender, and image generation — all through tool calls rather than
+describing how it would do them.
 
-![Windows](https://img.shields.io/badge/Platform-Windows-0078D6?logo=windows&logoColor=white)
-![Linux](https://img.shields.io/badge/Platform-Linux-FCC624?logo=linux&logoColor=black)
-![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)
-![Offline](https://img.shields.io/badge/offline-100%25-00f0ff)
-![Model](https://img.shields.io/badge/Bonsai%202-27B%20ternary-39ff14)
-![License](https://img.shields.io/badge/License-Apache--2.0-blue)
-
-> **🔒 PRIVACY**
->
-> The model, inference and UI all run on your PC. The browser only ever talks to
-> `127.0.0.1` - Bonsai is a local assistant, not a web service. Don't expose the
-> server to the internet.
+One Python file serves the UI, the HTTP API and the agent loop. No build step, no
+bundler, no framework install.
 
 ---
 
 ## Table of contents
 
-1. Quick start
-2. Requirements
-3. Capabilities
-4. Tool execution (how it works)
-5. The console - controls & HUD
-6. Live token stats & memory relief
-7. Chat history
-8. Configuration
-9. The AI model
-10. Security & privacy
-11. Troubleshooting
-12. Repository layout
-13. License
+1. [What it does](#1-what-it-does)
+2. [Quick start](#2-quick-start)
+3. [Setup, step by step](#3-setup-step-by-step)
+4. [Configuration files](#4-configuration-files)
+5. [Choosing a model](#5-choosing-a-model)
+6. [The optional extras](#6-the-optional-extras)
+7. [How a tool call happens](#7-how-a-tool-call-happens)
+8. [Path scope and approvals](#8-path-scope-and-approvals)
+9. [Image generation](#9-image-generation)
+10. [Web search](#10-web-search)
+11. [Where things are stored](#11-where-things-are-stored)
+12. [Troubleshooting](#12-troubleshooting)
+13. [Repository layout](#13-repository-layout)
+14. [Platform notes](#14-platform-notes)
+15. [License](#15-license)
 
 ---
 
-## 1. Quick start
+## 1. What it does
 
-Everything lives in this folder - the model files, the model server and the
-assistant app. **One click**:
+**Sees the screen.** Point it at a window or the whole desktop and it looks at the
+result before answering. Screenshots go into the conversation as real image
+messages, not as text descriptions.
 
-```
-run.bat
-```
+**Acts on the machine.** It has tools for reading and writing files, searching
+across the PC, running commands, driving the mouse and keyboard, managing
+windows, using the clipboard, fetching and scraping web pages, calling HTTP APIs,
+speaking aloud with local neural TTS, talking to Docker, editing Blender scenes,
+and generating images.
 
-Fresh Windows machine? Run **`AUTO-SETUP.cmd`** first - it installs every Python
-package (required + optional), verifies the model server and model files, and
-tells you what is missing. `OPTIONALS.cmd` installs the system-level extras
-(Docker Desktop + WSL2, Tesseract OCR, Blender MCP). See `requirements.md`
-for the full dependency list.
+**Two ways to reach it.** A browser UI at `http://127.0.0.1:8081`, and a plain
+HTTP API.
 
-On **Linux** it's just the same, with the `.sh` twins:
+**Keeps your history.** Conversations are saved and can be reopened. Images in a
+chat — ones you attach, ones it generates, ones it receives from a tool — stay in
+that conversation and come back after a reload.
 
-```
-./AUTO-SETUP.sh     # first time: Python + pip packages + system deps + Piper voices
-./run.sh
-./stop.sh
-```
+**Runs the model locally or not.** A local GGUF model through llama.cpp, or any
+OpenAI-compatible hosted endpoint. Both are usable at the same time; you pick per
+message.
 
-`AUTO-SETUP.sh` uses `sudo apt` (Debian/Ubuntu), falls back to `dnf` (Fedora)
-or `pacman` (Arch) where available, and skips anything already present. It
-installs the system packages the tools want (PortAudio for TTS playback,
-xclip for the clipboard, wmctrl for window tools, scrot/ImageMagick for
-screenshots) and downloads the Piper voices. Window tools are X11-only
-(Wayland compositors manage windows only partially).
+---
 
-It starts the assistant UI at **http://localhost:8081** and opens your browser.
-**The model is not loaded at startup** - it loads into RAM/VRAM the first time
-you send a message (so just opening the UI costs nothing), and the header shows
-`ONLINE / IDLE` → `LOADING MODEL...` → `ONLINE / LOADED`. EJECT stops it again,
-and the next message brings it back. On Windows the model server is
-`prism-llama`'s `llama-server.exe`; on Linux any `llama-server` binary found on
-`PATH` is used (set `PC_LLAMA_SERVER` to point at one explicitly). To stop the
-model server manually, double-click `stop.cmd` on Windows or run `./stop.sh` on
-Linux.
+## 2. Quick start
 
-The whole app is at **http://localhost:8081**. (The old `/chat` address redirects there, so older links still land in the right place.)
-Sidebars carry chats, downloads and the tool rail; the top bar carries mode,
-model, thinking effort and the model controls.
+The short version, if you already have Python and a model:
 
-
-Once the UI is open, try a few commands:
-
-```
-Create a Python script in the workspace that renames files with regex
-Open the README in the workspace and summarize it
-Screenshot the current window and describe what you see
-Check the latest news about Nvidia and pick three highlights
-List the .py files in this folder with their sizes
+```bash
+git clone https://github.com/IsGaraa/BonsaiAsistent
+cd BonsaiAsistent
+python bonsai_web.py
 ```
 
-While Bonsai is replying you can keep typing: **press Enter and the message is
-queued** - it appears in the conversation straight away with a pulsing
-**QUEUED · waiting for the current reply** badge, and is sent automatically as
-soon as the current reply ends (order is kept, and you can queue several). The
-button turns into **STOP · 2 queued**, so you always see the backlog; clicking
-it aborts the current reply, after which the queue starts. Starting a new chat
-clears it, and a queued message survives a page reload.
+Then open **http://127.0.0.1:8081**.
 
-## 2. Requirements
+That is genuinely all that is required. Python's standard library is enough — every
+optional package only unlocks extra tools, and any tool whose package is missing
+reports that clearly instead of failing silently.
 
-| Requirement | Why | Verdict |
-|---|---|---|
-| Windows or Linux | the app is a Python script; on Windows launching apps uses Windows URIs/commands, on Linux xdg-open/PATH binaries | required |
-| Python 3.10+ | runs `bonsai_web.py` | required |
-| GPU with ~7-8 GB VRAM | fast inference (tested on an RTX 4070, ~48 tok/s); CPU-only works, just slower | recommended |
-| `prism-llama` `llama-server` | the PrismML llama.cpp fork with ternary kernels - stock llama.cpp **can't** run Bonsai 2 files; Windows exe in `%LOCALAPPDATA%\Programs\prism-llama\`, Linux any `llama-server` on `PATH` (or `PC_LLAMA_SERVER`) | required |
-| `Pillow` / `pyautogui` / `pyperclip` | power `take_screenshot`, `control_input` and `clipboard` (Linux needs an X11 session + scrot/ImageMagick and xclip for the last two) | recommended (tools report a clear error if missing) |
-| `pywin32` / `psutil` | power the `window_list` / `window_action` tools (Linux uses `wmctrl` instead; pywin32 is Windows-only) | recommended (installed here; tools report a clear error if missing) |
-| `requests` / `websocket-client` | power the `api_call` / `ws_test` tools | recommended (installed here) |
-| `piper-tts` / `onnxruntime` / `sounddevice` | power the `tts_speak` / `tts_voices` tools (local neural TTS + direct playback; Linux falls back to `paplay`/`aplay`/`ffplay`) | recommended; voice models in the project's `piper\` (fetch with `python piper\download_voices.py` or `python3 piper/download_voices.py`) |
-| **Blender + MCP addon** | for the Blender tools (§4) | optional; `mcp-for-blender` Python package + the bundled addon enabled in Blender (Edit > Preferences > Add-ons > "MCP for Blender") |
-| Docker / Hyper3D / sketchfab accounts | optional extra Blender *content* tools | not bundled here - only the core Blender tools ship |
+To go further — pick and choose your extras — use the setup menu instead:
 
-## 3. Capabilities
-
-| Capability | Details |
+| | |
 |---|---|
-| **Multi-turn chat** | conversational assistant powered by a local 27B model (Bonsai 2, ternary 2-bit quantization) |
-| **Model selector** | swap the active AI model from the header dropdown - pick another local `.gguf` (Bonsai restarts the local model server with it) or an external OpenAI-compatible endpoint (LM Studio, Ollama, another port). Add models with the **+** button; see §8 |
-| **Live reasoning** | shows its chain of thought in real time, streaming as it is produced |
-| **Tool calls** | decides autonomously when to use a tool and surfaces every call (see §4) |
-| **Vision + screen capture** | understands attached images, can `take_screenshot` the live screen, and `screenshot_window` captures just the window it needs - it actually sees what's displayed (apps, error dialogs, terminal output) |
-| **PC control** | `control_input` moves the mouse, clicks, drags, scrolls and types like a human; `click_text` clicks a control by its visible label (no pixel guessing) |
-| **Waits instead of polling** | `wait_for` blocks until a file/download, port, URL, process, window or on-screen text is ready - so no more screenshot loops |
-| **Clipboard as a channel** | `copy_to_clipboard` / `paste_from_clipboard` with type hints, including pasting an image from another app straight into the conversation |
-| **Downloads that finish** | every download runs in the background with a live **DOWNLOADS** panel (bytes, %, speed, ETA, pause / resume / cancel / retry) - a 5 GB file no longer freezes the chat. One file can be split across up to 4 connections, throttled, or left running after the reply ends. `download_file` streams to disk with retries and resume; `download_batch` grabs many files (or every link on a page) at once; `download_authed` fetches what needs a token or cookie (secrets redacted); `download_page` saves a page to work offline; `download_verify` checks sha256/size and reports `FAILED CHECK`; `download_media` pulls video/audio/subs via yt-dlp; `web_resolve` finds the file behind a download *page* (index -> file host -> file, JS-built links, bot checks) and shows you the candidates before anything is written to disk |
-| **Shell + sandbox** | `run_command` executes real shell commands - PowerShell/cmd on Windows, `sh` on Linux (configurable timeout, up to 600s); `run_code` runs snippets in an isolated temp folder (auto-detects what's installed on the PC: Python + Node by default, plus Go/Lua/PHP/Ruby/Perl/Bash when present; timeouts up to 600s) |
-| **Asks you questions** | `ask_user` pauses and asks you a question (with optional clickable options) exactly like a human would - just like opencode |
-| **Todo list** | `todo_write` shows a live, visible checklist on the left panel as it works through longer tasks |
-| **Live HTML preview** | any `.html` page Bonsai writes (or `preview_file` explicitly) takes over the **center stage** - the arc reactor slides away and the page is shown full-panel, with a name and an **X** to bring the reactor back. Served from this PC, so JavaScript and local assets (CSS/JS/images next to the page) work. An image opens in the same stage, full size |
-| **Screenshots appear in the chat** | every `take_screenshot` / `screenshot_window` / `click_text` result is drawn as a labelled card (dimensions + saved path, click to open full size) **above** the collapsed tool log - no need to expand anything |
-| **Not locked to one folder** | with the default `ASK` scope Bonsai can read, write and **search the whole PC** (`C:\`, `/home/...`), and you approve each new folder - so "find my tax PDF" works outside the workspace too. The **PATH SCOPE** control in the sidebar switches between `WORKSPACE` / `ASK` / `SYSTEM` (§4.1) |
-| **Real system meters** | live CPU / RAM / GPU usage under the reactor, read from `psutil` + `nvidia-smi` instead of placeholder numbers |
-| **Window management** | `window_list` lists every open window (title, process, PID) and `window_action` brings one to the front, maximizes, minimizes or restores it - so Bonsai can switch apps before acting |
-| **API client** | `api_call` speaks REST/GraphQL (any HTTP method, JSON or raw bodies, custom headers) and `ws_test` connects to WebSocket endpoints, sends and collects replies |
-| **Scheduled tasks** | `schedule_task` (once / every N seconds / 5-field cron) runs shell commands in the background while the PC is on; they survive a restart and report back as toasts (§7) |
-| **Speaks out loud** | `tts_speak` reads text aloud with the local neural Piper engine (English + Romanian voices) and saves the WAV in the workspace; no cloud, no Windows voices, no media player - streams straight to the speakers with `sounddevice`. **Off by default** - flip the **TTS** header button to let Bonsai speak |
-| **Thinking effort** | **THINK: OFF / LOW / MED / HIGH** selector in the composer controls how deep Bonsai reasons (maps to `enable_thinking` / `reasoning_effort`) |
-| **Never waits idle** | Enter while a reply is streaming and your message is queued with a **QUEUED** badge, then sent automatically - no cancelling, no waiting for the UI (§1) |
-| **Live token stats** | real-time think vs. speak time, tokens/second and context usage under the input (see §6) |
-| **Always-in-memory** | the model stays loaded (resident) for the whole session - no idle timer ever unloads it, so a reply never stalls because of a pause (see §6) |
-| **Persistent history** | conversations saved in the browser and on disk; survive server restarts (see §7) |
-| **Plan / Build modes** | *Plan* is read-only (inspection only), *Build* grants full tool access |
-| **Blender control** | when Blender is open, Bonsai can create, move and edit 3D scenes inside it and screenshot the viewport - you keep the mouse (no exodus) |
-| **Fully offline** | model, inference and UI all run locally, with no cloud dependency |
+| **Windows** | `AUTO-SETUP.cmd` |
+| **Linux** | `./AUTO-SETUP.sh` |
 
-## 4. Tool execution (how it works)
+---
 
-Bonsai is a **tool-calling agent**. Tool calls are effectively **unlimited** -
-the model calls tools for as long as it needs and the conversation context is
-the natural stop (no artificial per-reply cap). Each tool runs, its result is
-folded back into the conversation, and the model continues. Every
-call shows up live in the chat as a chip (green = ok, red = error) with a
-full log; repeated back-to-back calls of the same tool collapse into one chip
-(e.g. `⚙️ web_search ×8`) so the console stays clean. A closing answer is
-always produced at the end.
+## 3. Setup, step by step
 
-| Tool | What it does | Notes |
-|---|---|---|
-| `launch_or_open` | Opens apps, websites, files and settings by name | Notepad, Steam, Chrome, Spotify, YouTube, workspace files, system settings... |
-| `list_dir` / `read_file` / `grep` / `write_file` / `edit_file` | Work on your files | the **workspace folder** by default; with `PATH SCOPE: ASK` Bonsai may also use an absolute path anywhere on the PC and you approve it per folder (§4.1). `grep` can sweep the whole disk |
-| `take_screenshot` | Captures the screen (or a region) and **feeds the image to Bonsai's eyes** | also saves a PNG in the workspace; you see it as a card in the chat |
-| `screenshot_window` | Captures **one named window** (title substring / process / PID) and feeds it to Bonsai's eyes | no more guesswork between `window_list` and a full-screen grab; a minimized window is restored first, and the list of open windows is suggested if nothing matches |
-| `wait_for` | Waits until something is true instead of polling screenshots | `kind`: `file` (appears, or reaches `min_bytes` - a download finishing), `port` (starts listening), `url` (HTTP 2xx/3xx), `process` (app launched), `window` (title appears), `text` (string in a file), `screen_text` (visible on screen, needs OCR); `must_disappear` waits for the opposite; reports `timed_out` + what it last saw instead of erroring |
-| `control_input` | Moves the mouse, clicks, double/right-clicks, drags, scrolls, types text, presses keys/hotkeys | screen-pixel coordinates; pair with `take_screenshot` to see the result |
-| `click_text` | Clicks a button/link **by the text it shows** - OCR locates it, typos are tolerated, and its centre is clicked | scope it with `window=` so background windows are not scanned; `dry_run` reports what would be clicked without clicking; a miss returns close matches as `did_you_mean`. Needs OCR (pytesseract + Tesseract) |
-| `clipboard` | Reads (`get`) or writes (`set`) the system clipboard | |
-| `copy_to_clipboard` / `paste_from_clipboard` | First-class clipboard channel with type hints | `copy` validates `format=json` before copying; `paste` with `format=auto` also picks up a copied **picture** and returns it as an image Bonsai can see (`text`/`json`/`image`) |
-| `download_file` | One public http(s) URL → a file in the workspace | streamed straight to disk (never buffers the whole file), `max_mb` cap, `retries`, resumes a `.part` file, keeps the server's `Content-Disposition` filename, and shows a preview for text |
-| `download_status` | Asks what the downloads are doing | pass a job id, or call it bare to list everything queued / running / paused with bytes, speed and ETA; the panel is the same data, live |
-| `download_batch` | **Many** files in one call | give `urls`, or point `from_page` at a page and let it collect the links (`match` filters them); 4 at a time by default, one folder, per-file ok/failed report |
-| `download_authed` | A file behind a login / token | `bearer`, `cookie` or full `headers`; the secret values are **redacted everywhere** - not in the result, not in the chat history, not in the tool log |
-| `download_page` | Save a web page **offline** | downloads the HTML plus its images/CSS/JS/fonts, rewrites the links to the local copies and writes an `index.html` that works with no internet |
-| `download_verify` | A file that must be **provably** correct | big downloads continue with HTTP resume, broken connections retry, then it checks `sha256` and/or the exact byte size and says `FAILED CHECK` instead of pretending |
-| `download_media` | Video / audio / subtitles | via `yt-dlp` (`pip install yt-dlp`): audio-only as mp3, subtitles, thumbnail, playlist, or cookies from your browser for private videos |
-| `web_resolve` | A **page** where the file is | some sites never hand you a file URL: an index that links out, a file host behind a "your download starts in N seconds" page, links built by JavaScript, or a bot check. This follows those hops (up to 3) and returns the candidate files with names and sizes, ranked so nav links and login pages sink. **Downloads nothing** - so Bonsai can tell you what is behind a page before gigabytes hit the disk. `render: true` re-loads it in a real browser for links that only exist after the page runs |
-| `follow: true` (on `download_file`) | "This URL is a page, get me the file" | resolves the page first, then downloads the file behind it, carrying the browser's session cookies across so the transfer is not challenged again. Off by default, so a page URL is never turned into a surprise multi-GB fetch |
-| `resolve: true` (on `download_batch`) | Many files from a *download* page | `from_page` alone grabs every link the markup carries, which is right for an asset index but wrong for a download page full of nav and login links. `resolve: true` walks the hops and takes only the real files behind them. Add `render: true` if the links only appear after the page runs its scripts |
-| `connections` / `throttle_kbps` / `background` (on every download tool) | Speed and control knobs | `connections: 1-4` splits one big file across parallel range requests (a large speed-up on slow single-stream hosts; ignored for small files and when the server refuses ranges). `throttle_kbps` caps one transfer so it leaves bandwidth free. `background: true` returns a job id at once and the transfer keeps going |
-| `archive` | Creates / extracts zip, tar, tar.gz, tgz archives | unpack or pack inside the workspace |
-| `ask_user` | Asks you a question and **waits for your answer** (options or free text) | pauses its work like opencode's question skill |
-| `todo_write` | Replaces the visible TODO checklist (pending / in_progress / completed) | shown live on the left panel |
-| `window_list` / `window_action` | Lists open windows (title, process, PID); brings one to front / maximizes / minimizes / restores | needs `pywin32` + `psutil` (both installed here) |
-| `api_call` | Any HTTP method to REST or GraphQL APIs, JSON or raw body, custom headers | needs `requests`; returns status, headers, elapsed ms and body |
-| `ws_test` | Connects to a `ws://`/`wss://` endpoint, optionally sends a message, collects replies | needs `websocket-client` |
-| `schedule_task` / `list_schedules` / `unschedule_task` | Run a shell command later: once, every N seconds, or by 5-field cron | see §7 for persistence, the run toasts and completed one-shots |
-| `tts_voices` / `tts_speak` | Lists local Piper voices; speaks text aloud and saves the WAV (`out\tts\`) | needs `piper-tts` + `onnxruntime` + `sounddevice`; voice models live in the project's `piper\` - run `python piper\download_voices.py` once; `tts_speak` only works after the **TTS** header button is turned on |
-| `web_search` / `web_fetch` | Look up current information online when it's not sure | `web_search` returns **structured** results (title, url, domain, snippet, source) plus `did_you_mean` and `related_searches`, so a typo like `serach` recovers in one call; `action="suggest"` is the cheap autocomplete-only check. `web_fetch` reads a page |
-| `run_command` | Runs a real shell command (cmd/PowerShell on Windows, `sh` on Linux) | timeout default 45s, configurable up to 600s, output capped to ~8 KB |
-| `run_code` | Runs a snippet in any installed language (see §2) | isolated temp folder, deleted afterwards; timeout default 30s, up to 600s; ~8 KB output cap |
-| `preview_file` | Show an `.html` page or an image in the center stage: it takes over the stage (reactor hidden, **X** restores it), or opens as a lightbox in `/chat` | also auto-suggested when `write_file` targets an `.html`/`.htm` file (returns a `preview_url`) |
-| `get_scene_info` | Lists the open Blender scene: objects, types, locations (Mesh, Camera, Light, ...) | requires Blender running with the *MCP for Blender* addon enabled |
-| `get_object_info` | Details on one object (location, rotation, scale, ...) | |
-| `execute_blender_code` | Runs real Python inside Blender's `bpy` context | add cubes, move them, re-parent, set materials - always step by step |
-| `get_viewport_screenshot` | Captures the Blender viewport and **feeds it to Bonsai's eyes** | shown as a thumbnail; the model confirms its work visually |
-| `bpy_api_lookup` / `describe_node_type` / `export_scene` | look up the exact `bpy` API, inspect one shader-node type, export the scene | Bonsai reads real API docs so its code actually runs |
+Both setup scripts are **menus, not scripts**. Nothing happens until you choose it.
 
-The **Blender** tools run through `mcp-for-blender` (a stdio MCP server that talks to
-the addon on `localhost:9876`). Bonsai keeps full control of the tool loop and
-reasoning - only the actual Blender commands are delegated. A status indicator in
-the header shows the connection: the Blender logo with a **green** dot
-(*connected*), **yellow** (*addon off*) or **red** (*not connected*); hover it
-for the detail.
-
-The **workspace** is the default area for the file tools, and (with
-`PATH SCOPE: ASK`) not a wall - see §4.1. You can pick any folder from the UI
-(📁 button in the header) with a native folder dialog, or set `PC_WORKDIR`
-(see §8).
-
-### 4.1 Path scope - reaching the rest of the PC
-
-The **PATH SCOPE** button at the bottom of the sidebar has three modes.
-
-Click it to cycle:
-| Mode | Behaviour |
-|---|---|
-| `WORKSPACE` | hard sandbox - only the workspace, no prompts (the old behaviour) |
-| `ASK` *(default)* | anything outside the workspace raises a **PERMISSION NEEDED** dialog: **ALLOW FOR THIS CONV** · **ALLOW ONCE** · **DENY** |
-| `SYSTEM` | trusted - the whole PC is reachable, no prompts at all |
-
-- **ALLOW FOR THIS CONV** remembers that folder (and everything under it) for
-  the rest of the conversation, so a second look at the same place is silent.
-  Starting a new chat clears the list.
-- **ALLOW ONCE** lets that single tool call through, then asks again.
-- **DENY** refuses the call, and Bonsai is told so - it won't keep hammering you
-  with the same request, and it should ask you what to do instead.
-- Every approved/denied folder is listed under the button with an **×** to
-  revoke it, plus **CLEAR APPROVALS** to forget them all.
-- Applies to `list_dir`, `read_file`, `write_file`, `edit_file`, `grep`,
-  `archive`, `download_file` and to the HTML preview routes. `grep` with
-  a path like `C:\Users` or `C:\` is how Bonsai searches the entire machine
-  (heavy system folders such as `Windows`, `Program Files` and `node_modules` are
-  skipped, and a scan stops after 40 000 files / 45 s and says so).
-- Approvals are asked **only while a reply is streaming in the UI** - a tool run
-  in the background (API, script) gets a clean "no one is around to approve it"
-  error instead of blocking forever. Set `PC_PATH_POLICY=workspace|ask|system`
-  to choose the mode at startup.
-- `run_command` / `run_code` run a shell and can already reach the whole disk, so
-  they are not path-gated - that is the same trust level as giving Bonsai the
-  **SYSTEM** scope.
-
-### 4.2 The DOWNLOADS panel
-
-Every download runs as a background job, so a big file no longer freezes the
-chat. The **DOWNLOADS** panel in the sidebar refreshes about once a
-second and shows, per transfer:
-
-- a progress bar with **bytes / total**, **%**, current **speed** and **ETA**,
-  plus `4 conn` when the file is split across parallel connections and
-  `resumed` when it continued an earlier attempt;
-- **PAUSE** (releases the socket and keeps the bytes), **RESUME**,
-  **CANCEL** (the `.part` file stays on disk) and **RETRY** after a failure;
-- **CLEAR FINISHED** to tidy the list, and a toast when something completes.
-
-A few things worth knowing:
-
-- A paused, cancelled or crashed download leaves a `.part` file (plus a small
-  `.segments.json` ledger for split downloads). Nothing is ever half-renamed
-  into its final name, and the next attempt continues from those bytes.
-- `connections: 1-4` splits one file into parallel range requests. It is
-  **skipped automatically** when the server does not support ranges or the file
-  is small, so it can never make things worse.
-- If a download outlasts the tool's `timeout`, the reply says it is still going
-  and hands back a job id - the transfer is not killed. `download_status` (or
-  the panel) picks it up from there.
-- The panel is shared state, so it survives a page refresh; only in-flight
-  transfers live in the server's memory and are gone if the server restarts
-  (the `.part` files remain, so a retry continues).
-
-## 5. The console - controls & HUD
-
-| Control | What it does |
-|---|---|
-| **SEND / STOP** | Submits your message; while Bonsai is replying it becomes **STOP** to abort the run |
-| **Enter while busy** | queues the message instead of cancelling it (see §1); the backlog is shown on the button, e.g. `STOP · 2 queued` |
-| **THINK: OFF / LOW / MED / HIGH** | Selects how deeply Bonsai reasons (`enable_thinking` / `reasoning_effort`); higher = deeper reasoning, slower replies. Default MED |
-| **TODO panel** | Live checklist on the left panel, updated by `todo_write` as longer tasks progress |
-| **Workspace (folder icon)** | Choose/open the working folder for the file tools |
-| **PATH SCOPE** | `WORKSPACE` / `ASK` / `SYSTEM` - how far the file tools may reach outside the workspace, and lists the folders you approved or denied (§4.1) |
-| **Model dropdown (+ ⚙)** | Pick the active model, add one, and - via the gear - set its runtime options (see §8) |
-| **Model status ball** | **Red** = no model loaded · **orange→green** cycling = loading into RAM/VRAM · **green** = loaded and resident |
-| **Blender icon + dot** | The Blender logo with a dot beside it: **green** = connected, **yellow** = addon off, **red** = not connected. Hover for the full reason |
-| **EJECT** | Stops the model server **now** and frees its RAM/VRAM; it restarts automatically on the next message |
-| **TTS** | Toggles Piper text-to-speech. **Off by default** - click to let Bonsai speak replies aloud (state resets on server restart) |
-| **Plan / Build** | Toggle mode - *Plan* read-only, *Build* full tool access |
-| **Mic (🎙)** | microphone voice input (speech-to-text) for your messages |
-| **NEW CHAT** | Start a fresh conversation |
-
-The **arc reactor** in the center panel shows both the mode and what Bonsai is
-doing:
-
-- **Rainbow** (slow colour cycle) - idle in **Build** mode
-- **Purple** - idle in **Plan** mode (read-only, no tools)
-- **Yellow** - thinking / processing the command
-- **Green** - executing a tool call
-
-The line under it mirrors the state, so it never claims to be waiting while
-Bonsai is busy: *"Awaiting your command"* appears only when idle; it switches to
-*"Thinking it through..."* / *"Working on your PC..."* / *"Read-only - no tools
-will run"* as needed.
-
-The **CPU / RAM / GPU** meters under the reactor are **real readings**, not
-decoration: CPU and RAM come from `psutil`, GPU utilisation from `nvidia-smi`
-(sampled every 1.5 s on a dedicated thread, cached, and shown as `n/a` when
-`nvidia-smi` isn't available - e.g. no NVIDIA GPU).
-
-The page has a dark theme by default and a light one, toggled by the
-sun/moon button at the bottom of the sidebar. Both themes use the same
-palette, so only the values change.
-
-## 6. Live token stats & memory relief
-
-**Real-time stats line** under the input while Bonsai works:
+### The menu
 
 ```
-THINK 2.8s · SPEAK 0.4s · 45.3 tok/s · tokens 138 · ctx 1638/32768
+==============================================================================
+  BONSAI  -  choose what to set up
+==============================================================================
+
+  REQUIRED
+    1  Python itself
+    2  Python packages
+    8  Verify the install
+
+  OPTIONAL - pick only what you want
+    3  Desktop extras (screenshots, OCR, TTS)
+    4  Point Bonsai at llama-server
+    5  Check the model files are here
+    6  Create API KEYS.txt from the template
+    7  Create models.json from the template
+    9  Docker Desktop status
+
+  OTHER
+    a  Run everything recommended  (1, 2, 4, 5, 8)
+    r  Start Bonsai
+    x  Quit
 ```
 
-- **THINK** - time spent reasoning before the first output token.
-- **SPEAK** - time spent generating the reply.
-- **tok/s** - average generation speed (RTX 4070 ≈ 44-48).
-- **ctx** - context slots used / total for the model you actually selected, refreshed live.
+Type a number to run one step, several numbers separated by spaces to queue
+several, or `a` for the recommended set. Steps that are already satisfied say so
+instead of redoing them. You can come back as often as you like — nothing is
+recorded as "done" against you.
 
-A compact gold chip with the same numbers is saved onto each reply so the
-stats survive reloads.
+### Running a step without the menu
 
-**Always resident, eject when you want** - the model stays fully loaded for as
-long as the app (and `llama-server`) are running, so there is no idle timer
-that could unload it mid-conversation or right before your next message. When
-you *want* the memory back (e.g. before running a big game), click **EJECT** in
-the header and the model unloads immediately - it simply loads again on the
-next message, no restart needed.
+Both scripts accept step numbers as arguments, which is handy from another script
+or a terminal:
 
-## 7. Chat history
+```bash
+AUTO-SETUP.cmd 5          # just check the model files are present
+AUTO-SETUP.cmd 2 3        # packages, then desktop extras
+AUTO-SETUP.sh a           # everything recommended
+```
 
-History is kept in two places and merged on load: the browser (instant,
-no round trip) and a file on disk, which is the durable one.
+### What each step does
 
-| Where | Browser (`localStorage`) | Disk |
+| # | Step | Why |
 |---|---|---|
-| The page (`/`) | `jarvis_chats` - instant load | `%APPDATA%\BonsaiAsistent\chats.json` (Linux: `$XDG_CONFIG_HOME`/`~/.config`) |
+| 1 | Python itself | Installs Python 3.13 via winget / the system package manager |
+| 2 | Python packages | `requirements.txt` + `tools/requirements.txt` |
+| 3 | Desktop extras | The optional libraries for screenshots, OCR and local TTS |
+| 4 | llama-server | Tells Bonsai where your model server is |
+| 5 | Model files | Checks the `.gguf` files are actually here |
+| 6 | API keys | Copies the template to `API KEYS.txt` and opens it |
+| 7 | models.json | Copies the template to `models.json` |
+| 8 | Verify | Imports the app and checks each optional library individually |
+| 9 | Docker | Reports whether Docker is installed and its engine is running |
 
-How it behaves:
+### About step 4 and ternary models
 
-- **Saved on every change** - after each reply, when you start/delete a chat,
-  and when the title is first set. The title becomes your first message
-  (truncated to 34 chars, plus `+ files` / `+ images`).
-- **Capped at the newest 200 conversations** in both places.
-- **The disk copy is the durable one**: the browser copy is
-  only a fast local mirror/fallback, and the two are *merged* on startup (the
-  richer copy of a chat wins) so a failed or stale save can never hide newer
-  messages. If the disk file is unreadable, `chats.json.bak` is used instead.
-- **Writes are atomic** - the file is written to `chats.json.tmp` and swapped in,
-  keeping the previous version as `chats.json.bak`, so a crash mid-write cannot
-  truncate your history. Malformed entries are dropped instead of poisoning the
-  file.
-- **Attachments are size-capped in storage.** Tool screenshots (base64 previews)
-  are never persisted. Large images you attach are kept for the 5 most recent
-  conversations on disk; older ones are replaced with a
-  placeholder so history cannot grow without limit. Images are still sent to the
-  model for the current conversation.
+Bonsai 2 is a **ternary** model. Stock llama.cpp cannot read these `.gguf` files.
+You need a **PrismML** build of llama.cpp with ternary kernels. If the server
+starts and then cannot load the weights, that is why.
 
+If you would rather not deal with that, skip the local model entirely and pick a
+hosted one from the dropdown. Everything except local inference keeps working, and
+no model download is needed.
 
-  UI is the one that survives a wiped browser.
-- **Scheduled tasks are persisted separately** in `schedules.json` in the same
-  BONSAI folder (`%APPDATA%\BonsaiAsistent` on Windows, `$XDG_CONFIG_HOME` or
-  `~/.config` on Linux). On startup Bonsai reloads it: `interval` and `cron`
-  jobs get their next future slot, and a `once` job whose moment passed while
-  Bonsai was closed runs immediately. Deleting a task (or clearing the file)
-  removes it.
+---
 
-## 8. Configuration
+## 4. Configuration files
 
-All settings are optional. Unless an environment variable is set, Bonsai uses
-the defaults defined at the top of `bonsai_web.py` (which resolve to the
-project's local folders).
+Two files are yours to edit. **Neither is required** — the app builds a working
+configuration without them.
 
-| Variable | Purpose | When to set it |
+### `API KEYS.txt` — your secrets
+
+Git-ignored, plaintext, and never read by anything but the code that signs a
+request. Nothing in it is sent to the browser, printed in the console, or written
+into a chat.
+
+A committed template ships with the repo so you know every field:
+
+| file | committed | holds |
 |---|---|---|
-| `BONSAI_DIR` | Folder containing the `.gguf` model files | only if the model files live somewhere other than the project folder |
-| `PC_WORKDIR` | The workspace folder the file tools use | to point file access at a specific folder by default |
-| `PC_PATH_POLICY` | Default path scope: `workspace`, `ask` (default) or `system` | to start in a fixed mode instead of `ASK` (§4.1) |
-| `PC_MAX_DOWNLOAD_MB` | Optional ceiling for one downloaded file (default: **no limit**) | set it only if you want a hard stop; per-call `max_mb` overrides it |
-| `BONSAI_DL_JOBS` | How many downloads may run at the same time, default 4 | lower it on a slow connection or a laptop that must stay responsive |
-| `PC_LLAMA_SERVER` | Path to the `llama-server` binary used for local models | only if it isn't on `PATH` (Linux) or in the default PrismML location (Windows) |
-| `PC_PIPER_DIR` | Folder holding the Piper voice models | only if the voices live outside the project's `piper\` |
+| `API KEYS.example.txt` | **yes** | every provider, all commented out, no values |
+| `API KEYS.txt` | **no** | your actual keys |
 
-The workspace can also be changed at runtime from the UI (📁 button in the
-header) - this is the recommended way.
+Create yours from the menu (step 6) or by hand:
 
-### Choosing the AI model
+```bash
+copy "API KEYS.example.txt" "API KEYS.txt"     # Windows
+cp API KEYS.example.txt "API KEYS.txt"         # Linux
+```
 
-The header dropdown (next to **TTS**) selects which model answers, and the
-**+** button next to it opens a small dialog that uses the normal Windows/ Linux
-file browser.
+Then uncomment the line you need:
 
-**Dropping models into the folder is enough.** On startup BONSAI scans the
-project folder and a `models/` subfolder and registers every `*.gguf` it finds
-(`mmproj` files are not listed as models, they are attached to their model).
-So if you copy `Qwen3.8.gguf` next to the Bonsai weights, it simply appears in
-the dropdown - nothing to configure.
+```
+OPENAI_API_KEY=sk-proj-...
+GEMINI_API_KEY=AIzaSy-...
+```
 
-Use the **+** button when models live somewhere else:
+### `models.json` — which models, and how
 
-| Option | What it does |
+Git-ignored, because it holds absolute paths from your machine.
+
+| file | committed | holds |
+|---|---|---|
+| `models.example.json` | **yes** | the schema, with placeholder paths |
+| `models.json` | **no** | your actual model list |
+
+**You probably do not need this file.** Without it, Bonsai finds every `.gguf` in
+the project folder by itself, pairs a vision projector to a text model when the
+filenames match, and drops any local entry whose file is not actually present.
+
+Reach for it when you want to:
+
+- set a context window or port per model
+- change sampling defaults per model (`cfg`)
+- add a hosted model without going through the UI
+- hide a tool from a model that cannot use it (`omit`)
+
+Shape:
+
+```jsonc
+{
+  "active": "local-bonsai2",
+  "models": [
+    {
+      "id": "local-bonsai2",
+      "label": "Bonsai 2 27B (local, ternary)",
+      "type": "local",
+      "path": "C:\\path\\to\\Ternary-Bonsai-2-27B-PQ2_0.gguf",
+      "mmproj": "C:\\path\\to\\Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf",
+      "ctx": 32768,
+      "port": 8080,
+      "cfg": { "ctx": 20000, "temp": 1.0, "top_p": 0.95, "top_k": 20, "ngl": 99 }
+    },
+    {
+      "id": "my-hosted-model",
+      "label": "Something hosted",
+      "type": "api",
+      "wire": "chat",
+      "base_url": "https://api.example.com/v1",
+      "model": "some-model",
+      "api_key": "OPENAI_API_KEY",     // the NAME, not the key
+      "cfg": { "ctx": 32768 }
+    }
+  ]
+}
+```
+
+Note `api_key` is the **name** of an entry in `API KEYS.txt`, never the key
+itself. If you put a live key in `models.json` it will be committed the moment
+you stop ignoring that file.
+
+---
+
+## 5. Choosing a model
+
+The dropdown at the top of the page, and the **+** button next to it.
+
+**Local (free, private, slow to load).** A `.gguf` in the project folder, served by
+llama.cpp. Nothing leaves the machine. Needs a PrismML build for ternary models.
+
+**Hosted (no download, needs a key).** Any OpenAI-compatible `/v1/chat/completions`
+endpoint, plus Anthropic-style `/v1/responses`. Add one with **+ → connect to an
+API server**, then pick it from the same list.
+
+Switching is per message. The local server is stopped before image generation so
+the two do not fight over VRAM.
+
+### The context meter
+
+`CTX` in the composer shows how much of the model's window the conversation is
+using, measured against the window that model actually has. It is read from the
+server, not a hardcoded default.
+
+---
+
+## 6. The optional extras
+
+None of this is needed to chat. Each is behind a menu item so you only install
+what you will use.
+
+`OPTIONALS.cmd` (Windows) presents these as a menu in the same way:
+
+| # | Extra | Size | Notes |
+|---|---|---|---|
+| 1 | Blender control | small | `mcp-for-blender`, then enable the addon in Blender |
+| 2 | Tesseract OCR | ~30 MB | needed by `click_text` / `screen_text` |
+| 3 | Docker Desktop | ~600 MB | needs item 4, and a reboot |
+| 4 | WSL2 + VM Platform | — | Docker's backend; reboot required |
+| 5 | Windows stability | — | long paths, a 48–96 GB page file |
+| 6 | Local image generation | ~13 GB | Qwen-Image 2.1 weights |
+| 7 | Browser engine | small | Playwright, for screenshots of web pages |
+
+```
+==============================================================================
+  BONSAI  -  OPTIONAL extras  (none of this is required to chat)
+==============================================================================
+
+    1  Blender control             mcp-for-blender        ~small
+    2  Tesseract OCR              click_text/screen_text ~30 MB
+    3  Docker Desktop             docker_* tools         ~600 MB (needs 4)
+    4  WSL2 + VM Platform         Docker's backend       reboot
+    5  Windows stability          long paths, page file  admin
+    6  Local image generation     Qwen-Image 2.1         ~13 GB
+    7  Browser engine             page screenshots       small
+    a  Run everything that is missing
+    x  Quit
+```
+
+On Linux, steps 1–7 of `AUTO-SETUP.sh` cover the same ground with the system
+package manager, including `grim` for screenshots on Wayland — which `scrot` and
+ImageMagick cannot do.
+
+---
+
+## 7. How a tool call happens
+
+1. You send a message.
+2. The model replies. If it wants to use a tool, its reply contains a tool call
+   instead of text.
+3. Bonsai runs the tool, streams a progress card for it, and puts the result back
+   into the conversation.
+4. The model reads that result and replies again.
+
+That repeats until it stops asking for tools, up to a hard round limit. A round
+in the middle can ask you a question — the UI shows the options and the turn
+waits for your answer rather than guessing.
+
+Anything that changes a file records a diff, and the page offers to revert it.
+
+---
+
+## 8. Path scope and approvals
+
+The workspace — the default folder — is not a wall. For anything outside it,
+Bonsai passes the absolute path and **you are asked to approve**.
+
+- A granted path stays granted for the rest of the conversation.
+- The scope can be widened to everything, for this chat or permanently.
+- Denials are respected. If a path is refused, the model is told to ask rather
+  than try again.
+
+The sidebar shows the current scope (`SCOPE: ASK` in the screenshot at the top of
+this file).
+
+---
+
+## 9. Image generation
+
+Text to image, locally, through stable-diffusion.cpp with a distilled
+few-step checkpoint (Qwen-Image 2.1 Viggle turbo).
+
+```bash
+python tools/fetch_image_model.py     # ~13 GB, once
+```
+
+**How it is configured, and why.** This model is distilled: it runs in 6 steps
+with **no classifier-free guidance**. Two things follow from that, and both matter:
+
+- `cfg-scale` is **1.0**. The old value of 6.0 was left over from the 40-step base
+  model and made every picture look overcooked — clipped skies, crushed shadows,
+  water pushed to neon.
+- The **sigma schedule is passed explicitly**. The engine's default is evenly
+  spaced; this model was distilled against a schedule with the nodes bunched at
+  the low-noise end. It ends in `0.0` — n+1 values for n steps. Leaving that off
+  makes the engine sample one step short and produce noise rather than a picture.
+
+**Live preview.** Every sampling step writes a preview, so you watch the picture
+form. This needs a tiled decode (`--vae-tiling`): the preview decode runs while
+the diffusion model is still resident, so it has less memory than the final decode
+and fails without tiling at anything above about 1.3 megapixels.
+
+**Cost.** At the 1920×1088 base that is roughly **240 s per image** with a preview
+every ~28 s. If you would rather have ~155 s and a preview every ~15 s, set the
+base back to 1536×864.
+
+**Output.** One file per generation, delivered at 1440p on the short edge — so
+16:9 lands at 2541×1440, and a 16:9 source that is not a whole number of 32-pixel
+steps is 0.7% narrow. The engine's raw output is not kept beside it.
+
+**VRAM.** At 2.09 megapixels this wants the whole card. A game holding 11 GB will
+stop it. Close other GPU work before generating.
+
+---
+
+## 10. Web search
+
+DuckDuckGo, over HTTP POST. This is worth one note because it is not the obvious
+choice: **a GET returns a CAPTCHA** — "select all squares containing a duck" —
+and the search silently falls through to a fallback that answers a different
+question. Posting returns real results.
+
+The model is told when it is being served something irrelevant. Results have to
+carry at least half the query's distinctive words, so a search for a game map
+cannot be satisfied by a page about logging into Facebook. Anything filtered out
+is reported as `dropped_irrelevant` rather than hidden.
+
+DuckDuckGo rate limits by IP, and it answers automated traffic with a CAPTCHA for
+a while after that. When it does, Bonsai **stops asking** for 15 minutes rather
+than retrying — asking a source that has already refused is what makes the refusal
+last — and says so plainly in the result.
+
+---
+
+## 11. Where things are stored
+
+| what | where |
 |---|---|
-| **Model file (.gguf)** | opens a file browser filtered to `*.gguf` and adds that one model |
-| **Model folder** | opens a folder browser and adds **every** `.gguf` in that folder *and its subfolders* (already-known files are skipped) |
-| **Vision projector** | pick a local model and **Browse…** its `mmproj` file, or **Clear** it |
-| **API server** | type a base URL + model id instead of a local file |
+| Chats, history | `%APPDATA%\BonsaiAsistent\` (Linux: `~/.config/BonsaiAsistent/`) |
+| Attachments — every image in a chat | `attachments\` beside the chat file |
+| Generated images | `out\images\` in the workspace |
+| API keys | `API KEYS.txt`, beside `bonsai_web.py` |
+| Model list | `models.json`, beside `bonsai_web.py` |
 
-How each type behaves:
+Attachment names are a hash of the file's bytes, so the same image attached twice
+is stored once. The chat stores the short `/att/...` reference, never megabytes of
+base64 — which is why pictures survive a reload.
 
-- **Local `.gguf`** entries are served by the bundled `llama-server`. Switching
-  between them is also lazy: the old model is stopped immediately (freeing its
-  VRAM) and the newly selected one loads on your next message - so browsing the
-  dropdown never costs a model load, and you can never accidentally be answered
-  by the model you just switched away from.
-- **Vision projectors (`mmproj`)** turn a text-only model into a seeing one.
-  They are auto-matched to their model by **filename prefix** (`Qwen3-8B-…`
-  pairs with `Qwen3-8B-mmproj-…`), both at startup and whenever a new file
-  appears, so dropping `qwen3.8-mmproj-F16.gguf` next to `Qwen3.8.gguf` is
-  enough. Because matching is heuristic, the **+** dialog can also attach or
-  clear a projector explicitly. Models with a working projector are marked
-  `· vision` in the dropdown, and the header shows `VISION: mmproj ON/OFF` for
-  the **active** model. Without a projector the model still works, but it
-  cannot read images or `take_screenshot`.
-- **API** entries point at any OpenAI-compatible server (LM Studio, Ollama,
-  vLLM, another llama.cpp instance...). Switching is instant - the app just
-  sends requests to that base URL and model id instead. Projectors do not apply
-  to them (the server decides what it supports).
+Environment variables: `PC_WORKDIR`, `PC_LLAMA_SERVER`, `PC_SD_DIR`,
+`BONSAI_CHATS_FILE`, `PC_IMG_PROVIDER`.
 
-The list and the active choice are stored in `models.json` (git-ignored, created
-on first change). A cloud icon marks API entries, a target icon marks local
-ones; a local model whose file has gone missing is shown as `(missing)`. You
-must switch away from a model before it can be removed from the list. The
-`+` dialog also re-scans the project and `models/` folders, so a newly dropped
-model shows up without touching `models.json`.
+---
 
-**Context size and sampling** - the gear (⚙) next to the model dropdown opens
-**MODEL SETTINGS** for the currently selected local model:
+## 12. Troubleshooting
 
-| Setting | Default | Notes |
-|---|---|---|
-| **Context size (ctx)** | **32768** | tokens the model can see. Bigger = longer conversations/files, but more VRAM and slower prompt processing. Capped at **102400 (100k)** - the KV cache grows with the window and is paid for in VRAM |
-| **Temperature** | 1.0 | lower = more focused/deterministic, higher = more varied |
-| **Top-p** | 0.95 | nucleus sampling cut-off |
-| **Top-k** | 20 | candidate limit; 0 disables it |
-| **GPU layers (-ngl)** | 99 | how many layers to offload to the GPU. Lower it (e.g. 20) if the model doesn't fit in VRAM |
+**Nothing happens when I send a message.**
+The page shows an empty bubble when a provider error was swallowed. It should
+now name the reason — a rejected API key reads *"The model rejected the API key
+for …"*. Check the console window; it has the real traceback.
 
-These are stored **per model** in `models.json`, so each model keeps its own
-settings. They are llama-server launch flags, so they are applied by starting a
-fresh server - never in the middle of a reply. **Save** does that for you: if the
-model is running it is stopped, and your next message brings it back with the new
-values. **EJECT**, re-clicking the already-selected model, and restarting the app
-do the same thing by hand. The context meter in the stats bar follows the saved
-value immediately, without waiting for the reload. **Defaults** restores
-32768 / 1.0 / 0.95 / 20 / 99, and values are clamped to sane ranges server-side.
-They apply to locally-served models; an external API endpoint is configured by
-its own server.
+**"Invalid credential" from a hosted model.**
+The key is expired, revoked, or is still the placeholder from the template. Replace
+it in `API KEYS.txt`.
 
-If a conversation ever grows past the context window, BONSAI says so in plain
-language and names the model and its real context size instead of surfacing a raw
-server error. Start a new chat, raise the context size, or drop some long
-attachments.
+**Local model will not load.**
+Bonsai 2 is ternary. Stock llama.cpp cannot read it — you need a PrismML build.
+Point Bonsai at it with setup step 4, or `set PC_LLAMA_SERVER=<path>`.
 
-## 9. The AI model
+**A tool says a package is missing.**
+It is optional and not installed. Setup step 3 covers the Python ones; `OPTIONALS`
+covers the system ones. The app is designed to stay fully usable without them.
 
-The assistant talks to **Bonsai 2 27B** - a ternary (1.58-bit) 27B-class model
-built on a Qwen3 hybrid-attention backbone, ~9x smaller than its FP16 original
-at near-parity quality (~5.9-7.2 GB instead of ~54 GB).
+**Screenshot works on Windows, not on Linux/Wayland.**
+Install `grim` — setup step 5. `scrot` and ImageMagick cannot capture a Wayland
+session.
 
-| File | What it is | Download |
-|---|---|---|
-| `Ternary-Bonsai-2-27B-PQ2_0.gguf` | Language model (7.21 GB, ternary g128) | [Hugging Face](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf) |
-| `Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf` | Vision projector (0.63 GB) - required for image input | same Hugging Face repo (row above) |
+**Image generation says out of memory.**
+Something else is holding VRAM. Close games first. If it persists, drop the base
+frame to 1536×864.
 
-Server profile: 32k context, `-ngl 99`, flash-attention, temp 1.0, top-p 0.95,
-top-k 20.
+**Search returns nothing relevant.**
+Check whether it says DuckDuckGo is rate limiting. If so, wait — it clears itself.
 
-Useful links (the model files themselves are in the table above):
+**Windows says the path is too long.**
+`OPTIONALS` item 5. Long paths need a sign-out to take effect.
 
-- 📚 PrismML model downloads & docs: **https://docs.prismml.com/download/models**
-- 🔧 Runtime engine (`llama-server`): **https://github.com/PrismML-Eng/llama.cpp** (stock llama.cpp won't load PQ2_0/PTQ1_0 tensors)
-- 🧪 Official demos: https://github.com/PrismML-Eng/Bonsai-demo
+---
 
-## 10. Security & privacy
-
-- Everything runs locally - the browser only talks to `127.0.0.1`.
-- File tools are confined to the configured workspace folder **unless you widen
-  the path scope** (§4.1): `ASK` asks you per folder, `SYSTEM` trusts Bonsai with
-  the whole disk. Every approval is visible in the sidebar and can be revoked.
-- Downloads only accept `http(s)` (no `file://`) and stream to disk in chunks, so
-  a 5 GB ISO costs the same RAM as a 5 KB file - there is **no size limit** by
-  default. Instead of a cap, Bonsai checks the free disk space first and refuses
-  cleanly when the file obviously will not fit; `PC_MAX_DOWNLOAD_MB` or a
-  per-call `max_mb` can still impose a ceiling. Credentials passed to
-  `download_authed` are replaced with `***redacted***` before the call is stored
-  in the chat history, the tool log or the server transcript - only the header
-  *names* are echoed back.
-- `run_code` runs in an isolated temp folder that is deleted afterwards (30s
-  timeout by default, up to 600s). Note: it runs as your user on this PC, so
-  snippets do have network access - prefer Python's sandbox tools where strict
-  isolation matters.
-- HTML previews are served only from the workspace: `/preview` serves only
-  `.html`/`.htm`, and its companion `/previewfile/…` route serves the page's
-  **non-HTML** assets (CSS/JS/images/fonts, with a fixed MIME allow-list) so
-  local assets resolve. Both are confined to the workspace, both preview
-  `<iframe>`s (the center stage and the image lightbox) run with
-  `sandbox="allow-scripts"` (so a previewed page is in an opaque origin and
-  cannot touch the rest of the UI), and the file is never executed on the
-  server.
-- Chat history lives on your PC only (`%APPDATA%\BonsaiAsistent\chats.json`,
-  written atomically with a `.bak` copy).
-- Scheduled tasks are stored in `schedules.json` next to it. They only run while
-  Bonsai is running, but a one-shot whose moment passed while it was closed runs
-  on the next start.
-- Don't expose the server to the internet; it's an assistant, not a web service.
-
-## 11. Troubleshooting
-
-| Symptom | Fix |
-|---|---|
-| First reply after a pause is slow | normal only if `llama-server` was stopped/restarted meanwhile - otherwise the model stays resident for the whole session |
-| Model won't start / blank UI | make sure `prism-llama`'s `llama-server` is installed (Windows exe or a binary on `PATH` / `PC_LLAMA_SERVER` on Linux) and `BONSAI_DIR` points at the `.gguf` files |
-| Vision doesn't work | the active model needs a vision projector: put a `*mmproj*.gguf` with a matching filename prefix next to the model, or attach one from the **+** dialog |
-| "Bonsai 2 model server could not start" | run `run.bat` again; check port 8080 isn't taken and the GPU/driver support CUDA |
-| Model answers but sees no files | pick the workspace folder (📁 button) - file tools are confined to it |
-| `take_screenshot` / `control_input` / `clipboard` error ("not installed") | install Pillow, pyautogui and pyperclip (`pip install pillow pyautogui pyperclip`) |
-| Tool output looks truncated | results are intentionally capped (~8 KB) to protect the 32k context |
-| Blender light stuck yellow (**ADDON OFF**) | open Blender and enable the addon (Edit > Preferences > Add-ons > search "MCP for Blender") - the server auto-starts on port 9876 |
-| Blender tools error "not reachable" | Blender must be running with the addon enabled; the reconnect is automatic on the next command |
-| Blender tools missing from the chat | close any other app serving MCP on `localhost:9876` and make sure `mcp-for-blender` is pip-installed (`pip install mcp-for-blender`) |
-
-## 12. Repository layout
+## 13. Repository layout
 
 ```
-bonsai_web.py          # the whole assistant (single file: backend + UI)
-run.bat / run.sh       # the ONE launcher: starts UI + model server (Win / Linux)
-stop.cmd / stop.sh     # stops the model server (Win / Linux)
-AUTO-SETUP.cmd         # one-shot installer on Windows: Python deps + required-file check
-AUTO-SETUP.sh          # same for Linux (apt/dnf/pacman + system packages + Piper voices)
-OPTIONALS.cmd          # system-level optionals: Docker/WSL2, Tesseract, Blender MCP (Windows)
-requirements.md        # full dependency list (required vs optional)
-requirements.txt       # pip installs for the extended tools (pywin32 is Windows-only)
-tools/                 # optional helper scripts (screenshot, clipboard, scraper, OCR) - the same capabilities are also built into bonsai_web.py
-tools.json             # tool-call spec reference (auto-generated from code)
-gpt_ui.html            # read-only copy of the served page, kept for reference. bonsai_web.py is the source of truth; refresh it with `python tools\dump_gpt_ui.py`
-instructions.txt       # quick-start guide (English)
-piper/                 # Piper TTS: tts.py + download_voices.py; voice .onnx models are git-ignored (fetch with `python piper\download_voices.py`)
-*.gguf                 # the model weights (local only, not in git)
-.gitattributes         # LF/CRLF normalization (shell scripts stay LF everywhere)
-README.md              # this file
+BonsaiAsistent/
+├── bonsai_web.py              the whole app - UI, API, agent loop
+├── gpt_ui.html                generated snapshot of the served page
+│
+├── AUTO-SETUP.cmd             Windows setup menu
+├── AUTO-SETUP.sh              Linux setup menu
+├── OPTIONALS.cmd              Windows optional extras menu
+├── run.bat / run.sh           launch
+├── stop.cmd / stop.sh         stop
+│
+├── API KEYS.example.txt       template - committed, no values
+├── models.example.json        template - committed, no paths or keys
+│
+├── tools/                     helper scripts and their requirements
+├── piper/                     Piper TTS voices (downloaded)
+├── image_models/              Qwen-Image weights (downloaded, ~13 GB)
+├── sd.cpp/                    stable-diffusion.cpp (downloaded)
+│
+├── requirements.txt           every optional Python package
+├── requirements.md            which package powers which tool
+├── tools.json                 tool registry
+│
+├── *.gguf                     model weights - NOT in the repo
+└── API KEYS.txt               your keys - NOT in the repo
 ```
 
-The repo intentionally does **not** contain the model weights (git-ignored;
-download from §9) nor the Piper voice models (fetch with
-`python piper\download_voices.py` / `python3 piper/download_voices.py`).
+**Not in the repo, by design:** model weights (6–7 GB each), image model weights
+(~13 GB), the llama.cpp binaries, the inference engine, `API KEYS.txt`,
+`models.json`, chat history, and generated images. The `.gitignore` is explicit
+about each, and the `.example` files exist so the *shape* of the two config files
+is versioned without their contents.
 
-### Platform notes (Windows vs Linux)
+---
 
-- `launch_or_open` opens apps either via the Windows shell (`os.startfile`,
-  URIs, Start-menu AppIDs) or on Linux via `xdg-open`/`gio` and binaries found
-  on `PATH`; workspace files open with the system default handler either way.
-  A name in the built-in app table that is a Windows path still falls back to
-  the `PATH` lookup on Linux, so "open gimp" works if gimp is installed.
-- `window_list` / `window_action` use win32 on Windows and `wmctrl` on Linux
-  (X11 sessions); install `wmctrl` for them.
-- `take_screenshot` tries PIL/ImageGrab, then the command-line grabbers in
-  order: `scrot` and ImageMagick `import` (X11), `grim` (Wayland), then
-  `gnome-screenshot`. On a Wayland session - the default on current GNOME and
-  KDE - only `grim` can see the screen; `AUTO-SETUP.sh` installs it when it
-  detects a Wayland session.
-- `control_input` (mouse and keyboard) goes through `pyautogui`, which drives
-  the pointer over **X11**. On a Wayland-only session it cannot work; the tool
-  says so rather than reporting a missing package. Log in to an X11 session
-  (or install `python3-xlib`) if you need it.
-- Reading an **image** off the clipboard uses `xclip`, then `xsel`, then
-  `wl-paste` - the last is the one that works on Wayland. Copying and pasting
-  **text** uses `pyperclip`, which finds all three on its own.
-- The folder/file pickers open a native Tk dialog, so they need `python3-tk`
-  and a display. With neither, the app says so and offers to take the path as
-  typed text instead of silently doing nothing. `AUTO-SETUP.sh` installs
-  `python3-tk` and `tesseract-ocr`.
-- `tts_speak` plays through `sounddevice`, then `paplay`/`aplay`/`ffplay`. If
-  none of them can play, the result now says the audio was written but not
-  played instead of claiming success.
-- `run_code` picks up whatever runtimes are installed (python, node, go, lua,
-  php, ruby, perl, bash).
-- Paths are portable: `BONSAI_DIR` / `PC_WORKDIR` / `PC_LLAMA_SERVER` env vars
-  override the per-platform defaults (chat history lives under `%APPDATA%` on
-  Windows and `$XDG_CONFIG_HOME`/`~/.config` on Linux).
-- A `models.json` that travelled from another machine keeps its old absolute
-  paths. On startup the app drops local models whose file is not here, repairs
-  the ones whose file is here under a different path, and never selects a
-  local model whose weights are missing - so an unzipped copy is usable
-  immediately.
-- `.gitattributes` pins `*.sh` to LF and `*.cmd`/`.bat`/`bonsai_web.py` to
-  CRLF, so a folder copied to Linux has working shell scripts.
+## 14. Platform notes
 
-**A note on the local model on Linux:** `_default_llama_exe` picks up any
-`llama-server` on `PATH`, but Bonsai 2 is a ternary model and **stock
-llama.cpp cannot read these `.gguf` files** - you need the PrismML build with
-ternary kernels (the Windows install puts it in
-`%LOCALAPPDATA%\Programs\prism-llama\`). If the server starts and then
-refuses to load the weights, that is why. `AUTO-SETUP.sh` checks for it and
-says so. The hosted models in the dropdown need none of this.
+**Windows** is the best-supported path: window management, `pywin32`, the page
+file and long-path fixes in `OPTIONALS`.
 
-## 13. License
+**Linux** works. Differences to expect:
 
-Apache-2.0 (same as the Bonsai 2 model - see `LICENSE` in the model package).
+- `python3-tk` is not in most distro Python builds and every folder picker opens a
+  Tk dialog — without it those buttons do nothing, with no error. Setup step 3
+  handles it.
+- Wayland needs `grim` for screenshots. Setup step 5.
+- Window management is `wmctrl`/`xdotool`, not `pywin32`.
+- The local model server must be on `PATH`, or `PC_LLAMA_SERVER` set.
+
+Both platforms use the same `bonsai_web.py`. Nothing in it is Windows-only except
+the handful of tools that say so.
+
+---
+
+## 15. License
+
+See `LICENSE`. The local model, the image model and the engine each carry their
+own licences — note in particular that Qwen-Image derivatives are
+**non-commercial, research use only**.

@@ -1,0 +1,86 @@
+{
+  "_comment": [
+    "TEMPLATE - no real keys, no real paths. Safe to commit.",
+    "Your real file is models.json, next to bonsai_web.py. That one is",
+    "git-ignored. Copy this over it with:",
+    "    copy models.example.json models.json      (Windows)",
+    "    cp models.example.json models.json        (Linux)",
+    "",
+    "models.json is OPTIONAL. If it is missing or unreadable, Bonsai builds its",
+    "own list: it finds every .gguf in this folder, pairs a vision projector to",
+    "a text model when the filenames match, and drops any local entry whose",
+    "file is not actually present. You only need this file to pre-configure",
+    "context sizes, ports, sampling defaults, or API models.",
+    "",
+    "Fields, all optional except id and type:",
+    "  id        unique name, used everywhere internally",
+    "  label     what the dropdown shows",
+    "  type      'local' (llama.cpp on this PC) or 'api' (a hosted endpoint)",
+    "  path      local only - absolute path to the .gguf",
+    "  mmproj    local only - absolute path to the vision projector",
+    "  port      local only - llama-server port (default 8080)",
+    "  ctx       context window to assume",
+    "  cfg       per-model sampling overrides (ctx/temp/top_p/top_k/ngl)",
+    "  wire      'chat' for /v1/chat/completions, 'responses' for /v1/responses",
+    "  omit      tool names this model must not be offered",
+    "",
+    "For an API model, api_key is the NAME of an entry in 'API KEYS.txt', not",
+    "the key itself. Never put a live key in this file.",
+    "",
+    "Delete any entry you do not want. This is yours to edit."
+  ],
+
+  "active": "local-bonsai2",
+  "models": [
+    {
+      "id": "local-bonsai2",
+      "label": "Bonsai 2 27B (local, ternary)",
+      "type": "local",
+      "path": "C:\\path\\to\\Ternary-Bonsai-2-27B-PQ2_0.gguf",
+      "mmproj": "C:\\path\\to\\Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf",
+      "ctx": 32768,
+      "port": 8080,
+      "cfg": {
+        "ctx": 20000,
+        "temp": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "ngl": 99
+      }
+    },
+    {
+      "id": "openrouter-some-model",
+      "label": "Example hosted model (OpenRouter)",
+      "type": "api",
+      "wire": "chat",
+      "base_url": "https://openrouter.ai/api/v1",
+      "model": "some/provider:model",
+      "api_key": "OPENROUTER_API_KEY",
+      "cfg": {
+        "ctx": 32768
+      }
+    },
+    {
+      "id": "local-server-no-vision",
+      "label": "Example local server, no projector",
+      "type": "local",
+      "path": "/home/you/models/some-local-model-Q4_K_M.gguf",
+      "ctx": 8192,
+      "port": 8080
+    },
+    {
+      "id": "text-only-hosted-model",
+      "label": "Example text-only model",
+      "type": "api",
+      "wire": "responses",
+      "base_url": "https://api.example.com/v1",
+      "model": "some-text-model",
+      "api_key": "MY_LLM_API_KEY",
+      "omit": ["screenshot", "take_screenshot", "window_action"],
+      "cfg": {
+        "ctx": 16384,
+        "temp": 0.7
+      }
+    }
+  ]
+}

@@ -40,12 +40,19 @@ image_models/
 *.safetensors
 sd.cpp/
 
-# Model selector config (per-machine model list + active choice)
+# Model selector config (per-machine model list + active choice).
+# models.example.json IS committed - it is the template with no keys and no
+# real paths in it. Only the working copy is ignored.
 models.json
 models.json.bak
 
-# API keys - plaintext secrets, never commit these
+# API keys - plaintext secrets, never commit these.
+# API KEYS.example.txt IS committed; it is all comments and placeholders.
 API KEYS.txt
+
+# Search rate-limit state (machine-local, timestamps and cached results)
+search_state.json
+search_state.json.part
 
 # Scheduled shell tasks (per-machine state written by schedule_task)
 schedules.json

@@ -1,0 +1,96 @@
+# =============================================================================
+#  API KEYS - BonsaiAsistent  -  TEMPLATE
+# =============================================================================
+#  This is the TEMPLATE. It has no real keys in it, which is why it is safe to
+#  commit to git. Your actual keys go in a file called exactly:
+#
+#      API KEYS.txt          (next to bonsai_web.py)
+#
+#  That file is git-ignored and must stay that way. The quickest way to start:
+#
+#      Windows   copy "API KEYS.example.txt" "API KEYS.txt"
+#      Linux     cp API KEYS.example.txt "API KEYS.txt"
+#
+#  ...or just run AUTO-SETUP, which offers this as a menu item.
+#
+#  Nothing in API KEYS.txt is ever sent to the browser, printed in the
+#  console, or written into the chat history. It is read once when a request
+#  is signed.
+#
+#  FORMAT
+#    NAME=value          one per line
+#    # comment           ignored, as is any blank line
+#    "quotes" around the value are fine, they get stripped
+#
+#  HOW A MODEL USES A KEY
+#    Add a model in the app's model dropdown (the + button -> "connect to an
+#    API server") and point its `api_key` at one of the NAMES below:
+#
+#        { "id": "gpt5", "type": "api",
+#          "base_url": "https://api.openai.com/v1",
+#          "model": "gpt-5",
+#          "api_key": "OPENAI_API_KEY" }
+#
+#    Bonsai then sends:  Authorization: Bearer <the value you put below>
+#
+#  Resolution order for `api_key`:
+#      1. a NAME defined in API KEYS.txt
+#      2. an environment variable with that name
+#      3. the string itself, used verbatim (last resort)
+#
+#  So you never have to paste a key into models.json. Put the secret in THIS
+#  file and only the name in models.json.
+#
+#  A local model server (llama.cpp, LM Studio, Ollama, PrismML...) needs no key
+#  at all - leave `api_key` out and no auth header is sent.
+#
+#  EVERY LINE BELOW IS COMMENTED OUT. Uncomment one and fill in the value.
+# =============================================================================
+
+# --- OpenAI -----------------------------------------------------------------
+# Get one at https://platform.openai.com/api-keys
+#OPENAI_API_KEY=sk-proj-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+# --- OpenRouter -------------------------------------------------------------
+# One key, many models. https://openrouter.ai/keys
+#OPENROUTER_API_KEY=sk-or-v1-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+# --- Groq -------------------------------------------------------------------
+# Free tier, very fast. https://console.groq.com/keys
+#GROQ_API_KEY=gsk_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+# --- Together AI ------------------------------------------------------------
+# https://api.together.ai/settings/api-keys
+#TOGETHER_API_KEY=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+# --- DeepSeek ---------------------------------------------------------------
+# Cheap, OpenAI-compatible. https://platform.deepseek.com/api_keys
+#DEEPSEEK_API_KEY=sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+# --- Google Gemini ----------------------------------------------------------
+# https://aistudio.google.com/app/apikey
+#GEMINI_API_KEY=AIzaSy-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+# --- Anthropic (Claude) -----------------------------------------------------
+# NOTE: Claude is not an OpenAI-compatible /v1/chat/completions endpoint, so
+# it needs a different API shape than this app speaks. The key is still read
+# from here, ready for when that is wired up.
+#ANTHROPIC_API_KEY=sk-ant-api03-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+# --- Hugging Face -----------------------------------------------------------
+# For gated models and the Inference API. https://huggingface.co/settings/tokens
+#HF_TOKEN=hf_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+# --- OpenCode Zen -----------------------------------------------------------
+# https://opencode.ai/zen - free and paid models behind one endpoint.
+#OPENCODE_API_KEY=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+# --- Anything else ----------------------------------------------------------
+# The name is whatever you want to call it. Add as many as you like:
+#
+#   MY_LLM_API_KEY=whatever-the-provider-called-it
+#
+# then reference it by name from models.json:
+#
+#   { "id": "myllm", "type": "api", "base_url": "https://.../v1",
+#     "model": "...", "api_key": "MY_LLM_API_KEY" }
