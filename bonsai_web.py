@@ -12008,7 +12008,8 @@ def _auth_error_text(exc):
                 "answered `Invalid credential`, so the key has expired, been "
                 "revoked, or is a placeholder rather than a real one. Replace it "
                 "in API KEYS.txt and try again."
-                % (name, entry.get("base") or "no base url recorded"))
+                % (name, entry.get("base_url") or entry.get("base")
+                   or "no base url recorded"))
     return ("The model refused the request for **%s** - the credential was not "
             "accepted (HTTP %d)." % (name, code))
 
@@ -17601,11 +17602,6 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Type",
                              "image/jpeg" if data[:2] == b"\xff\xd8" else "image/png")
             self.send_header("Content-Length", str(len(data)))
-            # This URL is the same for every step of a run - the page adds its
-            # own cache-buster - so anything that keys on the URL alone would
-            # hand back the first frame for the whole generation.
-            self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
-            self.send_header("Pragma", "no-cache")
             # The whole point is that this changes constantly.
             self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
             self.send_header("Pragma", "no-cache")
