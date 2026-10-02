@@ -6,6 +6,7 @@ import fnmatch
 import glob
 import hashlib
 import html
+import http.cookiejar
 import io
 import json
 import os
@@ -1337,10 +1338,37 @@ _SEARCH_HEADERS = {
 }
 
 
+# Bing answers a cookieless request with a degraded set. Asked "how tall is
+# the eiffel tower" it returned ten dictionary definitions of the word "tall"
+# and nothing about the tower - it had the query right, it was answering
+# something else. Visiting the homepage first to pick up a session cookie and
+# then searching with it returned fourteen results, four of them about the
+# tower. The junk stays in the leading positions either way, which is what the
+# relevance filter is for, but the real results are not in the list at all
+# without the session. So the searches share one cookie jar and one opener.
+_SEARCH_JAR = http.cookiejar.CookieJar()
+_SEARCH_OPENER = urllib.request.build_opener(
+    urllib.request.HTTPCookieProcessor(_SEARCH_JAR))
+_SEARCH_WARMED = {}
+
+
+def _search_warm(host, url=None):
+    """Give a search engine a session before asking it for anything."""
+    if _SEARCH_WARMED.get(host):
+        return
+    try:
+        _SEARCH_OPENER.open(urllib.request.Request(
+            url or ("https://" + host + "/"),
+            headers=dict(_SEARCH_HEADERS)), timeout=15).read(4000)
+    except Exception:
+        pass
+    _SEARCH_WARMED[host] = True
+
+
 def _search_html(url, timeout=20):
     """Fetch a search results page the way a browser would ask for it."""
     req = urllib.request.Request(url, headers=dict(_SEARCH_HEADERS))
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with _SEARCH_OPENER.open(req, timeout=timeout) as resp:
         data = resp.read(600000)
         enc = (resp.headers.get_content_charset() or "utf-8")
     return data.decode(enc, errors="replace")
@@ -1350,7 +1378,7 @@ def _search_post(url, params, timeout=20):
     """Same, but POST the query - which is how DuckDuckGo actually wants it."""
     body = urllib.parse.urlencode(params).encode()
     req = urllib.request.Request(url, data=body, headers=dict(_SEARCH_HEADERS))
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with _SEARCH_OPENER.open(req, timeout=timeout) as resp:
         data = resp.read(600000)
         enc = (resp.headers.get_content_charset() or "utf-8")
     return data.decode(enc, errors="replace")
@@ -1376,8 +1404,51 @@ _SEARCH_COOLDOWN = 900
 _SEARCH_LOCK = threading.Lock()
 
 
+# The block and the cache outlive the process. Both lived in memory, which
+# meant every restart asked DuckDuckGo again while it was still refusing -
+# and asking a source that has already said no is what makes the no last
+# longer. Restarting the app during a block used to reset the cooldown to
+# nothing.
+_SEARCH_STATE_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "search_state.json")
+
+
+def _search_state_load():
+    try:
+        with open(_SEARCH_STATE_FILE, "r", encoding="utf-8") as fh:
+            st = json.load(fh)
+    except Exception:
+        return
+    try:
+        _SEARCH_BLOCKED_UNTIL[0] = float(st.get("ddg_blocked_until") or 0)
+    except (TypeError, ValueError):
+        _SEARCH_BLOCKED_UNTIL[0] = 0
+    for k, v in (st.get("cache") or {}).items():
+        try:
+            ts, val = v[0], v[1]
+            if (time.time() - float(ts)) < _SEARCH_TTL and val:
+                _SEARCH_CACHE[k] = (float(ts), val)
+        except Exception:
+            continue
+
+
+def _search_state_save():
+    try:
+        payload = {"ddg_blocked_until": _SEARCH_BLOCKED_UNTIL[0],
+                   "cache": {k: [v[0], v[1]] for k, v in _SEARCH_CACHE.items()}}
+        tmp = _SEARCH_STATE_FILE + ".part"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh)
+        os.replace(tmp, _SEARCH_STATE_FILE)
+    except Exception:
+        pass
+
+
 def _ddg_is_blocked():
     return time.time() < _SEARCH_BLOCKED_UNTIL[0]
+
+
+_search_state_load()
 
 
 def _ddg_blocked_message():
@@ -1408,6 +1479,7 @@ def _search_cache_put(key, value):
     if len(_SEARCH_CACHE) > _SEARCH_CACHE_MAX:
         _SEARCH_CACHE.clear()
     _SEARCH_CACHE[key] = (time.time(), value)
+    _search_state_save()
 
 
 def _search_ddg(query, limit):
@@ -1442,6 +1514,7 @@ def _search_ddg(query, limit):
         if _ddg_detect_block(markup):
             with _SEARCH_LOCK:
                 _SEARCH_BLOCKED_UNTIL[0] = time.time() + _SEARCH_COOLDOWN
+            _search_state_save()
             return []
         results = _parse_duckduckgo(markup, limit)
         if results:
@@ -1770,6 +1843,7 @@ def _web_search(query, max_results=6, suggest_only=False):
                 _search_cache_put(cache_key, list(results))
         else:
             try:
+                _search_warm("www.bing.com")
                 markup = _search_html(
                     "https://www.bing.com/search?q=" + urllib.parse.quote(q)
                     + "&count=10&setlang=en")
