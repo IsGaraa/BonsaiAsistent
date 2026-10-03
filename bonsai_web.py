@@ -15406,7 +15406,18 @@ async function go(forcedParts, chat, alreadyAdded, askedMsg) {
   renderPreview();
   document.getElementById('user-input').value = '';
   try { await streamRun(await hydrateAtt(wireFor(target)), target, asked); }
-  catch (err) { doneThinking('Error: ' + err.message); setState('idle'); }
+  catch (err) {
+    /* A stop is the user's own decision, not something that went wrong, and
+       streamRun says so by throwing exactly Error('stopped'). Everything worth
+       keeping was already recorded by keepTurn before it threw, and stopRun
+       had labelled the row "(stopped by user)". Calling doneThinking here
+       appended a second line, "Error: stopped", in the error colour underneath
+       it - so deliberately stopping a reply reported a failure that never
+       happened. The row is left as stopRun left it; only a real error is
+       reported. setState still runs either way, so the header is READY. */
+    if (err && err.message === 'stopped') setState('idle');
+    else { doneThinking('Error: ' + (err && err.message)); setState('idle'); }
+  }
   finally {
     /* Releasing the button cannot live on a path that can be skipped. The
        catch handler calls doneThinking, which by now is the streaming
