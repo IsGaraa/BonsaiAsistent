@@ -4227,10 +4227,70 @@ def _port_listening(port=8080, host="127.0.0.1", timeout=1.5):
 
 # ---------------- Local image generation (Qwen-Image 2.1) ----------------
 #
-# Three files, because this architecture is not one model: a diffusion
-# transformer, a Qwen3-VL-8B text encoder, and its own VAE. The earlier Qwen
-# Image and Wan VAEs are not interchangeable with this one, which is the kind
-# of detail that produces a black picture and no error.
+# ============================================================================
+#  THE CHECKPOINT: Viggle/Qwen-Image-2.1-viggle-turbo-v0.3-6step-Q6_K
+# ============================================================================
+#  A distillation of Qwen/Qwen-Image-2.1 by Viggle. What follows is what its
+#  model card actually says, and every setting below exists because of a line
+#  in it. It is a non-commercial, research-use-only licence.
+#
+#  "6 steps instead of 40, with no classifier-free guidance."
+#      -> cfg-scale 1.0. There is no negative branch, so guidance cannot be
+#         traded for prompt adherence: it only moves the sample off the
+#         conditional mean. At 6.0 every render came back overcooked - clipped
+#         white skies, crushed black trees, water pushed to neon.
+#
+#  sigmas = [1.0, 0.9375, 0.875, 0.75, 0.5, 0.25]
+#      -> passed with --sigmas, because the card says plain num_inference_steps
+#         without sigmas "does not help" on this model. The nodes bunch at the
+#         low-noise end, which is not what a default even ramp gives.
+#
+#  ...and the list ends at 0.25, but must be sent with a trailing 0.0.
+#      This is the one thing the card does not spell out, and it is not a
+#      detail. Diffusers counts differently: it treats the last node as where
+#      the final step starts and descends to zero itself. The engine wants the
+#      descent spelled out - its own help shows "14.61,7.8,3.5,0.0" for three
+#      steps, n+1 values. Send the card's six and the engine logs
+#      "total_steps != custom_sigmas_count - 1, set total_steps to 5", quietly
+#      samples five steps ending at 0.25, and never reaches clean noise. The
+#      result is not a slightly worse picture, it is noise.
+#
+#  "Use the shipped scheduler config - shift_terminal: 0.02 wrecks the last
+#   step."
+#      -> not applicable here. That is a diffusers scheduler-config value and
+#         this engine has no equivalent knob; the only Qwen-Image-2.1 model
+#         args it exposes are the two prefix-cache ones.
+#
+#  "Keep the LoRA unmerged and at scale 1.0."
+#      -> this file IS the merged single-file transformer (Q6_K), which is the
+#         ComfyUI single-file path the card describes. Merged is "close to,
+#         but not the same as, the LoRA path" - about 8 in 96 requests settle
+#         on a different composition. Nothing to do about it in a GGUF build.
+#
+#  Changing the step count: "add or remove steps at the high-noise end only,
+#      and keep 0.875, 0.75, 0.5, 0.25." _viggle_sigmas() implements exactly
+#      that and reproduces the published 5-, 6- and 7-step schedules verbatim.
+#      The floor is 5, not 4: four steps was the superseded v0.1 checkpoint.
+#
+#  "About 1 MP is the sweet spot; up to about 4 MP works." The base frame is
+#      2.09 MP (see _IMG_ASPECTS) - inside the working range, above the sweet
+#      spot, chosen because a 1080p base upscaled to 1440p beats a 720p base
+#      upscaled the same way.
+#
+#  --guidance, the SECOND guidance knob, is deliberately not set.
+#      stable-diffusion.cpp has both --cfg-scale (classifier-free) and
+#      --guidance ("distilled guidance scale for models with guidance input",
+#      default 3.5). The engine records Guidance: 3.500000 in the metadata of
+#      this model even at cfg_scale 1.0, which looks alarming. It is inert
+#      here: rendering the same prompt and seed at guidance 3.5, 1.0 and 0.0
+#      produced byte-identical output (mean 29.0, same clipping, same grain).
+#      Qwen-Image 2.1 does not consume a guidance input. Left at the default
+#      on purpose rather than set to something that does nothing.
+#
+#  Three files, because this architecture is not one model: a diffusion
+#  transformer, a Qwen3-VL-8B text encoder, and its own VAE. The earlier Qwen
+#  Image and Wan VAEs are not interchangeable with this one, which is the kind
+#  of detail that produces a black picture and no error.
 IMAGE_MODEL_DIR = os.environ.get(
     "PC_IMAGE_MODEL_DIR", os.path.join(BONSAI_DIR, "image_models"))
 SD_DIR = os.environ.get("PC_SD_DIR", os.path.join(BONSAI_DIR, "sd.cpp"))
@@ -4613,6 +4673,18 @@ def _generate_image(args, hooks=None, direct=False):
                  output=None)
         on_prog = (hooks or {}).get("on_imgprog")
 
+        # Every call launches a fresh engine, so the weights are read from
+        # disk again each time - about 40s of that is the model load, against
+        # roughly 5s for the sampling itself.
+        #
+        # sd-server.exe does keep them resident, and the numbers are dramatic:
+        # first request through a fresh server 45.7s, second 4.8s, same
+        # weights. It is NOT used here, because this build's /sdapi/v1/txt2img
+        # returns no per-step previews (`previews: []` even with
+        # preview_interval=1), and --preview is a sd-cli-only argument that
+        # sd-server rejects outright. Moving would buy the speed by silently
+        # deleting the live preview, which is the opposite of what it is for.
+        # A build that serves previews over the API would make this worth doing.
         cmd = [exe,
                "--diffusion-model", found["diffusion"],
                "--vae", found["vae"],
@@ -6191,15 +6263,20 @@ TTS_VOICES_TOOL = _pc_tool(
 IMAGE_GEN_TOOL = _pc_tool(
     "generate_image",
     "Generate an image from a text description, using a local Qwen-Image 2.1 "
-    "model on this PC. The picture comes back and you can see it. Takes about "
-    "half a minute to a few minutes. Use it when the user asks you to draw, "
-    "make, illustrate, design or render something, or to create a picture. "
-    "Describe the subject, the setting, the light and the style in the prompt "
-    "- it is a text-to-image model and it only knows what you tell it. Good at "
-    "rendering text inside images and following composition. Sizes must be "
-    "multiples of 32; 512 and 768 are the sensible ones. Note this loads a "
-    "second large model, so any local language model is unloaded first - use "
-    "it while an API model is the active one.",
+    "Viggle turbo model on this PC. The picture comes back and you can see it. "
+    "Takes about 240 seconds at the default size - the weights are read from "
+    "disk on every call, so each one pays for the load. Use it when the user "
+    "asks you to draw, make, illustrate, design or render something, or to "
+    "create a picture. Describe the subject, the setting, the light and the "
+    "style in the prompt - it is a text-to-image model and it only knows what "
+    "you tell it. Good at rendering text inside images and following "
+    "composition. It runs with no classifier-free guidance, which means there "
+    "is no negative prompt to steer with: ask for what you want in the prompt "
+    "itself. The sample count and the sampler are fixed by the checkpoint and "
+    "cannot be steered from here - asking for more steps makes the picture "
+    "worse, not better, so if a result is wrong, reword the prompt and go "
+    "again. Note this loads a second large model, so any local language model "
+    "is unloaded first - use it while an API model is the active one.",
     {
         "prompt": {"type": "string",
                    "description": "What to draw. Be specific: subject, "
