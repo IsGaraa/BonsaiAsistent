@@ -5349,7 +5349,14 @@ QUESTION_TOOL = {
         "description": "Ask the user clarifying questions when input is "
                        "needed. Each question has a header (max 30 chars), a "
                        "full question text, and optional answer options. The "
-                       "user can pick an option or type a free-form answer.",
+                       "user can pick an option or type a free-form answer. "
+                       "Several questions can be asked at once and the user "
+                       "sees all of them together, answering one at a time. "
+                       "Set multi_select on a question when more than one of "
+                       "its options can be right at the same time - they then "
+                       "be toggled rather than chosen exclusively. Leave it "
+                       "off, the default, when exactly one option is the "
+                       "answer.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -5367,6 +5374,14 @@ QUESTION_TOOL = {
                                 "type": "string",
                                 "description": "Very short label (max 30 "
                                                "chars), e.g. 'Confirm'."
+                            },
+                            "multi_select": {
+                                "type": "boolean",
+                                "description": "True when the user may pick "
+                                               "several of these options at "
+                                               "once. Omit it, or false, "
+                                               "when exactly one option is "
+                                               "correct."
                             },
                             "options": {
                                 "type": "array",
@@ -11532,9 +11547,11 @@ def _execute_tool_call(name, args, tc, hooks, image_uri):
                 q_text = q.get("question", "")
                 q_options = q.get("options") or []
                 answers.append({"question": q_text, "options": q_options,
-                                 "header": q.get("header", "")})
+                                 "header": q.get("header", ""),
+                                 "multi_select": bool(q.get("multi_select"))})
             elif isinstance(q, str):
-                answers.append({"question": q, "options": [], "header": ""})
+                answers.append({"question": q, "options": [], "header": "",
+                                 "multi_select": False})
         on_ask = (hooks or {}).get("on_ask")
         if on_ask:
             raw_result = {"result": "ok",
@@ -11633,9 +11650,11 @@ def _execute_tool_call(name, args, tc, hooks, image_uri):
                 q_text = q.get("question", "")
                 q_options = q.get("options") or []
                 answers.append({"question": q_text, "options": q_options,
-                                 "header": q.get("header", "")})
+                                 "header": q.get("header", ""),
+                                 "multi_select": bool(q.get("multi_select"))})
             elif isinstance(q, str):
-                answers.append({"question": q, "options": [], "header": ""})
+                answers.append({"question": q, "options": [], "header": "",
+                                 "multi_select": False})
         on_ask = (hooks or {}).get("on_ask")
         if on_ask:
             raw_result = {"result": "ok",
@@ -12859,7 +12878,14 @@ PAGE = """<!doctype html>
   .imgcard .imgfoot a { color: var(--acc); }
 
   .askov { position: fixed; inset: 0; background: rgba(0,0,0,.45); display: flex; align-items: center; justify-content: center; z-index: 90; backdrop-filter: blur(3px); }
-  .askbox { background: var(--bg); border: 1px solid var(--bd); border-radius: 16px; padding: 22px; width: min(460px, 90vw); box-shadow: 0 12px 40px rgba(0,0,0,.25); }
+  .askbox { background: var(--bg); border: 1px solid var(--bd); border-radius: 16px; padding: 22px; width: min(460px, 90vw); box-shadow: 0 12px 40px rgba(0,0,0,.25);
+    /* A batch of five questions with described options is taller than the
+       window, and an overlay that runs off the bottom of the screen cannot be
+       scrolled - the questions below it were simply unreachable. The box
+       scrolls inside itself instead, and widens for a batch so a batch reads
+       as one dialog rather than a narrow column of five. */
+    max-height: 88vh; overflow-y: auto; }
+  .askbox.multi { width: min(620px, 92vw); }
   .askbox h4 { margin: 0 0 12px; font-size: 12px; color: var(--mut); letter-spacing: 1px; }
   .aq { margin-bottom: 14px; font-size: 15px; line-height: 1.5; }
   .opts { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
@@ -12882,6 +12908,8 @@ PAGE = """<!doctype html>
   .aqnum { font-size: 10.5px; font-weight: 700; letter-spacing: .8px;
            color: var(--violet); margin: 12px 0 4px; }
   .afree { display: flex; gap: 8px; }
+  .aqhint { font-size: 11.5px; color: var(--mut); margin: -2px 0 8px;
+            letter-spacing: .2px; }
   .afree input { flex: 1; border: 1px solid var(--bd); border-radius: 10px; padding: 9px 12px; background: var(--bg2); color: var(--txt); font: inherit; outline: none; }
   .afree button { padding: 8px 18px; }
   .dropov { position: fixed; inset: 0; z-index: 95; display: none; align-items: center; justify-content: center; pointer-events: none; }
@@ -14446,6 +14474,12 @@ function onAsk(j) {
     options: j.options || [], kind: j.kind || 'question',
   }];
   const answers = {};
+  /* A batch gets a wider box. Five questions at 460px read as five separate
+     dialogs stacked in a column, and the scroll inside the box is what makes
+     the lower ones reachable at all. */
+  if (qs.length > 1) box.classList.add('multi');
+  /* At least one question here can take more than one answer. */
+  const canMulti = qs.some(function (one) { return !!one.multi_select; });
   /* One commit path for both the option buttons and the free-text box, so a
      choice can never be dropped on the way out. Sends a bare list of one
      string per question, in order: that is what /api/answer reads, matched
@@ -14455,7 +14489,14 @@ function onAsk(j) {
      freeText fills the first question still unanswered, which is what typing
      into the box reads as; anything already chosen is kept. */
   const commit = function (freeText) {
-    const picked = qs.map(function (one, i) { return answers[i] || ''; });
+    /* A multi-select answer is a list of labels, and /api/answer reads one
+       plain string per question - so join them. ", " reads back as a sentence
+       to the model, which is what it has to act on, where an array would be
+       stringified into a Python list repr one hop before it. */
+    const picked = qs.map(function (one, i) {
+      const v = answers[i];
+      return Array.isArray(v) ? v.join(', ') : (v || '');
+    });
     if (freeText) {
       const first = picked.indexOf('');
       if (first >= 0) picked[first] = freeText;
@@ -14481,6 +14522,15 @@ function onAsk(j) {
         : { label: String(o), description: '' };
     }).filter(function (o) { return o.label; });
     if (!opts.length) return;
+    /* Only when the model asked for it. Saying "pick any" on every question
+       would imply several answers are welcome everywhere, which is the
+       opposite of what a single-answer question means. */
+    if (one.multi_select && opts.length > 1) {
+      const hint = document.createElement('div');
+      hint.className = 'aqhint';
+      hint.textContent = 'Pick as many as apply.';
+      box.appendChild(hint);
+    }
     const row = document.createElement('div');
     /* described options are wider than a pill and read worse side by side at
        this width, so they stack. An explicit class rather than :has() - the
@@ -14502,18 +14552,42 @@ function onAsk(j) {
       }
       b.setAttribute('data-q', String(qi));
       b.onclick = function () {
-        answers[qi] = o.label;
         /* A click records the answer and marks the button. It does NOT send:
            submitting on the first click of a two-question ask is the original
            complaint, and a batch must be answerable one question at a time
            before it goes. Sending happens when the last question is answered,
            or when SEND is pressed - which also covers a question deliberately
            left alone. */
-        row.querySelectorAll('.' + 'opt' + '[data-q="' + qi + '"]')
-            .forEach(function (n) { n.classList.remove('picked'); });
-        b.classList.add('picked');
+        if (one.multi_select) {
+          /* Toggles rather than replaces. A question that genuinely has more
+             than one right answer - which regions to touch, which of your files
+             to include - could not be answered at all before, because picking
+             the second one cleared the first and the tool only ever returned
+             one label. Answers here is a list; empty means the question is
+             unanswered, so a toggle-off has to delete the key or the "all
+             answered" count below would treat a cleared question as done. */
+          let cur = answers[qi];
+          if (!Array.isArray(cur)) cur = [];
+          const at = cur.indexOf(o.label);
+          if (at >= 0) cur.splice(at, 1); else cur.push(o.label);
+          if (cur.length) answers[qi] = cur; else delete answers[qi];
+          b.classList.toggle('picked', at < 0);
+        } else {
+          answers[qi] = o.label;
+          row.querySelectorAll('.opt[data-q="' + qi + '"]')
+              .forEach(function (n) { n.classList.remove('picked'); });
+          b.classList.add('picked');
+        }
         b.setAttribute('data-q', String(qi));
-        if (Object.keys(answers).length >= qs.length) commit();
+        /* Auto-submit on the last answer, but never for a batch containing a
+           multi-select question. Submitting the moment every question has an
+           answer makes a toggle unusable: you pick two of three options, the
+           dialog closes on the second click, and there is no way to change
+           your mind. One more click than the question actually needs. SEND is
+           there for exactly this, so an ask that can take several answers waits
+           to be sent. A plain single-answer ask still submits on the last
+           click, which is the behaviour people expect. */
+        if (!canMulti && Object.keys(answers).length >= qs.length) commit();
       };
       row.appendChild(b);
     });
@@ -14525,9 +14599,20 @@ function onAsk(j) {
     return;
   }
   const free = document.createElement('div'); free.className = 'afree';
-  const inp = document.createElement('input'); inp.placeholder = 'Type your answer...';
+  const inp = document.createElement('input');
+  inp.placeholder = canMulti ? 'Or type your own answer...' : 'Type your answer...';
   const btn = document.createElement('button'); btn.textContent = 'SEND';
-  const submit = function () { const v = inp.value.trim(); if (v) commit(v); };
+  btn.title = canMulti
+    ? 'Send your selections'
+    : 'Send this answer';
+  /* SEND sends what is selected even when the box is empty. It used to require
+     typed text, so an ask answered entirely by clicking its options had no way
+     to be submitted at all once the last option stopped auto-submitting - the
+     button did nothing and looked broken. */
+  const submit = function () {
+    const v = String(inp.value || '').trim();
+    commit(v || null);
+  };
   btn.onclick = submit;
   inp.onkeydown = function (e) { if (e.key === 'Enter') { e.preventDefault(); submit(); } };
   free.appendChild(inp); free.appendChild(btn);
@@ -18306,6 +18391,11 @@ class Handler(BaseHTTPRequestHandler):
                             "question": str(one.get("question") or one.get("header") or ""),
                             "header": str(one.get("header") or ""),
                             "options": options_of(one),
+                            # only ever true when the model asked for it, so a
+                            # plain question cannot accidentally become
+                            # multi-select just because it happens to offer
+                            # several options
+                            "multi_select": bool(one.get("multi_select")),
                             "kind": one.get("kind") or "question",
                             "path": one.get("path") or "",
                             "tool": one.get("tool") or "",
