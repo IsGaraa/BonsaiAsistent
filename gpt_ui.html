@@ -1,5 +1,5 @@
 <!-- GPT UI (PAGE_GPT) - the page served at /chat, copied verbatim from a
-     running bonsai_web.py at commit 95beb39.
+     running bonsai_web.py at commit 0a537ad.
 
      bonsai_web.py is the source of truth. This file is a read-only copy so
      the UI can be opened in an editor without wading through the Python;
@@ -2458,7 +2458,19 @@ function keepTurn(chat, anchorMsg, reply, calls, reason, stats, ended) {
   if (!chat) return null;
   const entry = { role: 'assistant', content: reply, calls: calls,
                   reason: reason && reason.trim() ? reason : undefined,
-                  stats: stats || undefined, ended: ended };
+                  stats: stats || undefined, ended: ended,
+                  /* The block order, exactly as a completed turn records it at
+                     the end of streamRun. Without it, stopping a reply flattened
+                     it: the page had been drawing each stretch of text and each
+                     tool call as its own segment in the order they arrived, and
+                     saving without the order left only "all the text, then all
+                     the tool cards", so the next render drew one bubble with
+                     everything in it. The turn had not actually lost anything -
+                     the interleaving was in OCS.parts and was simply not being
+                     written down. `ended` is what marks it as cut short; the
+                     segments themselves now survive the stop the same way they
+                     survive a normal finish. */
+                  parts: (typeof __ocParts === 'function') ? __ocParts() : undefined };
   if (anchorMsg) {
     const at = chat.messages.indexOf(anchorMsg);
     if (at >= 0) chat.messages.splice(at + 1, 0, entry);
