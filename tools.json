@@ -39,7 +39,7 @@
     "type": "function",
     "function": {
       "name": "grep",
-      "description": "Search inside files for a regular expression and get back the matching lines with file and line number (this is grep). Use it to find where something is defined, used or broken instead of reading whole files. The folder defaults to the whole workspace, but you can point it at any directory on this PC ('C:\\\\Users', 'C:\\\\', '/home/me') to search the entire machine - the user is asked to approve paths outside the workspace. Narrow a big sweep with include (e.g. '*.py'). Heavy system folders (Windows, Program Files, node_modules) are skipped, and the sweep stops after 40000 files or 45s.",
+      "description": "Search inside files for a regular expression and get back the matching lines with file and line number (this is grep). Use it to find where something is defined, used or broken instead of reading whole files. The folder defaults to the whole workspace, but you can point it at any directory on this PC ('C:\\\\Users', 'C:\\\\') to search the entire machine - the user is asked to approve paths outside the workspace. Narrow a big sweep with include (e.g. '*.py'). Heavy system folders (Windows, Program Files, node_modules) are skipped, and the sweep stops after 40000 files or 45s.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -439,7 +439,7 @@
           },
           "process": {
             "type": "string",
-            "description": "Process name (e.g. 'notepad.exe') to match."
+            "description": "Process name to match (e.g. 'notepad.exe')."
           },
           "pid": {
             "type": "integer",
@@ -817,7 +817,7 @@
     "type": "function",
     "function": {
       "name": "tts_speak",
-      "description": "Speak text aloud using the local neural Piper TTS engine (no cloud, no Windows voices). Also saves the speech as a WAV file in the workspace. Use this to give the user spoken feedback, alerts or TTS output.",
+      "description": "Speak text aloud using the local neural Piper TTS engine (no cloud, no built-in system voices). It plays straight away - there is nothing to switch on first, so just call it, do not go looking for a TTS button. Also saves the speech as a WAV file in the workspace. Use this to give the user spoken feedback, alerts or TTS output.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -839,8 +839,55 @@
   {
     "type": "function",
     "function": {
-      "name": "preview_html",
-      "description": "Live-preview an HTML page you created in the workspace. Call it after writing an .html/.htm file (e.g. a chart, a report or a small web app) - the UI will show a live iframe of the page. The page is served from this PC, so JavaScript and local assets work. Returns the preview URL.",
+      "name": "generate_image",
+      "description": "Generate an image from a text description, using a local Qwen-Image 2.1 Viggle turbo model on this PC. The picture comes back and you can see it. Takes about 240 seconds at the default size - the weights are read from disk on every call, so each one pays for the load. Use it when the user asks you to draw, make, illustrate, design or render something, or to create a picture. Describe the subject, the setting, the light and the style in the prompt - it is a text-to-image model and it only knows what you tell it. Good at rendering text inside images and following composition. It runs with no classifier-free guidance, which means there is no negative prompt to steer with: ask for what you want in the prompt itself. The sample count and the sampler are fixed by the checkpoint and cannot be steered from here - asking for more steps makes the picture worse, not better, so if a result is wrong, reword the prompt and go again. Note this loads a second large model, so any local language model is unloaded first - use it while an API model is the active one.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "prompt": {
+            "type": "string",
+            "description": "What to draw. Be specific: subject, setting, lighting, style, mood."
+          },
+          "negative_prompt": {
+            "type": "string",
+            "description": "Ignored. This model is distilled to run with no classifier-free guidance and no negative prompt, so there is nothing for one to steer. Say what you do not want in the prompt instead."
+          },
+          "aspect": {
+            "type": "string",
+            "description": "Shape of the picture: '16:9' (default), '9:16' for a phone-shaped one, '1:1', '4:3' or '3:4'. Use this rather than width and height - the sizes are chosen so the shape comes out right."
+          },
+          "width": {
+            "type": "integer",
+            "description": "Exact width in pixels. Only if you need a specific size; prefer aspect."
+          },
+          "height": {
+            "type": "integer",
+            "description": "Exact height in pixels. Only if you need a specific size; prefer aspect."
+          },
+          "upscale": {
+            "type": "boolean",
+            "description": "True (default) to also save a 1920x1080 version, resampled with Lanczos - no AI, no extra model, instant."
+          },
+          "steps": {
+            "type": "integer",
+            "description": "Denoising steps, 4-12, default 6 - and 6 is what this distilled turbo model was trained for, so leave it out unless the user asks for a specific number. Asking for more oversamples the model and gives a worse picture, not a better one."
+          },
+          "seed": {
+            "type": "integer",
+            "description": "Random seed (default -1, meaning pick one). Reuse a seed to get the same picture again."
+          }
+        },
+        "required": [
+          "prompt"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "preview_file",
+      "description": "Show something in the big center stage - an HTML page or an image. Call it after writing an .html/.htm file (a chart, a report, a small web app) to live-preview it with JavaScript and local assets working, or with a path to a picture to display it full size. Use it to show the user a picture you generated with generate_image: the finished file is in the workspace under out/images/, and previewing it puts it on the stage where they can actually look at it. Returns the preview URL.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -851,6 +898,79 @@
         },
         "required": [
           "path"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "fetch_image",
+      "description": "Fetch one picture from a URL and look at it yourself. Use this when you have a direct link to an image file and need to know what is in it, or need to show the user what it looks like. The picture is attached to the conversation for the user and sent to you as an image, so you can describe it, read text out of it, or point out what is in it. If the URL turns out to be a web page rather than a picture, the result says so - use images_in_page for that.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "url": {
+            "type": "string",
+            "description": "Direct link to the image (http/https)."
+          },
+          "referer": {
+            "type": "string",
+            "description": "Optional Referer header, for sites that refuse hot-linked images."
+          }
+        },
+        "required": [
+          "url"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "images_in_page",
+      "description": "Get the pictures out of a web page. Use this for a link to a page that CONTAINS photographs - an article, a forum thread, a wiki page, a shared chat conversation - rather than a link to a picture file. Returns every picture found, each with its size and the page it came from. By default the pictures are downloaded and shown to the user, and the first one is sent to you so you can see what the page is about. Set fetch=false to only list the links.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "url": {
+            "type": "string",
+            "description": "Link to the page (http/https)."
+          },
+          "limit": {
+            "type": "integer",
+            "description": "How many pictures to fetch, 1-12. Default 6."
+          },
+          "fetch": {
+            "type": "boolean",
+            "description": "Download and show them (default true). Set false to just get the links."
+          }
+        },
+        "required": [
+          "url"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "image_search",
+      "description": "Search the web for real photographs of a subject. Use this when the user wants to see what something actually looks like - a car part, a component, a place, an animal, a person, a product - or asks you to find a picture of it. Describe the subject in words rather than searching for a page. Returns direct picture links with the page each came from; call fetch_image on the ones worth looking at. No API key is needed.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "What to find a photograph of."
+          },
+          "limit": {
+            "type": "integer",
+            "description": "How many results, 1-12. Default 6."
+          }
+        },
+        "required": [
+          "query"
         ]
       }
     }
@@ -1253,7 +1373,7 @@
     "type": "function",
     "function": {
       "name": "edit",
-      "description": "Make targeted changes to existing files. Uses fuzzy matching with multiple strategies (exact, line-trimmed, whitespace-normalized, indentation-flexible, context-aware) to find and replace text. Returns a diff summary with additions/deletions.",
+      "description": "Make targeted changes to existing files. Uses fuzzy matching with multiple strategies (exact, line-trimmed, block-anchor, whitespace-normalized, indentation-flexible, escape-normalized, context-aware) to find and replace text. Returns a diff summary with additions/deletions.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -1313,7 +1433,7 @@
     "type": "function",
     "function": {
       "name": "question",
-      "description": "Ask the user clarifying questions when input is needed. Each question has a header (max 30 chars), a full question text, and optional answer options. The user can pick an option or type a free-form answer.",
+      "description": "Ask the user clarifying questions when input is needed. Each question has a header (max 30 chars), a full question text, and optional answer options. The user can pick an option or type a free-form answer. Several questions can be asked at once and the user sees all of them together, answering one at a time. Set multi_select on a question when more than one of its options can be right at the same time - they then be toggled rather than chosen exclusively. Leave it off, the default, when exactly one option is the answer.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -1330,6 +1450,10 @@
                 "header": {
                   "type": "string",
                   "description": "Very short label (max 30 chars), e.g. 'Confirm'."
+                },
+                "multi_select": {
+                  "type": "boolean",
+                  "description": "True when the user may pick several of these options at once. Omit it, or false, when exactly one option is correct."
                 },
                 "options": {
                   "type": "array",
@@ -1420,7 +1544,7 @@
     "type": "function",
     "function": {
       "name": "skill",
-      "description": "Load a specialized skill's instructions and resources. Skills provide specialized workflows for specific tasks. The skill content is injected into the conversation.",
+      "description": "Load a specialized skill's instructions and resources. Skills provide specialized workflows for specific tasks (e.g. 'opencode' for OpenCode questions, 'report' for bug reports). The skill content is injected into the conversation.",
       "parameters": {
         "type": "object",
         "properties": {

@@ -1,5 +1,5 @@
 <!-- GPT UI (PAGE_GPT) - the page served at /chat, copied verbatim from a
-     running bonsai_web.py at commit 0a537ad.
+     running bonsai_web.py at commit 8da35d0.
 
      bonsai_web.py is the source of truth. This file is a read-only copy so
      the UI can be opened in an editor without wading through the Python;
@@ -550,6 +550,17 @@
   .shotcard .shothd { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 5px 8px; font-size: 11px; color: var(--mut); border-bottom: 1px solid var(--bd); font-family: Consolas, monospace; }
   .shotcard .shothd b { color: var(--txt); font-weight: 600; }
   .shotcard .shotimg { display: block; width: 100%; height: auto; cursor: zoom-in; background: var(--bg); }
+  /* Several photographs from one page: a grid, not a stack. One picture wants to
+     be as large as the bubble allows; six of them at that size push the reply
+     they belong to off the bottom of the screen. */
+  .shotcard.multi { padding: 6px; }
+  .shotcard.multi .shotimg { display: inline-block; vertical-align: top; width: calc(50% - 3px); margin: 0 3px 6px 0; border-radius: 4px; }
+  .shotcard.multi .shotimg:nth-child(2n) { margin-right: 0; }
+  @media (max-width: 620px) { .shotcard.multi .shotimg { width: 100%; margin-right: 0; } }
+  /* An image the model wrote as ![alt](url). Bounded and clickable, and it is an
+     <a> so the full-size original is always one click away. */
+  a.mdimg { display: inline-block; max-width: 100%; margin: 4px 0; line-height: 0; }
+  a.mdimg img { max-width: 100%; max-height: 460px; width: auto; height: auto; border-radius: 5px; border: 1px solid var(--bd); background: var(--bg); cursor: zoom-in; }
   .shotcard .shotpath { padding: 4px 8px; font-size: 10.5px; color: var(--mut); font-family: Consolas, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
   /* context window meter - always visible, so you can see the cost of the
@@ -1551,6 +1562,35 @@ function fmt(s) {
       const u = String(url).replace(/"/g, '&quot;');
       return '<a href="' + u + '" target="_blank" rel="noreferrer">' + text + '</a>';
     };
+    /* ![alt](url) is a picture. Without a rule for it the link rule below
+       matches the [alt](url) inside and the model gets a bang in front of a
+       hyperlink - so an assistant that pastes a photo it just fetched shows the
+       user an exclamation mark and a link instead of the photograph.
+
+       The URL is checked before it can reach an <img src>. This string is built
+       from a model's output and an img src is somewhere a javascript: address
+       or a remote tracking pixel would get in, so the allowlist is by scheme
+       and by origin rather than "anything that looks like a URL". */
+    const imgSrcOk = function (u) {
+      const s = String(u == null ? '' : u).trim();
+      if (!s) return false;
+      if (s.indexOf('data:image/') === 0) return true;
+      if (s.indexOf('/att/') === 0 || s.indexOf('/imgpreview/') === 0 ||
+          s.indexOf('/previewfile/') === 0) return true;
+      return s.slice(0, 8).toLowerCase() === 'https://';
+    };
+    const image = function (url, alt) {
+      if (!imgSrcOk(url)) return anchor(url, alt || url);
+      const u = String(url).replace(/"/g, '&quot;');
+      /* esc() leaves double quotes alone, so the alt attribute gets its own. */
+      const a = esc(String(alt == null ? '' : alt)).replace(/"/g, '&quot;');
+      return '<a class="mdimg" href="' + u + '" target="_blank" rel="noreferrer">'
+        + '<img src="' + u + '" alt="' + a + '" loading="lazy"></a>';
+    };
+    t = t.replace(/!\[([^\]\n]*)\]\(([^)\s]+)\)/g, function (m, alt, url) {
+      if (!imgSrcOk(url)) return m;
+      return hold(image(url, alt));
+    });
     t = t.replace(/\[([^\]\n]+)\]\((https?:\/\/[^)\s"]+)\)/g, function (m, label, url) {
       return hold(anchor(url, label));
     });
@@ -1650,8 +1690,13 @@ function addUser(content, queued) {
   if (imgs.length || files.length) {
     const g = document.createElement('div'); g.className = 'thumbs';
     imgs.forEach(function (p) {
+      const u = p.image_url && p.image_url.url;
+      /* Same allowlist as every other picture in the page. A conversation that
+         has been saved and reloaded can hold anything that was pasted into it,
+         and this src used to be assigned whatever it said. */
+      if (!imgSrcAllowed(u)) return;
       const th = document.createElement('div'); th.className = 'thumb';
-      const im = document.createElement('img'); im.src = p.image_url.url; th.appendChild(im); g.appendChild(th);
+      const im = document.createElement('img'); im.src = u; th.appendChild(im); g.appendChild(th);
     });
     files.forEach(function (p) {
       const pf = document.createElement('span'); pf.className = 'pf'; pf.textContent = '\ud83d\udcc4 ' + p.name; g.appendChild(pf);
@@ -1676,7 +1721,14 @@ function toolResultText(r) {
   if (typeof r === 'string') return r;
   if (!r || typeof r !== 'object') return String(r);
   const copy = {};
-  Object.keys(r).forEach(function (k) { if (k !== 'preview' && k !== 'preview_url') copy[k] = r[k]; });
+  Object.keys(r).forEach(function (k) {
+    /* The picture fields are shown as cards above this text. Dumping a base64
+       data URL into the log turns a readable tool result into a wall of
+       characters, and it is the one field guaranteed to be megabytes long. */
+    if (k === 'preview' || k === 'preview_url' || k === 'previews' ||
+        k === 'image_data') return;
+    copy[k] = r[k];
+  });
   return JSON.stringify(copy, null, 2);
 }
 function openPreviewStage(url, name) {
@@ -1803,10 +1855,34 @@ function callImageSrc(c) {
   if (r.image_data) return r.image_data;
   return '';
 }
+/* Where a tool's picture is allowed to come from. Every <img> in the page goes
+   through this. A src is a DOM property, so esc() and the markdown rules never
+   see it, and one will happily take a javascript: address, a file: path or a
+   remote tracking pixel. Pictures we made or downloaded are served from our own
+   origin; a remote one is only allowed over https. */
+function imgSrcAllowed(u) {
+  const s = String(u == null ? '' : u).trim();
+  if (!s) return false;
+  if (s.indexOf('data:image/') === 0) return true;
+  if (s.indexOf('/att/') === 0 || s.indexOf('/imgpreview/') === 0 ||
+      s.indexOf('/previewfile/') === 0) return true;
+  return s.slice(0, 8).toLowerCase() === 'https://';
+}
+/* Every picture a tool produced, not just the first. Pulling the photographs out
+   of a web page returns all of them - the set is the point of that tool, and a
+   chat showing only the first would look like it had found just one. */
+function callImageList(c) {
+  if (!c) return [];
+  const r = c.result || {};
+  const many = c.previews || r.previews;
+  if (Array.isArray(many) && many.length) return many.filter(imgSrcAllowed);
+  const one = callImageSrc(c);
+  return one && imgSrcAllowed(one) ? [one] : [];
+}
 function shotCardDom(call) {
   if (!call) return null;
-  const src = callImageSrc(call);
-  if (!src) return null;
+  const list = callImageList(call);
+  if (!list.length) return null;
   const r = call.result || {};
   const saved = r.saved || r.path || '';
   const box = document.createElement('div'); box.className = 'shotcard';
@@ -1818,13 +1894,26 @@ function shotCardDom(call) {
     const d = document.createElement('span');
     d.textContent = r.width + '×' + r.height;
     head.appendChild(d);
+  } else if (list.length > 1) {
+    const d = document.createElement('span');
+    d.textContent = list.length + ' pictures';
+    head.appendChild(d);
   }
   box.appendChild(head);
-  const im = document.createElement('img'); im.className = 'shotimg';
-  im.src = src; im.alt = r.label || 'screenshot captured by Bonsai';
-  im.title = 'Click to open full size';
-  im.onclick = function () { window.open(src, '_blank'); };
-  box.appendChild(im);
+  /* One picture is shown large enough to actually look at. Several become a
+     grid, because the reason to fetch a page's photographs is to see the set,
+     and a column of full-width images would push the reply off the screen. */
+  if (list.length > 1) box.classList.add('multi');
+  list.forEach(function (src, i) {
+    const im = document.createElement('img'); im.className = 'shotimg';
+    im.src = src;
+    im.alt = r.label || 'picture fetched by Bonsai' +
+      (list.length > 1 ? ' (' + (i + 1) + ' of ' + list.length + ')' : '');
+    im.title = 'Click to open full size';
+    im.loading = 'lazy';
+    im.onclick = function () { window.open(src, '_blank'); };
+    box.appendChild(im);
+  });
   if (saved) {
     const p = document.createElement('div'); p.className = 'shotpath';
     p.textContent = saved;
@@ -3114,7 +3203,18 @@ async function go(forcedParts, chat, alreadyAdded, askedMsg) {
   renderPreview();
   document.getElementById('user-input').value = '';
   try { await streamRun(await hydrateAtt(wireFor(target)), target, asked); }
-  catch (err) { doneThinking('Error: ' + err.message); setState('idle'); }
+  catch (err) {
+    /* A stop is the user's own decision, not something that went wrong, and
+       streamRun says so by throwing exactly Error('stopped'). Everything worth
+       keeping was already recorded by keepTurn before it threw, and stopRun
+       had labelled the row "(stopped by user)". Calling doneThinking here
+       appended a second line, "Error: stopped", in the error colour underneath
+       it - so deliberately stopping a reply reported a failure that never
+       happened. The row is left as stopRun left it; only a real error is
+       reported. setState still runs either way, so the header is READY. */
+    if (err && err.message === 'stopped') setState('idle');
+    else { doneThinking('Error: ' + (err && err.message)); setState('idle'); }
+  }
   finally {
     /* Releasing the button cannot live on a path that can be skipped. The
        catch handler calls doneThinking, which by now is the streaming
@@ -3242,6 +3342,46 @@ function addFiles(files) {
 document.getElementById('attach').onclick = function () { document.getElementById('filein').click(); };
 document.getElementById('imgmode').onclick = function () { setImgMode(!imgMode); };
 document.getElementById('filein').onchange = function () { addFiles(this.files); this.value = ''; };
+/* A picture pasted as a link. There is no way to hand the assistant a URL
+   today: the only things that reach it are the file picker, the clipboard and a
+   drop, and all three need the bytes already on this machine. A link someone
+   copied out of a browser is the other way round.
+   The text is left exactly where it was - the link is usually the whole message
+   and deleting it would be surprising - and the picture appears as an
+   attachment beside it. A failed fetch says so in place of silently attaching
+   nothing, which is what a bare <img> would have done. */
+const PASTED_IMG_EXT = new RegExp('[.](?:jpe?g|png|webp|gif|bmp|avif)(?:[?#].*)?$', 'i');
+const URL_IN_TEXT = new RegExp('https?://[^\s<>")]+', 'g');
+function addUrlImage(url) {
+  return fetch('/api/fetch_image', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ url: url })
+  }).then(function (r) { return r.json(); }).then(function (j) {
+    if (!j || !j.ok || !j.url) throw new Error((j && j.error) || 'could not fetch that picture');
+    const a = { type: 'img', src: j.url, stored: j.url, remote: url };
+    pendingAtt.push(a);
+    renderPreview();
+    return a;
+  });
+}
+function attachPastedImageLinks(text) {
+  const found = String(text || '').match(URL_IN_TEXT) || [];
+  const pics = found.filter(function (u) { return PASTED_IMG_EXT.test(u); }).slice(0, 3);
+  if (!pics.length) return Promise.resolve(0);
+  const room = 4 - pendingAtt.length;
+  if (room <= 0) return Promise.resolve(0);
+  const todo = pics.slice(0, room);
+  return Promise.all(todo.map(function (u) {
+    return addUrlImage(u).catch(function (e) {
+      /* Same place addFiles reports a rejected attachment. The alternative -
+         a silently empty preview - reads as "Bonsai ignored my link". */
+      alert('Could not attach ' + u + '\n\n' + e.message);
+      return null;
+    });
+  })).then(function (got) {
+    return got.filter(Boolean).length;
+  });
+}
 /* Ctrl+V with an image on the clipboard attaches it, instead of pasting
    nothing at all. The image goes through the same addFiles() the paperclip
    uses, so it lands in the same preview, obeys the same four-attachment cap
@@ -3279,6 +3419,10 @@ document.getElementById('user-input').addEventListener('paste', function (e) {
      box, and the composer should not fill up with it either. Short pastes are
      left completely alone; only real blocks of text are caught. */
   var text = cd.getData ? (cd.getData('text/plain') || '') : '';
+  /* A pasted link to a picture is the clipboard's way of handing over an
+     image, and it needs no interception - the default paste is fine and the
+     fetch happens alongside it. */
+  if (text) attachPastedImageLinks(text);
   if (text.length < LONG_PASTE_CHARS) return;
   e.preventDefault();
   addTextAttachment(text);

@@ -53,6 +53,8 @@ API KEYS.txt
 # Search rate-limit state (machine-local, timestamps and cached results)
 search_state.json
 search_state.json.part
+vision_state.json
+vision_state.json.part
 
 # Scheduled shell tasks (per-machine state written by schedule_task)
 schedules.json

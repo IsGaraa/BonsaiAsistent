@@ -23,6 +23,12 @@ pytesseract
 # Blender control (optional addon)   -> Blender MCP tools
 mcp-for-blender
 
+# Headless browser                   -> web_resolve(render:true)
+# Installed but never declared here, so `pip install -r requirements.txt` gave
+# you no browser and the resolver quietly answered "no browser available". Needs
+# a one-off `playwright install chromium` as well.
+playwright
+
 # Local neural TTS                   -> tts_speak, tts_voices (Piper + playback)
 piper-tts
 onnxruntime
