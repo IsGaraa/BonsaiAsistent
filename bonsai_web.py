@@ -103,8 +103,23 @@ ATTACH_DIR = os.environ.get("BONSAI_ATTACH_DIR") or os.path.join(
     os.path.dirname(CHATS_FILE), "attachments")
 _ATTACH_EXT = {"image/png": ".png", "image/jpeg": ".jpg",
                "image/webp": ".webp", "image/gif": ".gif",
-               "image/bmp": ".bmp"}
-_ATTACH_RE = re.compile(r"^[0-9a-f]{64}\.(png|jpg|webp|gif|bmp)$")
+               "image/bmp": ".bmp", "image/avif": ".avif",
+               "image/svg+xml": ".svg"}
+_ATTACH_RE = re.compile(r"^[0-9a-f]{64}\.(png|jpg|webp|gif|bmp|avif|svg)$")
+# The two formats added for fetched pictures, and what each one costs us.
+#
+# AVIF is only a display format here. Browsers render it and the /att/ route
+# serves the right type, but a model cannot look at one unless the local Pillow
+# happens to have an AVIF decoder, so a fetched .avif is shown and reported
+# without the bytes ever reaching the model. That is worth saying out loud
+# rather than letting the model describe a photo it was never sent.
+#
+# SVG is a scriptable document, not a picture. Served from our own origin it is
+# stored XSS: <img> will not run its scripts, but opening the URL directly will,
+# and it can pull in external resources. It is served with a sandboxing CSP
+# below, which is what makes keeping it safe.
+_ATTACH_NEEDS_DECODE = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp")
+_ATTACH_SANDBOXED = (".svg",)
 # Tool calls are effectively unlimited - the model calls tools for as long as it
 # needs and the conversation context is the natural stop. The guard counter only
 # exists to catch a pathological infinite loop; tune it with BONSAI_MAX_TOOL_ROUNDS
@@ -1589,8 +1604,13 @@ def _search_relevant(query, rec, got=None):
 
 
 def _fetch_html(url, max_bytes=400000, timeout=20):
+    # Through the checked opener, not urlopen. Every other fetch in the app
+    # validates the scheme and the host; this one did not, so a model asked to
+    # read a page could be pointed at file:///c:/windows/win.ini - urllib
+    # handles the file scheme - or at a link-local metadata address, and both
+    # would have been read and handed back as if they were a web page.
     req = urllib.request.Request(url, headers={"User-Agent": _WEB_UA})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with _open_checked(req, timeout=timeout) as resp:
         data = resp.read(max_bytes)
         enc = (resp.headers.get_content_charset() or "utf-8")
     return data.decode(enc, errors="replace")
@@ -2396,6 +2416,131 @@ def _read_image_attachment(file_path):
                   f"to answer.</detail>",
         "image_data": data_uri,
     }
+
+
+# A picture's real type, from its own bytes. A server's Content-Type and a
+# file's extension are both claims by someone else; this is the picture
+# introducing itself. Needed because everything downstream decides what to do
+# with the bytes based on what they turn out to be - and because "fetch this
+# URL" means fetching whatever the URL decides to hand over.
+_IMAGE_MAGIC = (
+    (b"\x89PNG\r\n\x1a\n", "image/png"),
+    (b"\xff\xd8\xff", "image/jpeg"),
+    (b"GIF87a", "image/gif"),
+    (b"GIF89a", "image/gif"),
+    (b"BM", "image/bmp"),
+)
+# RIFF and WEBP are 4 bytes apart, so WEBP is checked as a pair.
+_IMAGE_RIFF = (b"RIFF", b"WEBP")
+
+
+def _sniff_image_mime(raw):
+    """The image type of some bytes, or None if they are not an image."""
+    if not raw or len(raw) < 12:
+        return None
+    for magic, mime in _IMAGE_MAGIC:
+        if raw.startswith(magic):
+            return mime
+    if raw[:4] == _IMAGE_RIFF[0] and raw[8:12] == _IMAGE_RIFF[1]:
+        return "image/webp"
+    # ISO base media (AVIF, HEIC): a 'ftyp' box whose brand starts at byte 8.
+    if raw[4:8] == b"ftyp":
+        brand = raw[8:12]
+        if brand in (b"avif", b"avis"):
+            return "image/avif"
+        if brand in (b"heic", b"heix", b"mif1", b"msf1"):
+            return "image/heic"
+    # SVG is text, and the only text format here that is genuinely a picture.
+    head = raw[:1024].lstrip()
+    if head.startswith(b"<?xml") or head.startswith(b"<svg") or b"<svg" in head[:512]:
+        if b"<svg" in raw[:4096].lower():
+            return "image/svg+xml"
+    return None
+
+
+def _attach_downloaded_image(dest, record):
+    """Hand a downloaded picture to both the chat and the model.
+
+    The download stack has always had the bytes on disk, and the chat has always
+    known how to draw a picture - it just never joined the two. Only text/*
+    responses were given a preview, so a .jpg came back named, sized and
+    reported, and then rendered as nothing at all: invisible to you, and never
+    sent to the model either.
+
+    Both outputs are needed and neither replaces the other. `preview` is the
+    durable /att/... reference the page draws and stores in the conversation;
+    `image_data` is the base64 the model actually looks at. A model with no
+    vision simply never gets the second one, and the picture still shows.
+
+    Returns True when the file turned out to be a picture that was attached.
+    Failures are recorded rather than raised: a download that cannot be shown is
+    still a download that happened, and its own result should survive.
+    """
+    try:
+        size = os.path.getsize(dest)
+    except OSError:
+        return False
+    if size > MAX_IMAGE_BYTES:
+        record["image_note"] = ("not shown: the file is %d MB, over the %d MB "
+                                "picture limit" % (size // (1024 * 1024),
+                                                   MAX_IMAGE_BYTES // (1024 * 1024)))
+        return False
+    try:
+        with open(dest, "rb") as fh:
+            raw = fh.read()
+    except OSError as exc:
+        record["image_note"] = "not shown: could not read it back (%s)" % exc
+        return False
+
+    mime = _sniff_image_mime(raw)
+    if not mime:
+        # Not an error worth raising. Plenty of things that are not pictures come
+        # back from a URL, and the caller asked for a file, which it got.
+        return False
+    if mime not in _ATTACH_EXT:
+        # HEIC, for one: a real photograph that no browser here will render and
+        # nothing will store. Saying so beats returning a link that 404s.
+        record["image_note"] = ("not shown: it is a %s file, which nothing here "
+                                "can display" % mime.split("/")[-1].upper())
+        return False
+
+    ext = _ATTACH_EXT[mime]
+    data_url = "data:%s;base64,%s" % (mime, base64.b64encode(raw).decode("ascii"))
+    stored = _store_attachment(data_url)
+    if stored:
+        record["preview"] = stored
+        record["content_type"] = mime
+    else:
+        record["image_note"] = "not shown: it could not be stored as a picture"
+        return True
+
+    if ext in _ATTACH_SANDBOXED:
+        # An SVG is a document, not a photograph. It renders, and it is kept, but
+        # it is not sent to the model as an image: a vision model is looking for
+        # a scene, and handing it markup invites it to describe the markup.
+        record["image_note"] = ("shown, but not sent to the model: an SVG is a "
+                                "document rather than a photograph")
+        return True
+    if ext not in _ATTACH_NEEDS_DECODE:
+        # AVIF displays perfectly in a browser and is simply not decodable here,
+        # so the model never gets bytes it could not have made sense of.
+        record["image_note"] = ("shown, but not sent to the model: this build "
+                                "cannot decode %s" % ext.lstrip(".").upper())
+        return True
+    if ext not in _ATTACH_NEEDS_DECODE:
+        record["image_note"] = ("shown, but not sent to the model: nothing here "
+                                "can decode %s" % ext.lstrip(".").upper())
+        return True
+
+    shown = _read_image_attachment(dest)
+    if shown.get("error"):
+        record["image_note"] = "shown, but the model cannot see it: " + shown["error"]
+        return True
+    record["image_data"] = shown["image_data"]
+    record["width"] = shown.get("width")
+    record["height"] = shown.get("height")
+    record.setdefault("label", "photo from the web")
+    return True
 
 
 def _read_oc(file_path, offset=None, limit=None):
@@ -3855,12 +4000,15 @@ def _public_models():
             item["available"] = bool(m.get("path") and os.path.exists(m["path"]))
             item["cfg"] = _entry_cfg(m)
             item["mmproj"] = m.get("mmproj") or ""
-            item["vision"] = bool(item["mmproj"]
-                                  and os.path.isfile(item["mmproj"]))
+            item["vision"] = _entry_vision(m)
         else:
             item["base_url"] = m.get("base_url")
             item["model"] = m.get("model")
             item["wire"] = _api_wire(m)
+            # A hosted model is assumed able to see until proven otherwise.
+            # Without this the picker showed every API model as text-only, which
+            # is both wrong for multimodal ones and useless as a warning.
+            item["vision"] = _entry_vision(m)
             # only ever report *that* a key is configured, never the value
             if m.get("omit"):
                 item["omit"] = m["omit"]
@@ -3886,9 +4034,7 @@ def _public_models():
             "ready": ready,
             "loading": bool(_LOADING_MODEL and not ready),
             "defaults": dict(_MODEL_DEFAULTS),
-            "vision": (entry or {}).get("type") == "local"
-                      and bool((entry or {}).get("mmproj")
-                               and os.path.isfile((entry or {}).get("mmproj"))),
+            "vision": _entry_vision(entry),
             "models": out}
 
 
@@ -6483,12 +6629,60 @@ CLICK_TEXT_TOOL = {
     }
 }
 
+IMAGE_TOOLS = [
+    _pc_tool("fetch_image",
+             "Fetch one picture from a URL and look at it yourself. Use this when "
+             "you have a direct link to an image file and need to know what is in "
+             "it, or need to show the user what it looks like. The picture is "
+             "attached to the conversation for the user and sent to you as an "
+             "image, so you can describe it, read text out of it, or point out "
+             "what is in it. If the URL turns out to be a web page rather than a "
+             "picture, the result says so - use images_in_page for that.",
+             {"url": {"type": "string",
+                      "description": "Direct link to the image (http/https)."},
+              "referer": {"type": "string",
+                          "description": "Optional Referer header, for sites that "
+                                         "refuse hot-linked images."}},
+             ["url"]),
+    _pc_tool("images_in_page",
+             "Get the pictures out of a web page. Use this for a link to a page "
+             "that CONTAINS photographs - an article, a forum thread, a wiki page, "
+             "a shared chat conversation - rather than a link to a picture file. "
+             "Returns every picture found, each with its size and the page it "
+             "came from. By default the pictures are downloaded and shown to the "
+             "user, and the first one is sent to you so you can see what the page "
+             "is about. Set fetch=false to only list the links.",
+             {"url": {"type": "string",
+                      "description": "Link to the page (http/https)."},
+              "limit": {"type": "integer",
+                        "description": "How many pictures to fetch, 1-12. "
+                                       "Default 6."},
+              "fetch": {"type": "boolean",
+                        "description": "Download and show them (default true). Set "
+                                       "false to just get the links."}},
+             ["url"]),
+    _pc_tool("image_search",
+             "Search the web for real photographs of a subject. Use this when the "
+             "user wants to see what something actually looks like - a car part, a "
+             "component, a place, an animal, a person, a product - or asks you to "
+             "find a picture of it. Describe the subject in words rather than "
+             "searching for a page. Returns direct picture links with the page "
+             "each came from; call fetch_image on the ones worth looking at. No "
+             "API key is needed.",
+             {"query": {"type": "string",
+                        "description": "What to find a photograph of."},
+              "limit": {"type": "integer",
+                        "description": "How many results, 1-12. Default 6."}},
+             ["query"]),
+]
+
 NEW_TOOLS = [WINDOW_LIST_TOOL, WINDOW_ACTION_TOOL,
              SCREENSHOT_WINDOW_TOOL, WAIT_FOR_TOOL,
              COPY_CLIPBOARD_TOOL, PASTE_CLIPBOARD_TOOL, CLICK_TEXT_TOOL,
              API_CALL_TOOL, WS_TEST_TOOL,
              SCHEDULE_TOOL, LIST_SCHEDULES_TOOL, UNSCHEDULE_TOOL,
-             TTS_VOICES_TOOL, TTS_SPEAK_TOOL, IMAGE_GEN_TOOL, PREVIEW_FILE_TOOL]
+             TTS_VOICES_TOOL, TTS_SPEAK_TOOL, IMAGE_GEN_TOOL, PREVIEW_FILE_TOOL] \
+    + IMAGE_TOOLS
 
 DOWNLOAD_TOOLS = [DOWNLOAD_STATUS_TOOL, DOWNLOAD_BATCH_TOOL,
                   DOWNLOAD_AUTHED_TOOL, DOWNLOAD_PAGE_TOOL,
@@ -8484,6 +8678,644 @@ def _resolve_host_allowed(url):
         return False, str(exc)
 
 
+class _CheckedRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Re-check the host on every hop, not just the first one.
+
+    _resolve_host_allowed is consulted before a request goes out, which reads
+    like protection and is not: urllib follows redirects by itself, so a public
+    host that answers 302 with a link-local address walks straight past a check
+    that only ever looked at the URL it was given. The comment above this
+    function even claims a plain fetcher would not follow such a redirect.
+
+    urllib calls redirect_request once per hop with the new URL, so validating
+    there is what makes the check mean what it says. A refused hop raises, which
+    aborts the chain instead of quietly continuing.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        ok, why = _resolve_host_allowed(newurl)
+        if not ok:
+            raise urllib.error.HTTPError(
+                newurl, code, "refused a redirect to %s (%s)" % (newurl, why),
+                headers, fp)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+# Everything that fetches a URL the model chose goes through this, so a refusal
+# is the same everywhere rather than depending on which tool was called.
+_SAFE_OPENER = urllib.request.build_opener(_CheckedRedirectHandler())
+
+
+def _open_checked(req, timeout=30):
+    """urlopen, but the scheme and every redirect hop are validated first."""
+    url = getattr(req, "full_url", req)
+    ok, why = _resolve_host_allowed(url)
+    if not ok:
+        raise urllib.error.URLError("refusing to fetch %s: %s" % (url, why))
+    return _SAFE_OPENER.open(req, timeout=timeout)
+
+
+def _fetch_image(url, timeout=60, referer=""):
+    """Fetch one picture from a URL, for the chat and for the model.
+
+    The tool the model reaches for when it needs to *look* at something: a photo
+    from a search result, a diagram, a screenshot someone linked to. It is
+    deliberately the narrow one - a single image, identified by its own bytes -
+    because a URL that a person trusts can still turn out to serve a login page,
+    and the difference is only visible after decoding.
+
+    Returns a record carrying `image_data` (the model looks at it) and `preview`
+    (the chat draws it). The caller pops image_data, exactly as it does for a
+    screenshot.
+    """
+    target = str(url or "").strip()
+    if not target:
+        return {"error": "url is required"}
+    if not _url_ok(target):
+        return {"error": "url must start with http:// or https://"}
+    ok, why = _resolve_host_allowed(target)
+    if not ok:
+        return {"error": "refusing to fetch %s: %s" % (target, why)}
+
+    headers = {"User-Agent": _WEB_UA, "Accept": "image/*,*/*;q=0.8"}
+    if referer:
+        headers["Referer"] = referer
+
+    # Fetched into a temp file rather than the workspace: the durable copy is
+    # the /att/ reference minted below, and leaving a second one in the working
+    # folder would just be clutter the user did not ask for.
+    tmp_dir = tempfile.mkdtemp(prefix="bonsai_fetch_")
+    dest = os.path.join(tmp_dir, _name_from_response(target, None) or "image.bin")
+    try:
+        try:
+            req = urllib.request.Request(target, headers=headers)
+            with _open_checked(req, timeout=timeout) as resp:
+                # Read one byte past the cap so an oversized body is detected
+                # rather than silently truncated into a corrupt "picture".
+                cap = MAX_IMAGE_BYTES + 1
+                raw = resp.read(cap)
+                declared = (resp.headers.get("Content-Type") or "").split(";")[0].strip()
+            if len(raw) > MAX_IMAGE_BYTES:
+                return {"error": "that image is larger than the %d MB limit"
+                                % (MAX_IMAGE_BYTES // (1024 * 1024))}
+            with open(dest, "wb") as fh:
+                fh.write(raw)
+        except urllib.error.HTTPError as exc:
+            return {"error": "the server answered %s for %s" % (exc.code, target)}
+        except Exception as exc:
+            return {"error": "could not fetch %s: %s" % (target, exc)}
+
+        record = {"result": "ok", "url": target, "bytes": len(raw),
+                  "content_type": declared or None,
+                  "label": "photo from the web"}
+        if not _attach_downloaded_image(dest, record):
+            # Say what actually arrived. "not an image" is the single most
+            # useful thing to know after following a link to a picture.
+            record["error"] = (
+                "that URL did not return an image - it returned %s. If it is a "
+                "web page rather than a picture file, use images_in_page to pull "
+                "the pictures out of it." % (declared or "something unrecognisable"))
+            record.pop("image_data", None)
+            return record
+        record["saved"] = record.get("preview")
+        return record
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+# Picture URLs in a page are not always pictures: tracking pixels, spacers, sprite
+# sheets, avatars and badges are all <img>, and a shared chat page can easily hold
+# more of those than photographs. Matching on the name is crude but it is the only
+# signal available before spending a request on each one.
+_IMG_JUNK = re.compile(
+    r"(?:^|[/_.-])(?:blank|spacer|pixel|transparent|1x1|pixelate|beacon|track|"
+    r"loader|loading|placeholder|sprite|logo|icon|favicon|avatar|badge|emoji|"
+    r"separator|divider)(?:[/_.-]|\d|$)", re.I)
+_IMG_OK_EXT = (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".avif", ".svg")
+
+
+def _absolute_url(base, url):
+    """Resolve a possibly-relative URL against the page it was found on."""
+    url = str(url or "").strip()
+    if not url or url.startswith(_SKIP_PREFIX):
+        return ""
+    try:
+        return urllib.parse.urljoin(base, url)
+    except Exception:
+        return ""
+
+
+def _looks_like_photo_url(url):
+    """Cheap yes/no on whether a URL is plausibly a photograph."""
+    low = str(url or "").lower()
+    if not low or _IMG_JUNK.search(low):
+        return False
+    try:
+        path = urllib.parse.urlsplit(low).path
+    except Exception:
+        return False
+    ext = os.path.splitext(path)[1]
+    if ext:
+        return ext in _IMG_OK_EXT
+    # No extension at all: plenty of CDNs serve photos from extensionless paths
+    # (/photo/12345), so it stays a candidate and the bytes decide.
+    return True
+
+
+def _page_image_urls(markup, base_url):
+    """Every plausible picture URL in a page, best first, deduplicated.
+
+    Deliberately reuses the attribute harvester the offline mirror already uses,
+    so a page that worked for download_page is understood here too - including
+    srcset, which is where the real photograph usually lives on a modern page.
+    """
+    base = base_url
+    m = re.search(r'(?is)<base[^>]+href\s*=\s*["\']([^"\']+)', markup or "")
+    if m:
+        base = _absolute_url(base_url, html.unescape(m.group(1))) or base_url
+
+    found, seen = [], set()
+
+    def take(raw):
+        url = _absolute_url(base, html.unescape(raw.strip()))
+        if not url or url in seen:
+            return
+        seen.add(url)
+        if _looks_like_photo_url(url):
+            found.append(url)
+
+    for m in _ASSET_ATTR.finditer(markup or ""):
+        attr = (m.group("attr") or "").lower()
+        if "src" in attr or attr.strip().startswith(("data-src", "data-original")):
+            take(m.group("url"))
+    for m in _SRCSET.finditer(markup or ""):
+        # "a.jpg 320w, a.jpg 960w" - the widest is the one worth having.
+        best = None
+        for part in (m.group("val") or "").split(","):
+            bits = part.strip().split()
+            if not bits:
+                continue
+            width = 0
+            if len(bits) > 1 and bits[1].endswith("w"):
+                try:
+                    width = int(bits[1][:-1])
+                except ValueError:
+                    width = 0
+            if best is None or width >= best[1]:
+                best = (bits[0], width)
+        if best:
+            take(best[0])
+    return found
+
+
+def _images_in_page(args):
+    """The pictures inside a web page, fetched and shown.
+
+    A link to a conversation, an article or a forum thread is not a picture, and
+    web_fetch correctly turns it into text with the images stripped as markup -
+    which is exactly wrong when the images were the point. This is the tool for
+    that case: find the picture URLs, download the real ones, show them, and
+    hand the first to the model so it can see what the page is about.
+    """
+    url = str(args.get("url") or "").strip()
+    if not url:
+        return {"error": "url is required"}
+    if not _url_ok(url):
+        return {"error": "url must start with http:// or https://"}
+    ok, why = _resolve_host_allowed(url)
+    if not ok:
+        return {"error": "refusing to fetch %s: %s" % (url, why)}
+
+    try:
+        limit = int(args.get("limit") or 6)
+    except Exception:
+        limit = 6
+    limit = max(1, min(limit, 12))
+    do_fetch = args.get("fetch")
+    do_fetch = True if do_fetch is None else bool(do_fetch)
+
+    markup = ""
+    try:
+        req = urllib.request.Request(
+            url, headers={"User-Agent": _WEB_UA,
+                          "Accept": "text/html,application/xhtml+xml,*/*;q=0.8"})
+        with _open_checked(req, timeout=30) as resp:
+            base = resp.geturl() or url
+            raw = resp.read(3_000_000)
+            enc = resp.headers.get_content_charset() or "utf-8"
+        markup = raw.decode(enc, errors="replace")
+    except urllib.error.HTTPError as exc:
+        return {"error": "the server answered %s for that page" % exc.code}
+    except Exception as exc:
+        return {"error": "could not open %s: %s" % (url, exc)}
+
+    title = ""
+    tm = re.search(r"(?is)<title[^>]*>(.*?)</title>", markup)
+    if tm:
+        title = html.unescape(re.sub(r"\s+", " ", tm.group(1)).strip())[:200]
+
+    candidates = _page_image_urls(markup, base)
+    record = {"result": "ok", "url": url, "page_title": title,
+              "found": len(candidates)}
+    if not candidates:
+        # A page whose pictures are only in the DOM is the normal case for a
+        # modern site, and saying so is more use than an empty list.
+        record["error"] = (
+            "no pictures were found in the markup of that page. It may build them "
+            "in the browser, or they may load from another domain. Try "
+            "image_search for the subject instead.")
+        return record
+
+    if not do_fetch:
+        record["images"] = [{"url": u} for u in candidates[:limit]]
+        record["note"] = ("links only - %d found. Call fetch_image on any you want "
+                          "to look at." % len(candidates))
+        return record
+
+    images, first_data, tried = [], None, 0
+    for cand in candidates:
+        if len(images) >= limit:
+            break
+        tried += 1
+        got = _fetch_image(cand, timeout=30, referer=base)
+        if got.get("error") or not got.get("preview"):
+            continue
+        images.append({"preview": got["preview"], "source_url": cand,
+                       "width": got.get("width"), "height": got.get("height"),
+                       "bytes": got.get("bytes"),
+                       "note": got.get("image_note")})
+        if first_data is None:
+            first_data = got.get("image_data")
+
+    record["images"] = images
+    record["fetched"] = len(images)
+    record["tried"] = tried
+    if not images:
+        record["error"] = ("found %d picture links but could not download any of "
+                           "them - the site may block hot-linked images. Try "
+                           "fetch_image with a referer, or image_search."
+                           % len(candidates))
+        return record
+    # The chat draws every picture in `previews`; the model gets the first one so
+    # it can see what the page was about. It can fetch_image the rest.
+    record["previews"] = [i["preview"] for i in images]
+    record["preview"] = images[0]["preview"]
+    if first_data:
+        record["image_data"] = first_data
+    record.setdefault("label", "pictures from " + (title or url))
+    return record
+
+
+# Image search needs no API key, which is the whole reason to reach for these two
+# rather than a service. Wikimedia Commons is tried first and on its own is
+# usually enough: its photographs are freely licensed, it documents itself, and
+# for a mechanical subject - an engine, a valve, a bird - it is both the most
+# likely and the most reusable answer. Bing is the fallback, and the search
+# machinery around it already knows how to undo its redirect URLs.
+_COMMONS_API = "https://commons.wikimedia.org/w/api.php"
+# The formats Commons holds that a browser will render and a model can look at.
+# Everything else it holds - .tif, .djvu, .ogv, .pdf - is a result the user
+# cannot open and fetch_image cannot store, so asking for it is a dead end.
+_COMMONS_MIME = ("image/png", "image/jpeg", "image/webp", "image/gif", "image/bmp")
+
+# Commons rate-limits hard, and it is easy to trip: one image_search walks the
+# query ladder and can spend several requests finding a rung that matches, and a
+# model that searches while it iterates does that repeatedly. The answer comes
+# back 429 and the source looks broken, which is worse than never having asked.
+#
+# So the same discipline the DuckDuckGo path already uses: space the requests,
+# remember the answers, and on a 429 stay off the source for a while and say so
+# rather than hammering it and reporting "no photographs found".
+_COMMONS_GAP = 1.2
+_COMMONS_COOLDOWN = 900
+_COMMONS_TTL = 900
+_COMMONS_CACHE_MAX = 64
+_COMMONS_CACHE = {}
+_COMMONS_LAST = [0.0]
+_COMMONS_BLOCKED_UNTIL = [0.0]
+_COMMONS_LOCK = threading.Lock()
+
+
+def _commons_blocked_message():
+    left = int(max(0.0, _COMMONS_BLOCKED_UNTIL[0] - time.time()))
+    if left <= 0:
+        return ""
+    return ("Wikimedia Commons is rate-limiting this machine for another %d "
+            "minute(s); only the fallback source was used." % max(1, left // 60))
+
+
+def _commons_api_get(search, limit):
+    """One Commons API call, spaced, cached, and honest about being throttled."""
+    cache_key = "%s|%s" % (search, limit)
+    hit = _COMMONS_CACHE.get(cache_key)
+    if hit and time.time() - hit[0] < _COMMONS_TTL:
+        return hit[1]
+
+    with _COMMONS_LOCK:
+        if _COMMONS_BLOCKED_UNTIL[0] > time.time():
+            raise RuntimeError(_commons_blocked_message() or "commons is cooling down")
+        wait = _COMMONS_GAP - (time.time() - _COMMONS_LAST[0])
+        if wait > 0:
+            time.sleep(wait)
+        _COMMONS_LAST[0] = time.time()
+
+    params = {
+        "action": "query", "format": "json", "formatversion": "2",
+        "generator": "search",
+        "gsrsearch": search,
+        "gsrnamespace": "6",        # File: - that is where pictures live
+        "gsrlimit": str(max(1, min(int(limit or 6) * 2, 20))),
+        "prop": "imageinfo",
+        "iiprop": "url|size|mime|extmetadata",
+        "iiurlwidth": "1600",       # ask for a sensible-sized rendition
+    }
+    url = _COMMONS_API + "?" + urllib.parse.urlencode(params)
+    req = urllib.request.Request(url, headers={
+        "User-Agent": _SEARCH_HEADERS.get("User-Agent", _WEB_UA),
+        "Accept": "application/json"})
+    try:
+        with _open_checked(req, timeout=25) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as exc:
+        if exc.code in (429, 503):
+            with _COMMONS_LOCK:
+                _COMMONS_BLOCKED_UNTIL[0] = time.time() + _COMMONS_COOLDOWN
+            raise RuntimeError(_commons_blocked_message())
+        raise
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return None
+    if len(_COMMONS_CACHE) >= _COMMONS_CACHE_MAX:
+        _COMMONS_CACHE.clear()
+    _COMMONS_CACHE[cache_key] = (time.time(), data)
+    return data
+
+
+def _commons_images(query, limit):
+    """Freely licensed photographs of a subject, from Wikimedia Commons.
+
+    Commons ANDs every term, so the query a person actually types - "BMW N47
+    engine EGR valve" - matches nothing at all, while "EGR valve" matches
+    plenty. Handing that straight to the API is how a working source looks
+    broken. So the query is walked back a word at a time, most distinctive
+    first, until something comes back: a slightly broader photograph beats no
+    photograph, and the model is told which query actually hit.
+
+    filetype:bitmap is not used. It changed nothing on the queries tried here,
+    and the mime check below is a more reliable filter than a search keyword.
+    """
+    terms = _image_terms(query)
+    # Commons ANDs every term, so "BMW N47 engine EGR valve" - what a person
+    # actually types - matches nothing, while "EGR valve" matches plenty. The
+    # query is walked back until something comes back, because a slightly
+    # broader photograph beats no photograph.
+    #
+    # The windows are cut from the distinctive words, never from the raw query.
+    # Cutting windows out of the raw words is what produced "where is the EGR"
+    # as a search, and Commons duly returned four astronomical photographs whose
+    # filenames happen to contain the letters egr. A rung is a noun phrase, so
+    # the words that are not part of the subject are dropped before slicing.
+    ladder = []
+    raw = str(query or "").strip()
+    if raw:
+        ladder.append(raw)
+    for width in range(len(terms), 0, -1):
+        for start in range(0, len(terms) - width + 1):
+            cand = " ".join(terms[start:start + width])
+            if cand and cand not in ladder:
+                ladder.append(cand)
+    if not ladder:
+        return []
+
+    out, used = [], None
+    for attempt, search in enumerate(ladder[:6]):
+        data = _commons_api_get(search, limit)
+        if data is None:
+            break
+
+        pages = ((data or {}).get("query") or {}).get("pages") or []
+        for page in pages:
+            info = (page.get("imageinfo") or [{}])[0]
+            # Only formats that can actually be shown and looked at. Commons is
+            # full of .tif and .svg scans, and a search result is only worth
+            # returning if fetch_image will succeed on it.
+            if str(info.get("mime") or "") not in _COMMONS_MIME:
+                continue
+            thumb = info.get("thumburl") or info.get("url")
+            if not thumb:
+                continue
+            meta = info.get("extmetadata") or {}
+
+            def field(key, _m=meta):
+                raw = (_m.get(key) or {}).get("value") or ""
+                return html.unescape(re.sub(r"<[^>]+>", " ", raw)).strip()
+
+            out.append({
+                "url": thumb,
+                "page_url": "https://commons.wikimedia.org/wiki/"
+                            + urllib.parse.quote(
+                                str(page.get("title") or "").replace(" ", "_")),
+                "title": re.sub(r"^File:\s*", "", str(page.get("title") or "")),
+                "width": info.get("thumbwidth") or info.get("width"),
+                "height": info.get("thumbheight") or info.get("height"),
+                "source": "wikimedia commons",
+                "license": field("LicenseShortName")[:60],
+                "author": field("Artist")[:120],
+            })
+        if out:
+            used = search
+            if attempt:
+                # Worth saying: the model asked one thing and got another, and
+                # should not describe the photograph as if it were the exact match.
+                out_note = ("no Commons file matched %r, so these are for the "
+                            "broader %r instead" % (query, used))
+            else:
+                out_note = ""
+            for item in out:
+                item["matched_query"] = used
+            if out_note:
+                for item in out:
+                    item["note"] = out_note
+            break
+    return out
+
+
+def _bing_images(query, limit):
+    """Photographs of a subject, from Bing's image results."""
+    url = ("https://www.bing.com/images/search?q=%s&form=HDRSC2"
+           "&qft=+filterui:imagesize-large" % urllib.parse.quote_plus(query))
+    try:
+        req = urllib.request.Request(url, headers=dict(_SEARCH_HEADERS))
+        with _open_checked(req, timeout=25) as resp:
+            markup = resp.read(600_000).decode("utf-8", errors="replace")
+    except Exception:
+        return []
+    out, seen = [], set()
+    # Bing wraps each result in m="{...json...}"; the picture URL is inside it.
+    for m in re.finditer(r'm="(\{[^"]*?\})"', markup):
+        try:
+            blob = json.loads(html.unescape(m.group(1)).replace("\\/", "/"))
+        except Exception:
+            continue
+        src = blob.get("murl") or blob.get("turl")
+        if not src or src in seen:
+            continue
+        seen.add(src)
+        out.append({
+            "url": src,
+            "page_url": blob.get("purl") or "",
+            "title": blob.get("t") or "",
+            "width": None, "height": None,
+            "source": "bing images",
+        })
+        if len(out) >= max(1, int(limit or 6)):
+            break
+    return out
+
+
+def _image_search(args):
+    """Find photographs of a subject, without an API key.
+
+    Returns links rather than pictures on purpose. Fetching is a second,
+    separately-budgeted step, so the model can pick the two or three that look
+    worth looking at instead of pulling a dozen megabytes into the conversation
+    and burning context on images of unrelated things.
+    """
+    query = str(args.get("query") or "").strip()
+    if not query:
+        return {"error": "query is required"}
+    try:
+        limit = int(args.get("limit") or 6)
+    except Exception:
+        limit = 6
+    limit = max(1, min(limit, 12))
+
+    results, errors = [], []
+    for finder in (_commons_images, _bing_images):
+        try:
+            got = finder(query, limit)
+        except Exception as exc:
+            errors.append("%s: %s" % (finder.__name__, str(exc)[:120]))
+            continue
+        results.extend(got)
+        if len(results) >= limit:
+            break
+
+    # Ranked, not filtered. A photograph of the right subject from the wrong
+    # site beats four of the wrong subject, so a partial match is kept and
+    # ordered - but a result sharing no distinctive word with the query at all is
+    # a different thing entirely, and is dropped.
+    scored = []
+    for rec in results:
+        hits, strong = _image_relevance(query, rec)
+        if not hits:
+            continue
+        # One shared word is not a match. "Ford" alone turns a brake-caliper
+        # search into a wall of F-150 news photographs, because every car article
+        # on the web says Ford. Two independent words, or one that appears in
+        # the picture's own name, is what makes it the same subject.
+        if _needs_two_hits(query, rec) and hits < 2:
+            continue
+        # Commons first when otherwise level. Its photographs are freely licensed
+        # and genuinely depict the subject; Bing's are scraped from wherever,
+        # including news articles about the subject rather than pictures of it.
+        rank = 1 if str(rec.get("source", "")).startswith("wikimedia") else 0
+        scored.append((rank, strong, hits, rec))
+    scored.sort(key=lambda t: (t[0], t[1], t[2]), reverse=True)
+    kept = [rec for _, _, _, rec in scored][:limit]
+
+    out = {
+        "result": "ok",
+        "query": query,
+        "images": kept,
+        "found": len(kept),
+    }
+    if errors and not kept:
+        out["errors"] = errors
+    throttled = _commons_blocked_message()
+    if throttled:
+        out["note"] = throttled
+    if not kept:
+        out["error"] = ("no photographs found for %r. Try different words - a "
+                        "part number, a species name, or the make and model."
+                        % query)
+        if throttled:
+            out["error"] += " " + throttled
+    else:
+        out["note"] = ("links only, best match first. Call fetch_image on any of "
+                       "these to look at it or show it to the user.")
+        if throttled:
+            out["note"] += " " + throttled
+    return out
+
+
+# Words that say nothing about what a photograph shows. Kept separate from
+# _SEARCH_STOP because a picture query is full of instructions ("show me a photo
+# of...") that a web query would not contain.
+_IMAGE_STOP = {
+    "the", "and", "for", "with", "this", "that", "from", "have", "has", "was",
+    "are", "you", "your", "can", "could", "please", "would", "about", "into",
+    "photo", "photos", "image", "images", "picture", "pictures", "pic", "pics",
+    "shot", "shots", "show", "find", "get", "give", "need", "want", "what",
+    "where", "which", "who", "how", "there", "their", "them", "some", "any",
+    "look", "looking", "example", "real", "actual", "best", "good",
+}
+
+
+def _image_terms(query):
+    """The words of a picture query that could identify the subject.
+
+    Three characters, not four, and no length rule borrowed from web search: the
+    words that identify a mechanical subject are exactly the short ones. N47,
+    EGR, V6 and 2.0 all say what the photograph is, and a four-character minimum
+    throws every one of them away.
+    """
+    return [t for t in re.findall(r"[a-z0-9]+", str(query or "").lower())
+            if len(t) >= 3 and t not in _IMAGE_STOP]
+
+
+def _needs_two_hits(query, rec):
+    """True when a single shared word is not enough to call this a match.
+
+    Applies once the query has three or more distinctive words: "rear brake
+    caliper" appearing nowhere but "Ford" in the caption is a different car
+    entirely. Short queries keep the looser rule, because with two words there
+    is no room for a false positive of that kind.
+    """
+    terms = _image_terms(query) + _image_terms(rec.get("matched_query") or "")
+    return len(set(terms)) >= 3
+
+
+def _image_relevance(query, rec):
+    """How well a picture's own words match what was asked for.
+
+    Scored rather than filtered, because these are pictures: a filename like
+    "Clogged_EGR_Valve_Intake_manifold.jpg" says far more than its caption, and
+    a caption may be in another language entirely. Returning a score lets the
+    best match be put first instead of thrown away for being imperfect.
+    """
+    # The words of the query, plus the words of whatever narrower query actually
+    # matched. A search for "BMW N47 engine EGR valve" finds a file called
+    # BMW_N47D20.jpg, and scoring that against the original query alone would
+    # rank the one correct photograph last.
+    hay_terms = _image_terms(query)
+    matched = rec.get("matched_query")
+    if matched and matched != query:
+        hay_terms = hay_terms + _image_terms(matched)
+    if not hay_terms:
+        return 1, 0
+    hay = urllib.parse.unquote(
+        " ".join(str(rec.get(k) or "") for k in ("title", "url", "page_url")).lower())
+    hits = [t for t in hay_terms if t in hay]
+    # A hit in the title or filename counts for more than one buried in a CDN
+    # path, where every result shares the same domain prefix.
+    strong = urllib.parse.unquote(
+        " ".join(str(rec.get(k) or "") for k in ("title", "url")).lower())
+    strong_hits = [t for t in hay_terms if t in strong]
+    return len(hits), len(strong_hits)
+
+
 def _resolve_ct_is_file(content_type):
     ct = str(content_type or "").split(";")[0].strip().lower()
     if not ct:
@@ -9485,6 +10317,11 @@ def _dl_execute(job):
                 record["preview"] = fh.read(1200)
         except Exception:
             pass
+    # A downloaded picture used to stop here: named, sized, reported, and drawn
+    # as nothing, because only text ever got a preview. Checking the bytes
+    # rather than the content type means a server that mislabels a photo - or
+    # hands back a login page instead of one - is handled correctly either way.
+    _attach_downloaded_image(dest, record)
     return record
 
 
@@ -11102,6 +11939,14 @@ def _api_call(args):
     url = str(args.get("url") or "").strip()
     if not url:
         return {"error": "url is required"}
+    # The same two checks every other fetch gets. api_call was reachable with
+    # any scheme and any host, and it is the one tool that can be told to POST,
+    # so it is the one where an unchecked URL matters most.
+    if not _url_ok(url):
+        return {"error": "url must start with http:// or https://"}
+    allowed, why = _resolve_host_allowed(url)
+    if not allowed:
+        return {"error": "refusing to call %s: %s" % (url, why)}
     try:
         timeout = min(max(int(args.get("timeout") or 20), 1), 120)
     except Exception:
@@ -11562,6 +12407,25 @@ def _execute_tool_call(name, args, tc, hooks, image_uri):
                                  == "suggest")
     elif name == "web_fetch":
         raw_result = _web_fetch(args.get("url"))
+    elif name == "fetch_image":
+        pic = _fetch_image(args.get("url"), referer=str(args.get("referer") or ""))
+        if pic.get("error"):
+            # A picture the model cannot have is a failure it can recover from,
+            # so the reason goes back verbatim. images_in_page is named in it
+            # because "that link was a page, not a picture" is the common miss.
+            raw_result = {"error": pic["error"]}
+        else:
+            image_uri = pic.pop("image_data", None)
+            raw_result = pic
+    elif name == "images_in_page":
+        page = _images_in_page(args)
+        if page.get("error") and not page.get("images"):
+            raw_result = {"error": page["error"]}
+        else:
+            image_uri = page.pop("image_data", None)
+            raw_result = page
+    elif name == "image_search":
+        raw_result = _image_search(args)
     elif name == "shell":
         raw_result = _shell_oc(args.get("command"), args.get("workdir"),
                                args.get("timeout"))
@@ -12002,6 +12866,52 @@ _BLIND_NOTE = (
 # remembered until that model is not the active one.
 _BLIND_MODELS = set()
 
+# Hosted entries measured to have no image support at all. Every one of these
+# answered a request carrying a picture with OpenRouter's own "No endpoints
+# found that support image input", which is the provider saying it plainly
+# rather than the model failing to look.
+#
+# This is only a starting list. A free-tier catalogue churns weekly, so it is
+# a floor and not the answer: _remember_blind adds to it at runtime, and an
+# entry can also declare "vision" in models.json.
+_KNOWN_TEXT_ONLY = {
+    "nemotron-3-super-120b-free", "nemotron-3-ultra-550b-free",
+    "nemotron-3-5-lightning-free", "north-mini-code-free",
+    "ling-3-0-flash-free", "poolside-laguna-s-2-1-free",
+    "poolside-laguna-xs-2-1-free", "liquid-lfm-2-5-2-6b-free",
+}
+
+# Blindness used to be relearned from scratch after every restart, because it
+# lived only in memory and the price of relearning it was a rejected request in
+# the middle of a conversation. It is written down next to the search cooldown,
+# which already survives restarts for the same reason.
+_VISION_STATE_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "vision_state.json")
+
+
+def _vision_state_load():
+    try:
+        with open(_VISION_STATE_FILE, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        ids = data.get("blind")
+        if isinstance(ids, list):
+            _BLIND_MODELS.update(str(x) for x in ids if x)
+    except Exception:
+        pass
+
+
+def _vision_state_save():
+    try:
+        tmp = _VISION_STATE_FILE + ".part"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"blind": sorted(_BLIND_MODELS)}, fh)
+        os.replace(tmp, _VISION_STATE_FILE)
+    except OSError:
+        pass
+
+
+_vision_state_load()
+
 
 def _is_blind(entry=None):
     entry = entry if entry is not None else _active_model()
@@ -12011,8 +12921,34 @@ def _is_blind(entry=None):
 def _remember_blind(entry=None):
     entry = entry if entry is not None else _active_model()
     mid = str((entry or {}).get("id") or "")
-    if mid:
+    if mid and mid not in _BLIND_MODELS:
         _BLIND_MODELS.add(mid)
+        _vision_state_save()
+
+
+def _entry_vision(entry):
+    """Can this model be shown a picture? None means "we have not found out".
+
+    Local models answer it exactly: a projector file either exists or it does
+    not. Hosted models were never asked, and the old code reported no vision for
+    them at all - so a perfectly good multimodal model like space-bunny was
+    listed as blind, while the app quietly discovered the truth at runtime by
+    having a request rejected.
+
+    So hosted models are assumed capable until something says otherwise, and the
+    three somethings are an explicit "vision" in models.json, the measured
+    floor above, and a refusal learned at runtime.
+    """
+    entry = entry or {}
+    mid = str(entry.get("id") or "")
+    if (entry.get("type") or "local") == "local":
+        return bool(entry.get("mmproj") and os.path.isfile(entry["mmproj"]))
+    declared = entry.get("vision")
+    if declared is not None:
+        return bool(declared)
+    if mid in _KNOWN_TEXT_ONLY or mid in _BLIND_MODELS:
+        return False
+    return True
 
 
 def _msgs_have_image(msgs):
@@ -12997,6 +13933,17 @@ PAGE = """<!doctype html>
   .shotcard .shothd { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 5px 8px; font-size: 11px; color: var(--mut); border-bottom: 1px solid var(--bd); font-family: Consolas, monospace; }
   .shotcard .shothd b { color: var(--txt); font-weight: 600; }
   .shotcard .shotimg { display: block; width: 100%; height: auto; cursor: zoom-in; background: var(--bg); }
+  /* Several photographs from one page: a grid, not a stack. One picture wants to
+     be as large as the bubble allows; six of them at that size push the reply
+     they belong to off the bottom of the screen. */
+  .shotcard.multi { padding: 6px; }
+  .shotcard.multi .shotimg { display: inline-block; vertical-align: top; width: calc(50% - 3px); margin: 0 3px 6px 0; border-radius: 4px; }
+  .shotcard.multi .shotimg:nth-child(2n) { margin-right: 0; }
+  @media (max-width: 620px) { .shotcard.multi .shotimg { width: 100%; margin-right: 0; } }
+  /* An image the model wrote as ![alt](url). Bounded and clickable, and it is an
+     <a> so the full-size original is always one click away. */
+  a.mdimg { display: inline-block; max-width: 100%; margin: 4px 0; line-height: 0; }
+  a.mdimg img { max-width: 100%; max-height: 460px; width: auto; height: auto; border-radius: 5px; border: 1px solid var(--bd); background: var(--bg); cursor: zoom-in; }
   .shotcard .shotpath { padding: 4px 8px; font-size: 10.5px; color: var(--mut); font-family: Consolas, monospace; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
   /* context window meter - always visible, so you can see the cost of the
@@ -13843,6 +14790,35 @@ function fmt(s) {
       const u = String(url).replace(/"/g, '&quot;');
       return '<a href="' + u + '" target="_blank" rel="noreferrer">' + text + '</a>';
     };
+    /* ![alt](url) is a picture. Without a rule for it the link rule below
+       matches the [alt](url) inside and the model gets a bang in front of a
+       hyperlink - so an assistant that pastes a photo it just fetched shows the
+       user an exclamation mark and a link instead of the photograph.
+
+       The URL is checked before it can reach an <img src>. This string is built
+       from a model's output and an img src is somewhere a javascript: address
+       or a remote tracking pixel would get in, so the allowlist is by scheme
+       and by origin rather than "anything that looks like a URL". */
+    const imgSrcOk = function (u) {
+      const s = String(u == null ? '' : u).trim();
+      if (!s) return false;
+      if (s.indexOf('data:image/') === 0) return true;
+      if (s.indexOf('/att/') === 0 || s.indexOf('/imgpreview/') === 0 ||
+          s.indexOf('/previewfile/') === 0) return true;
+      return s.slice(0, 8).toLowerCase() === 'https://';
+    };
+    const image = function (url, alt) {
+      if (!imgSrcOk(url)) return anchor(url, alt || url);
+      const u = String(url).replace(/"/g, '&quot;');
+      /* esc() leaves double quotes alone, so the alt attribute gets its own. */
+      const a = esc(String(alt == null ? '' : alt)).replace(/"/g, '&quot;');
+      return '<a class="mdimg" href="' + u + '" target="_blank" rel="noreferrer">'
+        + '<img src="' + u + '" alt="' + a + '" loading="lazy"></a>';
+    };
+    t = t.replace(/!\\[([^\\]\\n]*)\\]\\(([^)\\s]+)\\)/g, function (m, alt, url) {
+      if (!imgSrcOk(url)) return m;
+      return hold(image(url, alt));
+    });
     t = t.replace(/\\[([^\\]\\n]+)\\]\\((https?:\\/\\/[^)\\s"]+)\\)/g, function (m, label, url) {
       return hold(anchor(url, label));
     });
@@ -13942,8 +14918,13 @@ function addUser(content, queued) {
   if (imgs.length || files.length) {
     const g = document.createElement('div'); g.className = 'thumbs';
     imgs.forEach(function (p) {
+      const u = p.image_url && p.image_url.url;
+      /* Same allowlist as every other picture in the page. A conversation that
+         has been saved and reloaded can hold anything that was pasted into it,
+         and this src used to be assigned whatever it said. */
+      if (!imgSrcAllowed(u)) return;
       const th = document.createElement('div'); th.className = 'thumb';
-      const im = document.createElement('img'); im.src = p.image_url.url; th.appendChild(im); g.appendChild(th);
+      const im = document.createElement('img'); im.src = u; th.appendChild(im); g.appendChild(th);
     });
     files.forEach(function (p) {
       const pf = document.createElement('span'); pf.className = 'pf'; pf.textContent = '\\ud83d\\udcc4 ' + p.name; g.appendChild(pf);
@@ -13968,7 +14949,14 @@ function toolResultText(r) {
   if (typeof r === 'string') return r;
   if (!r || typeof r !== 'object') return String(r);
   const copy = {};
-  Object.keys(r).forEach(function (k) { if (k !== 'preview' && k !== 'preview_url') copy[k] = r[k]; });
+  Object.keys(r).forEach(function (k) {
+    /* The picture fields are shown as cards above this text. Dumping a base64
+       data URL into the log turns a readable tool result into a wall of
+       characters, and it is the one field guaranteed to be megabytes long. */
+    if (k === 'preview' || k === 'preview_url' || k === 'previews' ||
+        k === 'image_data') return;
+    copy[k] = r[k];
+  });
   return JSON.stringify(copy, null, 2);
 }
 function openPreviewStage(url, name) {
@@ -14095,10 +15083,34 @@ function callImageSrc(c) {
   if (r.image_data) return r.image_data;
   return '';
 }
+/* Where a tool's picture is allowed to come from. Every <img> in the page goes
+   through this. A src is a DOM property, so esc() and the markdown rules never
+   see it, and one will happily take a javascript: address, a file: path or a
+   remote tracking pixel. Pictures we made or downloaded are served from our own
+   origin; a remote one is only allowed over https. */
+function imgSrcAllowed(u) {
+  const s = String(u == null ? '' : u).trim();
+  if (!s) return false;
+  if (s.indexOf('data:image/') === 0) return true;
+  if (s.indexOf('/att/') === 0 || s.indexOf('/imgpreview/') === 0 ||
+      s.indexOf('/previewfile/') === 0) return true;
+  return s.slice(0, 8).toLowerCase() === 'https://';
+}
+/* Every picture a tool produced, not just the first. Pulling the photographs out
+   of a web page returns all of them - the set is the point of that tool, and a
+   chat showing only the first would look like it had found just one. */
+function callImageList(c) {
+  if (!c) return [];
+  const r = c.result || {};
+  const many = c.previews || r.previews;
+  if (Array.isArray(many) && many.length) return many.filter(imgSrcAllowed);
+  const one = callImageSrc(c);
+  return one && imgSrcAllowed(one) ? [one] : [];
+}
 function shotCardDom(call) {
   if (!call) return null;
-  const src = callImageSrc(call);
-  if (!src) return null;
+  const list = callImageList(call);
+  if (!list.length) return null;
   const r = call.result || {};
   const saved = r.saved || r.path || '';
   const box = document.createElement('div'); box.className = 'shotcard';
@@ -14110,13 +15122,26 @@ function shotCardDom(call) {
     const d = document.createElement('span');
     d.textContent = r.width + '\u00d7' + r.height;
     head.appendChild(d);
+  } else if (list.length > 1) {
+    const d = document.createElement('span');
+    d.textContent = list.length + ' pictures';
+    head.appendChild(d);
   }
   box.appendChild(head);
-  const im = document.createElement('img'); im.className = 'shotimg';
-  im.src = src; im.alt = r.label || 'screenshot captured by Bonsai';
-  im.title = 'Click to open full size';
-  im.onclick = function () { window.open(src, '_blank'); };
-  box.appendChild(im);
+  /* One picture is shown large enough to actually look at. Several become a
+     grid, because the reason to fetch a page's photographs is to see the set,
+     and a column of full-width images would push the reply off the screen. */
+  if (list.length > 1) box.classList.add('multi');
+  list.forEach(function (src, i) {
+    const im = document.createElement('img'); im.className = 'shotimg';
+    im.src = src;
+    im.alt = r.label || 'picture fetched by Bonsai' +
+      (list.length > 1 ? ' (' + (i + 1) + ' of ' + list.length + ')' : '');
+    im.title = 'Click to open full size';
+    im.loading = 'lazy';
+    im.onclick = function () { window.open(src, '_blank'); };
+    box.appendChild(im);
+  });
   if (saved) {
     const p = document.createElement('div'); p.className = 'shotpath';
     p.textContent = saved;
@@ -15545,6 +16570,46 @@ function addFiles(files) {
 document.getElementById('attach').onclick = function () { document.getElementById('filein').click(); };
 document.getElementById('imgmode').onclick = function () { setImgMode(!imgMode); };
 document.getElementById('filein').onchange = function () { addFiles(this.files); this.value = ''; };
+/* A picture pasted as a link. There is no way to hand the assistant a URL
+   today: the only things that reach it are the file picker, the clipboard and a
+   drop, and all three need the bytes already on this machine. A link someone
+   copied out of a browser is the other way round.
+   The text is left exactly where it was - the link is usually the whole message
+   and deleting it would be surprising - and the picture appears as an
+   attachment beside it. A failed fetch says so in place of silently attaching
+   nothing, which is what a bare <img> would have done. */
+const PASTED_IMG_EXT = new RegExp('[.](?:jpe?g|png|webp|gif|bmp|avif)(?:[?#].*)?$', 'i');
+const URL_IN_TEXT = new RegExp('https?://[^\\s<>")]+', 'g');
+function addUrlImage(url) {
+  return fetch('/api/fetch_image', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ url: url })
+  }).then(function (r) { return r.json(); }).then(function (j) {
+    if (!j || !j.ok || !j.url) throw new Error((j && j.error) || 'could not fetch that picture');
+    const a = { type: 'img', src: j.url, stored: j.url, remote: url };
+    pendingAtt.push(a);
+    renderPreview();
+    return a;
+  });
+}
+function attachPastedImageLinks(text) {
+  const found = String(text || '').match(URL_IN_TEXT) || [];
+  const pics = found.filter(function (u) { return PASTED_IMG_EXT.test(u); }).slice(0, 3);
+  if (!pics.length) return Promise.resolve(0);
+  const room = 4 - pendingAtt.length;
+  if (room <= 0) return Promise.resolve(0);
+  const todo = pics.slice(0, room);
+  return Promise.all(todo.map(function (u) {
+    return addUrlImage(u).catch(function (e) {
+      /* Same place addFiles reports a rejected attachment. The alternative -
+         a silently empty preview - reads as "Bonsai ignored my link". */
+      alert('Could not attach ' + u + '\\n\\n' + e.message);
+      return null;
+    });
+  })).then(function (got) {
+    return got.filter(Boolean).length;
+  });
+}
 /* Ctrl+V with an image on the clipboard attaches it, instead of pasting
    nothing at all. The image goes through the same addFiles() the paperclip
    uses, so it lands in the same preview, obeys the same four-attachment cap
@@ -15582,6 +16647,10 @@ document.getElementById('user-input').addEventListener('paste', function (e) {
      box, and the composer should not fill up with it either. Short pastes are
      left completely alone; only real blocks of text are caught. */
   var text = cd.getData ? (cd.getData('text/plain') || '') : '';
+  /* A pasted link to a picture is the clipboard's way of handing over an
+     image, and it needs no interception - the default paste is fine and the
+     fetch happens alongside it. */
+  if (text) attachPastedImageLinks(text);
   if (text.length < LONG_PASTE_CHARS) return;
   e.preventDefault();
   addTextAttachment(text);
@@ -18139,7 +19208,8 @@ class Handler(BaseHTTPRequestHandler):
             ext = os.path.splitext(name)[1].lower()
             mime = {".png": "image/png", ".jpg": "image/jpeg",
                     ".webp": "image/webp", ".gif": "image/gif",
-                    ".bmp": "image/bmp"}.get(ext, "application/octet-stream")
+                    ".bmp": "image/bmp", ".avif": "image/avif",
+                    ".svg": "image/svg+xml"}.get(ext, "application/octet-stream")
             try:
                 with open(real, "rb") as fh:
                     data = fh.read()
@@ -18149,6 +19219,22 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", mime)
             self.send_header("Content-Length", str(len(data)))
+            # An attachment arrives off the internet as often as it arrives off
+            # the clipboard, so the browser is told not to sniff past the type we
+            # gave it. Without this a file that is not really a picture can be
+            # reinterpreted as one.
+            self.send_header("X-Content-Type-Options", "nosniff")
+            if ext in _ATTACH_SANDBOXED:
+                # An SVG is a document that can run script, and this one is being
+                # served from the app's own origin. Sandboxed with no default
+                # sources, it renders as the picture it is and cannot execute
+                # anything, reach the network, or touch the page it came from -
+                # which is what a plain image would never be able to do. Inline
+                # styles are allowed because most SVGs are unusable without them.
+                self.send_header("Content-Security-Policy",
+                                 "default-src 'none'; style-src 'unsafe-inline'; "
+                                 "sandbox; base-uri 'none'; form-action 'none'")
+                self.send_header("Content-Disposition", "inline")
             # The name is the content hash, so the bytes at this URL can never
             # change. Saying so keeps a reload from re-downloading every photo
             # in every conversation you have open.
@@ -18224,6 +19310,7 @@ class Handler(BaseHTTPRequestHandler):
                             "/api/tts", "/api/models", "/api/pick_model",
                             "/api/ctx", "/api/revert", "/api/forget_changes",
                             "/api/compact", "/api/attach", "/api/image",
+                            "/api/fetch_image",
                             "/api/path_policy", "/api/blender",
                             "/api/dl_pause",
                             "/api/dl_resume", "/api/dl_cancel",
@@ -18274,6 +19361,23 @@ class Handler(BaseHTTPRequestHandler):
                                    "or bmp, up to 12 MB)"}))
                     return
                 self._send(200, json.dumps({"ok": True, "url": url}))
+                return
+            if path == "/api/fetch_image":
+                # The composer attaching a picture the user pasted as a link.
+                # The fetch happens here rather than in the browser so it goes
+                # through the same scheme, host and redirect checks as the
+                # model's own tool, and so the bytes land in the attachment store
+                # once instead of being dragged through the page.
+                got = _fetch_image(body.get("url"))
+                if got.get("error") or not got.get("preview"):
+                    self._send(200, json.dumps(
+                        {"ok": False,
+                         "error": got.get("error") or "that was not a picture"}))
+                    return
+                self._send(200, json.dumps(
+                    {"ok": True, "url": got["preview"],
+                     "width": got.get("width"), "height": got.get("height"),
+                     "note": got.get("image_note")}))
                 return
             if path == "/api/path_policy":
                 if body.get("clear"):
