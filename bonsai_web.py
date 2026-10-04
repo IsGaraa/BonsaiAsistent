@@ -8783,15 +8783,27 @@ def _fetch_image(url, timeout=60, referer=""):
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
-# Picture URLs in a page are not always pictures: tracking pixels, spacers, sprite
-# sheets, avatars and badges are all <img>, and a shared chat page can easily hold
-# more of those than photographs. Matching on the name is crude but it is the only
-# signal available before spending a request on each one.
+# Picture URLs in a page are not always pictures: tracking pixels, spacers,
+# sprite sheets, avatars, forum banners and rank badges are all <img>, and a
+# busy page holds far more of those than photographs. Matching on the name is
+# crude but it is the only signal available before spending a request on each
+# one.
 _IMG_JUNK = re.compile(
     r"(?:^|[/_.-])(?:blank|spacer|pixel|transparent|1x1|pixelate|beacon|track|"
-    r"loader|loading|placeholder|sprite|logo|icon|favicon|avatar|badge|emoji|"
-    r"separator|divider)(?:[/_.-]|\d|$)", re.I)
+    r"loader|loading|placeholder|sprite|logo|sitelogo|favicon|avatar|badge|emoji|"
+    r"separator|divider|header|topbar|banner|set_resources|smilie|smiley)(?:[/_.-]|\d|$)",
+    re.I)
 _IMG_OK_EXT = (".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".avif", ".svg")
+
+# Class names that mean "this image is part of what the page is about". Forum
+# and CMS markup says so explicitly - a posted photograph carries something like
+# ipsImage_thumbnailed, post-image or wp-image - and it is the one signal that
+# separates content from site furniture without spending a request. Without it
+# the biggest picture on a forum page wins, and that is a 750x300 advert.
+_IMG_CONTENT_HINT = re.compile(
+    r"(?:ipsimage|attachment|post[-_]?image|postimage|wp-image|gallery|"
+    r"figure|lightbox|fancybox|bbwrapper|message[-_]?body|photo|content[-_]?img)",
+    re.I)
 
 
 def _absolute_url(base, url):
@@ -8806,7 +8818,13 @@ def _absolute_url(base, url):
 
 
 def _looks_like_photo_url(url):
-    """Cheap yes/no on whether a URL is plausibly a photograph."""
+    """Cheap yes/no on whether a URL is plausibly a photograph.
+
+    A known image extension is now required. It used to be optional, which let
+    through a Google Tag Manager script URL and a XenForo/IPS miniProfile ajax
+    endpoint - both were fetched, both failed, and both consumed a slot that a
+    real photograph could have had.
+    """
     low = str(url or "").lower()
     if not low or _IMG_JUNK.search(low):
         return False
@@ -8814,12 +8832,7 @@ def _looks_like_photo_url(url):
         path = urllib.parse.urlsplit(low).path
     except Exception:
         return False
-    ext = os.path.splitext(path)[1]
-    if ext:
-        return ext in _IMG_OK_EXT
-    # No extension at all: plenty of CDNs serve photos from extensionless paths
-    # (/photo/12345), so it stays a candidate and the bytes decide.
-    return True
+    return os.path.splitext(path)[1] in _IMG_OK_EXT
 
 
 def _page_image_urls(markup, base_url):
@@ -8836,13 +8849,35 @@ def _page_image_urls(markup, base_url):
 
     found, seen = [], set()
 
-    def take(raw):
+    def take(raw, cls=""):
         url = _absolute_url(base, html.unescape(raw.strip()))
         if not url or url in seen:
             return
         seen.add(url)
         if _looks_like_photo_url(url):
-            found.append(url)
+            found.append({"url": url, "cls": cls or ""})
+
+    # <img> tags first, with their class and alt, because they carry the signal.
+    for m in _ASSET_IMG.finditer(markup or ""):
+        attrs = m.group("attrs") or ""
+        src = re.search(_ATTR_ONE % ("src|data-src|data-original"), attrs)
+        if not src:
+            continue
+        cls = re.search(_ATTR_ONE % "class", attrs)
+        alt = re.search(_ATTR_ONE % "alt", attrs)
+        # class and alt are both evidence of "this is page content", so they are
+        # carried together - but only when there is something to carry, rather
+        # than a lone space that reads as a value that was meant to be there.
+        hints = " ".join(x for x in (cls.group("val") if cls else "",
+                                     alt.group("val") if alt else "") if x.strip())
+        take(src.group("val"), hints)
+
+    # Then the generic attribute sweep, for pictures inside <source>, CSS or
+    # markup shapes that are not an <img> at all.
+    for m in _ASSET_ATTR.finditer(markup or ""):
+        attr = (m.group("attr") or "").lower()
+        if "src" in attr or attr.strip().startswith(("data-src", "data-original")):
+            take(m.group("url"))
 
     for m in _ASSET_ATTR.finditer(markup or ""):
         attr = (m.group("attr") or "").lower()
@@ -8866,6 +8901,48 @@ def _page_image_urls(markup, base_url):
         if best:
             take(best[0])
     return found
+
+
+def _photo_score(item):
+    """How much a fetched picture looks like the photograph a person meant.
+
+    Ranked on what the file actually turned out to be, not on its name or its
+    position in the document. That ordering matters: on a forum thread the
+    markup leads with the site logo, a spacer, four rank badges and a dozen
+    avatars, and the photograph someone came for is the fifteenth thing in the
+    list. Taking candidates in document order therefore returns the chrome and
+    leaves the photograph behind.
+
+    Declared width and height are not trusted: on the page this was built for,
+    an image declared at 422x747 is actually a 110x110 thumbnail. Only the
+    decoded pixels are evidence.
+    """
+    w = item.get("width") or 0
+    h = item.get("height") or 0
+    if not w or not h:
+        return -1
+    score = w * h
+    long_side = max(w, h)
+    short_side = min(w, h)
+    # A photograph has some size to it. An avatar, a badge or an icon is square
+    # and tiny, and area alone ranks a 400x400 avatar above a 640x480 snapshot.
+    if long_side < 200:
+        score *= 0.15
+    elif short_side < 150:
+        score *= 0.6
+    # Site furniture is very wide and very short - a banner is 5:1. A real
+    # photograph approaches 4:3, so a wild ratio costs it, gently, because a
+    # panorama is a legitimate thing for someone to have posted.
+    ratio = long_side / float(short_side or 1)
+    if ratio > 4:
+        score *= 0.25
+    # The markup's own opinion, when it has one: an image whose class or alt
+    # text says it belongs to the page's content outranks an equally sized one
+    # that is plainly furniture. This is what puts a posted photograph above a
+    # forum advert of the same dimensions.
+    if _IMG_CONTENT_HINT.search(item.get("cls") or ""):
+        score *= 4.0
+    return score
 
 
 def _images_in_page(args):
@@ -8914,7 +8991,9 @@ def _images_in_page(args):
     if tm:
         title = html.unescape(re.sub(r"\s+", " ", tm.group(1)).strip())[:200]
 
-    candidates = _page_image_urls(markup, base)
+    harvested = _page_image_urls(markup, base)
+    candidates = [c["url"] for c in harvested]
+    classes = {c["url"]: c.get("cls") or "" for c in harvested}
     record = {"result": "ok", "url": url, "page_title": title,
               "found": len(candidates)}
     if not candidates:
@@ -8933,31 +9012,62 @@ def _images_in_page(args):
         return record
 
     images, first_data, tried = [], None, 0
-    for cand in candidates:
-        if len(images) >= limit:
-            break
+    # Fetch a wider set than is wanted, then keep the best. Ranking has to happen
+    # on decoded pixels - see _photo_score - and the only way to know a pixel
+    # count is to have the picture. The budget is bounded so a page with two
+    # hundred <img> tags cannot turn one tool call into two hundred requests.
+    budget = min(len(candidates), max(limit * 3, 12), 20)
+    skipped = max(0, len(candidates) - budget)
+    pool = []
+    for cand in candidates[:budget]:
         tried += 1
         got = _fetch_image(cand, timeout=30, referer=base)
         if got.get("error") or not got.get("preview"):
             continue
-        images.append({"preview": got["preview"], "source_url": cand,
-                       "width": got.get("width"), "height": got.get("height"),
-                       "bytes": got.get("bytes"),
-                       "note": got.get("image_note")})
-        if first_data is None:
-            first_data = got.get("image_data")
+        item = {"preview": got["preview"], "source_url": cand,
+                "width": got.get("width"), "height": got.get("height"),
+                "bytes": got.get("bytes"),
+                "label": got.get("label") or "photo from the web",
+                "cls": classes.get(cand) or "",
+                # kept out of the reported list below - it is the model's copy,
+                # and a duplicate download to get it would be one wasted request
+                "_data": got.get("image_data")}
+        if got.get("image_note"):
+            item["note"] = got["image_note"]
+        pool.append(item)
+
+    pool.sort(key=_photo_score, reverse=True)
+    # Ranked photographs only. An SVG is a document - a rank badge, a chart, a
+    # logo - and it has no pixel dimensions to score, so it never displaces a
+    # real picture; it is offered afterwards, and only to fill a gap.
+    photos = [i for i in pool if _photo_score(i) > 0]
+    others = [i for i in pool if _photo_score(i) <= 0]
+    images = (photos + others)[:limit]
+    if images:
+        first_data = images[0].get("_data")
+    for item in images:
+        item.pop("_data", None)
+        item.pop("cls", None)
 
     record["images"] = images
     record["fetched"] = len(images)
     record["tried"] = tried
+    if skipped:
+        record["not_examined"] = skipped
     if not images:
         record["error"] = ("found %d picture links but could not download any of "
                            "them - the site may block hot-linked images. Try "
                            "fetch_image with a referer, or image_search."
                            % len(candidates))
         return record
-    # The chat draws every picture in `previews`; the model gets the first one so
-    # it can see what the page was about. It can fetch_image the rest.
+    if not images:
+        record["error"] = ("found %d picture links but could not download any of "
+                           "them - the site may block hot-linked images. Try "
+                           "fetch_image with a referer, or image_search."
+                           % len(candidates))
+        return record
+    # The chat draws every picture in `previews`; the model gets the best one,
+    # which is the one worth describing.
     record["previews"] = [i["preview"] for i in images]
     record["preview"] = images[0]["preview"]
     if first_data:
@@ -11155,6 +11265,11 @@ def _download_authed(args):
 _ASSET_ATTR = re.compile(
     r'(?P<attr>\b(?:src|href|poster|data-src|data-original)\s*=\s*)(?P<q>["\'])(?P<url>[^"\']+)(?P=q)',
     re.I)
+# The same attributes, with the element's class and alt text alongside them.
+# The class is the only cheap way to tell a posted photograph from a banner.
+_ASSET_IMG = re.compile(
+    r'(?is)<img\b(?P<attrs>[^>]*)>', re.I)
+_ATTR_ONE = r'\b(?P<name>%s)\s*=\s*(?P<q>["\'])(?P<val>[^"\']*)(?P=q)'
 _SRCSET = re.compile(r'(?P<attr>\bsrcset\s*=\s*)(?P<q>["\'])(?P<val>[^"\']+)(?P=q)', re.I)
 _ASSET_EXT = (".css", ".js", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg",
               ".ico", ".woff", ".woff2", ".ttf", ".otf", ".eot", ".mp4", ".webm",
