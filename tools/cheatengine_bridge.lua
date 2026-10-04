@@ -208,28 +208,51 @@ local function readExactly(pipe, n)
   local parts = {}
   while got < n do
     local chunk = pipe:readString(n - got)
-    if chunk == nil or #chunk == 0 then return nil end
+    if chunk == nil then
+      -- A nil here is the normal "nothing to read" answer, and it is the one
+      -- thing worth seeing in the log: the client connected and then there was
+      -- no request. Without this there is no way to tell an empty read from a
+      -- wrong method or a pipe that was never really connected.
+      return nil, 'readString(' .. tostring(n - got) .. ') returned nil' ..
+             ' (Connected=' .. tostring(pipe.Connected) .. ')'
+    end
+    if #chunk == 0 then
+      return nil, 'readString(' .. tostring(n - got) .. ') returned 0 bytes' ..
+             ' (Connected=' .. tostring(pipe.Connected) .. ')'
+    end
     parts[#parts + 1] = chunk
     got = got + #chunk
   end
-  return table.concat(parts)
+  return table.concat(parts), nil
 end
 
 local function readFrame(pipe)
-  local raw = readExactly(pipe, 4)
-  if not raw or #raw < 4 then return nil end
+  local raw, why = readExactly(pipe, 4)
+  if not raw or #raw < 4 then return nil, why or 'short length prefix' end
   local n = 0
   for i = 1, 4 do
     n = n + raw:byte(i) * (256 ^ (i - 1))
   end
-  if n <= 0 or n > 8 * 1024 * 1024 then return nil end
-  return readExactly(pipe, n)
+  if n <= 0 or n > 8 * 1024 * 1024 then
+    return nil, 'implausible frame length: ' .. tostring(n)
+  end
+  local body, why2 = readExactly(pipe, n)
+  if not body then return nil, why2 or ('short body, wanted ' .. tostring(n)) end
+  return body, nil
 end
 
 local function writeFrame(pipe, text)
   -- include0terminator is passed as false so exactly these bytes go out: the
   -- reader is told the length, so a terminator would be part of the payload.
-  pipe:writeString(text or '', false)
+  -- writeString reports the number of bytes sent, or nil on failure, which is
+  -- the only way to find out that the reply never left - and a reply that never
+  -- left looks identical on the client to a bridge that is not there.
+  local sent = pipe:writeString(text or '', false)
+  if sent == nil then
+    log('writeString FAILED for ' .. tostring(#(text or '')) .. ' bytes' ..
+        ' (Connected=' .. tostring(pipe.Connected) .. ')')
+  end
+  return sent
 end
 
 local function send(pipe, tbl)
@@ -249,8 +272,11 @@ local function serve(client)
   -- connection per request.
   local greeted = false
   while true do
-    local frame = readFrame(client)
-    if not frame then break end
+    local frame, why = readFrame(client)
+    if not frame then
+      log('connection ended: ' .. tostring(why))
+      break
+    end
     local ok, req = pcall(jsonparser.decode, frame)
     if not ok or type(req) ~= 'table' then
       send(client, { ok = false, error = 'malformed request' })
@@ -314,10 +340,12 @@ createThread(function()
     -- LuaPipe to talk on, and every read after that would be on the wrong object.
     local client = pipe:acceptConnection(true)
     if client then
+      log('client connected')
       local ok, err = pcall(serve, client)
       if not ok then log('client error: ' .. tostring(err)) end
       -- LuaPipe inherits Object, which has destroy(). There is no close() on it.
       pcall(function() client:destroy() end)
+      log('client closed')
     end
     sleep(120)
   end
