@@ -32,10 +32,16 @@
 --  accident, not to make this safe against a determined local process.
 
 local PIPE_NAME = 'bonsai_ce_bridge'
--- Beside the executable, because that is a path both sides can work out without
--- agreeing on an environment: CELua has no os.getenv, and the temp directory
--- moves. getCheatEngineDir() is CE's own and returns the install folder.
-local TOKEN_FILE = getCheatEngineDir() .. '\\bonsai_ce_token.txt'
+-- The token goes in the temp folder, not beside the executable. Cheat Engine
+-- usually runs unelevated and C:\Program Files is not writable without
+-- elevation, so a file there would fail with access denied and the bridge would
+-- never start - which looks exactly like "Cheat Engine cannot be driven".
+-- getTempFolder() is CE's own accessor for that path.
+local TOKEN_FILE = getTempFolder()
+if TOKEN_FILE:sub(-1) ~= '\\' and TOKEN_FILE:sub(-1) ~= '/' then
+  TOKEN_FILE = TOKEN_FILE .. '\\'
+end
+TOKEN_FILE = TOKEN_FILE .. 'bonsai_ce_token.txt'
 
 -- Declared here, assigned at the bottom. serve() closes over this local, so
 -- declaring it after serve would silently make it a nil global instead.
@@ -43,29 +49,28 @@ local TOKEN = nil
 
 local jsonparser = require('json')
 
-local function log(fmt, ...)
-  local ok, msg = pcall(string.format, fmt, ...)
-  print('[bonsai] ' .. tostring(msg or fmt))
+local function log(msg)
+  print('[bonsai] ' .. tostring(msg))
 end
 
--- A token written where the client can find it. Generated per CE start, so a
--- client that was connected to a previous session is not silently accepted by
--- the next one.
+-- A token written where the client can find it, so that a connection from a
+-- previous Cheat Engine session is not silently accepted by the next one.
+--
+-- Deliberately trivial. It guards against an accident, not against anyone
+-- attacking: a local process can read this file, which the note at the top of
+-- this file says plainly. The first version seeded math.random from the address
+-- of registerAITool, which meant taking the address of a CELua function to build
+-- a string - a compile-time hazard for a value that never needed to be
+-- unpredictable. os.time() changes every second and is used all over CE's own
+-- scripts, so it is the safest thing available.
 local function makeToken()
-  local t = {}
-  local seed = os.time() .. tostring({}) .. tostring(registerAITool)
-  math.randomseed(seed)
-  for _ = 1, 24 do
-    t[#t + 1] = string.char(math.random(48, 57), math.random(65, 90),
-                            math.random(97, 122))
-  end
-  return table.concat(t)
+  return 'ce-' .. tostring(os.time())
 end
 
 local function writeToken(token)
   local fh = io.open(TOKEN_FILE, 'w')
   if not fh then
-    log('could not write the token file: %s', tostring(TOKEN_FILE))
+    log('could not write the token file: ' .. tostring(TOKEN_FILE))
     return false
   end
   fh:write(token)
@@ -198,37 +203,40 @@ local function send(pipe, tbl)
   writeFrame(pipe, encoded)
 end
 
-local function serve(pipe)
-  pipe.lock and pipe.lock()
+local function serve(client)
+  -- No lock() here on purpose. CELua rejects `obj.method and obj.method()` as a
+  -- syntax error - a method reference is not a value in CELua, which is what
+  -- stopped this script loading at all - and there is nothing to contend with
+  -- anyway: one connection is accepted at a time and the client takes a new
+  -- connection per request.
   local greeted = false
   while true do
-    local frame = readFrame(pipe)
+    local frame = readFrame(client)
     if not frame then break end
     local ok, req = pcall(jsonparser.decode, frame)
     if not ok or type(req) ~= 'table' then
-      send(pipe, { ok = false, error = 'malformed request' })
+      send(client, { ok = false, error = 'malformed request' })
     else
       if not greeted then
         greeted = true
         if req.token ~= TOKEN then
-          send(pipe, { ok = false, error = 'bad token' })
+          send(client, { ok = false, error = 'bad token' })
           break
         end
       end
       local op = req.op or 'tools/list'
       if op == 'ping' then
-        send(pipe, { ok = true, result = 'bonsai ce bridge',
-                     tools = #listTools() })
+        send(client, { ok = true, result = 'bonsai ce bridge',
+                       tools = #listTools() })
       elseif op == 'tools/list' then
-        send(pipe, { ok = true, tools = listTools() })
+        send(client, { ok = true, tools = listTools() })
       elseif op == 'tools/call' then
-        send(pipe, runTool(req.name, req.arguments))
+        send(client, runTool(req.name, req.arguments))
       else
-        send(pipe, { ok = false, error = 'unknown op: ' .. tostring(op) })
+        send(client, { ok = false, error = 'unknown op: ' .. tostring(op) })
       end
     end
   end
-  pipe.unlock and pipe.unlock()
 end
 
 local TOKEN_ACTUAL = makeToken()
@@ -243,15 +251,19 @@ if not pipe or not pipe.valid then
   log('createPipe failed; Cheat Engine cannot be driven from outside')
   return
 end
-log('listening on \\\\.\\pipe\\%s with %d tool(s)', PIPE_NAME, #listTools())
+log('listening on \\\\.\\pipe\\' .. PIPE_NAME .. ' with ' ..
+    #listTools() .. ' tool(s)')
 
 createThread(function()
   while true do
-    local client = pipe:acceptConnection()
+    -- acceptConnection(true) is required: without split it does not hand back a
+    -- LuaPipe to talk on, and every read after that would be on the wrong object.
+    local client = pipe:acceptConnection(true)
     if client then
       local ok, err = pcall(serve, client)
-      if not ok then log('client error: %s', tostring(err)) end
-      pcall(function() client:close() end)
+      if not ok then log('client error: ' .. tostring(err)) end
+      -- LuaPipe inherits Object, which has destroy(). There is no close() on it.
+      pcall(function() client:destroy() end)
     end
     sleep(120)
   end

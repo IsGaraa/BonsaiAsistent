@@ -2949,16 +2949,24 @@ def _ce_token():
     Read per attempt rather than cached: the bridge makes a new one every time CE
     starts, so a cached token would be rejected after a restart for no visible
     reason.
+
+    The bridge writes it to the temp folder, because that is the one location
+    both sides can name without agreeing on anything and Cheat Engine can write
+    to without being elevated - C:\\Program Files is not writable otherwise. The
+    install folder is still checked, in case an older bridge script is in use.
     """
-    root = _cheat_engine_dir()
-    if not root:
-        return None
-    try:
-        with open(os.path.join(root, _CE_TOKEN_FILE), "r", encoding="utf-8") as fh:
-            token = fh.read().strip()
-        return token or None
-    except OSError:
-        return None
+    for folder in (tempfile.gettempdir(), _cheat_engine_dir()):
+        if not folder:
+            continue
+        try:
+            with open(os.path.join(folder, _CE_TOKEN_FILE), "r",
+                      encoding="utf-8") as fh:
+                token = fh.read().strip()
+            if token:
+                return token
+        except OSError:
+            continue
+    return None
 
 
 def _ce_pipe_path():
