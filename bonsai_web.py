@@ -19867,6 +19867,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, json.dumps(_changes_snapshot(), default=str))
         elif path == "/api/blender":
             self._send(200, json.dumps(_blender_status_payload()))
+        elif path == "/api/cheatengine":
+            self._send(200, json.dumps(_cheat_engine_status_payload(), default=str))
         elif path == "/api/tts":
             self._send(200, json.dumps({"enabled": tts_enabled(),
                                         "folder": PIPER_DIR}))
