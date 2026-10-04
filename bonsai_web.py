@@ -2974,44 +2974,58 @@ def _ce_pipe_path():
 
 
 def _ce_call(request, timeout=25.0, attempts=3):
-    """One request over the named pipe. Returns None when CE is not listening.
+    """One request over the named pipe.
 
-    A fresh connection per call. CE's LuaPipe server accepts one client at a time
-    and blocking on acceptConnection freezes that thread, so holding a connection
-    open across calls would serialise the whole agent behind it.
+    Returns None when Cheat Engine is not serving the pipe at all, and
+    {"ok": False, "error": ...} when it is serving but the exchange went wrong.
+    Those two are worth telling apart: the first means "Cheat Engine is not
+    running, or was started before the bridge script was installed", and the
+    second means it is running and the bridge thread is broken - which is only
+    visible in Cheat Engine's own Lua output. Reporting both as "not running"
+    sends the user looking in the wrong place.
     """
     token = _ce_token()
     if not token:
-        return None
+        return {"ok": False,
+                "error": "no token file: Cheat Engine has not run the bridge "
+                         "script yet (restart Cheat Engine once)"}
     payload = dict(request or {})
     payload.setdefault("token", token)
     blob = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     if len(blob) > 4 * 1024 * 1024:
         return {"ok": False, "error": "request was too large for the bridge"}
     path = _ce_pipe_path()
-    # Every instance busy, and the pipe not yet created, both mean "not right
-    # now" rather than "broken" - the first is a transient state that a moment
-    # later is not true, since each call takes a new connection and the previous
-    # one is by then closed.
     busy = {22, 32, 231, 232, 535}
     last = None
     for attempt in range(max(1, attempts)):
         try:
-            # A named pipe is a byte stream. Length-prefixed, so a message
-            # boundary can never be guessed wrong.
-            with open(path, "r+b", buffering=0) as pipe:
-                pipe.write(struct.pack("<I", len(blob)) + blob)
-                head = _read_exact(pipe, 4)
+            # Raw os.open/os.read rather than open(): a named pipe is not a
+            # regular file, and the buffered io layer will happily try to seek
+            # or measure it. os.open maps straight onto CreateFile.
+            # A named pipe is also a byte stream, so the length prefix is what
+            # makes the message boundary unambiguous.
+            fd = os.open(path, os.O_RDWR | os.O_BINARY)
+            try:
+                os.write(fd, struct.pack("<I", len(blob)) + blob)
+                head = _os_read_exact(fd, 4)
                 if not head:
-                    return None
+                    return {"ok": False,
+                            "error": "Cheat Engine accepted the connection but "
+                                     "sent nothing back - the bridge thread in "
+                                     "Cheat Engine is not running. Open View > "
+                                     "Lua Engine in Cheat Engine and look for "
+                                     "lines starting with [bonsai]."}
                 (size,) = struct.unpack("<I", head)
                 if size == 0 or size > 32 * 1024 * 1024:
                     return {"ok": False,
                             "error": "the bridge sent an implausible length"}
-                body = _read_exact(pipe, size)
+                body = _os_read_exact(fd, size)
                 if not body:
-                    return None
+                    return {"ok": False,
+                            "error": "Cheat Engine's reply was cut short"}
                 return json.loads(body.decode("utf-8", "replace"))
+            finally:
+                os.close(fd)
         except FileNotFoundError:
             return None            # the name exists only while CE serves it
         except OSError as exc:
@@ -3026,6 +3040,18 @@ def _ce_call(request, timeout=25.0, attempts=3):
         except (ValueError, UnicodeDecodeError) as exc:
             return {"ok": False, "error": "the bridge sent something unreadable: %s" % exc}
     return None if last is None else {"ok": False, "error": str(last)}
+
+
+def _os_read_exact(fd, count):
+    """Read exactly count bytes from a raw descriptor, or None if it went away."""
+    chunks, got = [], 0
+    while got < count:
+        part = os.read(fd, count - got)
+        if not part:
+            return None
+        chunks.append(part)
+        got += len(part)
+    return b"".join(chunks)
 
 
 def _read_exact(stream, count):
@@ -3050,7 +3076,7 @@ def _ce_refresh(force=False):
         return _CE_TOOLS
     res = _ce_call({"op": "tools/list"}, timeout=20.0)
     with _CE_LOCK:
-        if not res:
+        if res is None:
             _CE_TOOLS.update(at=now, items=[], state="absent",
                              detail="no pipe: Cheat Engine is not serving "
                                     r"\\.\pipe\%s" % _CE_PIPE_NAME)
@@ -3061,8 +3087,8 @@ def _ce_refresh(force=False):
             return _CE_TOOLS
         items = res.get("tools") or []
         _CE_TOOLS.update(at=now, items=items, state="ok",
-                         detail="%d tool(s) from Cheat Engine %s"
-                                % (len(items), _ce_token() and "session" or "session"))
+                         detail="%d tool(s) from the running Cheat Engine"
+                                % len(items))
     return _CE_TOOLS
 
 
