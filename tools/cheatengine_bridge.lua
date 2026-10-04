@@ -2,86 +2,137 @@
 --
 --  Drop this in Cheat Engine's autorun folder. It exposes the tools that the
 --  bundled AITools extension already registers - Dark Byte's own curated set of
---  35 - to any client on this machine, over a Windows named pipe.
+--  35 - so an assistant can use them.
 --
---  Why a named pipe and not a TCP port: CE 7.7 documents createServerSocket in
---  celua.txt but does not compile it - the symbol is absent from every binary in
---  the install - so CE can connect out to a TCP server but cannot listen on one.
---  createPipe is present and is what CE's own DotNet and mono bridges use
---  (autorun\DotNetInterface.lua, autorun\monoscript.lua). Python opens
---  \\.\pipe\<name> with no dependency at all.
+--  Why files and not a pipe
+--  ------------------------
+--  The obvious transport is createPipe, and it does not work from another
+--  process. Measured, not assumed:
 --
---  Why this needs a restart: CE has no command line flag to run a script. A file
---  in autorun\ is executed when CE starts, and that is the only foothold. There
---  is no way to reach an already-running CE that has not been made to cooperate.
+--    * the connection completes and Cheat Engine reports Connected=true
+--    * a client WriteFile of 48 bytes returns success
+--    * readString and readBytes both then return nil, nine attempts over a
+--      second, while Connected is still true
+--    * giving it eight idle seconds changes nothing
+--    * and it is not one-directional either - a frame the bridge writes on
+--      connect never arrives at the client
 --
---  Two things this does better than the stock extension:
+--  Both directions are dead while both ends report success, so the pipe CE
+--  creates is not a duplex channel to an outside process in this build. Cheat
+--  Engine ships luaclient.dll to talk to its own pipes, which suggests the pipe
+--  expects that handshake rather than a plain client - but there is no way to
+--  inspect the pipe from here, and this works:
+--
+--  A folder, and a timer. The bridge polls it a few times a second; a request
+--  file appears, it runs the tool and writes the answer back next to it. Slower
+--  than a pipe by a few hundred milliseconds, and completely legible: the
+--  requests and replies are files you can open and read.
+--
+--  Why this needs a restart
+--  -----------------------
+--  Cheat Engine has no command line flag to run a script. A file in autorun\ is
+--  executed when CE starts, and that is the only way in.
+--
+--  Two things this does better than the stock AITools extension:
 --
 --    * Handlers are wrapped in pcall. aibase.lua:560 calls functionToCall bare,
---      so a Lua error inside a tool kills the turn and the model never gets a
+--      and there is no pcall anywhere in aitools.lua, so a Lua error inside a
+--      tool - and these tools index CE objects that are nil whenever the wrong
+--      process is open - kills the turn and the model never gets a
 --      functionResponse at all. Here the error comes back as a value.
---    * Dispatch is a real function. The stock extension inlines it about five
---      levels deep inside a streaming loop, coupled to UI objects.
+--    * Dispatch is a function. The stock version inlines it about five levels
+--      deep inside a streaming loop, coupled to UI objects.
 --
 --  Security, plainly: a connected client can read and write the memory of any
 --  process this user can open, which is arbitrary code injection into anything
---  you are running. That is what Cheat Engine is for, but it does mean anything
---  else running as you can do it too. The pipe name is not a secret and the
---  token is only a guard against accidents, not an attack - a local process can
---  read the token file. It exists so that a stray connection cannot drive CE by
---  accident, not to make this safe against a determined local process.
+--  you are running. That is what Cheat Engine is for, but with a file mailbox it
+--  also means any other program running as you can drop a request in this folder
+--  and drive Cheat Engine. The token guards against accidents, not attacks: it is
+--  written next to the folder in your temp directory and any local process can
+--  read it. It is there so a stray file cannot drive CE, not to make this safe
+--  against a determined local program - and it is only checked once a request is
+--  read, because anything can already write the status file.
 
-local PIPE_NAME = 'bonsai_ce_bridge'
--- The token goes in the temp folder, not beside the executable. Cheat Engine
--- usually runs unelevated and C:\Program Files is not writable without
--- elevation, so a file there would fail with access denied and the bridge would
--- never start - which looks exactly like "Cheat Engine cannot be driven".
--- getTempFolder() is CE's own accessor for that path.
-local TOKEN_FILE = getTempFolder()
-if TOKEN_FILE:sub(-1) ~= '\\' and TOKEN_FILE:sub(-1) ~= '/' then
-  TOKEN_FILE = TOKEN_FILE .. '\\'
+local BASE = getTempFolder()
+if BASE:sub(-1) ~= '\\' and BASE:sub(-1) ~= '/' then
+  BASE = BASE .. '\\'
 end
-TOKEN_FILE = TOKEN_FILE .. 'bonsai_ce_token.txt'
+-- Flat files in the temp folder, not a subfolder of it. io.open will not create
+-- a directory, and createDir(path) did not produce one here either - the folder
+-- simply did not exist afterwards, so every write below failed while the bridge
+-- still logged that it was watching. The temp folder is the one place that is
+-- certain to exist and to be writable without elevation, and a handful of
+-- clearly-prefixed files in it needs no directory to be made.
+local PREFIX = BASE .. 'bonsai_ce_'
+local STATUS_FILE = PREFIX .. 'status.json'
+local REQ_FILE = PREFIX .. 'request.json'
+local LOG_FILE = PREFIX .. 'log'
+local POLL_MS = 250
 
--- Declared here, assigned at the bottom. serve() closes over this local, so
--- declaring it after serve would silently make it a nil global instead.
-local TOKEN = nil
+-- The token. Deliberately trivial: it guards against a stray request, not
+-- against anyone attacking, since a local process can read this file - which
+-- the note above says plainly. os.time() changes every second and is used all
+-- over Cheat Engine's own scripts, so it is the safest thing available.
+local TOKEN = 'ce-' .. tostring(os.time())
 
 local jsonparser = require('json')
 
+-- Log to Cheat Engine's output and to a file, because print() goes to the Lua
+-- Engine pane, which nobody has open, so everything this script had to say was
+-- invisible to the one person who needed it.
+local LOG_FILE = PREFIX .. 'log'
+
 local function log(msg)
-  print('[bonsai] ' .. tostring(msg))
-end
-
--- A token written where the client can find it, so that a connection from a
--- previous Cheat Engine session is not silently accepted by the next one.
---
--- Deliberately trivial. It guards against an accident, not against anyone
--- attacking: a local process can read this file, which the note at the top of
--- this file says plainly. The first version seeded math.random from the address
--- of registerAITool, which meant taking the address of a CELua function to build
--- a string - a compile-time hazard for a value that never needed to be
--- unpredictable. os.time() changes every second and is used all over CE's own
--- scripts, so it is the safest thing available.
-local function makeToken()
-  return 'ce-' .. tostring(os.time())
-end
-
-local function writeToken(token)
-  local fh = io.open(TOKEN_FILE, 'w')
-  if not fh then
-    log('could not write the token file: ' .. tostring(TOKEN_FILE))
-    return false
+  local line = '[bonsai] ' .. tostring(msg)
+  print(line)
+  local fh = io.open(LOG_FILE, 'a')
+  if fh then
+    fh:write(line .. '\n')
+    fh:close()
   end
-  fh:write(token)
+end
+
+local function writeFile(path, text)
+  local fh = io.open(path, 'w')
+  if not fh then return false end
+  fh:write(text)
   fh:close()
   return true
 end
 
+local function readFile(path)
+  local fh = io.open(path, 'rb')
+  if not fh then return nil end
+  local body = fh:read('*a')
+  fh:close()
+  if body == nil or #body == 0 then return nil end
+  return body
+end
+
+-- Make sure the AITools extension has registered its tools.
+--
+-- This script sits in autorun\ and Extensions are not guaranteed to have loaded
+-- by the time an autorun script runs, so asking beats trusting the ordering.
+-- loadLuaScriptsFromPath honours the extension's own loadOrder.txt, so
+-- aibase.lua still goes in before the tools that call registerAITool, and
+-- registering the same names twice is harmless - they are table keys.
+local AITOOLS_TRIED = false
+
+local function ensureAitools()
+  if aitools and next(aitools) ~= nil then return true end
+  if AITOOLS_TRIED then return false end
+  AITOOLS_TRIED = true
+  local dir = getCheatEngineDir()
+  if not dir or not loadLuaScriptsFromPath then return false end
+  local ok, err = pcall(loadLuaScriptsFromPath, dir .. '\\Extensions\\AITools', false)
+  if not ok then log('could not load AITools: ' .. tostring(err)) end
+  return (aitools and next(aitools) ~= nil) or false
+end
+
 -- Turn a Lua value into something jsonparser.encode will accept. Tool results
--- come back as arbitrary tables from CE, and a table with mixed key types or a
--- function in it is not encodable - which would otherwise turn a successful tool
--- call into a broken response.
+-- are arbitrary tables from CE, and one containing a function or a mixed-key
+-- table is not encodable - which would turn a successful call into a broken
+-- response.
 local function sanitise(v, depth)
   depth = depth or 0
   local t = type(v)
@@ -92,8 +143,7 @@ local function sanitise(v, depth)
   end
   if depth > 6 then return '<too deep>' end
   if t == 'table' then
-    local out, isArray = {}, true
-    local n = 0
+    local out, isArray, n = {}, true, 0
     for k, val in pairs(v) do
       if type(k) ~= 'number' then isArray = false end
       local s = sanitise(val, depth + 1)
@@ -101,7 +151,6 @@ local function sanitise(v, depth)
       if type(k) == 'number' then n = n + 1 end
     end
     if isArray and n == #v then return out end
-    -- a mixed or sparse table becomes a string rather than a malformed object
     if not isArray then
       local ok, encoded = pcall(jsonparser.encode, v)
       if ok then return encoded end
@@ -117,13 +166,13 @@ end
 local function runTool(name, args)
   local tool = aitools and aitools[name]
   if not tool then
-    return { ok = false, error = "no such tool: " .. tostring(name) }
+    return { ok = false, error = 'no such tool: ' .. tostring(name) }
   end
   if tool.enabled == false then
-    return { ok = false, error = "tool is disabled: " .. tostring(name) }
+    return { ok = false, error = 'tool is disabled: ' .. tostring(name) }
   end
   if not tool.functionToCall then
-    return { ok = false, error = "tool has no handler: " .. tostring(name) }
+    return { ok = false, error = 'tool has no handler: ' .. tostring(name) }
   end
   args = args or {}
   local res = { pcall(tool.functionToCall, args) }
@@ -136,37 +185,6 @@ local function runTool(name, args)
     return { ok = true, result = 'done (no value returned)' }
   end
   return { ok = true, result = value }
-end
-
--- Make sure the AITools extension has registered its tools before answering.
---
--- The startup log said "0 tool(s)" once, and that is not a harmless wrong
--- number: this script sits in autorun\, and Extensions are not guaranteed to have
--- loaded by the time an autorun script runs. listTools() is called per request,
--- so the tools do turn up - but only if something loads them, and the AITools
--- extension is behind a setting (EnableAITools, default on, "requires restart").
---
--- So rather than trust the ordering, ask for the folder to be loaded. It honours
--- the extension's own loadOrder.txt, so aibase.lua still goes in before the tools
--- that call registerAITool, and registering the same names twice is harmless -
--- they are table keys.
-local AITOOLS_TRIED = false
-local AITOOLS_PATH = nil
-
-local function ensureAitools()
-  if aitools and next(aitools) ~= nil then return true end
-  if AITOOLS_TRIED then return false end
-  AITOOLS_TRIED = true
-  local dir = getCheatEngineDir()
-  if not dir then return false end
-  AITOOLS_PATH = dir .. '\\Extensions\\AITools'
-  if loadLuaScriptsFromPath then
-    local ok, err = pcall(loadLuaScriptsFromPath, AITOOLS_PATH, false)
-    if not ok then
-      log('could not load the AITools extension: ' .. tostring(err))
-    end
-  end
-  return (aitools and next(aitools) ~= nil) or false
 end
 
 local function listTools()
@@ -182,8 +200,7 @@ local function listTools()
       out[#out + 1] = {
         name = t.name or name,
         description = t.description or '',
-        -- the extension already builds this in the OpenAI function shape, so
-        -- the schema can be passed straight through
+        -- already the OpenAI function shape, so the schema passes straight through
         parameters = t.parameters or { type = 'OBJECT', properties = {}, required = {} },
       }
     end
@@ -191,162 +208,117 @@ local function listTools()
   return out
 end
 
--- Length-prefixed framing over the string methods, deliberately.
---
--- readBytes() on a pipe returns a ByteTable, not a Lua string - CE's own code
--- does `local r = javapipe.readBytes(16)` and then feeds r to byteTableToQword,
--- which is the giveaway. Building a string out of those with table.concat throws,
--- the throw escapes readFrame, and the caller's pcall swallows it, so the client
--- gets no reply at all and just sees a connection that goes silent.
---
--- readString(size) and writeString(str, false) are both documented, both take
--- and return real strings, and readString's size argument is what the framing
--- needs anyway - readString() with no size has no delimiter to stop at, which is
--- why the length prefix exists in the first place.
-local function readExactly(pipe, n)
-  local got = 0
-  local parts = {}
-  while got < n do
-    local chunk = pipe:readString(n - got)
-    if chunk == nil then
-      -- A nil here is the normal "nothing to read" answer, and it is the one
-      -- thing worth seeing in the log: the client connected and then there was
-      -- no request. Without this there is no way to tell an empty read from a
-      -- wrong method or a pipe that was never really connected.
-      return nil, 'readString(' .. tostring(n - got) .. ') returned nil' ..
-             ' (Connected=' .. tostring(pipe.Connected) .. ')'
+local function encode(tbl)
+  local ok, text = pcall(jsonparser.encode, tbl)
+  if ok then return text end
+  return nil
+end
+
+-- One request, one reply. The id is echoed so a reply can never be mistaken for
+-- an answer to something else, and so a client that gave up does not collect a
+-- stale answer later.
+LAST_ID = nil
+
+local function handle(req)
+  if type(req) ~= 'table' then
+    return { ok = false, error = 'request was not a JSON object' }
+  end
+  if req.token ~= TOKEN then
+    return { ok = false, error = 'bad token - this reply is from a different ' ..
+                               'Cheat Engine session' }
+  end
+  local op = req.op or 'tools/list'
+  if op == 'ping' then
+    local tools = listTools()
+    return { ok = true, result = 'bonsai ce bridge', tools = #tools }
+  elseif op == 'tools/list' then
+    local tools = listTools()
+    local reply = { ok = true, tools = tools }
+    if #tools == 0 then
+      -- Empty is a real, fixable state and "0 tools" sends the user hunting.
+      reply.note = 'Cheat Engine is running and the bridge is up, but the ' ..
+        'AITools extension has registered no tools. Check Options > Settings ' ..
+        '> AI Tools > "EnableAITools", restart Cheat Engine after changing it, ' ..
+        'and check that Extensions\\AITools\\aitools.lua is present.'
     end
-    if #chunk == 0 then
-      return nil, 'readString(' .. tostring(n - got) .. ') returned 0 bytes' ..
-             ' (Connected=' .. tostring(pipe.Connected) .. ')'
-    end
-    parts[#parts + 1] = chunk
-    got = got + #chunk
+    return reply
+  elseif op == 'tools/call' then
+    return runTool(req.name, req.arguments)
   end
-  return table.concat(parts), nil
+  return { ok = false, error = 'unknown op: ' .. tostring(op) }
 end
 
-local function readFrame(pipe)
-  local raw, why = readExactly(pipe, 4)
-  if not raw or #raw < 4 then return nil, why or 'short length prefix' end
-  local n = 0
-  for i = 1, 4 do
-    n = n + raw:byte(i) * (256 ^ (i - 1))
+local function poll()
+  local body = readFile(REQ_FILE)
+  if not body then return end
+  local ok, req = pcall(jsonparser.decode, body)
+  if not ok or type(req) ~= 'table' then
+    writeFile(REQ_FILE, '')          -- drop it, so it is not retried forever
+    return
   end
-  if n <= 0 or n > 8 * 1024 * 1024 then
-    return nil, 'implausible frame length: ' .. tostring(n)
+  local id = req.id
+  if id == nil or id == LAST_ID then return end   -- already answered
+  LAST_ID = id
+  local reply = handle(req)
+  reply.id = id
+  local text = encode(reply)
+  if text then
+    writeFile(PREFIX .. 'reply-' .. tostring(id) .. '.json', text)
+  else
+    writeFile(PREFIX .. 'reply-' .. tostring(id) .. '.json',
+              '{"ok":false,"error":"the reply could not be encoded"}')
   end
-  local body, why2 = readExactly(pipe, n)
-  if not body then return nil, why2 or ('short body, wanted ' .. tostring(n)) end
-  return body, nil
+  writeFile(REQ_FILE, '')            -- consume it
 end
 
-local function writeFrame(pipe, text)
-  -- include0terminator is passed as false so exactly these bytes go out: the
-  -- reader is told the length, so a terminator would be part of the payload.
-  -- writeString reports the number of bytes sent, or nil on failure, which is
-  -- the only way to find out that the reply never left - and a reply that never
-  -- left looks identical on the client to a bridge that is not there.
-  local sent = pipe:writeString(text or '', false)
-  if sent == nil then
-    log('writeString FAILED for ' .. tostring(#(text or '')) .. ' bytes' ..
-        ' (Connected=' .. tostring(pipe.Connected) .. ')')
-  end
-  return sent
+-- Liveness, so the client can tell "Cheat Engine is not running" from "Cheat
+-- Engine is running but the bridge is not". Rewritten on every tick.
+local function writeStatus()
+  local tools = listTools()
+  writeFile(STATUS_FILE, encode({
+    ok = true,
+    pid = 0,
+    token = TOKEN,
+    tools = #tools,
+    poll_ms = POLL_MS,
+    folder = BASE,
+    prefix = PREFIX,
+  }) or '{"ok":false}')
 end
 
-local function send(pipe, tbl)
-  local ok, encoded = pcall(jsonparser.encode, tbl)
-  if not ok then
-    ok, encoded = pcall(jsonparser.encode,
-                        { ok = false, error = 'response could not be encoded' })
-  end
-  writeFrame(pipe, encoded)
+log('starting; files are ' .. PREFIX .. '*')
+writeStatus()
+writeFile(REQ_FILE, '')
+if ensureAitools() then
+  log('AITools is loaded')
+else
+  log('AITools has not registered yet; it is loaded on demand')
 end
+log('watching for requests every ' .. tostring(POLL_MS) .. 'ms, ' ..
+    #listTools() .. ' tool(s) available')
 
-local function serve(client)
-  -- No lock() here on purpose. CELua rejects `obj.method and obj.method()` as a
-  -- syntax error - a method reference is not a value in CELua, which is what
-  -- stopped this script loading at all - and there is nothing to contend with
-  -- anyway: one connection is accepted at a time and the client takes a new
-  -- connection per request.
-  local greeted = false
-  while true do
-    local frame, why = readFrame(client)
-    if not frame then
-      log('connection ended: ' .. tostring(why))
-      break
-    end
-    local ok, req = pcall(jsonparser.decode, frame)
-    if not ok or type(req) ~= 'table' then
-      send(client, { ok = false, error = 'malformed request' })
-    else
-      if not greeted then
-        greeted = true
-        if req.token ~= TOKEN then
-          send(client, { ok = false, error = 'bad token' })
-          break
-        end
-      end
-      local op = req.op or 'tools/list'
-      if op == 'ping' then
-        send(client, { ok = true, result = 'bonsai ce bridge',
-                       tools = #listTools() })
-      elseif op == 'tools/list' then
-        local tools = listTools()
-        local reply = { ok = true, tools = tools }
-        if #tools == 0 then
-          -- Empty is a real, fixable state and saying "0 tools" sends the user
-          -- hunting. There are exactly two reasons: the extension has not
-          -- registered anything, or its EnableAITools setting is off.
-          reply.note = 'Cheat Engine is running and the bridge is up, but the ' ..
-            'AITools extension has registered no tools. Check Options > ' ..
-            'Settings > AI Tools > "EnableAITools", and that ' ..
-            'Extensions\\AITools\\aitools.lua is present. Restart Cheat ' ..
-            'Engine after changing it.'
-        end
-        send(client, reply)
-      elseif op == 'tools/call' then
-        send(client, runTool(req.name, req.arguments))
-      else
-        send(client, { ok = false, error = 'unknown op: ' .. tostring(op) })
-      end
-    end
-  end
-end
-
-local TOKEN_ACTUAL = makeToken()
-if not writeToken(TOKEN_ACTUAL) then
-  log('no token file, not starting the bridge')
-  return
-end
-TOKEN = TOKEN_ACTUAL
-
-local pipe = createPipe(PIPE_NAME, 1024 * 1024, 1024 * 1024, 4)
-if not pipe or not pipe.valid then
-  log('createPipe failed; Cheat Engine cannot be driven from outside')
-  return
-end
--- No tool count here on purpose. This runs from autorun\, and the AITools
--- extension that registers the tools is not guaranteed to have loaded yet, so a
--- count at this point is a guess that reads like a fact - it said "0 tool(s)"
--- while the tools were about to appear. The count that matters comes from a
--- tools/list request, by which time they exist.
-log('listening on \\\\.\\pipe\\' .. PIPE_NAME .. ' (tools appear on first request)')
-
-createThread(function()
-  while true do
-    -- acceptConnection(true) is required: without split it does not hand back a
-    -- LuaPipe to talk on, and every read after that would be on the wrong object.
-    local client = pipe:acceptConnection(true)
-    if client then
-      log('client connected')
-      local ok, err = pcall(serve, client)
-      if not ok then log('client error: ' .. tostring(err)) end
-      -- LuaPipe inherits Object, which has destroy(). There is no close() on it.
-      pcall(function() client:destroy() end)
-      log('client closed')
-    end
-    sleep(120)
+-- The timer has to be held in a GLOBAL. Holding it in a file-scope local was not
+-- enough: the timer fired once or twice and then stopped for good, with status
+-- going stale and every request after that sitting unconsumed and no error
+-- anywhere. An autorun chunk's locals do not survive the chunk; a global does.
+-- createTimer also returns an object, and an object with no reference at all is
+-- simply collected - which looks identical from outside.
+bonsai_ce_ticks = 0
+bonsai_ce_timer = createTimer(POLL_MS, function()
+  bonsai_ce_ticks = bonsai_ce_ticks + 1
+  local ok, err = pcall(poll)
+  if not ok then log('poll failed: ' .. tostring(err)) end
+  -- Also protected: an unprotected throw inside a timer callback is one way for
+  -- a timer to die quietly, and the tick count is reported so a stall is visible
+  -- rather than inferred from a stale file.
+  pcall(writeStatus)
+  if bonsai_ce_ticks % 40 == 0 then
+    log('alive: ' .. tostring(bonsai_ce_ticks) .. ' ticks, last id ' ..
+        tostring(LAST_ID))
   end
 end)
+if not bonsai_ce_timer then
+  log('createTimer returned nothing; the bridge cannot poll for requests')
+  return
+end
+log('timer is running, held in the global bonsai_ce_timer')

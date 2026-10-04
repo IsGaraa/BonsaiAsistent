@@ -2891,30 +2891,42 @@ _BLENDER_FLAG_LOCK = threading.Lock()
 #
 # Not an MCP server and not a subprocess. CE 7.7 documents createServerSocket in
 # celua.txt but does not compile it - the symbol is in none of the 69 binaries in
-# the install - so CE cannot listen on a TCP port, only connect out to one. It can
-# create a Windows named pipe, which is what its own DotNet and mono bridges use,
-# and Python opens \\.\pipe\<name> with nothing installed.
+# the install - so CE cannot listen on a TCP port, only connect out to one.
 #
-# What serves that pipe is tools/cheatengine_bridge.lua, dropped into CE's
-# autorun folder. It enumerates the `aitools` table the bundled AITools extension
-# already populates - 35 tools written and maintained by CE's author - and serves
-# them over the pipe. There was no need to write a second set of memory tools.
+# Its named pipe looks like it should work and does not, which cost several
+# restarts to establish: an external client connects, WriteFile of 48 bytes
+# returns success, and readString and readBytes both return nil indefinitely
+# while Cheat Engine reports Connected=true. Eight idle seconds change nothing,
+# and a frame the bridge writes on connect never arrives either, so it is not
+# one-directional in a way that could be worked around. Both ends report success
+# and no bytes move.
+#
+# What does work is a folder and a timer. tools/cheatengine_bridge.lua polls
+# %TEMP%\bonsai_ce every 250ms; a request file appears, it runs the tool and
+# writes the reply next to it. Slower than a pipe by a few hundred milliseconds,
+# and completely legible - the traffic is files you can open and read.
+#
+# What serves that folder is the bundled AITools extension's own tool table, so
+# there was no need to write a second set of memory tools: 35 of them, maintained
+# by CE's author, already in the OpenAI function-calling shape.
 #
 # The cost is a restart: CE has no command line flag to run a script, so a file in
-# autorun\ running at startup is the only way in. There is no way to reach an
-# already-running CE that has not been made to cooperate.
+# autorun\ running at startup is the only way in.
 #
-# Security, stated once and plainly: a connected client can read and write the
-# memory of any process this user can open. That is arbitrary code injection into
-# anything you run. It is what Cheat Engine is for, but it also means any other
-# process running as you can do it, so this stays off unless asked and the
-# setting says so.
-_CE_PIPE_NAME = "bonsai_ce_bridge"
-_CE_TOKEN_FILE = "bonsai_ce_token.txt"
+# Security, stated once and plainly: a request in that folder can read and write
+# the memory of any process this user can open. That is arbitrary code injection
+# into anything you run, and with a file mailbox any other program running as you
+# can do it too. The token is a guard against accidents, not attacks - it sits
+# next to the folder in your temp directory - so this stays off unless asked and
+# the setting says so.
+_CE_PREFIX = "bonsai_ce_"
+_CE_STATUS_FILE = _CE_PREFIX + "status.json"
+_CE_REQUEST_FILE = _CE_PREFIX + "request.json"
+_CE_POLL_MS = 250
 _CE_OFFLINE_MSG = (
     "Cheat Engine is not reachable. Copy tools\\cheatengine_bridge.lua into "
     "Cheat Engine's autorun folder and start Cheat Engine - it cannot be reached "
-    "until CE restarts with that script in place.")
+    "until CE has run that script.")
 _CE_ENABLED = str(os.environ.get("PC_CHEATENGINE") or "").strip().lower() in (
     "1", "on", "true", "yes")
 _CE_FLAG_LOCK = threading.Lock()
@@ -2923,19 +2935,52 @@ _CE_TOOLS = {"at": 0.0, "items": [], "state": "unknown", "detail": ""}
 _CE_TTL = 60.0
 
 
-def _cheat_engine_dir():
-    """Where Cheat Engine is installed, or None.
+def _ce_folder():
+    """The temp directory that holds the mailbox files.
 
-    The token file is written beside the executable by the bridge script, so both
-    sides have to agree on the folder without agreeing on an environment.
+    Flat files, not a subfolder: the bridge side cannot create a directory -
+    io.open will not, and CE's createDir did not produce one here either - so a
+    folder would have to exist before anything worked, and it does not on a
+    machine that has never run the bridge. The temp directory always exists and
+    is writable without elevation.
     """
-    for env in ("BONSAI_CE_DIR",):
-        v = (os.environ.get(env) or "").strip()
-        if v and os.path.isdir(v):
-            return v
+    return tempfile.gettempdir()
+
+
+def _ce_read_json(path, limit=8 * 1024 * 1024):
+    try:
+        if os.path.getsize(path) > limit:
+            return None
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            text = fh.read().strip()
+        return json.loads(text) if text else None
+    except (OSError, ValueError):
+        return None
+
+
+def _ce_write_json(path, payload):
+    """Write via a temp file and rename, so a reader never sees half a request."""
+    tmp = path + ".part"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, ensure_ascii=False)
+        os.replace(tmp, path)
+        return True
+    except OSError:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        return False
+
+
+def _cheat_engine_dir():
+    """Where Cheat Engine is installed, or None. Diagnostics only."""
+    v = (os.environ.get("BONSAI_CE_DIR") or "").strip()
+    if v and os.path.isdir(v):
+        return v
     for root in (r"C:\Program Files\Cheat Engine",
                  r"C:\Program Files (x86)\Cheat Engine",
-                 r"C:\Program Files\Cheat Engine 7.7",
                  os.path.join(os.environ.get("LOCALAPPDATA") or "", "Programs",
                               "Cheat Engine")):
         if root and os.path.isfile(os.path.join(root, "cheatengine-x86_64.exe")):
@@ -2944,126 +2989,67 @@ def _cheat_engine_dir():
 
 
 def _ce_token():
-    """The token the current CE session generated, or None.
+    """The token of the running Cheat Engine session, or None.
 
-    Read per attempt rather than cached: the bridge makes a new one every time CE
-    starts, so a cached token would be rejected after a restart for no visible
-    reason.
-
-    The bridge writes it to the temp folder, because that is the one location
-    both sides can name without agreeing on anything and Cheat Engine can write
-    to without being elevated - C:\\Program Files is not writable otherwise. The
-    install folder is still checked, in case an older bridge script is in use.
+    The bridge writes it beside the mailbox, and rewrites status.json on every
+    tick, so the status file is the authority: reading a token file alone cannot
+    tell a live session from one that ended an hour ago.
     """
-    for folder in (tempfile.gettempdir(), _cheat_engine_dir()):
-        if not folder:
-            continue
-        try:
-            with open(os.path.join(folder, _CE_TOKEN_FILE), "r",
-                      encoding="utf-8") as fh:
-                token = fh.read().strip()
-            if token:
-                return token
-        except OSError:
-            continue
-    return None
-
-
-def _ce_pipe_path():
-    return r"\\.\pipe\%s" % _CE_PIPE_NAME
+    folder = _ce_folder()
+    if not folder:
+        return None
+    status = _ce_read_json(os.path.join(folder, _CE_STATUS_FILE), 64 * 1024)
+    if not status or not status.get("ok"):
+        return None
+    token = str(status.get("token") or "").strip()
+    return token or None
 
 
 def _ce_call(request, timeout=25.0, attempts=3):
-    """One request over the named pipe.
+    """One request through the mailbox. Returns None when CE is not running.
 
-    Returns None when Cheat Engine is not serving the pipe at all, and
-    {"ok": False, "error": ...} when it is serving but the exchange went wrong.
-    Those two are worth telling apart: the first means "Cheat Engine is not
-    running, or was started before the bridge script was installed", and the
-    second means it is running and the bridge thread is broken - which is only
-    visible in Cheat Engine's own Lua output. Reporting both as "not running"
-    sends the user looking in the wrong place.
+    Each call gets its own id and its own reply file, so two calls can never be
+    confused for one another and a reply left behind by an abandoned request is
+    simply never looked at.
     """
+    folder = _ce_folder()
+    if not folder:
+        return None
     token = _ce_token()
     if not token:
-        return {"ok": False,
-                "error": "no token file: Cheat Engine has not run the bridge "
-                         "script yet (restart Cheat Engine once)"}
+        return None
+    request_id = uuid.uuid4().hex[:16]
     payload = dict(request or {})
-    payload.setdefault("token", token)
-    blob = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    if len(blob) > 4 * 1024 * 1024:
-        return {"ok": False, "error": "request was too large for the bridge"}
-    path = _ce_pipe_path()
-    busy = {22, 32, 231, 232, 535}
-    last = None
-    for attempt in range(max(1, attempts)):
-        try:
-            # Raw os.open/os.read rather than open(): a named pipe is not a
-            # regular file, and the buffered io layer will happily try to seek
-            # or measure it. os.open maps straight onto CreateFile.
-            # A named pipe is also a byte stream, so the length prefix is what
-            # makes the message boundary unambiguous.
-            fd = os.open(path, os.O_RDWR | os.O_BINARY)
+    payload["id"] = request_id
+    payload["token"] = token
+    reply_path = os.path.join(folder, _CE_PREFIX + "reply-%s.json" % request_id)
+
+    if not _ce_write_json(os.path.join(folder, _CE_REQUEST_FILE), payload):
+        return {"ok": False, "error": "could not write the request file"}
+
+    # Generous relative to the 250ms poll: a memory scan or a long tool call is
+    # real work, and the reply is what tells us it finished.
+    deadline = time.time() + max(2.0, float(timeout or 25.0))
+    while time.time() < deadline:
+        reply = _ce_read_json(reply_path)
+        if reply is not None:
             try:
-                os.write(fd, struct.pack("<I", len(blob)) + blob)
-                head = _os_read_exact(fd, 4)
-                if not head:
-                    return {"ok": False,
-                            "error": "Cheat Engine accepted the connection but "
-                                     "sent nothing back - the bridge thread in "
-                                     "Cheat Engine is not running. Open View > "
-                                     "Lua Engine in Cheat Engine and look for "
-                                     "lines starting with [bonsai]."}
-                (size,) = struct.unpack("<I", head)
-                if size == 0 or size > 32 * 1024 * 1024:
-                    return {"ok": False,
-                            "error": "the bridge sent an implausible length"}
-                body = _os_read_exact(fd, size)
-                if not body:
-                    return {"ok": False,
-                            "error": "Cheat Engine's reply was cut short"}
-                return json.loads(body.decode("utf-8", "replace"))
-            finally:
-                os.close(fd)
-        except FileNotFoundError:
-            return None            # the name exists only while CE serves it
-        except OSError as exc:
-            last = exc
-            code = getattr(exc, "winerror", None) or exc.errno
-            if code in busy and attempt + 1 < max(1, attempts):
-                time.sleep(0.25 * (attempt + 1))
-                continue
-            if code in busy:
-                return None
-            return {"ok": False, "error": "named pipe error: %s" % exc}
-        except (ValueError, UnicodeDecodeError) as exc:
-            return {"ok": False, "error": "the bridge sent something unreadable: %s" % exc}
-    return None if last is None else {"ok": False, "error": str(last)}
-
-
-def _os_read_exact(fd, count):
-    """Read exactly count bytes from a raw descriptor, or None if it went away."""
-    chunks, got = [], 0
-    while got < count:
-        part = os.read(fd, count - got)
-        if not part:
-            return None
-        chunks.append(part)
-        got += len(part)
-    return b"".join(chunks)
-
-
-def _read_exact(stream, count):
-    """Read exactly count bytes, or None if the peer went away."""
-    chunks, got = [], 0
-    while got < count:
-        part = stream.read(count - got)
-        if not part:
-            return None
-        chunks.append(part)
-        got += len(part)
-    return b"".join(chunks)
+                os.remove(reply_path)
+            except OSError:
+                pass
+            if str(reply.get("id") or request_id) != request_id:
+                return {"ok": False, "error": "the bridge replied to another request"}
+            return reply
+        time.sleep(0.12)
+    try:
+        os.remove(reply_path)
+    except OSError:
+        pass
+    return {"ok": False,
+            "error": "Cheat Engine took the request but never answered it after "
+                     "%.0fs - it may be mid-tool-call, or its bridge may have "
+                     "stopped. Its log is in %%TEMP%%\\bonsai_ce.log"
+                     % (timeout or 25.0)}
 
 
 def _ce_refresh(force=False):
@@ -3071,15 +3057,15 @@ def _ce_refresh(force=False):
     now = time.time()
     if not force and _CE_TOOLS["items"] and now - _CE_TOOLS["at"] < _CE_TTL:
         return _CE_TOOLS
-    if not force and _CE_TOOLS["state"] == "absent" and \
-            now - _CE_TOOLS["at"] < 15.0:
+    if not force and _CE_TOOLS["state"] in ("absent", "no-tools") and \
+            now - _CE_TOOLS["at"] < 5.0:
         return _CE_TOOLS
     res = _ce_call({"op": "tools/list"}, timeout=20.0)
     with _CE_LOCK:
         if res is None:
             _CE_TOOLS.update(at=now, items=[], state="absent",
-                             detail="no pipe: Cheat Engine is not serving "
-                                    r"\\.\pipe\%s" % _CE_PIPE_NAME)
+                             detail="Cheat Engine is not running, or has not "
+                                    "started since the bridge script was installed")
             return _CE_TOOLS
         if not res.get("ok"):
             _CE_TOOLS.update(at=now, items=[], state="error",
@@ -3091,13 +3077,10 @@ def _ce_refresh(force=False):
                              detail="%d tool(s) from the running Cheat Engine"
                                     % len(items))
         else:
-            # The bridge is up but the AITools extension has registered nothing,
-            # and it says why. That is a fixable state, not a broken connection,
-            # so it is not dressed up as either.
-            _CE_TOOLS.update(at=now, items=[], state="empty",
+            _CE_TOOLS.update(at=now, items=[], state="no-tools",
                              detail=str(res.get("note") or
-                                        "Cheat Engine is running but reported no "
-                                        "tools"))
+                                        "Cheat Engine is running but reported "
+                                        "no tools"))
     return _CE_TOOLS
 
 
@@ -3111,7 +3094,6 @@ def set_cheat_engine_enabled(value):
         _CE_ENABLED = bool(value)
         on = _CE_ENABLED
     if on:
-        # fail fast so the sidebar dot is honest rather than optimistic
         threading.Thread(target=_ce_refresh, kwargs={"force": True},
                          daemon=True).start()
     return on
@@ -3123,10 +3105,9 @@ def _cheat_engine_tool_schemas():
     cache = _ce_refresh()
     out = []
     for tool in cache.get("items") or []:
-        params = tool.get("parameters") or {}
-        # CE builds its parameters in the OpenAI function shape already, but with
-        # a CELua type name; the schema has to say "object" to be valid.
-        params = dict(params)
+        params = dict(tool.get("parameters") or {})
+        # CE builds these in the OpenAI function shape already, but with a CELua
+        # type name; the schema has to say "object" to be valid.
         params["type"] = "object"
         out.append({"type": "function",
                     "function": {"name": "ce_" + str(tool.get("name") or ""),
@@ -3143,11 +3124,13 @@ def _cheat_engine_tool_names():
 
 
 def _cheat_engine_tool_call(name, args):
-    real = str(name or "")[3:] if str(name or "").startswith("ce_") else str(name or "")
+    real = str(name or "")
+    real = real[3:] if real.startswith("ce_") else real
     if not real:
         return {"error": "no such Cheat Engine tool"}
+    # A scan over a large range, or a disassembly of a big block, is real work.
     res = _ce_call({"op": "tools/call", "name": real, "arguments": args or {}},
-                   timeout=180.0)
+                   timeout=300.0)
     if res is None:
         return {"error": _CE_OFFLINE_MSG}
     if not res.get("ok"):
@@ -3159,7 +3142,7 @@ def _cheat_engine_tool_call(name, args):
 
 
 def _cheat_engine_status_payload():
-    """What the sidebar dot shows. Probed only when switched on."""
+    """What the sidebar switch shows. Probed only when switched on."""
     out = {"enabled": _CE_ENABLED, "state": "off", "detail": "", "tools": 0}
     if not _CE_ENABLED:
         return out
