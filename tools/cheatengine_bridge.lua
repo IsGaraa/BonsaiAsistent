@@ -138,8 +138,40 @@ local function runTool(name, args)
   return { ok = true, result = value }
 end
 
+-- Make sure the AITools extension has registered its tools before answering.
+--
+-- The startup log said "0 tool(s)" once, and that is not a harmless wrong
+-- number: this script sits in autorun\, and Extensions are not guaranteed to have
+-- loaded by the time an autorun script runs. listTools() is called per request,
+-- so the tools do turn up - but only if something loads them, and the AITools
+-- extension is behind a setting (EnableAITools, default on, "requires restart").
+--
+-- So rather than trust the ordering, ask for the folder to be loaded. It honours
+-- the extension's own loadOrder.txt, so aibase.lua still goes in before the tools
+-- that call registerAITool, and registering the same names twice is harmless -
+-- they are table keys.
+local AITOOLS_TRIED = false
+local AITOOLS_PATH = nil
+
+local function ensureAitools()
+  if aitools and next(aitools) ~= nil then return true end
+  if AITOOLS_TRIED then return false end
+  AITOOLS_TRIED = true
+  local dir = getCheatEngineDir()
+  if not dir then return false end
+  AITOOLS_PATH = dir .. '\\Extensions\\AITools'
+  if loadLuaScriptsFromPath then
+    local ok, err = pcall(loadLuaScriptsFromPath, AITOOLS_PATH, false)
+    if not ok then
+      log('could not load the AITools extension: ' .. tostring(err))
+    end
+  end
+  return (aitools and next(aitools) ~= nil) or false
+end
+
 local function listTools()
   local out = {}
+  ensureAitools()
   if not aitools then return out end
   local names = {}
   for name in pairs(aitools) do names[#names + 1] = name end
@@ -159,19 +191,28 @@ local function listTools()
   return out
 end
 
--- Length-prefixed framing. readString's delimiter behaviour is not documented,
--- so the size is sent explicitly and the payload is read as bytes. A named pipe
--- is a byte stream and not a message stream, so this is the only framing that
--- cannot be ambiguous.
+-- Length-prefixed framing over the string methods, deliberately.
+--
+-- readBytes() on a pipe returns a ByteTable, not a Lua string - CE's own code
+-- does `local r = javapipe.readBytes(16)` and then feeds r to byteTableToQword,
+-- which is the giveaway. Building a string out of those with table.concat throws,
+-- the throw escapes readFrame, and the caller's pcall swallows it, so the client
+-- gets no reply at all and just sees a connection that goes silent.
+--
+-- readString(size) and writeString(str, false) are both documented, both take
+-- and return real strings, and readString's size argument is what the framing
+-- needs anyway - readString() with no size has no delimiter to stop at, which is
+-- why the length prefix exists in the first place.
 local function readExactly(pipe, n)
-  local chunks, got = {}, 0
+  local got = 0
+  local parts = {}
   while got < n do
-    local chunk = pipe:readBytes(n - got)
-    if not chunk or #chunk == 0 then return nil end
-    chunks[#chunks + 1] = chunk
+    local chunk = pipe:readString(n - got)
+    if chunk == nil or #chunk == 0 then return nil end
+    parts[#parts + 1] = chunk
     got = got + #chunk
   end
-  return table.concat(chunks)
+  return table.concat(parts)
 end
 
 local function readFrame(pipe)
@@ -186,12 +227,9 @@ local function readFrame(pipe)
 end
 
 local function writeFrame(pipe, text)
-  local payload = text or ''
-  local n = #payload
-  local head = string.char(n % 256, math.floor(n / 256) % 256,
-                           math.floor(n / 65536) % 256,
-                           math.floor(n / 16777216) % 256)
-  pipe:writeBytes(head .. payload)
+  -- include0terminator is passed as false so exactly these bytes go out: the
+  -- reader is told the length, so a terminator would be part of the payload.
+  pipe:writeString(text or '', false)
 end
 
 local function send(pipe, tbl)
@@ -229,7 +267,19 @@ local function serve(client)
         send(client, { ok = true, result = 'bonsai ce bridge',
                        tools = #listTools() })
       elseif op == 'tools/list' then
-        send(client, { ok = true, tools = listTools() })
+        local tools = listTools()
+        local reply = { ok = true, tools = tools }
+        if #tools == 0 then
+          -- Empty is a real, fixable state and saying "0 tools" sends the user
+          -- hunting. There are exactly two reasons: the extension has not
+          -- registered anything, or its EnableAITools setting is off.
+          reply.note = 'Cheat Engine is running and the bridge is up, but the ' ..
+            'AITools extension has registered no tools. Check Options > ' ..
+            'Settings > AI Tools > "EnableAITools", and that ' ..
+            'Extensions\\AITools\\aitools.lua is present. Restart Cheat ' ..
+            'Engine after changing it.'
+        end
+        send(client, reply)
       elseif op == 'tools/call' then
         send(client, runTool(req.name, req.arguments))
       else
@@ -251,8 +301,12 @@ if not pipe or not pipe.valid then
   log('createPipe failed; Cheat Engine cannot be driven from outside')
   return
 end
-log('listening on \\\\.\\pipe\\' .. PIPE_NAME .. ' with ' ..
-    #listTools() .. ' tool(s)')
+-- No tool count here on purpose. This runs from autorun\, and the AITools
+-- extension that registers the tools is not guaranteed to have loaded yet, so a
+-- count at this point is a guess that reads like a fact - it said "0 tool(s)"
+-- while the tools were about to appear. The count that matters comes from a
+-- tools/list request, by which time they exist.
+log('listening on \\\\.\\pipe\\' .. PIPE_NAME .. ' (tools appear on first request)')
 
 createThread(function()
   while true do

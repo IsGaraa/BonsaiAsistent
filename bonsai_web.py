@@ -3086,9 +3086,18 @@ def _ce_refresh(force=False):
                              detail=str(res.get("error") or "unknown error"))
             return _CE_TOOLS
         items = res.get("tools") or []
-        _CE_TOOLS.update(at=now, items=items, state="ok",
-                         detail="%d tool(s) from the running Cheat Engine"
-                                % len(items))
+        if items:
+            _CE_TOOLS.update(at=now, items=items, state="ok",
+                             detail="%d tool(s) from the running Cheat Engine"
+                                    % len(items))
+        else:
+            # The bridge is up but the AITools extension has registered nothing,
+            # and it says why. That is a fixable state, not a broken connection,
+            # so it is not dressed up as either.
+            _CE_TOOLS.update(at=now, items=[], state="empty",
+                             detail=str(res.get("note") or
+                                        "Cheat Engine is running but reported no "
+                                        "tools"))
     return _CE_TOOLS
 
 
@@ -17320,6 +17329,7 @@ function renderCeStatus(j) {
   const st = (j && j.state) || 'off';
   btn.classList.toggle('on', !!(j && j.enabled));
   if (st === 'ok') btn.textContent = 'CHEAT ENGINE: ' + (j.tools || 0) + ' TOOLS';
+  else if (st === 'empty') btn.textContent = 'CHEAT ENGINE: NO TOOLS';
   else if (st === 'absent') btn.textContent = 'CHEAT ENGINE: NOT RUNNING';
   else if (st === 'error') btn.textContent = 'CHEAT ENGINE: ERROR';
   else btn.textContent = 'CHEAT ENGINE: OFF';
