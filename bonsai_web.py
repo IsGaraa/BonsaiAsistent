@@ -3505,11 +3505,16 @@ def _set_model_config(mid, raw):
             # app decides a conversation is full by comparing against it, and
             # there was nowhere to record the real size - every hosted model was
             # stuck on the 32768 default, and a 1M model was metered as 32k.
-            want = int(cfg.get("ctx") or 0)
-            have = int(_entry_cfg(entry).get("ctx") or 0)
-            if "ctx" in (raw or {}) and want and want != have:
-                entry.setdefault("cfg", {})["ctx"] = want
-                _save_models()
+            #
+            # That was a reason to record the number. It is not a reason to let
+            # the number be set: the provider serves the window it serves, and
+            # a request for more is truncated or refused upstream, so an edit
+            # here could only ever be wrong. Where the provider publishes its
+            # window it is read from there; where it does not, the configured
+            # figure stands and is labelled unverified. Either way the field is
+            # locked, and this ignores a ctx that arrives from anywhere - the
+            # dialog, or a hand-rolled POST.
+            refused = "ctx" in (raw or {})
             if "api_key" in (raw or {}):
                 if key_ref:
                     entry["api_key"] = key_ref
@@ -3527,6 +3532,14 @@ def _set_model_config(mid, raw):
                                  "stays in API KEYS.txt")
             else:
                 res["detail"] = "saved - the key name was cleared"
+            if refused:
+                shown, verified = _entry_ctx(entry)
+                res["detail"] = ("saved - the context window of a hosted model is "
+                                 "the provider's and was left at %s%s"
+                                 % (format(shown, ","),
+                                    "" if verified else " (not published by the "
+                                                      "provider, so this is the "
+                                                      "configured figure)"))
             res["api_key_set"] = _api_key_present(entry.get("api_key"))
             if not res["api_key_set"] and not _is_loopback(entry):
                 res["warn"] = _no_key_warning(entry)
@@ -9388,6 +9401,65 @@ def _bing_images(query, limit):
     return out
 
 
+_OPENVERSE_API = "https://api.openverse.org/v1/images/"
+_OPENVERSE_GAP = 1.0
+_OPENVERSE_LAST = [0.0]
+_OPENVERSE_LOCK = threading.Lock()
+# Openverse indexes Flickr, Wikimedia, museums and stock archives. It is a poor
+# source for a specific mechanical part - nobody photographs an EGR valve and
+# uploads it - and a very good one for anything with photographs of it in the
+# wild. Google Images was tried here first, because it is the obvious answer for
+# "show me what this looks like", and it cannot be used: this machine's address
+# is served a bot-detection page ("Our systems have detected unusual traffic
+# from your computer network") that redirects to /sorry/index and contains no
+# results at all, headless or otherwise. Evading that is not a thing worth
+# building, so the chain is Commons, Openverse and Bing instead.
+_OPENVERSE_MIME = ("image/jpeg", "image/png", "image/webp", "image/gif")
+
+
+def _openverse_images(query, limit):
+    """Freely licensed photographs of a subject, from the Openverse aggregator."""
+    with _OPENVERSE_LOCK:
+        wait = _OPENVERSE_GAP - (time.time() - _OPENVERSE_LAST[0])
+        if wait > 0:
+            time.sleep(wait)
+        _OPENVERSE_LAST[0] = time.time()
+    params = {"q": query, "page_size": str(max(1, min(int(limit or 6) * 2, 20))),
+              "license_type": "all", "mature": "false"}
+    req = urllib.request.Request(_OPENVERSE_API + "?" + urllib.parse.urlencode(params),
+                                 headers={"User-Agent": _WEB_UA,
+                                          "Accept": "application/json"})
+    with _open_checked(req, timeout=30) as resp:
+        data = json.loads(resp.read().decode("utf-8", "replace"))
+
+    out = []
+    for item in (data or {}).get("results") or []:
+        if not isinstance(item, dict):
+            continue
+        url = item.get("url")
+        if not url or not url.startswith("http"):
+            continue
+        # The filetype field is null on most results - it is a newer field and is
+        # simply not populated - so filtering on it rejects every real result.
+        # The extension on the URL is what is actually there. SVG is left out
+        # because it is a document; an extensionless URL is accepted, since this
+        # is an index of images already and the bytes decide at fetch time.
+        ext = os.path.splitext(urllib.parse.urlsplit(url).path)[1].lower()
+        if ext in (".svg", ".tif", ".tiff", ".gifv"):
+            continue
+        out.append({
+            "url": url,
+            "page_url": item.get("foreign_landing_url") or "",
+            "title": (item.get("title") or "")[:200],
+            "width": item.get("width"), "height": item.get("height"),
+            "source": "openverse",
+            "license": item.get("license") or "",
+            "author": (item.get("creator") or "")[:120],
+            "credit": ((item.get("attribution") or "") or "")[:160],
+        })
+    return out
+
+
 def _image_search(args):
     """Find photographs of a subject, without an API key.
 
@@ -9406,38 +9478,35 @@ def _image_search(args):
     limit = max(1, min(limit, 12))
 
     results, errors = [], []
-    for finder in (_commons_images, _bing_images):
+    for finder in (_commons_images, _openverse_images, _bing_images):
         try:
             got = finder(query, limit)
         except Exception as exc:
             errors.append("%s: %s" % (finder.__name__, str(exc)[:120]))
             continue
         results.extend(got)
+        # Commons holds real photographs of the subject and licenses them for
+        # reuse, so once it has answered there is nothing to gain from scraping
+        # image search results on top of it. Stopping here is also what keeps a
+        # throttled Commons from pushing the search through two more sources.
+        if got and finder is _commons_images:
+            break
         if len(results) >= limit:
             break
 
-    # Ranked, not filtered. A photograph of the right subject from the wrong
-    # site beats four of the wrong subject, so a partial match is kept and
-    # ordered - but a result sharing no distinctive word with the query at all is
-    # a different thing entirely, and is dropped.
-    scored = []
-    for rec in results:
-        hits, strong = _image_relevance(query, rec)
-        if not hits:
-            continue
-        # One shared word is not a match. "Ford" alone turns a brake-caliper
-        # search into a wall of F-150 news photographs, because every car article
-        # on the web says Ford. Two independent words, or one that appears in
-        # the picture's own name, is what makes it the same subject.
-        if _needs_two_hits(query, rec) and hits < 2:
-            continue
-        # Commons first when otherwise level. Its photographs are freely licensed
-        # and genuinely depict the subject; Bing's are scraped from wherever,
-        # including news articles about the subject rather than pictures of it.
-        rank = 1 if str(rec.get("source", "")).startswith("wikimedia") else 0
-        scored.append((rank, strong, hits, rec))
-    scored.sort(key=lambda t: (t[0], t[1], t[2]), reverse=True)
-    kept = [rec for _, _, _, rec in scored][:limit]
+    commons = [r for r in results if r.get("source") == "wikimedia commons"]
+    engines = [r for r in results if r.get("source") != "wikimedia commons"]
+    # Commons searches file names, so a term match there means something and is
+    # used to order them. The image search engines rank by relevance already;
+    # their order is left alone, because overriding it with a keyword test over
+    # the filename is what made these searches come back nearly empty - a
+    # photograph of an EGR cooler is not called one, so almost nothing about it
+    # matched the words and almost everything was thrown away.
+    if commons:
+        commons.sort(key=lambda r: _image_relevance(query, r)[0], reverse=True)
+        kept = commons[:limit]
+    else:
+        kept = engines[:limit]
 
     out = {
         "result": "ok",
@@ -9457,8 +9526,10 @@ def _image_search(args):
         if throttled:
             out["error"] += " " + throttled
     else:
+        srcs = sorted({str(r.get("source")) for r in kept})
         out["note"] = ("links only, best match first. Call fetch_image on any of "
-                       "these to look at it or show it to the user.")
+                       "these to look at it or show it to the user."
+                       + (" Found via " + ", ".join(srcs) + "." if len(srcs) > 1 else ""))
         if throttled:
             out["note"] += " " + throttled
     return out
@@ -9487,18 +9558,6 @@ def _image_terms(query):
     """
     return [t for t in re.findall(r"[a-z0-9]+", str(query or "").lower())
             if len(t) >= 3 and t not in _IMAGE_STOP]
-
-
-def _needs_two_hits(query, rec):
-    """True when a single shared word is not enough to call this a match.
-
-    Applies once the query has three or more distinctive words: "rear brake
-    caliper" appearing nowhere but "Ford" in the caption is a different car
-    entirely. Short queries keep the looser rule, because with two words there
-    is no room for a false positive of that kind.
-    """
-    terms = _image_terms(query) + _image_terms(rec.get("matched_query") or "")
-    return len(set(terms)) >= 3
 
 
 def _image_relevance(query, rec):
@@ -13818,6 +13877,12 @@ PAGE = """<!doctype html>
   .mdlbox .hint { color: var(--mut); font-size: 11.5px; margin-top: 8px; }
   .cfgrid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin-bottom: 4px; }
   .cfgrid label { display: flex; flex-direction: column; gap: 4px; font-size: 11.5px; color: var(--mut); }
+  /* The sub-line under a locked field: why it is showing a number the user
+     cannot change. Small and quiet, because it is an explanation rather than
+     an error. */
+  .cfgrid .cfgsub { font-size: 10.5px; color: var(--txt2); opacity: .85; }
+  .cfgrid input:disabled, .cfgrid input[readonly] {
+    opacity: .6; cursor: not-allowed; background: var(--bg2, var(--bg)); }
   .cfgrid input { width: 100%; box-sizing: border-box; background: transparent; border: 1px solid var(--bd); border-radius: 8px; padding: 8px 10px; color: var(--txt); font-size: 13px; outline: none; }
   .cfgrid input:focus { border-color: var(--mut); }
   .cfgrid label.keyfield { grid-column: 1 / -1; }
@@ -14281,7 +14346,7 @@ PAGE = """<!doctype html>
       <div class="mdlbox">
         <h4>MODEL SETTINGS <span id="cfgwho"></span></h4>
         <div class="cfgrid">
-        <label>Context size (ctx)<input id="cfg_ctx" type="number" min="512" max="4194304" step="512"></label>
+        <label>Context size (ctx)<input id="cfg_ctx" type="number" min="512" max="4194304" step="512"><span class="cfgsub" id="cfg_ctxnote" hidden></span></label>
           <label>Temperature<input id="cfg_temp" type="number" min="0" max="2" step="0.05"></label>
           <label>Top-p<input id="cfg_top_p" type="number" min="0.01" max="1" step="0.01"></label>
           <label>Top-k<input id="cfg_top_k" type="number" min="0" max="1000" step="1"></label>
@@ -17489,11 +17554,40 @@ function cfgFill(j) {
   const cfg = (act && act.cfg) || (j && j.defaults) || { ctx: 32768, temp: 1, top_p: 0.95, top_k: 20, ngl: 99 };
   if (act && act.ctx) BONSAI_CTX = act.ctx;
   const set = function (id, v) { const e = document.getElementById(id); if (e) e.value = v; };
-  set('cfg_ctx', cfg.ctx); set('cfg_temp', cfg.temp);
+  const isApi = !!(act && act.type === 'api');
+  /* Almost everything in this dialog is a llama.cpp launch flag.
+     --ctx-size, --temp, --top-p, --top-k and -ngl are passed to the local
+     model server when it starts (see _start_bonsai) and are sent in no request
+     at all: a hosted endpoint is only ever sent the model, the messages, the
+     tools and the reasoning effort. So for a hosted model these fields could
+     not mean anything - and leaving them editable is worse than useless, since
+     saving one silently discards it and the dialog then reports "saved".
+
+     The one thing that is the provider's rather than the user's is the context
+     window, so that is shown filled in and locked, and the sub-line says which
+     kind of number it is. */
+  ['cfg_ctx', 'cfg_temp', 'cfg_top_p', 'cfg_top_k', 'cfg_ngl'].forEach(function (id) {
+    const e = document.getElementById(id);
+    if (!e) return;
+    e.disabled = isApi;
+    e.readOnly = isApi;
+    e.title = isApi ? 'Only local models use this - it is a model-server launch flag.'
+                    : (id === 'cfg_ctx' ? 'Launched as --ctx-size for the local model server.' : '');
+  });
+  const ctxIn = document.getElementById('cfg_ctx');
+  const ctxNote = document.getElementById('cfg_ctxnote');
+  set('cfg_ctx', isApi && act && act.ctx ? act.ctx : cfg.ctx);
+  if (ctxNote) {
+    ctxNote.textContent = !isApi ? ''
+      : (act && act.ctx_verified
+        ? 'set by the provider'
+        : 'not published by the provider - shown as configured');
+    ctxNote.hidden = !isApi;
+  }
+  set('cfg_temp', cfg.temp);
   set('cfg_top_p', cfg.top_p); set('cfg_top_k', cfg.top_k); set('cfg_ngl', cfg.ngl);
   const who = document.getElementById('cfgwho');
   if (who) who.textContent = act ? ('- ' + (act.label || act.id)) : '';
-  const isApi = !!(act && act.type === 'api');
   const keyRow = document.getElementById('cfg-keyrow');
   if (keyRow) keyRow.hidden = !isApi;
   const testBtn = document.getElementById('cfg-testkey');
@@ -17540,6 +17634,14 @@ if (_cfgSave) _cfgSave.onclick = function () {
   };
   const cfg = { ctx: num('cfg_ctx'), temp: num('cfg_temp'), top_p: num('cfg_top_p'),
                 top_k: num('cfg_top_k'), ngl: num('cfg_ngl') };
+  if (act.type === 'api') {
+    /* Locked in the dialog, and not sent from here either. Nothing in cfg
+       reaches a hosted endpoint: the window is the provider's, and the
+       sampling numbers are llama.cpp launch flags. So there is nothing here to
+       decide and nothing worth storing - which is why the key name is the only
+       editable thing about a hosted model. */
+    delete cfg.ctx;
+  }
   const body = { action: 'config', id: act.id, cfg: cfg };
   if (act.type === 'api') {
     const k = document.getElementById('cfg_apikey');
