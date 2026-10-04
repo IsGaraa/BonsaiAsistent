@@ -2886,6 +2886,249 @@ _BLENDER_ENABLED = str(os.environ.get("PC_BLENDER") or "").strip().lower() in (
 _BLENDER_FLAG_LOCK = threading.Lock()
 
 
+# ---------------------------------------------------------------------------
+# Cheat Engine.
+#
+# Not an MCP server and not a subprocess. CE 7.7 documents createServerSocket in
+# celua.txt but does not compile it - the symbol is in none of the 69 binaries in
+# the install - so CE cannot listen on a TCP port, only connect out to one. It can
+# create a Windows named pipe, which is what its own DotNet and mono bridges use,
+# and Python opens \\.\pipe\<name> with nothing installed.
+#
+# What serves that pipe is tools/cheatengine_bridge.lua, dropped into CE's
+# autorun folder. It enumerates the `aitools` table the bundled AITools extension
+# already populates - 35 tools written and maintained by CE's author - and serves
+# them over the pipe. There was no need to write a second set of memory tools.
+#
+# The cost is a restart: CE has no command line flag to run a script, so a file in
+# autorun\ running at startup is the only way in. There is no way to reach an
+# already-running CE that has not been made to cooperate.
+#
+# Security, stated once and plainly: a connected client can read and write the
+# memory of any process this user can open. That is arbitrary code injection into
+# anything you run. It is what Cheat Engine is for, but it also means any other
+# process running as you can do it, so this stays off unless asked and the
+# setting says so.
+_CE_PIPE_NAME = "bonsai_ce_bridge"
+_CE_TOKEN_FILE = "bonsai_ce_token.txt"
+_CE_OFFLINE_MSG = (
+    "Cheat Engine is not reachable. Copy tools\\cheatengine_bridge.lua into "
+    "Cheat Engine's autorun folder and start Cheat Engine - it cannot be reached "
+    "until CE restarts with that script in place.")
+_CE_ENABLED = str(os.environ.get("PC_CHEATENGINE") or "").strip().lower() in (
+    "1", "on", "true", "yes")
+_CE_FLAG_LOCK = threading.Lock()
+_CE_LOCK = threading.Lock()
+_CE_TOOLS = {"at": 0.0, "items": [], "state": "unknown", "detail": ""}
+_CE_TTL = 60.0
+
+
+def _cheat_engine_dir():
+    """Where Cheat Engine is installed, or None.
+
+    The token file is written beside the executable by the bridge script, so both
+    sides have to agree on the folder without agreeing on an environment.
+    """
+    for env in ("BONSAI_CE_DIR",):
+        v = (os.environ.get(env) or "").strip()
+        if v and os.path.isdir(v):
+            return v
+    for root in (r"C:\Program Files\Cheat Engine",
+                 r"C:\Program Files (x86)\Cheat Engine",
+                 r"C:\Program Files\Cheat Engine 7.7",
+                 os.path.join(os.environ.get("LOCALAPPDATA") or "", "Programs",
+                              "Cheat Engine")):
+        if root and os.path.isfile(os.path.join(root, "cheatengine-x86_64.exe")):
+            return root
+    return None
+
+
+def _ce_token():
+    """The token the current CE session generated, or None.
+
+    Read per attempt rather than cached: the bridge makes a new one every time CE
+    starts, so a cached token would be rejected after a restart for no visible
+    reason.
+    """
+    root = _cheat_engine_dir()
+    if not root:
+        return None
+    try:
+        with open(os.path.join(root, _CE_TOKEN_FILE), "r", encoding="utf-8") as fh:
+            token = fh.read().strip()
+        return token or None
+    except OSError:
+        return None
+
+
+def _ce_pipe_path():
+    return r"\\.\pipe\%s" % _CE_PIPE_NAME
+
+
+def _ce_call(request, timeout=25.0, attempts=3):
+    """One request over the named pipe. Returns None when CE is not listening.
+
+    A fresh connection per call. CE's LuaPipe server accepts one client at a time
+    and blocking on acceptConnection freezes that thread, so holding a connection
+    open across calls would serialise the whole agent behind it.
+    """
+    token = _ce_token()
+    if not token:
+        return None
+    payload = dict(request or {})
+    payload.setdefault("token", token)
+    blob = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    if len(blob) > 4 * 1024 * 1024:
+        return {"ok": False, "error": "request was too large for the bridge"}
+    path = _ce_pipe_path()
+    # Every instance busy, and the pipe not yet created, both mean "not right
+    # now" rather than "broken" - the first is a transient state that a moment
+    # later is not true, since each call takes a new connection and the previous
+    # one is by then closed.
+    busy = {22, 32, 231, 232, 535}
+    last = None
+    for attempt in range(max(1, attempts)):
+        try:
+            # A named pipe is a byte stream. Length-prefixed, so a message
+            # boundary can never be guessed wrong.
+            with open(path, "r+b", buffering=0) as pipe:
+                pipe.write(struct.pack("<I", len(blob)) + blob)
+                head = _read_exact(pipe, 4)
+                if not head:
+                    return None
+                (size,) = struct.unpack("<I", head)
+                if size == 0 or size > 32 * 1024 * 1024:
+                    return {"ok": False,
+                            "error": "the bridge sent an implausible length"}
+                body = _read_exact(pipe, size)
+                if not body:
+                    return None
+                return json.loads(body.decode("utf-8", "replace"))
+        except FileNotFoundError:
+            return None            # the name exists only while CE serves it
+        except OSError as exc:
+            last = exc
+            code = getattr(exc, "winerror", None) or exc.errno
+            if code in busy and attempt + 1 < max(1, attempts):
+                time.sleep(0.25 * (attempt + 1))
+                continue
+            if code in busy:
+                return None
+            return {"ok": False, "error": "named pipe error: %s" % exc}
+        except (ValueError, UnicodeDecodeError) as exc:
+            return {"ok": False, "error": "the bridge sent something unreadable: %s" % exc}
+    return None if last is None else {"ok": False, "error": str(last)}
+
+
+def _read_exact(stream, count):
+    """Read exactly count bytes, or None if the peer went away."""
+    chunks, got = [], 0
+    while got < count:
+        part = stream.read(count - got)
+        if not part:
+            return None
+        chunks.append(part)
+        got += len(part)
+    return b"".join(chunks)
+
+
+def _ce_refresh(force=False):
+    """Discover CE's tools, cached briefly. Returns the cache dict."""
+    now = time.time()
+    if not force and _CE_TOOLS["items"] and now - _CE_TOOLS["at"] < _CE_TTL:
+        return _CE_TOOLS
+    if not force and _CE_TOOLS["state"] == "absent" and \
+            now - _CE_TOOLS["at"] < 15.0:
+        return _CE_TOOLS
+    res = _ce_call({"op": "tools/list"}, timeout=20.0)
+    with _CE_LOCK:
+        if not res:
+            _CE_TOOLS.update(at=now, items=[], state="absent",
+                             detail="no pipe: Cheat Engine is not serving "
+                                    r"\\.\pipe\%s" % _CE_PIPE_NAME)
+            return _CE_TOOLS
+        if not res.get("ok"):
+            _CE_TOOLS.update(at=now, items=[], state="error",
+                             detail=str(res.get("error") or "unknown error"))
+            return _CE_TOOLS
+        items = res.get("tools") or []
+        _CE_TOOLS.update(at=now, items=items, state="ok",
+                         detail="%d tool(s) from Cheat Engine %s"
+                                % (len(items), _ce_token() and "session" or "session"))
+    return _CE_TOOLS
+
+
+def _cheat_engine_enabled():
+    return _CE_ENABLED
+
+
+def set_cheat_engine_enabled(value):
+    global _CE_ENABLED
+    with _CE_FLAG_LOCK:
+        _CE_ENABLED = bool(value)
+        on = _CE_ENABLED
+    if on:
+        # fail fast so the sidebar dot is honest rather than optimistic
+        threading.Thread(target=_ce_refresh, kwargs={"force": True},
+                         daemon=True).start()
+    return on
+
+
+def _cheat_engine_tool_schemas():
+    if not _CE_ENABLED:
+        return []
+    cache = _ce_refresh()
+    out = []
+    for tool in cache.get("items") or []:
+        params = tool.get("parameters") or {}
+        # CE builds its parameters in the OpenAI function shape already, but with
+        # a CELua type name; the schema has to say "object" to be valid.
+        params = dict(params)
+        params["type"] = "object"
+        out.append({"type": "function",
+                    "function": {"name": "ce_" + str(tool.get("name") or ""),
+                                 "description": str(tool.get("description") or ""),
+                                 "parameters": params}})
+    return out
+
+
+def _cheat_engine_tool_names():
+    if not _CE_ENABLED:
+        return set()
+    return {"ce_" + str(t.get("name") or "")
+            for t in (_ce_refresh().get("items") or []) if t.get("name")}
+
+
+def _cheat_engine_tool_call(name, args):
+    real = str(name or "")[3:] if str(name or "").startswith("ce_") else str(name or "")
+    if not real:
+        return {"error": "no such Cheat Engine tool"}
+    res = _ce_call({"op": "tools/call", "name": real, "arguments": args or {}},
+                   timeout=180.0)
+    if res is None:
+        return {"error": _CE_OFFLINE_MSG}
+    if not res.get("ok"):
+        return {"error": str(res.get("error") or "the tool failed")}
+    result = res.get("result")
+    if isinstance(result, str):
+        return {"result": result}
+    return {"result": json.dumps(result, ensure_ascii=False, indent=2)[:20000]}
+
+
+def _cheat_engine_status_payload():
+    """What the sidebar dot shows. Probed only when switched on."""
+    out = {"enabled": _CE_ENABLED, "state": "off", "detail": "", "tools": 0}
+    if not _CE_ENABLED:
+        return out
+    cache = _ce_refresh()
+    out["state"] = cache.get("state") or "unknown"
+    out["detail"] = cache.get("detail") or ""
+    out["tools"] = len(cache.get("items") or [])
+    if out["state"] == "ok":
+        out["detail"] = "%d tool(s) available from Cheat Engine" % out["tools"]
+    return out
+
+
 def _blender_enabled():
     return _BLENDER_ENABLED
 
@@ -6811,7 +7054,8 @@ def _tools_for(mode):
         return [FILE_TOOLS["list_dir"],
                 FILE_TOOLS["grep"]] + WEB_SPECS + [CHAT_TITLE_TOOL]
     return ([TOOL_SPEC] + list(FILE_TOOLS.values()) + WEB_SPECS +
-            PC_TOOLS + _blender_tool_schemas() + [CHAT_TITLE_TOOL])
+            PC_TOOLS + _blender_tool_schemas() + _cheat_engine_tool_schemas() +
+            [CHAT_TITLE_TOOL])
 
 
 def system_prompt(mode):
@@ -12909,6 +13153,8 @@ def _execute_tool_call(name, args, tc, hooks, image_uri):
                     raw_result = {"result": body}
                 else:
                     raw_result = {"result": "done (see capture)"}
+    elif name in _cheat_engine_tool_names():
+        raw_result = _cheat_engine_tool_call(name, args)
     else:
         raw_result = _exec_file_tool(name, args)
     result = public_result(_clip_result(raw_result))
@@ -14292,6 +14538,7 @@ PAGE = """<!doctype html>
     </div>
     <div class="side-foot">
       <button class="btn-ghost blswitch" id="blswitch" title="Blender MCP bridge. Off means its tools are not in the model's tool list and no Blender process is started. Click to switch on.">BLENDER: OFF</button>
+      <button class="btn-ghost blswitch" id="ceswitch" title="Cheat Engine bridge. Off means its tools are not in the model's tool list and Bonsai does not connect to Cheat Engine at all. ON GIVES AN ASSISTANT THE ABILITY TO READ AND WRITE THE MEMORY OF ANY PROCESS YOU CAN OPEN - that is arbitrary code injection into anything you run, available to any other program running as you. Copy tools\\cheatengine_bridge.lua into Cheat Engine's autorun folder first; Cheat Engine must be restarted before it can be reached.">CHEAT ENGINE: OFF</button>
       <div class="blrow" id="blstatus" title="Blender MCP status"><svg class="blicon" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 1.6C7.4 1.6 3.7 3.9 3.7 6.9c0 1.6 1.1 3 2.8 3.9-2.1.9-3.5 2.4-3.5 4.2 0 3.2 4 5.8 9 5.8 2.4 0 4.6-.7 6.2-1.8l3.4 2.8 1.7-2-3.3-2.7c.6-.9.9-1.9.9-3 0-1.9-1-3.6-2.6-4.9.3-.5.4-1.1.4-1.7 0-3-3.7-5.3-8.3-5.3Z"/><ellipse cx="12" cy="6.9" rx="4.2" ry="2.5" fill="#18181b"/></svg><span class="bldot off" id="bldot"></span></div>
       <button class="btn-ghost wd" id="workbtn"></button>
       <button class="btn-ghost scopebtn" id="scopebtn" title="How far Bonsai may reach outside the workspace. Click to switch: WORKSPACE (hard sandbox) / ASK (ask me every time) / SYSTEM (no prompts).">SCOPE: ...</button>
@@ -17015,6 +17262,7 @@ function refreshBlender() {
   fetch('/api/blender').then(function (r) { return r.json(); })
     .then(renderBlenderStatus)
     .catch(function () { renderBlenderStatus({ state: 'down' }); });
+  refreshCe();
 }
 const _blSwitch = document.getElementById('blswitch');
 if (_blSwitch) _blSwitch.onclick = function () {
@@ -17027,8 +17275,52 @@ if (_blSwitch) _blSwitch.onclick = function () {
     .then(renderBlenderStatus)
     .catch(function () { renderBlenderStatus({ state: 'down' }); });
 };
+/* Cheat Engine. Same shape as the Blender switch, and for the same reason: the
+   tools are not in the model's list while it is off, and nothing is connected.
+   The confirmation is not ceremony - a connected client can inject code into any
+   process this user can open, so this is the one switch in the app that asks
+   before arming itself. */
+function renderCeStatus(j) {
+  const btn = document.getElementById('ceswitch');
+  if (!btn) return;
+  const st = (j && j.state) || 'off';
+  btn.classList.toggle('on', !!(j && j.enabled));
+  if (st === 'ok') btn.textContent = 'CHEAT ENGINE: ' + (j.tools || 0) + ' TOOLS';
+  else if (st === 'absent') btn.textContent = 'CHEAT ENGINE: NOT RUNNING';
+  else if (st === 'error') btn.textContent = 'CHEAT ENGINE: ERROR';
+  else btn.textContent = 'CHEAT ENGINE: OFF';
+  btn.title = 'Cheat Engine bridge. ' + ((j && j.detail) || '') +
+    ' | Off means its tools are not in the model tool list and Bonsai does not ' +
+    'connect to Cheat Engine. Switching on lets an assistant read and write the ' +
+    'memory of any process you can open.';
+}
+function refreshCe() {
+  fetch('/api/cheatengine').then(function (r) { return r.json(); })
+    .then(renderCeStatus)
+    .catch(function () { renderCeStatus({ state: 'off', enabled: false }); });
+}
+const _ceSwitch = document.getElementById('ceswitch');
+if (_ceSwitch) _ceSwitch.onclick = function () {
+  const want = !(_ceSwitch.className.indexOf('on') >= 0);
+  if (want) {
+    const go = confirm('Switch Cheat Engine tools on?\\n\\n' +
+      'An assistant will be able to read and write the memory of any process ' +
+      'you can open. That is arbitrary code injection into anything you run - ' +
+      'games, browsers, other programs - and it is also available to any other ' +
+      'program running as you, because the bridge listens on this machine.\\n\\n' +
+      'Cheat Engine must already be running with tools\\cheatengine_bridge.lua ' +
+      'in its autorun folder.\\n\\nSwitch on?');
+    if (!go) return;
+  }
+  _ceSwitch.textContent = 'CHEAT ENGINE: \u2026';
+  fetch('/api/cheatengine', { method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ enabled: want }) })
+    .then(function (r) { return r.json(); })
+    .then(renderCeStatus)
+    .catch(function () { renderCeStatus({ state: 'off', enabled: false }); });
+};
 document.getElementById('ejectbtn').onclick = function () {
-  const btn = document.getElementById('ejectbtn');
   if (btn.disabled) return;
   btn.disabled = true;
   btn.classList.add('on');
@@ -19638,6 +19930,7 @@ class Handler(BaseHTTPRequestHandler):
                             "/api/compact", "/api/attach", "/api/image",
                             "/api/fetch_image",
                             "/api/path_policy", "/api/blender",
+                            "/api/cheatengine",
                             "/api/dl_pause",
                             "/api/dl_resume", "/api/dl_cancel",
                             "/api/dl_retry", "/api/dl_clear"):
@@ -19704,6 +19997,11 @@ class Handler(BaseHTTPRequestHandler):
                     {"ok": True, "url": got["preview"],
                      "width": got.get("width"), "height": got.get("height"),
                      "note": got.get("image_note")}))
+                return
+            if path == "/api/cheatengine":
+                on = set_cheat_engine_enabled(body.get("enabled", True))
+                self._send(200, json.dumps(_cheat_engine_status_payload(),
+                                           default=str))
                 return
             if path == "/api/path_policy":
                 if body.get("clear"):
