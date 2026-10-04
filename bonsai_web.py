@@ -3333,6 +3333,94 @@ def _model_sanitise_cfg(raw):
             "ngl": num("ngl", -1, 999, int, _MODEL_DEFAULTS["ngl"])}
 
 
+_OPENROUTER_HOSTS = ("openrouter.ai",)
+# One request returns every model OpenRouter serves, context window included,
+# so this is fetched once and shared by all of them. Cached for a day because
+# context windows do not move and the catalogue is large.
+_OPENROUTER_CTX_TTL = 86400
+_OPENROUTER_CTX = {"at": 0.0, "map": {}, "tried": 0.0}
+_OPENROUTER_CTX_LOCK = threading.Lock()
+
+
+def _is_openrouter(entry):
+    try:
+        host = (urllib.parse.urlsplit((entry or {}).get("base_url") or "").hostname
+                or "").lower()
+    except Exception:
+        return False
+    return any(host == h or host.endswith("." + h) for h in _OPENROUTER_HOSTS)
+
+
+def _openrouter_context_map():
+    """Real context windows, from OpenRouter's published model list.
+
+    A hosted model's window is the provider's, not ours. The registry had no way
+    to learn it, so cfg.ctx was simply never written for a hosted model and the
+    meter showed the 32768 default - a plain wrong number for a model that takes
+    a million, and one that silently contradicts what the user configured.
+
+    OpenRouter publishes the figure for every model it serves, so it is asked
+    rather than guessed. The other providers do not publish it, and for those
+    the configured value stands and is reported as unverified rather than
+    dressed up as fact.
+    """
+    with _OPENROUTER_CTX_LOCK:
+        age = time.time() - _OPENROUTER_CTX["at"]
+        if _OPENROUTER_CTX["map"] and age < _OPENROUTER_CTX_TTL:
+            return _OPENROUTER_CTX["map"]
+        # a failed attempt is not retried on every call
+        if _OPENROUTER_CTX["tried"] and time.time() - _OPENROUTER_CTX["tried"] < 600:
+            return {}
+        _OPENROUTER_CTX["tried"] = time.time()
+    try:
+        req = urllib.request.Request(
+            "https://openrouter.ai/api/v1/models",
+            headers={"Accept": "application/json", "User-Agent": _WEB_UA})
+        with urllib.request.urlopen(req, timeout=45) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+    except Exception:
+        return {}
+    out = {}
+    for item in (data or {}).get("data") or []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            n = int(item.get("context_length") or 0)
+        except (TypeError, ValueError):
+            continue
+        mid = str(item.get("id") or "")
+        if mid and 0 < n <= MAX_CTX_TOKENS:
+            out[mid] = n
+            # ":free" and ":floor" variants share the base model's window
+            base = mid.split(":")[0]
+            if base and base not in out:
+                out[base] = n
+    if out:
+        with _OPENROUTER_CTX_LOCK:
+            _OPENROUTER_CTX["map"] = out
+            _OPENROUTER_CTX["at"] = time.time()
+    return out
+
+
+def _entry_ctx(entry):
+    """(context window, is it the provider's real figure?)
+
+    For a local model the number in cfg is the truth - it is what --ctx-size is
+    launched with. For a hosted one it is only ever a declaration, so where the
+    provider publishes its window that wins and the declaration is reported as
+    unverified.
+    """
+    entry = entry or {}
+    configured = int(_entry_cfg(entry).get("ctx") or _MODEL_DEFAULTS["ctx"])
+    if (entry.get("type") or "local") == "local":
+        return configured, True
+    if _is_openrouter(entry):
+        published = _openrouter_context_map().get(str(entry.get("model") or entry.get("id") or ""))
+        if published:
+            return published, True
+    return configured, False
+
+
 def _entry_cfg(entry):
     cfg = dict(_MODEL_DEFAULTS)
     cfg.update({k: v for k, v in ((entry or {}).get("cfg") or {}).items()
@@ -3539,7 +3627,11 @@ def _apply_model(entry):
     if entry.get("type") == "api":
         BONSAI_BASE = _api_base(entry) or "http://127.0.0.1:8080"
         BONSAI_MODEL_ID = entry.get("model") or entry["id"]
-        BONSAI_CTX = int(entry.get("ctx") or ctx)
+        # The provider's window where it publishes one, not the registry's
+        # default. A hosted model's context is the provider's to decide, and
+        # BONSAI_CTX is what the meter divides by - so the old value made a
+        # million-token model read as full at 33k.
+        BONSAI_CTX = _entry_ctx(entry)[0]
     else:
         BONSAI_BASE = "http://127.0.0.1:%d" % int(entry.get("port") or 8080)
         BONSAI_MODEL_ID = entry["id"]
@@ -3994,7 +4086,7 @@ def _public_models():
         # Every model, hosted ones included: the picker draws the window beside
         # the name, and a hosted entry that reported none was drawn as a blank,
         # which read as "unknown" when in fact the number was simply never sent.
-        item["ctx"] = _entry_cfg(m)["ctx"]
+        item["ctx"], item["ctx_verified"] = _entry_ctx(m)
         if mtype == "local":
             item["path"] = m.get("path")
             item["available"] = bool(m.get("path") and os.path.exists(m["path"]))
@@ -4028,12 +4120,18 @@ def _public_models():
                                      and not _is_loopback(m))
         out.append(item)
     ready = _bonsai_ready()
+    active_ctx, active_ctx_verified = _entry_ctx(entry)
     return {"active": entry["id"] if entry else None,
             "active_label": (entry or {}).get("label"),
             "managed": (entry or {}).get("type") == "local",
             "ready": ready,
             "loading": bool(_LOADING_MODEL and not ready),
             "defaults": dict(_MODEL_DEFAULTS),
+            "ctx": active_ctx,
+            # False means the number is whatever the registry was told, not
+            # something the provider confirmed. The page says so rather than
+            # presenting a guess as a measurement.
+            "ctx_verified": active_ctx_verified,
             "vision": _entry_vision(entry),
             "models": out}
 
@@ -7558,8 +7656,13 @@ def _ctx_usage(raw_messages, mode=MODE_BUILD, quick=False):
         # registry default whatever the model could actually read.
         total = _ctx_api_total(entry)
     if not total:
-        total = int(_entry_cfg(entry).get("ctx") or 0)
+        total = _entry_cfg(entry).get("ctx") or 0
     own = max(0, used - fixed)
+    # whether the window itself is a measurement or a declaration. The tooltip
+    # says so, because a hosted provider that does not publish its window leaves
+    # the registry's number standing, and that number is a guess dressed up as a
+    # measurement unless it is labelled.
+    window_known = _entry_ctx(entry)[1]
     # 'why' lets the tooltip say something true. "estimated - model not loaded"
     # is wrong for a hosted model, which is never going to be loaded here.
     why = "exact" if exact else ("quick" if quick else
@@ -7567,6 +7670,7 @@ def _ctx_usage(raw_messages, mode=MODE_BUILD, quick=False):
                                   else "model-not-loaded"))
     base = {"used": used, "fixed": fixed, "own": own, "total": total,
             "exact": exact, "mode": mode, "images": images, "why": why,
+            "window_known": window_known,
             # the thresholds the console uses to decide when to compact, sent
             # from here so the two can never drift apart
             "fold_at": int(COMPACT_AT * 100), "fold_min": COMPACT_MIN_TOKENS,
@@ -16362,7 +16466,12 @@ function ctxPaint() {
       hint.innerHTML = '<b>' + (j.exact ? '' : '~') + Number(j.used).toLocaleString() + '</b>'
         + ' of <b>' + Number(j.total || 0).toLocaleString() + '</b> tokens'
         + '<br>system prompt + tools: ' + Number(j.fixed || 0).toLocaleString()
-        + '<br>this conversation: ' + Number(j.own || 0).toLocaleString() + extra;
+        + '<br>this conversation: ' + Number(j.own || 0).toLocaleString()
+        + (j.window_known === false
+          ? '<br>window: not published by the provider - the figure above is what'
+            + ' this model is set to, not a measurement'
+          : '')
+        + extra;
     }
   }
 }
