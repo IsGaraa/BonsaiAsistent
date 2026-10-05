@@ -14908,6 +14908,19 @@ PAGE = """<!doctype html>
   .tlitem.err { border-color: var(--err); color: var(--err); }
   .tlitem .rs { color: var(--mut); margin-top: 4px; white-space: pre-wrap; overflow-wrap: anywhere; }
   .tlitem .rs img.tthumb { max-width: 240px; border-radius: 8px; margin-top: 6px; cursor: zoom-in; display: block; }
+  /* What the assistant said out loud. The surrounding .tlitem is a log line in
+     11.5px monospace built for JSON, and a spoken sentence is neither. The
+     border and the inherited font are what make this read as a quotation rather
+     than a second log entry. */
+  .tlitem .spoken { margin: 0 0 7px; padding: 7px 11px; background: var(--bg3);
+                    border-left: 3px solid var(--acc);
+                    border-radius: 0 8px 8px 0; }
+  .tlitem .spoken .shead { font-family: Consolas, monospace; font-size: 10px;
+                           color: var(--mut); letter-spacing: .05em;
+                           text-transform: uppercase; margin-bottom: 4px; }
+  .tlitem .spoken .stext { font-family: "Segoe UI", system-ui, sans-serif;
+                           font-size: 14px; line-height: 1.5; color: var(--txt);
+                           white-space: pre-wrap; overflow-wrap: anywhere; }
   .tlprev { margin-top: 8px; }
   /* the Show button in a tool-log preview row: set on a real button,
      with no rule anywhere, so it rendered as a raw browser button in an
@@ -16259,10 +16272,60 @@ function previewIframeDom(r) {
   w.appendChild(a); w.appendChild(b2);
   return w;
 }
+/* What was actually said out loud, as a quotation rather than a log line.
+
+   The spoken sentence is the one part of a tts_speak call a person wants to
+   read. It arrives inside `arguments`, so before this it appeared only inside
+   JSON on the gear line - quoted, escaped, and in a monospace font sized for
+   machine output. It is also not always the reply it is answering: the model
+   may speak a summary or an alert, in which case the difference is the whole
+   point of showing it.
+
+   Built from the call record, so it appears live and survives a reload without
+   anything extra being saved. */
+function spokenDom(call) {
+  if (!call || call.name !== 'tts_speak') return null;
+  let a = call.arguments || {};
+  if (typeof a === 'string') { try { a = JSON.parse(a); } catch (e) { return null; } }
+  const said = String(a.text || '').trim();
+  if (!said) return null;
+  const r = (typeof call.result === 'string') ? {} : (call.result || {});
+  const box = document.createElement('div');
+  box.className = 'spoken';
+  const head = document.createElement('div');
+  head.className = 'shead';
+  /* The speaker glyph is escaped the Python way. A JavaScript four-digit escape
+     pair would be two lone surrogates here rather than one character, which are
+     not encodable and fail the moment the page is written out as UTF-8. */
+  let bits = '\U0001F50A spoken aloud';
+  if (a.voice) bits += ' \u00b7 ' + a.voice;
+  const sp = Number(a.speed);
+  if (sp && sp !== 1) bits += ' \u00b7 ' + sp + '\u00d7';
+  if (r.duration_seconds) bits += ' \u00b7 ' + r.duration_seconds + 's';
+  head.textContent = bits;
+  const q = document.createElement('div');
+  q.className = 'stext';
+  q.textContent = said;
+  box.appendChild(head);
+  box.appendChild(q);
+  return box;
+}
 function toolItemDom(call) {
   const it = document.createElement('div');
   it.className = 'tlitem' + (call.result && call.result.error ? ' err' : '');
-  const nm = document.createElement('div'); nm.textContent = '\u2699 ' + call.name + ' ' + JSON.stringify(call.arguments || {});
+  const spoken = spokenDom(call);
+  if (spoken) it.appendChild(spoken);
+  const nm = document.createElement('div');
+  /* The spoken text is dropped from the gear line because it is now shown
+     properly above it. Leaving it in would print the sentence twice, once
+     readable and once escaped. */
+  let shown = call.arguments || {};
+  if (call.name === 'tts_speak' && shown && typeof shown === 'object') {
+    const copy = {};
+    Object.keys(shown).forEach(function (k) { if (k !== 'text') copy[k] = shown[k]; });
+    shown = copy;
+  }
+  nm.textContent = '\u2699 ' + call.name + ' ' + JSON.stringify(shown);
   const rs = document.createElement('div'); rs.className = 'rs'; rs.textContent = toolResultText(call.result);
   it.appendChild(nm); it.appendChild(rs);
   const pv = previewIframeDom(call.result);
