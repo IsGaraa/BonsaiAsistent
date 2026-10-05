@@ -7,6 +7,9 @@ silent in a specific way: the page still loads and still looks like the app,
 it simply never runs a line of code, so the first symptom is something else
 entirely - "my chats stopped saving" - pointing nowhere near the real cause.
 
+There are now two pages with script on them, the chat and /kokoro, and both are
+checked.
+
 Run it after any change to the page markup or the embedded script:
 
     python tools\\check_js.py
@@ -20,7 +23,11 @@ import urllib.request
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 BASE = os.environ.get("BONSAI_URL", "http://127.0.0.1:8081")
-PAGES = ("/", "/chat")
+# Every page with script on it. /kokoro is a second, separate page rather than
+# part of the chat UI, and leaving it off this list meant a syntax error there
+# would pass this check silently - which is the exact failure this file exists
+# to prevent, just on the other page.
+PAGES = ("/", "/chat", "/kokoro")
 
 # The two things that have actually broken this file, both from writing
 # JavaScript inside a non-raw Python string.
