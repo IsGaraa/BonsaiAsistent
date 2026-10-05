@@ -6941,11 +6941,8 @@ UNSCHEDULE_TOOL = _pc_tool(
 
 TTS_VOICES_TOOL = _pc_tool(
     "tts_voices",
-    "List the local Kokoro text-to-speech voices available on this machine. "
-    "English only - the model ships styles for a dozen languages but this app "
-    "offers the American and British ones (names beginning af_, am_, bf_, bm_). "
-    "Use tts_speak with one of the returned names. There is also a voice picker "
-    "on the /kokoro page at http://127.0.0.1:8081/kokoro.",
+    "List the local Kokoro voices (English only: af_*, am_*, bf_*, bm_*). "
+    "Pass one to tts_speak.",
     {},
     []
 )
@@ -7023,13 +7020,11 @@ TTS_SPEAK_TOOL = {
     "type": "function",
     "function": {
         "name": "tts_speak",
-        "description": "Speak text aloud using the local Kokoro neural TTS "
-                       "engine (no cloud, no built-in system voices). It plays "
-                       "straight away - there is nothing to switch on first, so "
-                       "just call it, do not go looking for a TTS button. Also "
-                       "saves the speech as a WAV file in the workspace. Use "
-                       "this to give the user spoken feedback, alerts or TTS "
-                       "output. English only.",
+        "description": "Speak text aloud with the local Kokoro engine and save "
+                       "it as a WAV in out/tts/. It plays as it goes, so just "
+                       "call it - never go looking for a TTS button. Do not "
+                       "tell the user where the file was saved or what format "
+                       "it is in; they did not ask. English only.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -7041,23 +7036,15 @@ TTS_SPEAK_TOOL = {
                                                           "out things like "
                                                           "'Dr' or 'kg'."},
                 "voice": {"type": "string",
-                          "description": "Optional - leave it out unless the "
-                                         "user asks for a particular voice. It "
-                                         "defaults to 'af_jessica', which is "
-                                         "the voice the user has chosen, so "
-                                         "there is no reason to look one up or "
-                                         "pass one to get a normal reply "
-                                         "spoken. Others worth using: af_nova, "
-                                         "af_sky, af_heart, bf_lily. American "
-                                         "styles are af_*/am_*, British "
-                                         "bf_*/bm_*, and all 28 English voices "
-                                         "are available via tts_voices."},
+                          "description": "Optional. Defaults to af_jessica, the "
+                                         "user's voice - leave it out unless "
+                                         "asked. Others: af_nova, af_sky, "
+                                         "af_heart, bf_lily. American "
+                                         "af_*/am_*, British bf_*/bm_*; "
+                                         "tts_voices lists all 28."},
                 "speed": {"type": "number",
-                          "description": "Speaking rate, 0.5 to 2.0, default 1.0. "
-                                         "Above 1 is faster and below 1 slower. "
-                                         "Use it for urgency (1.3) or for "
-                                         "something dense that needs slowing "
-                                         "down (0.85)."}
+                          "description": "Rate, 0.5 to 2.0, default 1.0. 1.3 "
+                                         "for urgency, 0.85 for dense text."}
             },
             "required": ["text"]
         }
@@ -12494,6 +12481,26 @@ def _kokoro_prune_cache(folder, keep=60):
         pass
 
 
+def _tts_out_dir():
+    """Where synthesised wavs live: out/tts/ under the workspace.
+
+    One answer for everyone. The tts_speak description tells the model the wav
+    is in out/tts/, the writer used to compute the folder with its own fallback,
+    and the /ttswav/ route hardcoded a third copy - so the promise in the prompt,
+    the folder written and the folder served could each disagree. The fallback is
+    kept because refusing to speak over an uncreatable directory would be worse,
+    but now every caller gets the same directory that was actually created.
+    """
+    for candidate in (os.path.join(WORKDIR, "out", "tts"),
+                      os.path.join(WORKDIR, "out"), WORKDIR):
+        try:
+            os.makedirs(candidate, exist_ok=True)
+            return candidate
+        except OSError:
+            continue
+    return WORKDIR
+
+
 def _tts_speak(args):
     text = str(args.get("text") or "").strip()
     if not text:
@@ -12514,14 +12521,7 @@ def _tts_speak(args):
     except (TypeError, ValueError):
         speed = 1.0
     speed = max(0.5, min(2.0, speed))
-    out_dir = os.path.join(WORKDIR, "out", "tts")
-    for candidate in (out_dir, os.path.join(WORKDIR, "out"), WORKDIR):
-        try:
-            os.makedirs(candidate, exist_ok=True)
-            out_dir = candidate
-            break
-        except OSError:
-            continue
+    out_dir = _tts_out_dir()
     # The filename is a hash of what produced it, so the same request always
     # lands on the same file and a repeat press is a cache hit rather than two
     # seconds of identical synthesis. No timestamp: that guaranteed a miss.
@@ -12530,7 +12530,7 @@ def _tts_speak(args):
     ).hexdigest()[:12]
     wav_path = os.path.join(out_dir, "tts_%s_%s.wav" % (digest, voice))
     try:
-        duration, rate, cached = _kokoro_speak_wav(text, voice, speed, wav_path)
+        duration, _rate, _cached = _kokoro_speak_wav(text, voice, speed, wav_path)
     except Exception as exc:
         return {"error": "Kokoro synthesis failed: %s" % exc}
     # The /kokoro page passes play=False because the browser plays it itself, and
@@ -12538,17 +12538,17 @@ def _tts_speak(args):
     # so the tool and the header toggle behave exactly as they always did.
     suppressed = args.get("play") is False
     played = None if suppressed else _play_wav(wav_path)
-    out = {"result": "ok", "engine": "Kokoro-82M v1.0", "voice": voice,
-           "speed": speed, "text": text[:200],
-           "wav": wav_path.replace("\\", "/"),
-           "bytes": os.path.getsize(wav_path),
-           "duration_seconds": duration, "sample_rate": rate,
-           "cached": cached,
-           # "did this make a noise", not "is there a file". A suppressed call
-           # reports False rather than the True that `None is not False` gives -
-           # the browser is playing it and saying True here claims a speaker did
-           # something it did not.
-           "played": (not suppressed) and played is not False}
+    out = {"result": "ok", "voice": voice, "duration_seconds": duration,
+           "wav": "out/tts/" + os.path.basename(wav_path)}
+    # Deliberately small. This payload is re-read on every later turn of the chat,
+    # and the fat version made the model narrate the file back at the user -
+    # "saved to C:/Users/.../out/tts/tts_1a2b3c4d5e6f_af_jessica.wav, 412KB,
+    # 22050 Hz". It knew none of that before saying it and the user did not ask.
+    # Dropped: engine, speed, text, bytes, sample_rate, cached, played.
+    #   text was the worst - up to 200 characters of a sentence the model had
+    #   itself just written, carried into the context of every turn after.
+    # Kept: duration_seconds, because the spoken block prints it as "7.68s", and
+    # the warnings below, which are the ones that change what to do next.
     if suppressed:
         out["playback"] = "suppressed - the caller is playing the file itself"
     elif played is False:
@@ -20957,7 +20957,7 @@ class Handler(BaseHTTPRequestHandler):
         if not name.lower().endswith(".wav"):
             self._send(415, "only .wav is served here", "text/plain")
             return
-        folder = os.path.join(WORKDIR, "out", "tts")
+        folder = _tts_out_dir()
         try:
             real = os.path.realpath(os.path.join(folder, name))
             base = os.path.realpath(folder)
@@ -21296,7 +21296,17 @@ class Handler(BaseHTTPRequestHandler):
                 if out.get("error"):
                     self._send(200, json.dumps(out, default=str))
                     return
+                # The page shows the file size and sample rate under the player.
+                # Those are wanted on screen and not wanted in the model's
+                # context, so they are added here - at the page boundary - rather
+                # than carried in the tool result where the model would read them
+                # back to the user. os.path.getsize is the file on disk, not a
+                # remembered length, so it stays true after a cache hit.
                 out["wav_url"] = "/ttswav/" + os.path.basename(out["wav"])
+                out["bytes"] = os.path.getsize(
+                    os.path.join(_tts_out_dir(),
+                                 os.path.basename(out["wav"])))
+                out["sample_rate"] = KOKORO_SAMPLE_RATE
                 self._send(200, json.dumps(out, default=str))
                 return
             if path == "/api/models":
