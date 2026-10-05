@@ -2807,13 +2807,61 @@ def _shell_oc(command, workdir=None, timeout=None):
 
 
 def _execute_js(code, timeout=None):
+    """Run JavaScript in a plain Node runtime and report what it printed.
+
+    Wrapped rather than written straight to a file, for two reasons that were
+    both found by the model hitting them.
+
+    The globals: this tool's own description said it could "script tool calls",
+    so the model wrote `tools.shell(...)`, and then `text(...)` to print. Neither
+    exists. It burned three calls rediscovering that, and each failure looked
+    like a broken tool rather than a missing global. `text` is provided now, and
+    the description says plainly that there is no `tools` bridge - it is Node
+    with fetch, not a tool caller.
+
+    The crash: when user code awaits something and then throws, Node 24 on
+    Windows aborts the whole process instead of exiting -
+    "Assertion failed: !(handle->flags & UV_HANDLE_CLOSING)", exit code
+    3221226505. Reproduced with a two-line file, so it is Node and not this
+    code. Wrapping in an async function with a catch turns the same failure into
+    an ordinary non-zero exit with the message on stderr, which is the whole
+    difference between "the tool is broken" and "your code threw".
+    """
     import subprocess
     timeout_s = min(max(int(timeout or 30), 1), 120)
-    # Write to temp file and run with node
-    tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".js", delete=False, encoding="utf-8")
+    launcher = (
+        "const __out = [];\n"
+        "globalThis.text = function () {\n"
+        "  __out.push(Array.prototype.join.call(arguments, ' '));\n"
+        "};\n"
+        "function __flush() {\n"
+        "  if (__out.length) process.stdout.write(__out.join('\\n') + '\\n');\n"
+        "  __out.length = 0;\n"
+        "}\n"
+        "process.on('exit', __flush);\n"
+        "process.on('unhandledRejection', function (e) {\n"
+        "  __flush();\n"
+        "  __fail(e);\n"
+        "});\n"
+        "function __fail(e) {\n"
+        "  const m = (e && (e.stack || e.message)) || String(e);\n"
+        "  process.stderr.write(m + '\\n');\n"
+        "  process.exitCode = 1;\n"
+        "}\n"
+        "(async function () {\n"
+        "  try {\n"
+        + code + "\n"
+        "  } catch (e) { __fail(e); }\n"
+        "})().then(__flush, function (e) { __flush(); __fail(e); });\n"
+    )
+    tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".mjs", delete=False,
+                                     encoding="utf-8")
     try:
-        tmp.write(code)
+        tmp.write(launcher)
         tmp.close()
+        # .mjs, because the wrapper is a module: Node reparsed a .js file as ESM
+        # when it saw top-level await and printed a MODULE_TYPELESS_PACKAGE_JSON
+        # warning on every single call.
         result = subprocess.run(["node", tmp.name], capture_output=True, text=True,
                                 timeout=timeout_s, encoding="utf-8", errors="replace")
         output = result.stdout or ""
@@ -6251,10 +6299,12 @@ EXECUTE_TOOL = {
     "type": "function",
     "function": {
         "name": "execute",
-        "description": "Run JavaScript in a sandboxed runtime to script tool "
-                       "calls and HTTP requests. Use this to automate sequences "
-                       "of operations, fetch data, or compose results from "
-                       "multiple tool calls.",
+        "description": "Run JavaScript in a sandboxed runtime. It is Node "
+                       "with fetch available and top-level await allowed, so "
+                       "you can fetch a URL and work with the response. There "
+                       "is NO tools object - call the other tools directly "
+                       "rather than from here. Use text(...) to print a result "
+                       "back.",
         "parameters": {
             "type": "object",
             "properties": {
