@@ -12407,13 +12407,32 @@ def _kokoro_voices():
 
 
 def _kokoro_speak_wav(text, voice, speed, out_path):
-    """Synthesise to a 16-bit mono wav. Returns (duration, sample_rate) or raises.
+    """Synthesise to a 16-bit mono wav, or reuse the one already written.
 
-    The wav is written with the standard library rather than soundfile: Kokoro
-    hands back float samples, and converting to int16 by hand is four lines,
-    which is cheaper than making every user install another package.
+    Returns (duration, sample_rate, cached).
+
+    The cache is not an optimisation bolted on afterwards - it is the difference
+    between pressing the button again costing two seconds of synthesis and
+    costing nothing. The filename is a hash of the voice, the speed and the
+    text, so the same request lands on the same file every time. That is only
+    sound because nothing here is random: kokoro-onnx exposes no seed and CPU
+    inference is deterministic, so the same three inputs give the same audio and
+    a cache hit returns exactly what a fresh run would have produced.
+
+    A file that exists but will not parse as wav is treated as a miss and
+    removed, so a truncated write cannot turn into permanent silence.
     """
     import wave as wave_mod
+    if os.path.exists(out_path) and os.path.getsize(out_path) > 44:
+        try:
+            with wave_mod.open(out_path, "rb") as w:
+                return (round(w.getnframes() / max(1, w.getframerate()), 2),
+                        int(w.getframerate()), True)
+        except Exception:
+            try:
+                os.remove(out_path)
+            except OSError:
+                pass
     import numpy as np
     engine = _kokoro_engine()
     if isinstance(engine, dict):
@@ -12450,7 +12469,29 @@ def _kokoro_speak_wav(text, voice, speed, out_path):
         wf.setsampwidth(2)
         wf.setframerate(int(rate))
         wf.writeframes(pcm.tobytes())
-    return round(pcm.size / float(rate), 2), int(rate)
+    _kokoro_prune_cache(os.path.dirname(out_path))
+    return round(pcm.size / float(rate), 2), int(rate), False
+
+
+def _kokoro_prune_cache(folder, keep=60):
+    """Drop the oldest wavs past `keep`. Best effort; never raises.
+
+    The cache is keyed on content, so every distinct thing ever said keeps a
+    file. Without this it grows for as long as the workspace does.
+    """
+    try:
+        wavs = [os.path.join(folder, f) for f in os.listdir(folder)
+                if f.endswith(".wav")]
+        if len(wavs) <= keep:
+            return
+        wavs.sort(key=lambda p: os.path.getmtime(p))
+        for old in wavs[:len(wavs) - keep]:
+            try:
+                os.remove(old)
+            except OSError:
+                pass
+    except Exception:
+        pass
 
 
 def _tts_speak(args):
@@ -12481,11 +12522,15 @@ def _tts_speak(args):
             break
         except OSError:
             continue
-    wav_path = os.path.join(
-        out_dir, "tts_" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        + "_" + voice + ".wav")
+    # The filename is a hash of what produced it, so the same request always
+    # lands on the same file and a repeat press is a cache hit rather than two
+    # seconds of identical synthesis. No timestamp: that guaranteed a miss.
+    digest = hashlib.sha256(
+        ("%s\x00%.2f\x00%s" % (voice, speed, text)).encode("utf-8")
+    ).hexdigest()[:12]
+    wav_path = os.path.join(out_dir, "tts_%s_%s.wav" % (digest, voice))
     try:
-        duration, rate = _kokoro_speak_wav(text, voice, speed, wav_path)
+        duration, rate, cached = _kokoro_speak_wav(text, voice, speed, wav_path)
     except Exception as exc:
         return {"error": "Kokoro synthesis failed: %s" % exc}
     # The /kokoro page passes play=False because the browser plays it itself, and
@@ -12498,6 +12543,7 @@ def _tts_speak(args):
            "wav": wav_path.replace("\\", "/"),
            "bytes": os.path.getsize(wav_path),
            "duration_seconds": duration, "sample_rate": rate,
+           "cached": cached,
            # "did this make a noise", not "is there a file". A suppressed call
            # reports False rather than the True that `None is not False` gives -
            # the browser is playing it and saying True here claims a speaker did
@@ -16664,9 +16710,12 @@ function speakNote(row, text, bad) {
   }, 7000);
 }
 function speakReply(btn, row) {
-  /* Read the PROSE only. The bubble also holds the spoken block, and reading
-     the whole thing would say the quoted speech again on top of the reply. */
-  const src = row.querySelector('.abody');
+  /* Read the PROSE only, and accept either label for it. The bubble also holds
+     the spoken block, so reading the whole thing would say the quoted speech
+     again on top of the reply. .abody alone was not enough: the step module
+     marks its prose .ocpara, so on those rows this found nothing and the button
+     did nothing at all without a word about it. */
+  const src = row.querySelector(SPOKEN_PROSE_SEL);
   let said = speakableText(src ? (src.innerText || src.textContent || '') : '');
   if (!said) return;
   /* Long replies are slow to synthesise and tiring to listen to, so this caps

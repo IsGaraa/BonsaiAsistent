@@ -1,5 +1,5 @@
 <!-- GPT UI (PAGE_GPT) - the page served at /chat, copied verbatim from a
-     running bonsai_web.py at commit d39ed70.
+     running bonsai_web.py at commit dc19fe2.
 
      bonsai_web.py is the source of truth. This file is a read-only copy so
      the UI can be opened in an editor without wading through the Python;
@@ -2185,9 +2185,12 @@ function speakNote(row, text, bad) {
   }, 7000);
 }
 function speakReply(btn, row) {
-  /* Read the PROSE only. The bubble also holds the spoken block, and reading
-     the whole thing would say the quoted speech again on top of the reply. */
-  const src = row.querySelector('.abody');
+  /* Read the PROSE only, and accept either label for it. The bubble also holds
+     the spoken block, so reading the whole thing would say the quoted speech
+     again on top of the reply. .abody alone was not enough: the step module
+     marks its prose .ocpara, so on those rows this found nothing and the button
+     did nothing at all without a word about it. */
+  const src = row.querySelector(SPOKEN_PROSE_SEL);
   let said = speakableText(src ? (src.innerText || src.textContent || '') : '');
   if (!said) return;
   /* Long replies are slow to synthesise and tiring to listen to, so this caps
