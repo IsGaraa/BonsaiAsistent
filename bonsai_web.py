@@ -14854,6 +14854,10 @@ PAGE = """<!doctype html>
                font-style: italic; font-family: Consolas, monospace; }
   .msgrow { display: flex; flex-direction: column; }
   .msgrow.user { align-items: flex-end; }
+  /* Also used by a .msgrow.user.spokenq, which is a bubble holding text the
+     assistant said out loud. That class is a marker only and deliberately has
+     no rules of its own here: it should be indistinguishable from a message the
+     user typed, because that is the whole idea. */
   .ubub { background: var(--bub); border-radius: 16px 16px 4px 16px; padding: 10px 14px; max-width: 80%; font-size: 14px; white-space: pre-wrap; word-break: break-word; line-height: 1.5; }
   .ubub .thumbs { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 6px; }
   .ubub .thumb { width: 60px; height: 60px; border-radius: 10px; overflow: hidden; border: 1px solid var(--bd); }
@@ -14908,19 +14912,6 @@ PAGE = """<!doctype html>
   .tlitem.err { border-color: var(--err); color: var(--err); }
   .tlitem .rs { color: var(--mut); margin-top: 4px; white-space: pre-wrap; overflow-wrap: anywhere; }
   .tlitem .rs img.tthumb { max-width: 240px; border-radius: 8px; margin-top: 6px; cursor: zoom-in; display: block; }
-  /* What the assistant said out loud. The surrounding .tlitem is a log line in
-     11.5px monospace built for JSON, and a spoken sentence is neither. The
-     border and the inherited font are what make this read as a quotation rather
-     than a second log entry. */
-  .tlitem .spoken { margin: 0 0 7px; padding: 7px 11px; background: var(--bg3);
-                    border-left: 3px solid var(--acc);
-                    border-radius: 0 8px 8px 0; }
-  .tlitem .spoken .shead { font-family: Consolas, monospace; font-size: 10px;
-                           color: var(--mut); letter-spacing: .05em;
-                           text-transform: uppercase; margin-bottom: 4px; }
-  .tlitem .spoken .stext { font-family: "Segoe UI", system-ui, sans-serif;
-                           font-size: 14px; line-height: 1.5; color: var(--txt);
-                           white-space: pre-wrap; overflow-wrap: anywhere; }
   .tlprev { margin-top: 8px; }
   /* the Show button in a tool-log preview row: set on a real button,
      with no rule anywhere, so it rendered as a raw browser button in an
@@ -16272,49 +16263,73 @@ function previewIframeDom(r) {
   w.appendChild(a); w.appendChild(b2);
   return w;
 }
-/* What was actually said out loud, as a quotation rather than a log line.
+/* What was actually said out loud, rendered as a message you pasted.
 
-   The spoken sentence is the one part of a tts_speak call a person wants to
-   read. It arrives inside `arguments`, so before this it appeared only inside
-   JSON on the gear line - quoted, escaped, and in a monospace font sized for
-   machine output. It is also not always the reply it is answering: the model
-   may speak a summary or an alert, in which case the difference is the whole
-   point of showing it.
+   This was a bordered block inside the tool card, which put it inside a
+   <details> - and a <details> is closed. The text was there and invisible,
+   which is worse than not showing it: there was no way to tell whether speech
+   had happened at all. It is now a real .msgrow.user / .ubub bubble placed
+   before the assistant's turn, which is what a pasted message looks like and
+   what this one is pretending to be.
 
-   Built from the call record, so it appears live and survives a reload without
-   anything extra being saved. */
-function spokenDom(call) {
-  if (!call || call.name !== 'tts_speak') return null;
+   Placed rather than nested, for the same reason: the tool log sits inside the
+   assistant's message row, so a right-aligned bubble appended into it would be
+   inside someone else's message, right-aligned against it.
+
+   Voice, speed and duration go in the title attribute rather than in the bubble.
+   A caption inside would stop it looking pasted at all, and one underneath would
+   be a footnote hanging off the wrong message; hovering gives the detail
+   without changing the shape. */
+function spokenText(call) {
+  if (!call || call.name !== 'tts_speak') return '';
   let a = call.arguments || {};
-  if (typeof a === 'string') { try { a = JSON.parse(a); } catch (e) { return null; } }
-  const said = String(a.text || '').trim();
+  if (typeof a === 'string') { try { a = JSON.parse(a); } catch (e) { return ''; } }
+  return String(a.text || '').trim();
+}
+function spokenBubble(call) {
+  const said = spokenText(call);
   if (!said) return null;
+  let a = call.arguments || {};
+  if (typeof a === 'string') { try { a = JSON.parse(a); } catch (e) { a = {}; } }
   const r = (typeof call.result === 'string') ? {} : (call.result || {});
-  const box = document.createElement('div');
-  box.className = 'spoken';
-  const head = document.createElement('div');
-  head.className = 'shead';
-  /* The speaker glyph is escaped the Python way. A JavaScript four-digit escape
-     pair would be two lone surrogates here rather than one character, which are
-     not encodable and fail the moment the page is written out as UTF-8. */
-  let bits = '\U0001F50A spoken aloud';
-  if (a.voice) bits += ' \u00b7 ' + a.voice;
+  const row = document.createElement('div');
+  row.className = 'msgrow user spokenq';
+  const b = document.createElement('div');
+  b.className = 'ubub';
+  b.textContent = said;
+  let tip = 'spoken aloud';
+  if (a.voice) tip += ' · ' + a.voice;
   const sp = Number(a.speed);
-  if (sp && sp !== 1) bits += ' \u00b7 ' + sp + '\u00d7';
-  if (r.duration_seconds) bits += ' \u00b7 ' + r.duration_seconds + 's';
-  head.textContent = bits;
-  const q = document.createElement('div');
-  q.className = 'stext';
-  q.textContent = said;
-  box.appendChild(head);
-  box.appendChild(q);
-  return box;
+  if (sp && sp !== 1) tip += ' · ' + sp + '×';
+  if (r.duration_seconds) tip += ' · ' + r.duration_seconds + 's';
+  b.title = tip;
+  row.appendChild(b);
+  return row;
+}
+function placeSpokenBubbles(calls, host) {
+  (calls || []).forEach(function (c) {
+    if (c._bubbled) return;
+    if (!spokenText(c)) return;
+    const row = spokenBubble(c);
+    if (!row) return;
+    /* Marked on the record so a live call and a later render of the same object
+       cannot produce two bubbles - but as a NON-ENUMERABLE property, because
+       this record is appended to the calls list and saved with the chat. An
+       ordinary property would go into that JSON, come back on reload still
+       carrying the flag, and the bubble would never be drawn again. Defining it
+       as non-enumerable keeps JSON.stringify from ever seeing it, which is what
+       a saved chat has to do. */
+    try {
+      Object.defineProperty(c, '_bubbled', { value: true, enumerable: false });
+    } catch (e) { c._bubbled = true; }
+    const owner = host && host.closest ? host.closest('.msgrow') : null;
+    if (owner && owner.parentNode) owner.parentNode.insertBefore(row, owner);
+    else convInner().appendChild(row);
+  });
 }
 function toolItemDom(call) {
   const it = document.createElement('div');
   it.className = 'tlitem' + (call.result && call.result.error ? ' err' : '');
-  const spoken = spokenDom(call);
-  if (spoken) it.appendChild(spoken);
   const nm = document.createElement('div');
   /* The spoken text is dropped from the gear line because it is now shown
      properly above it. Leaving it in would print the sentence twice, once
@@ -16444,6 +16459,10 @@ function addToolLog(container, calls) {
   const l = document.createElement('div'); l.className = 'tl';
   (calls).forEach(function (c) { l.appendChild(toolItemDom(c)); });
   d.appendChild(s); d.appendChild(l); container.appendChild(d);
+  /* Same bubble on the saved-chat path, so a conversation read back looks the
+     way it looked live. After the append, for the same reason as the live one:
+     the placement is relative to the assistant's row. */
+  placeSpokenBubbles(calls, d);
   const shots = document.createElement('div'); shots.className = 'shots';
   let shotCount = 0;
   (calls).forEach(function (c) {
@@ -16662,6 +16681,11 @@ function onTool(call) {
   }
   thinkingRow.tlog.s.textContent = 'Tool log \u00b7 ' + liveCalls.length + ' running...';
   thinkingRow.tlog.l.appendChild(toolItemDom(call));
+  /* After the append, so the tool log is in the document and the bubble can be
+     placed against the turn it belongs to. Passed just this call: onTool fires
+     when the call starts, before there is a result, so there is no duration to
+     quote yet - the text is already known and that is what the bubble carries. */
+  placeSpokenBubbles([call], thinkingRow.tlog.d);
   const live = shotCardDom(call);
   if (live) thinkingRow.b.insertBefore(live, thinkingRow.tlog.d);
   scrollBottom();
