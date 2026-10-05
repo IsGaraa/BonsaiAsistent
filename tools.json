@@ -837,7 +837,7 @@
           },
           "voice": {
             "type": "string",
-            "description": "Kokoro voice name, default 'af_sarah'. The ones worth trying first are bf_lily, af_nova, af_sky and af_heart - reach for those before picking anything else. American: af_* or am_*. British: bf_* or bm_*. All 28 English voices are available; list them with tts_voices."
+            "description": "Optional - leave it out unless the user asks for a particular voice. It defaults to 'af_jessica', which is the voice the user has chosen, so there is no reason to look one up or pass one to get a normal reply spoken. Others worth using: af_nova, af_sky, af_heart, bf_lily. American styles are af_*/am_*, British bf_*/bm_*, and all 28 English voices are available via tts_voices."
           },
           "speed": {
             "type": "number",

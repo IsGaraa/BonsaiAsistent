@@ -7041,14 +7041,17 @@ TTS_SPEAK_TOOL = {
                                                           "out things like "
                                                           "'Dr' or 'kg'."},
                 "voice": {"type": "string",
-                          "description": "Kokoro voice name, default 'af_sarah'. "
-                                         "The ones worth trying first are "
-                                         "bf_lily, af_nova, af_sky and "
-                                         "af_heart - reach for those before "
-                                         "picking anything else. American: "
-                                         "af_* or am_*. British: bf_* or bm_*. "
-                                         "All 28 English voices are available; "
-                                         "list them with tts_voices."},
+                          "description": "Optional - leave it out unless the "
+                                         "user asks for a particular voice. It "
+                                         "defaults to 'af_jessica', which is "
+                                         "the voice the user has chosen, so "
+                                         "there is no reason to look one up or "
+                                         "pass one to get a normal reply "
+                                         "spoken. Others worth using: af_nova, "
+                                         "af_sky, af_heart, bf_lily. American "
+                                         "styles are af_*/am_*, British "
+                                         "bf_*/bm_*, and all 28 English voices "
+                                         "are available via tts_voices."},
                 "speed": {"type": "number",
                           "description": "Speaking rate, 0.5 to 2.0, default 1.0. "
                                          "Above 1 is faster and below 1 slower. "
@@ -12251,7 +12254,7 @@ def _kokoro_start_reaper():
 # in the release and hardcoding 28 names would rot the first time one is added.
 _KOKORO_LANG_PREFIX = {"af": "American female", "am": "American male",
                        "bf": "British female", "bm": "British male"}
-KOKORO_DEFAULT_VOICE = "af_sarah"
+KOKORO_DEFAULT_VOICE = "af_jessica"
 # Voices to put in front of the user. All 28 are installed and reachable either
 # way - this only decides what is offered first and what the model is told to
 # try - so it is a preference, not a restriction. Ordered as given rather than
@@ -14732,6 +14735,32 @@ PAGE = """<!doctype html>
   /* the user's bubble already had a class; the assistant's was an unclassed
      div, so a reply had nothing separating it from the next message */
   .msgrow.bonsai { flex-direction: row; align-items: flex-start; gap: 9px; }
+  /* "Speak this", on each reply. Deliberately quiet: a small speaker glyph,
+     borderless and dimmed to a third opacity, that only comes up when the row
+     is hovered or the button is reached directly. Anything with a permanent
+     border or full contrast would put a control on every message in the chat,
+     which is a louder interface than the user asked for.
+     It is the last child of the row, and the avatar is too - so it sits
+     immediately beside the mark. The live row has no avatar, so it lands in the
+     same place with nothing to sit beside, which is the point of not anchoring
+     it to the mark itself. */
+  .speakbtn { flex: none; align-self: flex-start; width: 22px; height: 22px;
+    border: 1px solid transparent; border-radius: 6px; background: transparent;
+    color: var(--mut); cursor: pointer; font-size: 11px; line-height: 1;
+    display: flex; align-items: center; justify-content: center; padding: 0;
+    opacity: .3; transition: opacity .12s, background .12s, color .12s; }
+  .msgrow.bonsai:hover .speakbtn, .msgrow.thinkrow:hover .speakbtn { opacity: .8; }
+  .speakbtn:hover { opacity: 1; background: var(--bg3); color: var(--txt);
+    border-color: var(--bd); }
+  .speakbtn:focus-visible { opacity: 1; outline: 2px solid var(--acc); outline-offset: 1px; }
+  .speakbtn[disabled] { opacity: .25; cursor: default; }
+  .speakbtn.busy { opacity: 1; color: var(--acc); }
+  /* the same glyph, dimmed, next to a reply that has already been read */
+  .msgrow.bonsai.spoke .speakbtn, .msgrow.thinkrow.spoke .speakbtn { opacity: .55; }
+  /* transient note from the speak button. On the row, never in the bubble. */
+  .speaknote { flex: none; align-self: center; font-size: 10.5px; color: var(--mut);
+    max-width: 220px; line-height: 1.3; }
+  .speaknote.bad { color: var(--err); }
   .bbub { flex: 1; min-width: 0; max-width: 100%; background: var(--bg2);
           border: 1px solid var(--bd2); border-radius: 4px 16px 16px 16px;
           padding: 11px 15px; font-size: 14px;
@@ -16338,8 +16367,12 @@ function spokenBubble(call) {
   body.textContent = said;
   b.appendChild(head);
   b.appendChild(body);
-  row.appendChild(av);
+  /* Bubble then avatar, which is the order addAsst uses and the order every
+     other Bonsai message is in. This was the other way round, so the spoken
+     bubble sat with its mark on the opposite side from the reply above and
+     below it - the same model, laid out two different ways. */
   row.appendChild(b);
+  row.appendChild(av);
   return row;
 }
 /* The dedupe lives on the DOM node it drew into, never on the call record.
@@ -16570,6 +16603,119 @@ function addReasonBox(container, text, live) {
   d.appendChild(s); d.appendChild(c); container.appendChild(d);
   return { d: d, s: s, c: c };
 }
+/* ---------- Speak this, on a reply ----------
+   A quiet speaker button on every Bonsai reply, so the user can hear a reply
+   read rather than wait for the model to decide to speak it. It goes through the
+   same /api/kokoro/speak the tool and the /kokoro page use, so there is one
+   synthesis path and one set of settings. The tool is untouched: this is a
+   control for the user, and it never appears in anything the model sees.
+
+   The voice is af_jessica unless it has been changed on /kokoro, which writes
+   the same key - so picking a voice there changes these buttons too, and there
+   is still only one setting to reason about. */
+const KOKORO_VOICE_KEY = 'bonsai_kokoro_voice';
+const KOKORO_BTN_VOICE = 'af_jessica';
+let kokoroAudio = null;
+function kokoroVoice() {
+  try { return localStorage.getItem(KOKORO_VOICE_KEY) || KOKORO_BTN_VOICE; }
+  catch (e) { return KOKORO_BTN_VOICE; }
+}
+/* The reply is markdown. Spoken verbatim it would say "asterisk asterisk bold"
+   and "backtick backtick", and a fenced block would be read out character by
+   character. Code is dropped rather than read - nobody wants a regex read aloud
+   - and the markers come off the rest. Tables are left alone: a row of pipes
+   spoken is odd but it is still shorter than the alternative, and no reply
+   depends on being heard. */
+/* Every regex backslash below is doubled. This text lives in a Python string,
+     not a raw one: a lone space-class escape survives only as a warning, but a
+     lone digit escape is a valid Python OCTAL escape and turns a regex
+     backreference into a control character - the regex then still compiles in
+     the browser and quietly stops matching. (That includes the ones in this
+     comment, which is why it describes them instead of writing them.) */
+function speakableText(md) {
+  let s = String(md || '');
+  s = s.replace(/```[\\s\\S]*?```/g, ' ');        // fenced code, dropped
+  s = s.replace(/~~~[\\s\\S]*?~~~/g, ' ');
+  s = s.replace(/`[^`\\n]*`/g, ' ');             // inline code, dropped
+  s = s.replace(/!\\[[^\\]]*\\]\\([^)]*\\)/g, ' '); // images
+  s = s.replace(/\\[([^\\]]*)\\]\\([^)]*\\)/g, '$1'); // links keep their text
+  s = s.replace(/^\\s{0,3}>\\s?/gm, '');          // quote marks
+  s = s.replace(/^\\s{0,3}#{1,6}\\s+/gm, '');      // heading hashes
+  s = s.replace(/^\\s*[-*+]\\s+/gm, '');           // bullets
+  s = s.replace(/^\\s*\\d+[.)]\\s+/gm, '');         // ordered bullets
+  s = s.replace(/(\\*\\*|__)(.*?)\\1/g, '$2');     // bold
+  s = s.replace(/(\\*|_)(?=\\S)(.*?)(?<=\\S)\\1/g, '$2'); // italic
+  s = s.replace(/~~(.*?)~~/g, '$1');               // strikethrough
+  s = s.replace(/\\|/g, ' ');                      // table pipes
+  s = s.replace(/^-{3,}$/gm, ' ');                 // rules
+  return s.replace(/\\s+/g, ' ').trim();
+}
+/* A short note beside the button, for "read the first part" or a failure.
+   Deliberately on the ROW and not inside the bubble: speakReply reads the
+   bubble to know what to say, so anything left in there would be read aloud as
+   part of the reply on the next click. */
+function speakNote(row, text, bad) {
+  let n = row.querySelector('.speaknote');
+  if (!n) {
+    n = document.createElement('div');
+    row.appendChild(n);
+  }
+  n.className = 'speaknote' + (bad ? ' bad' : '');
+  n.textContent = text;
+  if (n._t) clearTimeout(n._t);
+  n._t = setTimeout(function () {
+    if (n.parentNode) n.parentNode.removeChild(n);
+  }, 7000);
+}
+function speakReply(btn, row) {
+  const bubble = row.querySelector('.bbub') || row.querySelector('.bubble');
+  const src = bubble ? (bubble.querySelector('.abody') || bubble) : null;
+  let said = speakableText(src ? (src.innerText || src.textContent || '') : '');
+  if (!said) return;
+  /* Long replies are slow to synthesise and tiring to listen to, so this caps
+     rather than refusing - the user gets the opening of the answer, and is told
+     it was cut. 1200 characters is roughly two and a half minutes of speech. */
+  let cut = false;
+  if (said.length > 1200) { said = said.slice(0, 1200); cut = true; }
+  if (kokoroAudio) { try { kokoroAudio.pause(); } catch (e) {} }
+  btn.disabled = true; btn.classList.add('busy');
+  fetch('/api/kokoro/speak', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text: said, voice: kokoroVoice(), speed: 1.0 })
+  }).then(function (r) { return r.json(); })
+    .then(function (d) {
+      if (d.error) throw new Error(d.error);
+      const a = new Audio(d.wav_url);
+      kokoroAudio = a;
+      a.onended = function () { btn.classList.remove('busy'); };
+      a.onerror = function () { btn.classList.remove('busy'); };
+      return a.play();
+    })
+    .then(function () {
+      btn.disabled = false; row.classList.add('spoke');
+      if (cut) speakNote(row, 'read the first part of a long reply');
+    })
+    .catch(function (e) {
+      btn.disabled = false; btn.classList.remove('busy');
+      speakNote(row, 'could not speak that: ' + e.message, true);
+    });
+}
+function addSpeakBtn(row) {
+  if (row.querySelector('.speakbtn')) return row;
+  const btn = document.createElement('button');
+  btn.className = 'speakbtn';
+  btn.type = 'button';
+  /* Spelled as Python's eight-digit escape. JavaScript's brace form is legal in
+     the browser but not in this string, where a four-digit escape runs out
+     mid-number and the whole page fails to parse. */
+  btn.textContent = '\U0001F508';          // speaker with three waves
+  btn.title = 'Speak this reply aloud (' + kokoroVoice() + ')';
+  btn.setAttribute('aria-label', 'Speak this reply aloud');
+  btn.onclick = function (e) { e.preventDefault(); e.stopPropagation(); speakReply(btn, row); };
+  row.appendChild(btn);                  // beside the avatar, which is also last
+  return row;
+}
+
 function addAsst(text, calls, reason, stats, entry) {
   const row = document.createElement('div'); row.className = 'msgrow bonsai';
   /* the mark, so a reply is visibly from Bonsai rather than more text on the
@@ -16595,6 +16741,7 @@ function addAsst(text, calls, reason, stats, entry) {
   }
   /* no stats chip: see the note in the other page copy */
   row.appendChild(b); row.appendChild(av);
+  addSpeakBtn(row);
   convInner().appendChild(row); scrollBottom();
   return inner;
 }
@@ -17232,6 +17379,11 @@ async function streamRun(messages, chat, anchorMsg) {
   if (aborted) throw new Error('stopped');
   if (!gotEnd) throw new Error('The reply was cut off unexpectedly - please try again.');
   if (thinkingRow && thinkingRow.body) thinkingRow.body.innerHTML = fmt(reply);
+  /* The live row is a .thinkrow with no avatar, so its speak button goes on the
+     same last-child position the avatar occupies on a saved reply - beside the
+     mark where there is one, and in the same spot where there is not. Added
+     after the prose is in place so there is text to read. */
+  if (thinkingRow) addSpeakBtn(thinkingRow.row);
   doneThinking();
   setState('idle');
   const last = chat.messages[chat.messages.length - 1];

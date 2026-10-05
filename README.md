@@ -324,7 +324,8 @@ voices that used to ship with the project are gone with no replacement.
 | | |
 |---|---|
 | **Output** | 24 kHz mono WAV, written to `out\tts\` |
-| **Voices** | `tts_voices` lists them; default `af_sarah` |
+| **Voices** | `tts_voices` lists them; default `af_jessica` |
+| **Speaking a reply** | a small 🔈 beside the Bonsai mark on any reply — muted until you hover the row. Same `af_jessica`, and picking a different voice on `/kokoro` changes these buttons too |
 | **Speed** | `tts_speak` takes `speed` from 0.5× to 2× |
 | **Playback** | `sounddevice`, falling back to `winsound` / `paplay` / `aplay` / `ffplay` |
 
