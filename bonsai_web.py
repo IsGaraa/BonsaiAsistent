@@ -158,6 +158,15 @@ KOKORO_MODEL = os.environ.get("PC_KOKORO_MODEL", "kokoro-v1.0.onnx")
 # one ~27 MB npz. KOKORO_LANGS decides which of them this app will offer.
 KOKORO_VOICES_FILE = "voices-v1.0.bin"
 KOKORO_SAMPLE_RATE = 24000
+# CPU by default, and deliberately so. kokoro-onnx picks its execution provider
+# by looking at which onnxruntime distribution is installed: if the GPU one is
+# there it asks for every provider it can see. This machine has onnxruntime-gpu,
+# so it tried TensorRT (no nvinfer_10.dll), fell back to CUDA (no cudnn64_9.dll),
+# fell back again to CPU - three provider initialisations and a wall of
+# tracebacks to end up exactly where it would have started. For an 82M model
+# CPU is the right answer anyway: synthesis is fast, and when the image model is
+# loaded the graphics card is spoken for. Set PC_KOKORO_PROVIDER to override.
+KOKORO_PROVIDER = os.environ.get("PC_KOKORO_PROVIDER", "CPUExecutionProvider")
 MODELS_FILE = os.path.join(BONSAI_DIR, "models.json")
 MODELS_DIR = os.path.join(BONSAI_DIR, "models")
 # Secrets live here, not in the app: one NAME=value per line, '#' comments.
@@ -12218,7 +12227,20 @@ def _kokoro_engine():
             return {"error": "kokoro-onnx is not installed: "
                              "pip install kokoro-onnx (%s)" % exc}
         try:
-            _KOKORO["model"] = Kokoro(model, voices)
+            # kokoro-onnx reads ONNX_PROVIDER when it resolves the provider, so
+            # setting it around the constructor is the supported way to choose -
+            # and putting it back afterwards means this does not leak into
+            # anything else in the process that happens to use onnxruntime.
+            previous = os.environ.get("ONNX_PROVIDER")
+            os.environ["ONNX_PROVIDER"] = KOKORO_PROVIDER
+            try:
+                _KOKORO["model"] = Kokoro(model, voices)
+                _KOKORO["provider"] = KOKORO_PROVIDER
+            finally:
+                if previous is None:
+                    os.environ.pop("ONNX_PROVIDER", None)
+                else:
+                    os.environ["ONNX_PROVIDER"] = previous
         except Exception as exc:
             return {"error": "Kokoro failed to load %s: %s" % (KOKORO_MODEL, exc)}
         return _KOKORO["model"]
@@ -12251,6 +12273,7 @@ def _kokoro_voices():
                          "af_/am_/bf_/bm_" % KOKORO_VOICES_FILE}
     return {"result": "ok", "engine": "Kokoro-82M v1.0",
             "model": KOKORO_MODEL, "folder": KOKORO_DIR,
+            "provider": KOKORO_PROVIDER,
             "languages": "English only",
             "sample_rate": KOKORO_SAMPLE_RATE,
             "voices": names,
@@ -12267,9 +12290,7 @@ def _kokoro_speak_wav(text, voice, speed, out_path):
 
     The wav is written with the standard library rather than soundfile: Kokoro
     hands back float samples, and converting to int16 by hand is four lines,
-    which is cheaper than making every user install another package. Clipped
-    rather than wrapped on the way - a wrap turns a peak into a tick, and
-    clipping is the distortion you can hear least.
+    which is cheaper than making every user install another package.
     """
     import wave as wave_mod
     import numpy as np
@@ -12282,8 +12303,11 @@ def _kokoro_speak_wav(text, voice, speed, out_path):
     if samples.size == 0:
         raise RuntimeError("Kokoro produced no audio for that text")
     peak = float(np.max(np.abs(samples))) or 1.0
-    # Normalise to just under full scale so a quiet voice is still audible
-    # without the peak itself clipping.
+    # Attenuate only, never boost. Kokoro already outputs at a sane level - af_sarah
+    # peaks around 63% of full scale - so this is not a loudness normalisation
+    # despite the name, it is a ceiling. Clipped rather than wrapped on the way:
+    # a wrap turns a peak into a tick, and clipping is the distortion you can
+    # hear least.
     gain = min(1.0, 0.97 / peak)
     pcm = np.clip(samples * gain * 32767.0, -32768, 32767).astype(np.int16)
     with wave_mod.open(out_path, "wb") as wf:
@@ -12332,17 +12356,21 @@ def _tts_speak(args):
     # The /kokoro page passes play=False because the browser plays it itself, and
     # doing both would talk over the click that asked for it. Default stays True
     # so the tool and the header toggle behave exactly as they always did.
-    if args.get("play") is False:
-        played = None
-    else:
-        played = _play_wav(wav_path)
+    suppressed = args.get("play") is False
+    played = None if suppressed else _play_wav(wav_path)
     out = {"result": "ok", "engine": "Kokoro-82M v1.0", "voice": voice,
            "speed": speed, "text": text[:200],
            "wav": wav_path.replace("\\", "/"),
            "bytes": os.path.getsize(wav_path),
            "duration_seconds": duration, "sample_rate": rate,
-           "played": played is not False}
-    if played is False:
+           # "did this make a noise", not "is there a file". A suppressed call
+           # reports False rather than the True that `None is not False` gives -
+           # the browser is playing it and saying True here claims a speaker did
+           # something it did not.
+           "played": (not suppressed) and played is not False}
+    if suppressed:
+        out["playback"] = "suppressed - the caller is playing the file itself"
+    elif played is False:
         # Say so. The audio file is real and on disk, so the honest result is
         # "written but nobody could play it", with the way out.
         out["warning"] = (
