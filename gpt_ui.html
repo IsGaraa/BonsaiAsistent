@@ -1,5 +1,5 @@
 <!-- GPT UI (PAGE_GPT) - the page served at /chat, copied verbatim from a
-     running bonsai_web.py at commit f215c53.
+     running bonsai_web.py at commit 82eb117.
 
      bonsai_web.py is the source of truth. This file is a read-only copy so
      the UI can be opened in an editor without wading through the Python;
@@ -1895,6 +1895,11 @@ function spokenBlock(call) {
   box.appendChild(body);
   return box;
 }
+/* How each reply renderer labels the prose itself: addAsst uses .abody, the
+   step module .ocpara. Anything that has to find "where the reply text is" has
+   to know both, or it silently stops working on whichever one it missed. */
+const SPOKEN_PROSE_SEL = '.abody, .ocpara';
+
 /* Placed into a bubble that is already in the document, immediately before the
    prose, so it reads as what was said and then the answer to it. */
 function placeSpokenBlocks(calls, bubble) {
@@ -1909,7 +1914,7 @@ function placeSpokenBlocks(calls, bubble) {
     bubble._spoken[key] = 1;
     const blk = spokenBlock(c);
     if (!blk) return;
-    const body = bubble.querySelector('.abody');
+    const body = bubble.querySelector(SPOKEN_PROSE_SEL);
     if (body) bubble.insertBefore(blk, body);
     else bubble.appendChild(blk);
   });
@@ -2249,11 +2254,48 @@ function watchForSpeak() {
   if (!conv || typeof MutationObserver === 'undefined') return;
   speakWatchOn = true;
   const sel = '.msgrow.bonsai, .msgrow.thinkrow';
+  /* Prose, as the reply renderers label it. */
+  const proseSel = SPOKEN_PROSE_SEL;
+  /* A bubble holding nothing but the waiting stub or the steps is not a reply
+     yet, and draining into it would put the speech in the wrong place. */
+  function hasProse(bub) {
+    if (!bub) return false;
+    if (bub.querySelector && bub.querySelector(proseSel)) return true;
+    const kids = bub.children || [];
+    for (let i = 0; i < kids.length; i++) {
+      const c = (kids[i].className || '').split(/\s+/);
+      if (c.indexOf('thinkstub') >= 0 || c.indexOf('ocsteps') >= 0 ||
+          c.indexOf('tlog') >= 0 || c.indexOf('toolsline') >= 0 ||
+          c.indexOf('reasonbox') >= 0) continue;
+      return true;
+    }
+    return false;
+  }
+  function drainRow(row) {
+    if (!row) return;
+    const bub = row.querySelector('.bbub') || row.querySelector('.bubble');
+    if (bub && hasProse(bub)) drainSpoken(bub);
+  }
   function scan(node) {
     if (!node || node.nodeType !== 1) return;
-    if (node.matches && node.matches(sel)) { addSpeakBtn(node); return; }
+    if (node.matches && node.matches(sel)) {
+      addSpeakBtn(node);
+      /* A row that arrives already holding its reply. */
+      drainRow(node);
+      return;
+    }
     if (!node.querySelectorAll) return;
     node.querySelectorAll(sel).forEach(function (r) { addSpeakBtn(r); });
+    /* Prose landing inside a row that already exists - the waiting row turning
+       into a reply, which happens after the tool has already fired. The added
+       node may BE the prose rather than contain it, so both are checked. */
+    const prose = [];
+    if (node.matches && node.matches(proseSel)) prose.push(node);
+    node.querySelectorAll(proseSel).forEach(function (p) { prose.push(p); });
+    for (let i = 0; i < prose.length; i++) {
+      const row = prose[i].closest ? prose[i].closest('.msgrow') : null;
+      if (row) drainRow(row);
+    }
   }
   new MutationObserver(function (muts) {
     for (let i = 0; i < muts.length; i++) {
@@ -2261,6 +2303,34 @@ function watchForSpeak() {
       for (let j = 0; j < added.length; j++) scan(added[j]);
     }
   }).observe(conv, { childList: true, subtree: true });
+}
+
+/* Where the text is finally placed depends on which renderer drew the reply.
+
+   addAsst is not the only one. The step module builds its own reply rows - two
+   of them - each with its own avatar and bubble, and neither of them is
+   addAsst. A block placed into thinkingRow.b therefore lands in a bubble that
+   is not the one on screen, which is exactly what was happening: the speech
+   step rendered, the reply rendered, and the text was nowhere to be seen.
+
+   So the call is queued and drained into whichever row actually receives prose,
+   which the observer below notices wherever it comes from. Dedupe stays per
+   bubble rather than global: a global set would suppress the text when a chat
+   is re-rendered in the same session, since the records come back with the same
+   ids - which is the shape of the disappearing bug all over again. */
+const _pendingSpoken = [];
+function queueSpoken(calls) {
+  (calls || []).forEach(function (c) {
+    if (spokenText(c)) _pendingSpoken.push(c);
+  });
+  /* Bounded, so a turn that produced speech and then no reply at all cannot
+     hand its words to whatever the user asks next. */
+  while (_pendingSpoken.length > 8) _pendingSpoken.shift();
+}
+function drainSpoken(bubble) {
+  if (!bubble || !bubble.parentNode || !_pendingSpoken.length) return;
+  placeSpokenBlocks(_pendingSpoken, bubble);
+  _pendingSpoken.length = 0;
 }
 
 function addAsst(text, calls, reason, stats, entry) {
@@ -2300,6 +2370,10 @@ function addThinking() {
      nothing can ever finish it - its "Starting" then sat in the chat for
      good, long after the work it was waiting for had been done. */
   if (thinkingRow) doneThinking();
+  /* A new turn starts with nothing owed to it. Anything still queued belonged
+     to a turn that produced no reply row, and handing its words to this one
+     would put one answer's speech inside another's message. */
+  _pendingSpoken.length = 0;
   liveCalls = [];
   /* Hidden until it holds something. The row cannot be removed: it is the
      witness the wait-watch polls - startWaitWatch clears itself when
@@ -2415,9 +2489,11 @@ function onTool(call) {
   }
   thinkingRow.tlog.s.textContent = 'Tool log · ' + liveCalls.length + ' running...';
   thinkingRow.tlog.l.appendChild(toolItemDom(call));
-  /* Into the live turn's own bubble, which is where its reply prose will go, so
-     the spoken text ends up directly above it rather than in a row of its own. */
-  placeSpokenBlocks([call], thinkingRow.b);
+  /* Queued rather than placed: this fires when the tool starts, and the row that
+     will hold the reply does not exist yet - and when the step module is doing
+     the rendering it never will be thinkingRow.b. The observer drains the queue
+     into whichever row actually gets prose. */
+  queueSpoken([call]);
   const live = shotCardDom(call);
   if (live) thinkingRow.b.insertBefore(live, thinkingRow.tlog.d);
   scrollBottom();
