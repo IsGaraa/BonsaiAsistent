@@ -1,5 +1,5 @@
 <!-- GPT UI (PAGE_GPT) - the page served at /chat, copied verbatim from a
-     running bonsai_web.py at commit c741f27.
+     running bonsai_web.py at commit af1a322.
 
      bonsai_web.py is the source of truth. This file is a read-only copy so
      the UI can be opened in an editor without wading through the Python;
@@ -5425,7 +5425,8 @@ init();
             stripLegacy(bub);
             var old = bub.querySelector('.abody');
             if (old && old.parentNode) old.parentNode.removeChild(old);
-            renderOrdered(bub, rcalls, parts);
+            var firstProse = renderOrdered(bub, rcalls, parts);
+            placeSpeech(rcalls, firstProse || bub);
             /* The steps and the answer are drawn as rows of their own, so
                this bubble can be left with nothing in it. It used to be
                filled by the stats chip; with that gone a reloaded chat
@@ -5462,6 +5463,23 @@ init();
   function renderOrdered(bubble, calls, parts) {
     var box = null;
     var anchor = bubble;
+    /* the first prose row this message drew, so the speech can go in it.
+       Reported rather than looked up afterwards: the prose rows are plain
+       siblings, so a query for ".ocpara-bubble" cannot tell this message's
+       first paragraph from the next message's. */
+    var firstProse = null;
+    /* The anchor starts as the reply's own bubble, which lives INSIDE the
+       row. Inserting a paragraph next to it therefore nested a whole reply
+       row inside another one - and the outer row is hidden when its bubble
+       is empty, which took the first paragraph of every message whose parts
+       began with prose with it. Always measure from the outermost node that
+       is still inside the conversation, which is what placeSteps does. */
+    var arow = bubble && bubble.parentNode;
+    var conv = arow && arow.parentNode;
+    function topNode(n) {
+      while (n && conv && n.parentNode && n.parentNode !== conv) n = n.parentNode;
+      return n;
+    }
     /* Steps are grouped only for as long as they run together. A piece of
        prose in the middle closes the group, so the conversation reads
        think / say / do / think / say rather than all the steps and then
@@ -5494,8 +5512,10 @@ init();
         var ra = el('div', 'av bonsai'); ra.innerHTML = BONSAI_MARK;
         var rr = el('div', 'msgrow bonsai');
         rb.appendChild(n); rr.appendChild(ra); rr.appendChild(rb);
-        if (anchor && anchor.parentNode) {
-          anchor.parentNode.insertBefore(rr, anchor.nextSibling);
+        if (!firstProse) firstProse = rb;
+        var ref = topNode(anchor);
+        if (ref && ref.parentNode) {
+          ref.parentNode.insertBefore(rr, ref.nextSibling);
           anchor = rr;
         }
       } else if (p.k === 'r') {
@@ -5512,7 +5532,24 @@ init();
       if (sc) { shots.appendChild(sc); nshot++; }
     });
     if (nshot) bubble.insertBefore(shots, bubble.firstChild);
-  }  function stripLegacy(root) {
+    return firstProse;
+  }
+  /* The spoken text belongs with the reply, and on a reload the reply is
+     drawn here rather than by the page. addAsst was called with no calls at
+     all - they are withheld so the tool log is not drawn twice - so the
+     page's own placement never ran and every saved tts_speak lost its block.
+     That is why it showed during the turn and then vanished: the live
+     observer drains the queue into whichever row receives prose, and the
+     rebuild at the end of the turn had nowhere to put it. */
+  function placeSpeech(calls, bubble) {
+    if (!bubble) return;
+    if (typeof P.spokenText !== 'function'
+        || typeof P.placeSpokenBlocks !== 'function') return;
+    var list = (calls || []).filter(function (c) { return P.spokenText(c); });
+    if (!list.length) return;
+    P.placeSpokenBlocks(list, bubble);
+  }
+  function stripLegacy(root) {
     if (!root || !root.querySelectorAll) return;
     var junk = root.querySelectorAll(
       '.toolchip, .pill, .pills, .toollog, .tlog, .toolsline, .reasonbox');
