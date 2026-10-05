@@ -1,5 +1,5 @@
 <!-- GPT UI (PAGE_GPT) - the page served at /chat, copied verbatim from a
-     running bonsai_web.py at commit 82eb117.
+     running bonsai_web.py at commit d39ed70.
 
      bonsai_web.py is the source of truth. This file is a read-only copy so
      the UI can be opened in an editor without wading through the Python;
@@ -2253,7 +2253,12 @@ function watchForSpeak() {
   const conv = convInner();
   if (!conv || typeof MutationObserver === 'undefined') return;
   speakWatchOn = true;
-  const sel = '.msgrow.bonsai, .msgrow.thinkrow';
+  /* Only real reply rows. NOT .msgrow.thinkrow - the waiting row is transient:
+     the step module empties it and hides it once the reply text moves into a
+     row of its own, so anything drawn there is shown and then taken away again.
+     That was the whole of the disappearing: the block went into the row the
+     model was thinking in, which is not the row the reply ends up in. */
+  const sel = '.msgrow.bonsai';
   /* Prose, as the reply renderers label it. */
   const proseSel = SPOKEN_PROSE_SEL;
   /* A bubble holding nothing but the waiting stub or the steps is not a reply
@@ -2273,6 +2278,10 @@ function watchForSpeak() {
   }
   function drainRow(row) {
     if (!row) return;
+    const l = (row.className || '').split(/\s+/);
+    /* A waiting row is not a reply. Draining into it is what made the text
+       appear and then vanish when the real reply replaced it. */
+    if (l.indexOf('bonsai') < 0) return;
     const bub = row.querySelector('.bbub') || row.querySelector('.bubble');
     if (bub && hasProse(bub)) drainSpoken(bub);
   }
@@ -2328,8 +2337,19 @@ function queueSpoken(calls) {
   while (_pendingSpoken.length > 8) _pendingSpoken.shift();
 }
 function drainSpoken(bubble) {
-  if (!bubble || !bubble.parentNode || !_pendingSpoken.length) return;
-  placeSpokenBlocks(_pendingSpoken, bubble);
+  if (!bubble || !bubble.parentNode) return;
+  /* The queue first, then the turn's own calls as a reconciliation. The queue
+     is the intent - "this speech is waiting for a home" - but on the first call
+     of a turn it could be emptied by whatever claimed the row first, and the
+     text then went nowhere while everything else looked healthy. liveCalls is
+     this turn's authoritative list, so if the queue is dry and this bubble has
+     prose with no block in it yet, the calls are simply read again and drawn.
+
+     Per-bubble dedupe means reconciling costs nothing and cannot double up. */
+  let source = _pendingSpoken;
+  if (!source.length) source = (typeof liveCalls !== 'undefined' && liveCalls) || [];
+  if (!source.length) return;
+  placeSpokenBlocks(source, bubble);
   _pendingSpoken.length = 0;
 }
 
