@@ -1,5 +1,5 @@
 <!-- GPT UI (PAGE_GPT) - the page served at /chat, copied verbatim from a
-     running bonsai_web.py at commit 0a7109b.
+     running bonsai_web.py at commit f215c53.
 
      bonsai_web.py is the source of truth. This file is a read-only copy so
      the UI can be opened in an editor without wading through the Python;
@@ -95,8 +95,8 @@
     border: 1px solid transparent; border-radius: 6px; background: transparent;
     color: var(--mut); cursor: pointer; font-size: 11px; line-height: 1;
     display: flex; align-items: center; justify-content: center; padding: 0;
-    opacity: .3; transition: opacity .12s, background .12s, color .12s; }
-  .msgrow.bonsai:hover .speakbtn, .msgrow.thinkrow:hover .speakbtn { opacity: .8; }
+    opacity: .5; transition: opacity .12s, background .12s, color .12s; }
+  .msgrow.bonsai:hover .speakbtn, .msgrow.thinkrow:hover .speakbtn { opacity: .85; }
   .speakbtn:hover { opacity: 1; background: var(--bg3); color: var(--txt);
     border-color: var(--bd); }
   .speakbtn:focus-visible { opacity: 1; outline: 2px solid var(--acc); outline-offset: 1px; }
@@ -115,13 +115,16 @@
   /* the assistant keeps a neutral surface: it is the one carrying formatted
      prose, code and tables, and a tint behind all that reads as noise */
   .ubub { border: 1px solid var(--bub-bd); box-shadow: 0 1px 2px rgba(0,0,0,.05); }
-  /* Text the assistant said out loud. Same row, same avatar, same .bbub and the
-     same side of the page as any other reply - it has to read as Bonsai saying
-     it, not as something typed at the prompt. The only thing marking it is the
-     small caption; .spokenq itself is a marker and carries no appearance, so
-     nothing about it can drift away from a real reply's. */
-  .msgrow.bonsai.spokenq .sphead { font-size: 10.5px; color: var(--mut);
-      letter-spacing: .05em; text-transform: uppercase; margin-bottom: 5px; }
+  /* Text the assistant said out loud. A block inside the reply's own bubble, not
+     a row of its own: the step module relies on a reply row being immediately
+     followed by its steps, and a second Bonsai row in the conversation breaks
+     that as well as anything anchoring on the last row. */
+  .spoken { margin: 0 0 10px; padding: 7px 10px; background: var(--bg3);
+            border-left: 2px solid var(--bd2); border-radius: 0 7px 7px 0; }
+  .spoken .sphead { font-size: 10px; color: var(--mut); letter-spacing: .05em;
+                    text-transform: uppercase; margin-bottom: 4px; }
+  .spoken .stext { font-size: 14px; line-height: 1.5; color: var(--txt);
+                   white-space: pre-wrap; overflow-wrap: anywhere; }
   /* sized here rather than left to .mark's 100% resolving against an
      auto-width parent, which is circular and engine-dependent */
   .msgrow.bonsai .av { flex: none; width: 26px; height: 26px;
@@ -267,10 +270,8 @@
                font-style: italic; font-family: Consolas, monospace; }
   .msgrow { display: flex; flex-direction: column; }
   .msgrow.user { align-items: flex-end; }
-  /* Also used by a .msgrow.user.spokenq, which is a bubble holding text the
-     assistant said out loud. That class is a marker only and deliberately has
-     no rules of its own here: it should be indistinguishable from a message the
-     user typed, because that is the whole idea. */
+  /* Text the assistant said out loud is a .spoken block inside this bubble, not a
+     bubble of its own - see the block in the speak section. */
   .ubub { background: var(--bub); border-radius: 16px 16px 4px 16px; padding: 10px 14px; max-width: 80%; font-size: 14px; white-space: pre-wrap; word-break: break-word; line-height: 1.5; }
   .ubub .thumbs { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 6px; }
   .ubub .thumb { width: 60px; height: 60px; border-radius: 10px; overflow: hidden; border: 1px solid var(--bd); }
@@ -1850,73 +1851,67 @@ function previewIframeDom(r) {
   w.appendChild(a); w.appendChild(b2);
   return w;
 }
-/* What was actually said out loud, as a message from Bonsai.
+/* What was actually said out loud, rendered INSIDE the reply's own bubble.
 
-   This was a .msgrow.user bubble, which is the page's own word for "the user
-   said this" - it rendered as if the prompt had been typed at the box, which is
-   the opposite of what it is. It is now built from the same pieces as any other
-   reply: msgrow.bonsai, the Bonsai avatar, and a .bbub. Same side of the page,
-   same bubble, and only a small caption saying it was spoken. */
+   This was a whole extra .msgrow.bonsai in the conversation, and that is the
+   thing it must not be. The step module places its steps as a sibling of the
+   reply row and relies on that adjacency - ".msgrow.bonsai + .ocsteps" - and
+   anything walking the conversation picks the last row as an anchor. A second
+   Bonsai row sitting in the middle is indistinguishable from a real message to
+   all of it: the steps stopped lining up, the anchor could land on the phantom,
+   and the bubble that follows came out empty. It also explains why the text kept
+   vanishing - whatever rebuilt the turn rebuilt it without the row that was
+   never part of it.
+
+   Inside the bubble there is no new row, so none of that applies. It still reads
+   as Bonsai saying it, because it sits in Bonsai's own message under Bonsai's
+   own mark. */
 function spokenText(call) {
   if (!call || call.name !== 'tts_speak') return '';
   let a = call.arguments || {};
   if (typeof a === 'string') { try { a = JSON.parse(a); } catch (e) { return ''; } }
   return String(a.text || '').trim();
 }
-function spokenBubble(call) {
+function spokenBlock(call) {
   const said = spokenText(call);
   if (!said) return null;
   let a = call.arguments || {};
   if (typeof a === 'string') { try { a = JSON.parse(a); } catch (e) { a = {}; } }
   const r = (typeof call.result === 'string') ? {} : (call.result || {});
-  const row = document.createElement('div');
-  row.className = 'msgrow bonsai spokenq';
-  const av = document.createElement('div');
-  av.className = 'av bonsai';
-  av.innerHTML = BONSAI_MARK;
-  const b = document.createElement('div');
-  b.className = 'bbub';
+  const box = document.createElement('div');
+  box.className = 'spoken';
   const head = document.createElement('div');
   head.className = 'sphead';
-  let bits = '🔊 spoken';
+  let bits = '🔊 spoken aloud';
   if (a.voice) bits += ' · ' + a.voice;
   const sp = Number(a.speed);
   if (sp && sp !== 1) bits += ' · ' + sp + '×';
   if (r.duration_seconds) bits += ' · ' + r.duration_seconds + 's';
   head.textContent = bits;
   const body = document.createElement('div');
+  body.className = 'stext';
   body.textContent = said;
-  b.appendChild(head);
-  b.appendChild(body);
-  /* Bubble then avatar, which is the order addAsst uses and the order every
-     other Bonsai message is in. This was the other way round, so the spoken
-     bubble sat with its mark on the opposite side from the reply above and
-     below it - the same model, laid out two different ways. */
-  row.appendChild(b);
-  row.appendChild(av);
-  return row;
+  box.appendChild(head);
+  box.appendChild(body);
+  return box;
 }
-/* The dedupe lives on the DOM node it drew into, never on the call record.
-   The record is held on the message in memory and the conversation can be
-   rebuilt from those same objects, so a flag on the record outlives the element
-   it describes: the rebuild deletes the bubble and then refuses to redraw it,
-   and the text vanishes from the chat with no way to get it back. A fresh
-   container starts with no record, so a rebuild draws again. */
-function placeSpokenBubbles(calls, host) {
+/* Placed into a bubble that is already in the document, immediately before the
+   prose, so it reads as what was said and then the answer to it. */
+function placeSpokenBlocks(calls, bubble) {
+  if (!bubble || !bubble.parentNode) return;
   (calls || []).forEach(function (c, i) {
-    const said = spokenText(c);
-    if (!said) return;
+    if (!spokenText(c)) return;
     const key = (c && (c.tool_call_id || c.id)) || ('#' + i);
-    if (host) {
-      if (!host._spoken) host._spoken = {};
-      if (host._spoken[key]) return;
-      host._spoken[key] = 1;
-    }
-    const row = spokenBubble(c);
-    if (!row) return;
-    const owner = host && host.closest ? host.closest('.msgrow') : null;
-    if (owner && owner.parentNode) owner.parentNode.insertBefore(row, owner);
-    else convInner().appendChild(row);
+    /* On the bubble, so a rebuild draws it again. A flag on the call record
+       outlived the element it described and permanently suppressed the text. */
+    if (!bubble._spoken) bubble._spoken = {};
+    if (bubble._spoken[key]) return;
+    bubble._spoken[key] = 1;
+    const blk = spokenBlock(c);
+    if (!blk) return;
+    const body = bubble.querySelector('.abody');
+    if (body) bubble.insertBefore(blk, body);
+    else bubble.appendChild(blk);
   });
 }
 function toolItemDom(call) {
@@ -2051,10 +2046,6 @@ function addToolLog(container, calls) {
   const l = document.createElement('div'); l.className = 'tl';
   (calls).forEach(function (c) { l.appendChild(toolItemDom(c)); });
   d.appendChild(s); d.appendChild(l); container.appendChild(d);
-  /* Same bubble on the saved-chat path, so a conversation read back looks the
-     way it looked live. After the append, for the same reason as the live one:
-     the placement is relative to the assistant's row. */
-  placeSpokenBubbles(calls, d);
   const shots = document.createElement('div'); shots.className = 'shots';
   let shotCount = 0;
   (calls).forEach(function (c) {
@@ -2189,8 +2180,9 @@ function speakNote(row, text, bad) {
   }, 7000);
 }
 function speakReply(btn, row) {
-  const bubble = row.querySelector('.bbub') || row.querySelector('.bubble');
-  const src = bubble ? (bubble.querySelector('.abody') || bubble) : null;
+  /* Read the PROSE only. The bubble also holds the spoken block, and reading
+     the whole thing would say the quoted speech again on top of the reply. */
+  const src = row.querySelector('.abody');
   let said = speakableText(src ? (src.innerText || src.textContent || '') : '');
   if (!said) return;
   /* Long replies are slow to synthesise and tiring to listen to, so this caps
@@ -2222,6 +2214,11 @@ function speakReply(btn, row) {
     });
 }
 function addSpeakBtn(row) {
+  if (!row || !row.className) return row;
+  /* Only Bonsai's rows. The observer already filters, but the guard means no
+     caller can put a speak button on a user's message by mistake. */
+  const l = row.className.split(/\s+/);
+  if (l.indexOf('bonsai') < 0 && l.indexOf('thinkrow') < 0) return row;
   if (row.querySelector('.speakbtn')) return row;
   const btn = document.createElement('button');
   btn.className = 'speakbtn';
@@ -2235,6 +2232,35 @@ function addSpeakBtn(row) {
   btn.onclick = function (e) { e.preventDefault(); e.stopPropagation(); speakReply(btn, row); };
   row.appendChild(btn);                  // beside the avatar, which is also last
   return row;
+}
+/* Four separate places build an assistant row - addAsst, the image card, and
+   two inside the step module - and each builds its own markup. Adding the button
+   at each of them meant it appeared on some replies and not others, which is
+   worse than not having it: it looks broken rather than absent. One observer
+   decorates whatever appears instead, so a builder nobody has found still gets
+   one, and there is no list to keep up to date.
+
+   Only added nodes are visited, and addSpeakBtn is a no-op on a row that
+   already has the button, so this is idempotent and cheap. */
+let speakWatchOn = false;
+function watchForSpeak() {
+  if (speakWatchOn) return;
+  const conv = convInner();
+  if (!conv || typeof MutationObserver === 'undefined') return;
+  speakWatchOn = true;
+  const sel = '.msgrow.bonsai, .msgrow.thinkrow';
+  function scan(node) {
+    if (!node || node.nodeType !== 1) return;
+    if (node.matches && node.matches(sel)) { addSpeakBtn(node); return; }
+    if (!node.querySelectorAll) return;
+    node.querySelectorAll(sel).forEach(function (r) { addSpeakBtn(r); });
+  }
+  new MutationObserver(function (muts) {
+    for (let i = 0; i < muts.length; i++) {
+      const added = muts[i].addedNodes;
+      for (let j = 0; j < added.length; j++) scan(added[j]);
+    }
+  }).observe(conv, { childList: true, subtree: true });
 }
 
 function addAsst(text, calls, reason, stats, entry) {
@@ -2262,8 +2288,10 @@ function addAsst(text, calls, reason, stats, entry) {
   }
   /* no stats chip: see the note in the other page copy */
   row.appendChild(b); row.appendChild(av);
-  addSpeakBtn(row);
-  convInner().appendChild(row); scrollBottom();
+  convInner().appendChild(row);
+  /* Into this row's own bubble, after the row is in the document. */
+  placeSpokenBlocks(calls, b);
+  scrollBottom();
   return inner;
 }
 function addThinking() {
@@ -2387,11 +2415,9 @@ function onTool(call) {
   }
   thinkingRow.tlog.s.textContent = 'Tool log · ' + liveCalls.length + ' running...';
   thinkingRow.tlog.l.appendChild(toolItemDom(call));
-  /* After the append, so the tool log is in the document and the bubble can be
-     placed against the turn it belongs to. Passed just this call: onTool fires
-     when the call starts, before there is a result, so there is no duration to
-     quote yet - the text is already known and that is what the bubble carries. */
-  placeSpokenBubbles([call], thinkingRow.tlog.d);
+  /* Into the live turn's own bubble, which is where its reply prose will go, so
+     the spoken text ends up directly above it rather than in a row of its own. */
+  placeSpokenBlocks([call], thinkingRow.b);
   const live = shotCardDom(call);
   if (live) thinkingRow.b.insertBefore(live, thinkingRow.tlog.d);
   scrollBottom();
@@ -2900,11 +2926,6 @@ async function streamRun(messages, chat, anchorMsg) {
   if (aborted) throw new Error('stopped');
   if (!gotEnd) throw new Error('The reply was cut off unexpectedly - please try again.');
   if (thinkingRow && thinkingRow.body) thinkingRow.body.innerHTML = fmt(reply);
-  /* The live row is a .thinkrow with no avatar, so its speak button goes on the
-     same last-child position the avatar occupies on a saved reply - beside the
-     mark where there is one, and in the same spot where there is not. Added
-     after the prose is in place so there is text to read. */
-  if (thinkingRow) addSpeakBtn(thinkingRow.row);
   doneThinking();
   setState('idle');
   const last = chat.messages[chat.messages.length - 1];
@@ -3860,6 +3881,10 @@ document.getElementById('ttsbtn').onclick = function () {
     .catch(function () { alert('TTS toggle failed'); });
 };
 refreshTts();
+/* One observer puts a speak button on every assistant row, whichever of the
+   four renderers drew it. Started here because the conversation element exists
+   by this point in the script. */
+watchForSpeak();
 
 /* ---------- MODEL selector ---------- */
 function modelLabel(m) {
