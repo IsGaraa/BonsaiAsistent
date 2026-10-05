@@ -3,6 +3,7 @@ import base64
 import ctypes
 import datetime
 import fnmatch
+import gc
 import glob
 import hashlib
 import html
@@ -12179,13 +12180,67 @@ def _archive(args):
 #            Kokoro publishes no ro_ styles at all, so this drops that language
 #            entirely. Everything here is English.
 #
-# The model is loaded once and kept. Loading costs a second or two and ~310 MB,
-# and tts_speak is called per reply, so re-loading it every time was the single
-# most wasteful thing the old implementation could have done (it did not - Piper
-# re-loaded per call too, which is part of why it felt slow).
+# The model is cached, and released again after a quiet period. Loading costs a
+# second or two and ~420 MB resident, while tts_speak is called per reply - so
+# re-loading every time was the most wasteful thing this could do (Piper did
+# exactly that, which is part of why it felt slow), and never releasing it means
+# holding that 420 MB for the life of the process next to a 27B model and an
+# image generator. A short idle window is the only arrangement that does neither.
 
-_KOKORO = {"model": None, "checked": 0.0}
+_KOKORO = {"model": None, "provider": KOKORO_PROVIDER, "last": 0.0,
+            "busy": 0, "unloads": 0}
 _KOKORO_LOCK = threading.Lock()
+_KOKORO_REAPER_STARTED = False
+
+
+def _kokoro_unload_if_idle():
+    """Drop the model if it has been idle past the window. True if it was freed.
+
+    Three conditions, and all three have to hold: something is loaded, nothing
+    is mid-synthesis, and the clock says it is stale. The busy check is what
+    stops a 1s utterance being pulled out from under itself by a sweep that
+    lands at the wrong moment.
+    """
+    if KOKORO_IDLE_UNLOAD <= 0:
+        return False
+    with _KOKORO_LOCK:
+        if _KOKORO["model"] is None or _KOKORO["busy"]:
+            return False
+        if (time.time() - _KOKORO["last"]) < KOKORO_IDLE_UNLOAD:
+            return False
+        _KOKORO["model"] = None
+        _KOKORO["unloads"] += 1
+    # Outside the lock, and deliberately: collecting 310 MB takes long enough
+    # that holding the lock across it would stall a speech request arriving at
+    # that moment for no reason - the model is already unreachable by then.
+    gc.collect()
+    return True
+
+
+def _kokoro_reaper():
+    """Free the model once it has gone quiet, whether or not anyone asks again.
+
+    A check on the next call would not release anything until somebody wanted to
+    speak - which is precisely when it no longer matters that the memory was
+    held. This wakes on an interval and does nothing at all unless the model is
+    loaded and stale. Daemon, so it dies with the process instead of holding
+    shutdown open.
+    """
+    while True:
+        time.sleep(KOKORO_REAP_INTERVAL)
+        try:
+            _kokoro_unload_if_idle()
+        except Exception:
+            pass
+
+
+def _kokoro_start_reaper():
+    global _KOKORO_REAPER_STARTED
+    if _KOKORO_REAPER_STARTED or KOKORO_IDLE_UNLOAD <= 0:
+        return
+    _KOKORO_REAPER_STARTED = True
+    threading.Thread(target=_kokoro_reaper, daemon=True,
+                     name="bonsai-kokoro-reaper").start()
 
 # Voice-name prefixes, and what they mean. af/am American female/male, bf/bm
 # British. The first two letters are the only naming convention the voices file
@@ -12194,6 +12249,31 @@ _KOKORO_LOCK = threading.Lock()
 _KOKORO_LANG_PREFIX = {"af": "American female", "am": "American male",
                        "bf": "British female", "bm": "British male"}
 KOKORO_DEFAULT_VOICE = "af_sarah"
+
+
+def _env_seconds(name, default):
+    try:
+        return float(os.environ.get(name, "") or default)
+    except (TypeError, ValueError):
+        return default
+
+
+# Hold the model for two minutes after the last utterance, then let it go. That
+# is the compromise between the two things that pull against each other here:
+# reloading costs about 2s and 310 MB of disk read, while keeping it costs 310 MB
+# of RAM for as long as the process lives - forever, on a machine that has a
+# 27B model, an image generator and a browser to pay for. Unloading after every
+# utterance would throw the cache away entirely and be the worst of both; two
+# minutes covers the case that matters, which is replies arriving in bursts, and
+# gives the memory back for everything else.
+#
+# 0 or less disables it and the model stays resident. Override with
+# PC_KOKORO_IDLE_UNLOAD (seconds).
+KOKORO_IDLE_UNLOAD = _env_seconds("PC_KOKORO_IDLE_UNLOAD", 120.0)
+# How often the reaper looks. A tenth of the window is frequent enough that an
+# unload happens within ~15s of the deadline without a thread waking 480 times
+# an hour for nothing.
+KOKORO_REAP_INTERVAL = max(2.0, KOKORO_IDLE_UNLOAD / 8.0)
 
 
 def _kokoro_paths():
@@ -12209,10 +12289,16 @@ def _kokoro_paths():
 def _kokoro_engine():
     """The loaded Kokoro instance, or an error dict.
 
-    Cached on the module. The cache is keyed on nothing but the paths, so
-    changing PC_KOKORO_MODEL mid-process would not be picked up - which is fine,
-    because the alternative is re-reading 310 MB off the disk on every reply.
+    Cached, with an idle timeout. The window is checked here as well as by the
+    reaper, so the model still comes back correctly if the reaper thread is ever
+    not running - a stale model being reused is the failure that would matter,
+    and this makes it impossible rather than unlikely.
+
+    The cache is keyed on nothing but the paths, so changing PC_KOKORO_MODEL
+    mid-process would not be picked up - fine, because the alternative is
+    re-reading 310 MB off the disk on every reply.
     """
+    _kokoro_unload_if_idle()
     model, voices, missing = _kokoro_paths()
     if missing:
         return {"error": "Kokoro is not fully installed - missing %s in %s "
@@ -12220,6 +12306,8 @@ def _kokoro_engine():
                          % (", ".join(missing), KOKORO_DIR)}
     with _KOKORO_LOCK:
         if _KOKORO["model"] is not None:
+            _KOKORO["last"] = time.time()
+            _kokoro_start_reaper()
             return _KOKORO["model"]
         try:
             from kokoro_onnx import Kokoro
@@ -12236,6 +12324,7 @@ def _kokoro_engine():
             try:
                 _KOKORO["model"] = Kokoro(model, voices)
                 _KOKORO["provider"] = KOKORO_PROVIDER
+                _KOKORO["last"] = time.time()
             finally:
                 if previous is None:
                     os.environ.pop("ONNX_PROVIDER", None)
@@ -12243,6 +12332,7 @@ def _kokoro_engine():
                     os.environ["ONNX_PROVIDER"] = previous
         except Exception as exc:
             return {"error": "Kokoro failed to load %s: %s" % (KOKORO_MODEL, exc)}
+        _kokoro_start_reaper()
         return _KOKORO["model"]
 
 
@@ -12274,6 +12364,12 @@ def _kokoro_voices():
     return {"result": "ok", "engine": "Kokoro-82M v1.0",
             "model": KOKORO_MODEL, "folder": KOKORO_DIR,
             "provider": KOKORO_PROVIDER,
+            # Whether the 310 MB is resident right now, and the rule that decides.
+            # Reported because "it loads on demand and lets go again" is a claim
+            # a user should be able to check rather than take on trust.
+            "loaded": _KOKORO["model"] is not None,
+            "idle_unload_seconds": KOKORO_IDLE_UNLOAD,
+            "unloads": _KOKORO["unloads"],
             "languages": "English only",
             "sample_rate": KOKORO_SAMPLE_RATE,
             "voices": names,
@@ -12297,8 +12393,22 @@ def _kokoro_speak_wav(text, voice, speed, out_path):
     engine = _kokoro_engine()
     if isinstance(engine, dict):
         raise RuntimeError(engine["error"])
-    samples, rate = engine.create(text, voice=voice, speed=speed,
-                                  lang="en-us")
+    # Claim the model for the duration. Synthesis is around half a second and the
+    # reaper only fires past a two-minute gap, so the odds of a collision are
+    # low - but "low" is not "no", and the cost of dropping the session out from
+    # under a running utterance is a crash rather than a wasted cycle.
+    with _KOKORO_LOCK:
+        _KOKORO["busy"] += 1
+    try:
+        samples, rate = engine.create(text, voice=voice, speed=speed,
+                                      lang="en-us")
+    finally:
+        with _KOKORO_LOCK:
+            _KOKORO["busy"] -= 1
+            # Stamped on the way out, not on the way in: the clock should start
+            # when the speech finished, or a burst of replies keeps resetting it
+            # and the model never unloads while the user is in conversation.
+            _KOKORO["last"] = time.time()
     samples = np.asarray(samples, dtype=np.float32).reshape(-1)
     if samples.size == 0:
         raise RuntimeError("Kokoro produced no audio for that text")

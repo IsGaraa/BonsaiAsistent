@@ -310,8 +310,11 @@ python kokoro\download_model.py  # weights, ~340 MB, once
 ```
 
 `--model int8` fetches a 109 MB quantised model instead of the 310 MB fp32 one,
-`--model fp16` a 156 MB one. The engine loads once and stays resident, so the
-second reply to speak costs about a second rather than a reload.
+`--model fp16` a 156 MB one. The engine loads on first use and is held for two
+minutes after the last utterance, then released — so a burst of replies pays the
+load once, and the ~420 MB it occupies goes back when you stop asking for
+speech. `PC_KOKORO_IDLE_UNLOAD` changes the window in seconds; `0` keeps it
+resident.
 
 **English only.** The voices file ships styles for a dozen languages; this app
 offers the 28 American and British ones (`af_*`, `am_*`, `bf_*`, `bm_*`).
