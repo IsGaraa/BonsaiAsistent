@@ -1,5 +1,5 @@
 <!-- GPT UI (PAGE_GPT) - the page served at /chat, copied verbatim from a
-     running bonsai_web.py at commit af1a322.
+     running bonsai_web.py at commit 8544bda.
 
      bonsai_web.py is the source of truth. This file is a read-only copy so
      the UI can be opened in an editor without wading through the Python;
@@ -102,6 +102,10 @@
   .speakbtn:focus-visible { opacity: 1; outline: 2px solid var(--acc); outline-offset: 1px; }
   .speakbtn[disabled] { opacity: .25; cursor: default; }
   .speakbtn.busy { opacity: 1; color: var(--acc); }
+  /* The replay button on a spoken block is always visible, not hover-gated: it
+     is the only way to hear that utterance again, and a control that appears
+     only when the pointer is already over it is not a control people find. */
+  .spoken .spokenbtn { opacity: .8; width: 18px; height: 18px; font-size: 10px; }
   /* the same glyph, dimmed, next to a reply that has already been read */
   .msgrow.bonsai.spoke .speakbtn, .msgrow.thinkrow.spoke .speakbtn { opacity: .55; }
   /* transient note from the speak button. On the row, never in the bubble. */
@@ -121,8 +125,12 @@
      that as well as anything anchoring on the last row. */
   .spoken { margin: 0 0 10px; padding: 7px 10px; background: var(--bg3);
             border-left: 2px solid var(--bd2); border-radius: 0 7px 7px 0; }
+  /* flex, so the label keeps the room it needs and the button sits at the end
+     instead of the text being pushed aside by the glyph */
   .spoken .sphead { font-size: 10px; color: var(--mut); letter-spacing: .05em;
-                    text-transform: uppercase; margin-bottom: 4px; }
+                    text-transform: uppercase; margin-bottom: 4px;
+                    display: flex; align-items: center; gap: 8px; }
+  .spoken .spokenbtn { flex: none; margin-left: auto; text-transform: none; }
   .spoken .stext { font-size: 14px; line-height: 1.5; color: var(--txt);
                    white-space: pre-wrap; overflow-wrap: anywhere; }
   /* sized here rather than left to .mark's 100% resolving against an
@@ -1892,8 +1900,49 @@ function spokenBlock(call) {
   body.className = 'stext';
   body.textContent = said;
   box.appendChild(head);
+  /* Replay THIS utterance, not the reply around it. The reply's own button reads
+     the prose, which is a different thing entirely. The saved wav is asked for
+     first and the server replays it when it is there, so pressing this on an
+     old speech costs one stat() instead of a fresh synthesis. */
+  const play = document.createElement('button');
+  play.className = 'speakbtn spokenbtn';
+  play.type = 'button';
+  play.textContent = '🔊';              // speaker, as on the reply
+  play.title = 'Play this again';
+  play.setAttribute('aria-label', 'Play this again');
+  play.onclick = function (e) {
+    e.preventDefault(); e.stopPropagation();
+    replaySpoken(play, said, a.voice, a.speed);
+  };
+  head.appendChild(play);
   box.appendChild(body);
   return box;
+}
+/* Ask for the saved wav. The server hashes voice, speed and text to the same
+   filename it wrote last time and replays that file when it exists, so this is
+   not a request to make a new one. If the file is gone it synthesises, because
+   a dead button is worse than a slow one. */
+function replaySpoken(btn, text, voice, speed) {
+  if (kokoroAudio) { try { kokoroAudio.pause(); } catch (e) {} }
+  btn.disabled = true; btn.classList.add('busy');
+  fetch('/api/kokoro/speak', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text: text, voice: voice, speed: Number(speed) || 1.0 })
+  }).then(function (r) { return r.json(); })
+    .then(function (d) {
+      if (d.error) throw new Error(d.error);
+      const a = new Audio(d.wav_url);
+      kokoroAudio = a;
+      a.onended = function () { btn.classList.remove('busy'); };
+      a.onerror = function () { btn.classList.remove('busy'); };
+      return a.play();
+    })
+    .then(function () { btn.disabled = false; })
+    .catch(function (e) {
+      btn.disabled = false; btn.classList.remove('busy');
+      speakNote(btn.closest ? btn.closest('.msgrow') : null,
+                'could not play that: ' + e.message, true);
+    });
 }
 /* How each reply renderer labels the prose itself: addAsst uses .abody, the
    step module .ocpara. Anything that has to find "where the reply text is" has
