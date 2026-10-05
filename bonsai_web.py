@@ -14739,6 +14739,13 @@ PAGE = """<!doctype html>
   /* the assistant keeps a neutral surface: it is the one carrying formatted
      prose, code and tables, and a tint behind all that reads as noise */
   .ubub { border: 1px solid var(--bub-bd); box-shadow: 0 1px 2px rgba(0,0,0,.05); }
+  /* Text the assistant said out loud. Same row, same avatar, same .bbub and the
+     same side of the page as any other reply - it has to read as Bonsai saying
+     it, not as something typed at the prompt. The only thing marking it is the
+     small caption; .spokenq itself is a marker and carries no appearance, so
+     nothing about it can drift away from a real reply's. */
+  .msgrow.bonsai.spokenq .sphead { font-size: 10.5px; color: var(--mut);
+      letter-spacing: .05em; text-transform: uppercase; margin-bottom: 5px; }
   /* sized here rather than left to .mark's 100% resolving against an
      auto-width parent, which is circular and engine-dependent */
   .msgrow.bonsai .av { flex: none; width: 26px; height: 26px;
@@ -16293,23 +16300,13 @@ function previewIframeDom(r) {
   w.appendChild(a); w.appendChild(b2);
   return w;
 }
-/* What was actually said out loud, rendered as a message you pasted.
+/* What was actually said out loud, as a message from Bonsai.
 
-   This was a bordered block inside the tool card, which put it inside a
-   <details> - and a <details> is closed. The text was there and invisible,
-   which is worse than not showing it: there was no way to tell whether speech
-   had happened at all. It is now a real .msgrow.user / .ubub bubble placed
-   before the assistant's turn, which is what a pasted message looks like and
-   what this one is pretending to be.
-
-   Placed rather than nested, for the same reason: the tool log sits inside the
-   assistant's message row, so a right-aligned bubble appended into it would be
-   inside someone else's message, right-aligned against it.
-
-   Voice, speed and duration go in the title attribute rather than in the bubble.
-   A caption inside would stop it looking pasted at all, and one underneath would
-   be a footnote hanging off the wrong message; hovering gives the detail
-   without changing the shape. */
+   This was a .msgrow.user bubble, which is the page's own word for "the user
+   said this" - it rendered as if the prompt had been typed at the box, which is
+   the opposite of what it is. It is now built from the same pieces as any other
+   reply: msgrow.bonsai, the Bonsai avatar, and a .bbub. Same side of the page,
+   same bubble, and only a small caption saying it was spoken. */
 function spokenText(call) {
   if (!call || call.name !== 'tts_speak') return '';
   let a = call.arguments || {};
@@ -16323,35 +16320,46 @@ function spokenBubble(call) {
   if (typeof a === 'string') { try { a = JSON.parse(a); } catch (e) { a = {}; } }
   const r = (typeof call.result === 'string') ? {} : (call.result || {});
   const row = document.createElement('div');
-  row.className = 'msgrow user spokenq';
+  row.className = 'msgrow bonsai spokenq';
+  const av = document.createElement('div');
+  av.className = 'av bonsai';
+  av.innerHTML = BONSAI_MARK;
   const b = document.createElement('div');
-  b.className = 'ubub';
-  b.textContent = said;
-  let tip = 'spoken aloud';
-  if (a.voice) tip += ' · ' + a.voice;
+  b.className = 'bbub';
+  const head = document.createElement('div');
+  head.className = 'sphead';
+  let bits = '\U0001F50A spoken';
+  if (a.voice) bits += ' · ' + a.voice;
   const sp = Number(a.speed);
-  if (sp && sp !== 1) tip += ' · ' + sp + '×';
-  if (r.duration_seconds) tip += ' · ' + r.duration_seconds + 's';
-  b.title = tip;
+  if (sp && sp !== 1) bits += ' · ' + sp + '×';
+  if (r.duration_seconds) bits += ' · ' + r.duration_seconds + 's';
+  head.textContent = bits;
+  const body = document.createElement('div');
+  body.textContent = said;
+  b.appendChild(head);
+  b.appendChild(body);
+  row.appendChild(av);
   row.appendChild(b);
   return row;
 }
+/* The dedupe lives on the DOM node it drew into, never on the call record.
+   The record is held on the message in memory and the conversation can be
+   rebuilt from those same objects, so a flag on the record outlives the element
+   it describes: the rebuild deletes the bubble and then refuses to redraw it,
+   and the text vanishes from the chat with no way to get it back. A fresh
+   container starts with no record, so a rebuild draws again. */
 function placeSpokenBubbles(calls, host) {
-  (calls || []).forEach(function (c) {
-    if (c._bubbled) return;
-    if (!spokenText(c)) return;
+  (calls || []).forEach(function (c, i) {
+    const said = spokenText(c);
+    if (!said) return;
+    const key = (c && (c.tool_call_id || c.id)) || ('#' + i);
+    if (host) {
+      if (!host._spoken) host._spoken = {};
+      if (host._spoken[key]) return;
+      host._spoken[key] = 1;
+    }
     const row = spokenBubble(c);
     if (!row) return;
-    /* Marked on the record so a live call and a later render of the same object
-       cannot produce two bubbles - but as a NON-ENUMERABLE property, because
-       this record is appended to the calls list and saved with the chat. An
-       ordinary property would go into that JSON, come back on reload still
-       carrying the flag, and the bubble would never be drawn again. Defining it
-       as non-enumerable keeps JSON.stringify from ever seeing it, which is what
-       a saved chat has to do. */
-    try {
-      Object.defineProperty(c, '_bubbled', { value: true, enumerable: false });
-    } catch (e) { c._bubbled = true; }
     const owner = host && host.closest ? host.closest('.msgrow') : null;
     if (owner && owner.parentNode) owner.parentNode.insertBefore(row, owner);
     else convInner().appendChild(row);
