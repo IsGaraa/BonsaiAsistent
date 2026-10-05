@@ -7022,9 +7022,12 @@ TTS_SPEAK_TOOL = {
         "name": "tts_speak",
         "description": "Speak text aloud with the local Kokoro engine and save "
                        "it as a WAV in out/tts/. It plays as it goes, so just "
-                       "call it - never go looking for a TTS button. Do not "
-                       "tell the user where the file was saved or what format "
-                       "it is in; they did not ask. English only.",
+                       "call it - never go looking for a TTS button. Speaking "
+                       "the same text with the same voice and speed again "
+                       "replays the saved file instead of synthesising it "
+                       "twice. Do not tell the user where the file was saved "
+                       "or what format it is in; they did not ask. English "
+                       "only.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -12393,6 +12396,44 @@ def _kokoro_voices():
                 for n in names]}
 
 
+def _wav_info(path):
+    """(duration, sample_rate) if path is a usable wav, else None.
+
+    Never loads Kokoro, which is the whole point: asking whether a file is
+    already on disk must not cost the model. A file that exists but will not
+    parse is treated as a miss and removed, so a truncated write cannot turn
+    into permanent silence.
+    """
+    import wave as wave_mod
+    if not path or not os.path.exists(path) or os.path.getsize(path) <= 44:
+        return None
+    try:
+        with wave_mod.open(path, "rb") as w:
+            return (round(w.getnframes() / max(1, w.getframerate()), 2),
+                    int(w.getframerate()))
+    except Exception:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        return None
+
+
+def _tts_wav_name(voice, speed, text):
+    """The one filename this exact request produces.
+
+    A hash of what produced it, so the same request always lands on the same
+    file and a repeat press is a replay rather than two seconds of identical
+    synthesis. No timestamp: that guaranteed a miss. Sound only because nothing
+    here is random - kokoro-onnx exposes no seed and CPU inference is
+    deterministic, so the same three inputs give the same audio.
+    """
+    digest = hashlib.sha256(
+        ("%s\x00%.2f\x00%s" % (voice, speed, text)).encode("utf-8")
+    ).hexdigest()[:12]
+    return "tts_%s_%s.wav" % (digest, voice)
+
+
 def _kokoro_speak_wav(text, voice, speed, out_path):
     """Synthesise to a 16-bit mono wav, or reuse the one already written.
 
@@ -12410,16 +12451,9 @@ def _kokoro_speak_wav(text, voice, speed, out_path):
     removed, so a truncated write cannot turn into permanent silence.
     """
     import wave as wave_mod
-    if os.path.exists(out_path) and os.path.getsize(out_path) > 44:
-        try:
-            with wave_mod.open(out_path, "rb") as w:
-                return (round(w.getnframes() / max(1, w.getframerate()), 2),
-                        int(w.getframerate()), True)
-        except Exception:
-            try:
-                os.remove(out_path)
-            except OSError:
-                pass
+    probe = _wav_info(out_path)
+    if probe is not None:
+        return (probe[0], probe[1], True)
     import numpy as np
     engine = _kokoro_engine()
     if isinstance(engine, dict):
@@ -12505,41 +12539,58 @@ def _tts_speak(args):
     text = str(args.get("text") or "").strip()
     if not text:
         return {"error": "text is required"}
-    engine = _kokoro_engine()
-    if isinstance(engine, dict):
-        return engine
-    available = _kokoro_voice_list(engine)
     voice = str(args.get("voice") or KOKORO_DEFAULT_VOICE).strip()
     if voice.endswith(".onnx"):                 # a Piper-era name
         voice = voice[:-5]
-    if voice not in available:
-        return {"error": "voice %r is not an English Kokoro voice. List them "
-                         "with tts_voices." % voice,
-                "voices": available}
     try:
         speed = float(args.get("speed") or 1.0)
     except (TypeError, ValueError):
         speed = 1.0
     speed = max(0.5, min(2.0, speed))
     out_dir = _tts_out_dir()
-    # The filename is a hash of what produced it, so the same request always
-    # lands on the same file and a repeat press is a cache hit rather than two
-    # seconds of identical synthesis. No timestamp: that guaranteed a miss.
-    digest = hashlib.sha256(
-        ("%s\x00%.2f\x00%s" % (voice, speed, text)).encode("utf-8")
-    ).hexdigest()[:12]
-    wav_path = os.path.join(out_dir, "tts_%s_%s.wav" % (digest, voice))
+    wav_path = os.path.join(out_dir, _tts_wav_name(voice, speed, text))
+
+    # Ask the disk BEFORE the model. Speech this app already made is on disk, so
+    # the honest answer costs one stat() - and asking _kokoro_engine() first, as
+    # this used to, loaded ~420 MB of model and took over a second before
+    # reaching the cache check that made the whole exercise pointless. Playing a
+    # recording back must never be able to wake the synthesiser.
+    probe = _wav_info(wav_path)
+    if probe is not None:
+        return _tts_done(args, voice, speed, text, wav_path, probe[0], probe[1],
+                         "replayed")
+    engine = _kokoro_engine()
+    if isinstance(engine, dict):
+        return engine
+    available = _kokoro_voice_list(engine)
+    if voice not in available:
+        return {"error": "voice %r is not an English Kokoro voice. List them "
+                         "with tts_voices." % voice,
+                "voices": available}
     try:
         duration, _rate, _cached = _kokoro_speak_wav(text, voice, speed, wav_path)
     except Exception as exc:
         return {"error": "Kokoro synthesis failed: %s" % exc}
+    return _tts_done(args, voice, speed, text, wav_path, duration, _rate,
+                     "synthesised")
+
+
+def _tts_done(args, voice, speed, text, wav_path, duration, rate, source):
+    """The shared tail: play it if asked, and report the small honest result.
+
+    Split out because there are now two ways to reach it - the file was already
+    there, or it had just been written - and the two used to differ in more than
+    timing. Replayed and synthesised must look identical to the caller except
+    for `source`, or a replay would report having played something it never
+    played, which is the same class of lie the played flag exists to prevent.
+    """
     # The /kokoro page passes play=False because the browser plays it itself, and
     # doing both would talk over the click that asked for it. Default stays True
     # so the tool and the header toggle behave exactly as they always did.
     suppressed = args.get("play") is False
     played = None if suppressed else _play_wav(wav_path)
     out = {"result": "ok", "voice": voice, "duration_seconds": duration,
-           "wav": "out/tts/" + os.path.basename(wav_path)}
+           "wav": "out/tts/" + os.path.basename(wav_path), "source": source}
     # Deliberately small. This payload is re-read on every later turn of the chat,
     # and the fat version made the model narrate the file back at the user -
     # "saved to C:/Users/.../out/tts/tts_1a2b3c4d5e6f_af_jessica.wav, 412KB,
@@ -12553,11 +12604,11 @@ def _tts_speak(args):
         out["playback"] = "suppressed - the caller is playing the file itself"
     elif played is False:
         # Say so. The audio file is real and on disk, so the honest result is
-        # "written but nobody could play it", with the way out.
+        # "there but nobody could play it", with the way out.
         out["warning"] = (
-            "the speech was generated and saved, but nothing on this machine "
-            "could play it - no sounddevice, and no paplay, aplay or ffplay. "
-            "On Linux install one: sudo apt install pulseaudio-utils")
+            "the speech is saved, but nothing on this machine could play it - "
+            "no sounddevice, and no paplay, aplay or ffplay. On Linux install "
+            "one: sudo apt install pulseaudio-utils")
     return out
 
 
@@ -14801,6 +14852,10 @@ PAGE = """<!doctype html>
   .speakbtn:focus-visible { opacity: 1; outline: 2px solid var(--acc); outline-offset: 1px; }
   .speakbtn[disabled] { opacity: .25; cursor: default; }
   .speakbtn.busy { opacity: 1; color: var(--acc); }
+  /* The replay button on a spoken block is always visible, not hover-gated: it
+     is the only way to hear that utterance again, and a control that appears
+     only when the pointer is already over it is not a control people find. */
+  .spoken .spokenbtn { opacity: .8; width: 18px; height: 18px; font-size: 10px; }
   /* the same glyph, dimmed, next to a reply that has already been read */
   .msgrow.bonsai.spoke .speakbtn, .msgrow.thinkrow.spoke .speakbtn { opacity: .55; }
   /* transient note from the speak button. On the row, never in the bubble. */
@@ -14820,8 +14875,12 @@ PAGE = """<!doctype html>
      that as well as anything anchoring on the last row. */
   .spoken { margin: 0 0 10px; padding: 7px 10px; background: var(--bg3);
             border-left: 2px solid var(--bd2); border-radius: 0 7px 7px 0; }
+  /* flex, so the label keeps the room it needs and the button sits at the end
+     instead of the text being pushed aside by the glyph */
   .spoken .sphead { font-size: 10px; color: var(--mut); letter-spacing: .05em;
-                    text-transform: uppercase; margin-bottom: 4px; }
+                    text-transform: uppercase; margin-bottom: 4px;
+                    display: flex; align-items: center; gap: 8px; }
+  .spoken .spokenbtn { flex: none; margin-left: auto; text-transform: none; }
   .spoken .stext { font-size: 14px; line-height: 1.5; color: var(--txt);
                    white-space: pre-wrap; overflow-wrap: anywhere; }
   /* sized here rather than left to .mark's 100% resolving against an
@@ -16417,8 +16476,49 @@ function spokenBlock(call) {
   body.className = 'stext';
   body.textContent = said;
   box.appendChild(head);
+  /* Replay THIS utterance, not the reply around it. The reply's own button reads
+     the prose, which is a different thing entirely. The saved wav is asked for
+     first and the server replays it when it is there, so pressing this on an
+     old speech costs one stat() instead of a fresh synthesis. */
+  const play = document.createElement('button');
+  play.className = 'speakbtn spokenbtn';
+  play.type = 'button';
+  play.textContent = '\U0001F50A';              // speaker, as on the reply
+  play.title = 'Play this again';
+  play.setAttribute('aria-label', 'Play this again');
+  play.onclick = function (e) {
+    e.preventDefault(); e.stopPropagation();
+    replaySpoken(play, said, a.voice, a.speed);
+  };
+  head.appendChild(play);
   box.appendChild(body);
   return box;
+}
+/* Ask for the saved wav. The server hashes voice, speed and text to the same
+   filename it wrote last time and replays that file when it exists, so this is
+   not a request to make a new one. If the file is gone it synthesises, because
+   a dead button is worse than a slow one. */
+function replaySpoken(btn, text, voice, speed) {
+  if (kokoroAudio) { try { kokoroAudio.pause(); } catch (e) {} }
+  btn.disabled = true; btn.classList.add('busy');
+  fetch('/api/kokoro/speak', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text: text, voice: voice, speed: Number(speed) || 1.0 })
+  }).then(function (r) { return r.json(); })
+    .then(function (d) {
+      if (d.error) throw new Error(d.error);
+      const a = new Audio(d.wav_url);
+      kokoroAudio = a;
+      a.onended = function () { btn.classList.remove('busy'); };
+      a.onerror = function () { btn.classList.remove('busy'); };
+      return a.play();
+    })
+    .then(function () { btn.disabled = false; })
+    .catch(function (e) {
+      btn.disabled = false; btn.classList.remove('busy');
+      speakNote(btn.closest ? btn.closest('.msgrow') : null,
+                'could not play that: ' + e.message, true);
+    });
 }
 /* How each reply renderer labels the prose itself: addAsst uses .abody, the
    step module .ocpara. Anything that has to find "where the reply text is" has

@@ -328,6 +328,18 @@ voices that used to ship with the project are gone with no replacement.
 | **Speaking a reply** | a small 🔈 beside the Bonsai mark on any reply — muted until you hover the row. Same `af_jessica`, and picking a different voice on `/kokoro` changes these buttons too |
 | **Speed** | `tts_speak` takes `speed` from 0.5× to 2× |
 | **Playback** | `sounddevice`, falling back to `winsound` / `paplay` / `aplay` / `ffplay` |
+| **Asking twice** | replays the file already in `out\tts\`, never a second synthesis |
+
+**Asking for the same speech twice replays it.** Each wav is named for a hash of
+the voice, the speed and the text, so the same request lands on the same file
+every time. The second ask costs a `stat()`: Kokoro is not loaded, nothing is
+synthesised, and no duplicate audio is written. Measured at 3.65 s to synthesise
+against 0.007 s to replay. Something never spoken before is still synthesised.
+
+Every spoken block carries its own always-visible 🔊 for this. The block's button
+replays that one utterance; the reply's button reads the prose, which is a
+different thing. Replays are served by `/ttswav/<name>`, which only serves bare
+filenames out of `out\tts\` and rejects any name carrying a path.
 
 **A page for trying voices.** <http://127.0.0.1:8081/kokoro> — type something,
 pick a voice, drag the speed, hear it. It always plays in the browser and so
@@ -335,6 +347,9 @@ ignores the header TTS toggle.
 
 Speech in the chat is **off by default**: replies only speak after you click the
 **TTS** button in the header, and that state resets on restart.
+
+The wavs in `out\tts\` are kept. Nothing prunes them, so anything spoken once can
+be replayed for as long as the file is there.
 
 ---
 
