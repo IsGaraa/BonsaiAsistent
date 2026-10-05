@@ -47,12 +47,14 @@ DETAILS
       endpoints (api_call, ws_test), and schedule shell commands to run later -
       once, every N seconds or on a cron schedule (schedule_task,
       list_schedules, unschedule_task).
-    - TTS: I can speak text aloud with the local neural Piper engine
-      (tts_speak, tts_voices) - English and Romanian voices, saved as WAV files
-      in workspace\out\tts. No cloud, no Windows voices, no media player.
-      OFF by default: click the TTS button in the header to enable speech
-      (resets to OFF on restart). Voice models live in piper\ and are not in
-      git - fetch them once with: python piper\download_voices.py
+    - TTS: I can speak text aloud with the local Kokoro neural engine
+      (tts_speak, tts_voices) - English only, 28 American and British voices,
+      saved as WAV files in workspace\out\tts. No cloud, no Windows voices, no
+      media player. tts_speak takes a speed of 0.5x to 2x. OFF by default:
+      click the TTS button in the header to enable speech (resets to OFF on
+      restart). There is also a voice tester at http://127.0.0.1:8081/kokoro.
+      Model weights live in kokoro\ and are not in git - fetch them once with:
+      python kokoro\download_model.py
     - CODE + PREVIEW: run_code runs snippets in an isolated temp folder in the
       languages installed on this PC (Python + Node now; Go/Lua/PHP/Ruby/Perl/
       Bash are auto-detected if you install them) with timeouts up to 600s.

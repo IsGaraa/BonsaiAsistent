@@ -670,6 +670,11 @@
             "description": "Extra request headers, e.g. {\"Authorization\": \"Bearer ...\"}"
           },
           "body": {
+            "type": [
+              "object",
+              "array",
+              "string"
+            ],
             "description": "Request body. Use a dict/list for JSON or a string for raw text."
           },
           "content_type": {
@@ -708,6 +713,11 @@
             "description": "WebSocket URL, e.g. ws://127.0.0.1:8000/ws or wss://..."
           },
           "send": {
+            "type": [
+              "object",
+              "array",
+              "string"
+            ],
             "description": "Optional message to send after connecting. Dicts/lists are JSON-encoded."
           },
           "timeout": {
@@ -805,7 +815,7 @@
     "type": "function",
     "function": {
       "name": "tts_voices",
-      "description": "List the local Piper text-to-speech voices available on this machine (each .onnx + .onnx.json pair in the Piper folder). Use tts_speak with one of the returned names.",
+      "description": "List the local Kokoro text-to-speech voices available on this machine. English only - the model ships styles for a dozen languages but this app offers the American and British ones (names beginning af_, am_, bf_, bm_). Use tts_speak with one of the returned names. There is also a voice picker on the /kokoro page at http://127.0.0.1:8081/kokoro.",
       "parameters": {
         "type": "object",
         "properties": {},
@@ -817,17 +827,21 @@
     "type": "function",
     "function": {
       "name": "tts_speak",
-      "description": "Speak text aloud using the local neural Piper TTS engine (no cloud, no built-in system voices). It plays straight away - there is nothing to switch on first, so just call it, do not go looking for a TTS button. Also saves the speech as a WAV file in the workspace. Use this to give the user spoken feedback, alerts or TTS output.",
+      "description": "Speak text aloud using the local Kokoro neural TTS engine (no cloud, no built-in system voices). It plays straight away - there is nothing to switch on first, so just call it, do not go looking for a TTS button. Also saves the speech as a WAV file in the workspace. Use this to give the user spoken feedback, alerts or TTS output. English only.",
       "parameters": {
         "type": "object",
         "properties": {
           "text": {
             "type": "string",
-            "description": "The text to speak."
+            "description": "The text to speak. Write it to be heard: abbreviations and symbols are read out as words, so spell out things like 'Dr' or 'kg'."
           },
           "voice": {
             "type": "string",
-            "description": "Piper voice name, default 'en_US-lessac-medium'. Romanian: 'ro_RO-mihai-medium'. List with tts_voices."
+            "description": "Kokoro voice name, default 'af_sarah'. American: af_* or am_*. British: bf_* or bm_*. Try am_michael, bf_emma, af_bella. List them all with tts_voices."
+          },
+          "speed": {
+            "type": "number",
+            "description": "Speaking rate, 0.5 to 2.0, default 1.0. Above 1 is faster and below 1 slower. Use it for urgency (1.3) or for something dense that needs slowing down (0.85)."
           }
         },
         "required": [
@@ -840,7 +854,7 @@
     "type": "function",
     "function": {
       "name": "generate_image",
-      "description": "Generate an image from a text description, using a local Qwen-Image 2.1 Viggle turbo model on this PC. The picture comes back and you can see it. Takes about 240 seconds at the default size - the weights are read from disk on every call, so each one pays for the load. Use it when the user asks you to draw, make, illustrate, design or render something, or to create a picture. Describe the subject, the setting, the light and the style in the prompt - it is a text-to-image model and it only knows what you tell it. Good at rendering text inside images and following composition. It runs with no classifier-free guidance, which means there is no negative prompt to steer with: ask for what you want in the prompt itself. The sample count and the sampler are fixed by the checkpoint and cannot be steered from here - asking for more steps makes the picture worse, not better, so if a result is wrong, reword the prompt and go again. Note this loads a second large model, so any local language model is unloaded first - use it while an API model is the active one.",
+      "description": "Generate an image from a text description, using a local Qwen-Image 2.1 model on this PC - an uncensored fine-tune of it, which draws whatever is asked without refusing. The picture comes back and you can see it. Expect several minutes at the default size, not seconds: it is a full 7B model run over the normal 40-step flow schedule, and the weights are read from disk on every call, so each one pays for the load too. Only run one at a time and do not re-send a request that looks slow. Use it when the user asks you to draw, make, illustrate, design or render something, or to create a picture. Describe the subject, the setting, the light and the style in the prompt - it is a text-to-image model and it only knows what you tell it. Good at rendering text inside images and following composition. Leave the step count alone unless the user asks for a specific one: the default is what the model documents, and unlike a distilled model more steps here genuinely refines the result, so going up to around 60 is a legitimate way to spend time on a picture the user cares about. If a result is simply wrong, reword the prompt first - that fixes far more than more steps will. Note this loads a second large model, so any local language model is unloaded first - use it while an API model is the active one.",
       "parameters": {
         "type": "object",
         "properties": {
@@ -850,11 +864,11 @@
           },
           "negative_prompt": {
             "type": "string",
-            "description": "Ignored. This model is distilled to run with no classifier-free guidance and no negative prompt, so there is nothing for one to steer. Say what you do not want in the prompt instead."
+            "description": "Ignored. This model runs with guidance on but an empty negative prompt, which is what it was trained that way - there is no behaviour for steering away from a named term. Say what you do not want in the prompt instead."
           },
           "aspect": {
             "type": "string",
-            "description": "Shape of the picture: '16:9' (default), '9:16' for a phone-shaped one, '1:1', '4:3' or '3:4'. Use this rather than width and height - the sizes are chosen so the shape comes out right."
+            "description": "Shape of the picture: '16:9' (default), '9:16' for a phone-shaped one, '1:1', '4:3', '3:4', '3:2' or '2:3'. The plain words 'widescreen', 'portrait' and 'square' work too. Use this rather than width and height - the sizes are chosen so the shape comes out right. An unrecognised ratio still draws, but as 16:9, and the result says so."
           },
           "width": {
             "type": "integer",
@@ -866,11 +880,11 @@
           },
           "upscale": {
             "type": "boolean",
-            "description": "True (default) to also save a 1920x1080 version, resampled with Lanczos - no AI, no extra model, instant."
+            "description": "True (default) to deliver the picture resampled to 1440p on its short edge - a 16:9 one arrives as 2541x1440. Lanczos, so no AI and no extra model; it enlarges, it does not add detail. False keeps the size the engine generated at."
           },
           "steps": {
             "type": "integer",
-            "description": "Denoising steps, 4-12, default 6 - and 6 is what this distilled turbo model was trained for, so leave it out unless the user asks for a specific number. Asking for more oversamples the model and gives a worse picture, not a better one."
+            "description": "Denoising steps, 10-80, default 40. Leave it out unless the user asks for a specific number - 40 is what this model documents. Going above the default is a real way to buy a more refined picture, at proportionally more minutes; it is not a fix for a prompt that asked for the wrong thing."
           },
           "seed": {
             "type": "integer",

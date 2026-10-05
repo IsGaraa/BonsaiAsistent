@@ -28,10 +28,13 @@ wasm/
 wasm-component/
 windows-*/
 
-# Piper TTS voice models + audio - fetch them with piper/download_voices.py
-piper/*.onnx
-piper/*.onnx.json
-piper/*.wav
+# Kokoro TTS weights - fetch them with kokoro/download_model.py.
+# The script itself is committed; the 310 MB model, the 27 MB voices file and
+# any generated wav are not.
+kokoro/*.onnx
+kokoro/*.bin
+kokoro/*.wav
+kokoro/*.part
 
 # Local image generation (Qwen-Image 2.1) - 13.2 GB of weights fetched by
 # tools/fetch_image_model.py. *.gguf already covers the diffusion model, but

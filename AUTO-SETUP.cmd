@@ -107,8 +107,8 @@ echo.
 echo   OCR helper (click_text / screen_text need it plus the Tesseract binary)
 %PYEXE% -m pip install pytesseract
 echo.
-echo   Local neural TTS (Piper)
-%PYEXE% -m pip install piper-tts onnxruntime sounddevice
+echo   Local neural TTS (Kokoro)
+%PYEXE% -m pip install kokoro-onnx onnxruntime numpy sounddevice
 echo.
 echo   %OK% done. Any that failed are optional - the rest of Bonsai still works.
 goto :after
@@ -223,11 +223,11 @@ if errorlevel 1 (
 )
 %PYEXE% -c "import win32gui, psutil, pyautogui, PIL, pyperclip, requests, websocket; print('  desktop tools: ok')" 2>nul
 %PYEXE% -c "import pytesseract; print('  ocr helper  : ok')" 2>nul
-%PYEXE% -c "import piper, onnxruntime, sounddevice; print('  local tts   : ok')" 2>nul
-if exist "%~dp0piper\*.onnx" (
-    echo   %OK% piper voices found
+%PYEXE% -c "import kokoro_onnx, onnxruntime, sounddevice; print('  local tts   : ok')" 2>nul
+if exist "%~dp0kokoro\voices-v1.0.bin" (
+    echo   %OK% kokoro model found
 ) else (
-    echo   [--] no Piper voices - run: %PYEXE% piper\download_voices.py
+    echo   [--] no Kokoro model - run: %PYEXE% kokoro\download_model.py
 )
 echo.
 echo   That is every optional library checked. Lines that did not print are the

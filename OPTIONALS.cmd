@@ -141,7 +141,7 @@ goto :after
 :o_images
 echo.
 echo == Local image generation (Qwen-Image 2.1) ==
-echo   Weights are ~13 GB, fetched by a script rather than committed.
+echo   Weights are ~17 GB, fetched by a script rather than committed.
 if exist "image_models\diffusion\*.gguf" (
     echo   [ok] diffusion weights already present
     goto :after
@@ -151,14 +151,16 @@ if not exist "tools\fetch_image_model.py" (
     goto :after
 )
 set "q="
-set /p "q=  Download them now? About 13 GB. [y/N]: "
+set /p "q=  Download them now? About 17 GB. [y/N]: "
 if /i not "%q%"=="y" goto :after
 python tools\fetch_image_model.py
 if errorlevel 1 (
     echo   [!] download failed - run it again when you have a better connection.
 ) else (
     echo   [ok] done.
-    echo   Note: at 1920x1088 the engine needs the whole card. Close anything
+    echo   Note: this is the full uncensored 7B model at 40 steps, so a picture
+echo   takes ~10 minutes at 1920x1088. The engine also needs the whole
+ echo card. Close anything
     echo   else holding VRAM - a game alone will use ~11 GB.
 )
 goto :after
@@ -216,7 +218,7 @@ echo     2  Tesseract OCR              click_text/screen_text ~30 MB
 echo     3  Docker Desktop             docker_* tools         ~600 MB ^(needs 4^)
 echo     4  WSL2 + VM Platform         Docker's backend       reboot
 echo     5  Windows stability          long paths, page file  admin
-echo     6  Local image generation     Qwen-Image 2.1         ~13 GB
+echo     6  Local image generation     Qwen-Image 2.1         ~17 GB
 echo     7  Browser engine             page screenshots       small
 echo.
 echo     a  Run everything that is missing

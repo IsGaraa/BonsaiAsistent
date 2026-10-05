@@ -142,7 +142,22 @@ MODE_PLAN = "plan"
 _DEF_WORKDIR = (r"C:\Users\drago\Desktop\workspace" if IS_WINDOWS
                 else os.path.expanduser("~/bonsai_workspace"))
 WORKDIR = os.path.realpath(os.environ.get("PC_WORKDIR", _DEF_WORKDIR))
-PIPER_DIR = os.environ.get("PC_PIPER_DIR", os.path.join(BONSAI_DIR, "piper"))
+KOKORO_DIR = os.environ.get("PC_KOKORO_DIR", os.path.join(BONSAI_DIR, "kokoro"))
+# The three model exports kokoro-onnx's release publishes. fp32 is the default:
+# it is the reference export, and 310 MB is not a cost worth optimising away for
+# a model that synthesises in about a second. int8 is a quarter of the size and
+# loads faster on CPU; fp16 needs an onnxruntime build that has fp16 kernels,
+# which the plain CPU wheel does not always have.
+KOKORO_MODELS = {
+    "kokoro-v1.0.onnx": 325463296,
+    "kokoro-v1.0.int8.onnx": 114085888,
+    "kokoro-v1.0.fp16.onnx": 163577856,
+}
+KOKORO_MODEL = os.environ.get("PC_KOKORO_MODEL", "kokoro-v1.0.onnx")
+# The voices file holds every style the release ships - a dozen languages - in
+# one ~27 MB npz. KOKORO_LANGS decides which of them this app will offer.
+KOKORO_VOICES_FILE = "voices-v1.0.bin"
+KOKORO_SAMPLE_RATE = 24000
 MODELS_FILE = os.path.join(BONSAI_DIR, "models.json")
 MODELS_DIR = os.path.join(BONSAI_DIR, "models")
 # Secrets live here, not in the app: one NAME=value per line, '#' comments.
@@ -3413,13 +3428,18 @@ SYSTEM = ("You are the friendly assistant living on the user's "
              "name, not a separator. ")
           + "\nWhen you need a choice, a password or a confirmation, ask rather "
           "than assuming. For a longer task keep a visible list of steps.\n"
-          "Image generation: the local model is a distilled turbo checkpoint "
-          "trained for 6 denoising steps, so ask generate_image for at most 6 "
-          "steps and leave 'steps' out entirely unless the user explicitly "
-          "wants a different number. Going past 6 oversamples the model and "
-          "makes the picture worse, not better, so more steps is never the way "
-          "to improve a result - reword the prompt instead. Anything over 12 is "
-          "clamped server-side regardless of what you send.\n"
+          "Image generation: the local model is a full Qwen-Image 2.1 (an "
+          "uncensored fine-tune of it) sampled over the normal 40-step flow "
+          "schedule, not a distilled few-step checkpoint. So leave 'steps' out "
+          "entirely and let the server pick 40 - that is the number the model "
+          "documents, and it is the one that looks right. Unlike a turbo "
+          "checkpoint, more steps here does refine the picture rather than "
+          "oversample it, so if the user wants a better result and you are out "
+          "of prompt ideas, raising the step count towards 60 is legitimate; "
+          "anything over 80 is clamped server-side regardless of what you send. "
+          "Whatever the step count, these runs take minutes, not seconds, so do "
+          "not fire off several at once or retry one that looks slow - a "
+          "duplicate request costs the user a full extra wait.\n"
           "Colour: wrap only the part of a reply that carries meaning in "
           "[color=NAME]...[/color] and leave the rest plain - a warning, an "
           "error, a key value, the one word that answers the question, and "
@@ -4754,69 +4774,96 @@ def _port_listening(port=8080, host="127.0.0.1", timeout=1.5):
 # ---------------- Local image generation (Qwen-Image 2.1) ----------------
 #
 # ============================================================================
-#  THE CHECKPOINT: Viggle/Qwen-Image-2.1-viggle-turbo-v0.3-6step-Q6_K
+#  THE CHECKPOINT: qwen-image-2.1-UC-Q8_0.gguf
 # ============================================================================
-#  A distillation of Qwen/Qwen-Image-2.1 by Viggle. What follows is what its
-#  model card actually says, and every setting below exists because of a line
-#  in it. It is a non-commercial, research-use-only licence.
+#  An uncensored fine-tune of Qwen/Qwen-Image-2.1, as a Q8_0 GGUF
+#  ("UC" = uncensored). Read out of the file's own GGUF header rather than its
+#  filename: general.architecture is "qwen_image21", general.file_type is 7
+#  (Q8_0), 297 tensors, 7.59 GB.
 #
-#  "6 steps instead of 40, with no classifier-free guidance."
-#      -> cfg-scale 1.0. There is no negative branch, so guidance cannot be
-#         traded for prompt adherence: it only moves the sample off the
-#         conditional mean. At 6.0 every render came back overcooked - clipped
-#         white skies, crushed black trees, water pushed to neon.
+#  That architecture string is the single most important fact in this block,
+#  because it is what changed. The checkpoint that used to be here was
+#  "qwen_image" and was a six-step distillation; this is "qwen_image21" and is
+#  not distilled at all. Nearly every setting below moved as a result, and the
+#  ones that did not move are the ones that were never about the model.
 #
-#  sigmas = [1.0, 0.9375, 0.875, 0.75, 0.5, 0.25]
-#      -> passed with --sigmas, because the card says plain num_inference_steps
-#         without sigmas "does not help" on this model. The nodes bunch at the
-#         low-noise end, which is not what a default even ramp gives.
+#  STEP COUNT: 40, not 6.
+#      -> the upstream card's own num_inference_steps for the base model, and
+#         the whole reason the old value was 6 is gone. IMAGE_DEFAULT_STEPS is
+#         40; the floor is 10, well below it, because the flow schedule this
+#         engine picks depends on resolution and NOT on step count - so a short
+#         run is a cheaper picture, not a broken one. That asymmetry is the
+#         clearest single difference between the two checkpoints.
 #
-#  ...and the list ends at 0.25, but must be sent with a trailing 0.0.
-#      This is the one thing the card does not spell out, and it is not a
-#      detail. Diffusers counts differently: it treats the last node as where
-#      the final step starts and descends to zero itself. The engine wants the
-#      descent spelled out - its own help shows "14.61,7.8,3.5,0.0" for three
-#      steps, n+1 values. Send the card's six and the engine logs
-#      "total_steps != custom_sigmas_count - 1, set total_steps to 5", quietly
-#      samples five steps ending at 0.25, and never reaches clean noise. The
-#      result is not a slightly worse picture, it is noise.
+#  NO --sigmas, which is a deliberate omission and the easiest thing to get
+#  wrong here.
+#      -> the engine selects a resolution-dependent flow schedule itself for
+#         qwen_image21. The spacing of the sigma nodes depends on the pixel
+#         count, which is not known until width/height have been resolved, so
+#         the engine holds that decision to the point where it can make it
+#         correctly. The old checkpoint needed --sigmas spelled out precisely
+#         because it had been distilled onto a fixed six-node schedule that no
+#         resolution-dependent rule reproduces. Sending that schedule here would
+#         override the better-informed choice with a worse one.
 #
-#  "Use the shipped scheduler config - shift_terminal: 0.02 wrecks the last
-#   step."
-#      -> not applicable here. That is a diffusers scheduler-config value and
-#         this engine has no equivalent knob; the only Qwen-Image-2.1 model
-#         args it exposes are the two prefix-cache ones.
+#  GUIDANCE: --cfg-scale 6.0.
+#      -> the engine's own Qwen-Image-2.1 text-to-image example passes 6.0.
+#         Worth being precise about the discrepancy with the upstream card,
+#         which uses true_cfg_scale=4.0: the two are different mechanisms.
+#         true_cfg_scale is Qwen's own guidance parameter, exposed in this
+#         engine through the prompt-encoding path, while --cfg-scale is
+#         classifier-free guidance applied at sampling time. The value used
+#         here is the one the engine documents for this model rather than the
+#         one the reference implementation happens to pass.
 #
-#  "Keep the LoRA unmerged and at scale 1.0."
-#      -> this file IS the merged single-file transformer (Q6_K), which is the
-#         ComfyUI single-file path the card describes. Merged is "close to,
-#         but not the same as, the LoRA path" - about 8 in 96 requests settle
-#         on a different composition. Nothing to do about it in a GGUF build.
+#  The old value was 1.0, and that was not a style choice either - it was
+#  correct for that checkpoint, which was distilled with no CFG at all. A
+#  distilled model has the guidance baked into its weights, so leaving CFG on
+#  pushes the sample off the conditional mean (clipped skies, crushed blacks),
+#  which is exactly the overcooked look it was avoiding. This model has to be
+#  told how closely to follow the text; at 1.0 it samples the unconditional
+#  branch and quietly ignores the prompt.
 #
-#  Changing the step count: "add or remove steps at the high-noise end only,
-#      and keep 0.875, 0.75, 0.5, 0.25." _viggle_sigmas() implements exactly
-#      that and reproduces the published 5-, 6- and 7-step schedules verbatim.
-#      The floor is 5, not 4: four steps was the superseded v0.1 checkpoint.
-#
-#  "About 1 MP is the sweet spot; up to about 4 MP works." The base frame is
-#      2.09 MP (see _IMG_ASPECTS) - inside the working range, above the sweet
-#      spot, chosen because a 1080p base upscaled to 1440p beats a 720p base
-#      upscaled the same way.
-#
-#  --guidance, the SECOND guidance knob, is deliberately not set.
-#      stable-diffusion.cpp has both --cfg-scale (classifier-free) and
-#      --guidance ("distilled guidance scale for models with guidance input",
-#      default 3.5). The engine records Guidance: 3.500000 in the metadata of
-#      this model even at cfg_scale 1.0, which looks alarming. It is inert
-#      here: rendering the same prompt and seed at guidance 3.5, 1.0 and 0.0
-#      produced byte-identical output (mean 29.0, same clipping, same grain).
-#      Qwen-Image 2.1 does not consume a guidance input. Left at the default
-#      on purpose rather than set to something that does nothing.
+#  NEGATIVE PROMPT: still not sent, but for a different reason.
+#      -> the base model is guidance-enabled but its own recipe passes an EMPTY
+#         negative prompt. There is no trained behaviour for steering away from
+#         a named term, so a supplied one is reported back as ignored rather
+#         than spent on a second text pass for no effect. The previous reason
+#         ("there is no negative branch at cfg 1.0") is no longer true and the
+#         comment next to the code says so.
 #
 #  Three files, because this architecture is not one model: a diffusion
 #  transformer, a Qwen3-VL-8B text encoder, and its own VAE. The earlier Qwen
 #  Image and Wan VAEs are not interchangeable with this one, which is the kind
-#  of detail that produces a black picture and no error.
+#  of detail that produces a black picture and no error. The engine's
+#  qwen_image21 documentation names both companions explicitly, and the pair
+#  already on disk matches.
+#
+#  --guidance, the SECOND guidance knob, is deliberately not set.
+#      stable-diffusion.cpp has both --cfg-scale (classifier-free) and
+#      --guidance ("distilled guidance scale for models with guidance input",
+#      default 3.5). Qwen-Image 2.1 does not consume a guidance input at all,
+#      and that was measured on the previous checkpoint by rendering the same
+#      prompt and seed at guidance 3.5, 1.0 and 0.0 - byte-identical output
+#      every time. The architecture is unchanged in this respect, so the
+#      conclusion carries over: left at the default rather than set to
+#      something that provably does nothing.
+#
+#  SIZES: every dimension must be divisible by 32, and the engine will not
+#      quietly round a bad one. The upstream 2.1 card's own aspect ratios are
+#      larger than the default frame here (2048x2048 for 1:1, 2752x1536 for
+#      16:9). _IMG_ASPECTS keeps a 1080p-based default deliberately: it is
+#      inside the working range, and it is the difference between a run that
+#      takes a few minutes and one that takes the better part of ten, which is
+#      worth a great deal more than the extra resolution. Sizes near or above
+#      those native ratios work - raise it deliberately, not by accident.
+#
+#  UNTESTED AGAINST THIS CHECKPOINT. The settings above are read from the
+#  engine's documentation and the GGUF header, not from a render: swapping the
+#  weights does not re-validate the sampling, and nothing here has been
+#  confirmed by looking at a picture this model produced. The timing arithmetic
+#  in the timeout and preview comments is extrapolated from measurements taken
+#  on the six-step checkpoint, so treat the first run as the real measurement.
 IMAGE_MODEL_DIR = os.environ.get(
     "PC_IMAGE_MODEL_DIR", os.path.join(BONSAI_DIR, "image_models"))
 SD_DIR = os.environ.get("PC_SD_DIR", os.path.join(BONSAI_DIR, "sd.cpp"))
@@ -4864,6 +4911,13 @@ _IMG_ASPECTS = {
     "square": (1088, 1088),
     "4:3": (1440, 1088),
     "3:4": (1088, 1440),
+    # 3:2 and 2:3 are the two the model's own card lists that were missing here.
+    # Scaled to the same 1088 short edge as everything else, which keeps them at
+    # the same pixel count as 16:9 - they cost the same to draw, they are simply
+    # less square. 1632 is exactly 3:2 and is a whole number of 32-pixel steps,
+    # which the engine requires.
+    "3:2": (1632, 1088),
+    "2:3": (1088, 1632),
 }
 # The delivered size: 1440p on the short edge, so 16:9 is 2560x1440. The
 # per-aspect frames live in _IMG_ASPECTS above and are derived from the
@@ -4960,12 +5014,19 @@ def _sd_cli():
     return os.path.join(SD_DIR, "sd-cli.exe")
 
 
-def _find_first(directory, *needles):
+def _find_first(directory, *needles, exclude=()):
     """First file in a folder whose name contains all of the needles.
 
     The quantisation is a filename, not a directory, and the file that is here
     is whichever one someone downloaded. Matching on the parts that matter
     means swapping Q4_0 for Q4_K_M later is deleting a file, not editing code.
+
+    `exclude` is a list of substrings that must NOT appear. It exists because
+    sorting alone picks the wrong file here: names are sorted, and 'Q' sorts
+    before 'q', so a checkpoint whose filename happens to start with a capital Q
+    wins over a lowercase one purely by ASCII collation. With two multi-gigabyte
+    checkpoints in the same folder that is not a preference, it is a coin toss
+    dressed up as a decision - so the file we do not want is named and skipped.
     """
     try:
         names = sorted(os.listdir(directory))
@@ -4973,6 +5034,8 @@ def _find_first(directory, *needles):
         return None
     for n in names:
         low = n.lower()
+        if any(x in low for x in exclude):
+            continue
         if all(x in low for x in needles) and low.endswith(
                 (".gguf", ".safetensors", ".onnx")):
             return os.path.join(directory, n)
@@ -4983,63 +5046,83 @@ def _find_first(directory, *needles):
 # the folder, sorted - and this file happens to win that on ASCII collation
 # because its Q is uppercase. Relying on collation to choose between 6 GB files
 # is not a plan, so it is named here and the fuzzy match stays as the fallback.
-IMAGE_DIFFUSION_FILE = "Qwen-Image-2.1-viggle-turbo-v0.3-6step-Q6_K.gguf"
-# Distilled turbo: six steps is what it was trained for, and asking for the
-# default 24 gives a worse picture rather than a better one.
-IMAGE_DEFAULT_STEPS = 6
-IMAGE_MAX_STEPS = 12
+IMAGE_DIFFUSION_FILE = "qwen-image-2.1-UC-Q8_0.gguf"
 
+# The checkpoint that used to be the default, listed so discovery can skip it.
+# It is not deleted - it is just no longer reachable from the app, because a
+# "Qwen-Image-2.1" needle plus sorting would otherwise still hand it back and it
+# sorts first on capital Q.
+IMAGE_DIFFUSION_EXCLUDE = ("viggle",)
 
-# The 6-step schedule from the Viggle model card, verbatim. Not a linear ramp:
-# the nodes bunch up at the low-noise end, which is where a distilled few-step
-# model spends its remaining detail.
-VIGGLE_SIGMA_TAIL = (0.875, 0.75, 0.5, 0.25)
+# The family, not the quantisation. See _image_parts for why the uncensored
+# family has to be named explicitly: the same repository also publishes the
+# censored qwen-image-2.1-* weights, and a looser needle would let those win.
+IMAGE_DIFFUSION_NEEDLE = "qwen-image-2.1-uc"
 
-# The card's rule for any other step count: "add or remove steps at the
-# high-noise end only, and keep 0.875, 0.75, 0.5, 0.25". The head fills the
-# slots between 1.0 and the first tail node, which reproduces the published
-# 5-, 6- and 7-step schedules exactly.
-VIGGLE_SIGMA_FLOOR = 5          # 4 steps was the old v0.1 model, not this one
-VIGGLE_CFG = 1.0                # distilled with no classifier-free guidance
+# This is NOT the distilled turbo checkpoint any more, so the sampling budget is
+# the base model's. The step count is the one the upstream card ships with
+# (num_inference_steps=40); it is a full 7B transformer sampled over a normal
+# flow schedule, not six steps of a compressed one.
+IMAGE_DEFAULT_STEPS = 40
+# Headroom above the card's number rather than a ceiling below it. 40 is the
+# documented default, not a maximum, and a caller asking for 50 is asking for
+# "a bit more refined" - which on a base model is a real, supported request, not
+# the oversampling mistake it was on the 6-step checkpoint.
+IMAGE_MIN_STEPS = 10
+IMAGE_MAX_STEPS = 80
 
+# The engine's own Qwen-Image-2.1 text-to-image example passes --cfg-scale 6.0.
+# This is also the base model's guidance scale, and the counterpart to the 1.0
+# the distilled checkpoint needed: distillation bakes the guidance into the
+# weights, so a distilled model is sampled with CFG off (true_cfg_scale=1.0),
+# while the base model has to be told how closely to follow the text.
+IMAGE_CFG = 6.0
 
-def _viggle_sigmas(steps):
-    """Sigma schedule for the installed turbo checkpoint.
+# The live preview updates every 5th denoiser step, so a 40-step run shows
+# steps 5, 10, 15 ... 40. The engine's own help defines a positive interval as
+# "updates every Nth denoiser step", so this is literal rather than approximate.
+#
+# Five is chosen because the first few steps of a flow-matching run have almost
+# nothing to show: they are still high-frequency structure, so decoding at 1, 2,
+# 3 and 4 spends four expensive TAE passes on what is visually the same grain.
+# Composition does not start reading until roughly a quarter of the way in, and
+# on a 40-step run that is step 10 - so 5 is the first one worth paying for.
+#
+# It is a fixed number rather than something derived from the step count on
+# purpose. The early steps are early whether the run is 40 or 80 steps, and a
+# derived interval makes the cadence drift between runs: steps//10 previews
+# every 4th step at 40 and every 8th at 80, so the very frames that were going
+# to be skipped are the ones the user most wants to see on a long run.
+#
+# Cost, from the measurements in commit 295417c: a tiled TAE decode at this
+# 1920x1088 base is around 24s, against roughly 9s for a sampling step. Eight
+# previews is therefore about 190s on top of a ~370s sample - worth it at this
+# frame, and it is the dominant reason the default timeout had to move.
+IMAGE_PREVIEW_INTERVAL = 5
 
-    Returns a comma-separated string for --sigmas. The engine's own default
-    schedule is evenly spaced, and feeding a distilled model that instead of
-    its trained one is what leaves it looking flat and over-contrasted.
-
-    The trailing 0 is not in the model card's list and is the one thing that
-    must be added here. The card gives six nodes for six steps because
-    diffusers counts differently: it treats the last node as the sigma the
-    final step starts from and descends to zero itself. The engine wants the
-    descent to be spelled out - its own help shows "14.61,7.8,3.5,0.0" for
-    three steps, that is n+1 values - so a card list passed straight through
-    is read as one step short. It then warns "total_steps !=
-    custom_sigmas_count - 1, set total_steps to 5" and quietly samples five
-    steps ending at sigma 0.25, never reaching clean noise. The result is not
-    a slightly worse picture, it is unusable: confirmed by rendering the same
-    prompt and seed both ways, the truncated schedule gave an image of pure
-    high-frequency noise."""
-    steps = max(VIGGLE_SIGMA_FLOOR, int(steps))
-    head = steps - len(VIGGLE_SIGMA_TAIL)
-    top = 1.0
-    first_tail = VIGGLE_SIGMA_TAIL[0]
-    vals = [top - k * ((top - first_tail) / head)
-            for k in range(head)]
-    vals = [round(v, 6) for v in vals] + list(VIGGLE_SIGMA_TAIL)
-    # The descent to clean, spelled out for the engine: n+1 values for n steps.
-    vals.append(0.0)
-    return ",".join(("%g" % v) for v in vals)
+# No --sigmas for this model, and that is a deliberate omission rather than an
+# oversight. The engine picks a resolution-dependent flow schedule by itself for
+# the qwen_image21 architecture, so passing a schedule would override the one
+# thing the engine is best placed to choose - the spacing depends on the pixel
+# count, which is not known until the call is assembled. The checkpoint this
+# replaced needed an explicit --sigmas because it was distilled onto a fixed
+# six-node schedule that no resolution-dependent rule would reproduce. Feed this
+# model that schedule and the nodes bunch at the low-noise end for a reason that
+# no longer exists, which is oversampling noise rather than adding detail.
+# _viggle_sigmas() and the VIGGLE_* constants are gone with the checkpoint.
 
 
 def _image_named_steps(path):
     """Steps stated in the filename, if the filename states them.
 
-    '...6step...' or '...-6-step...' - so a turbo checkpoint carries its own
-    sampling budget with it and the caller does not have to know which model is
-    installed."""
+    '...6step...' or '...-6-step...' - a distilled checkpoint carries its own
+    sampling budget in its name, so if one is ever dropped into the folder again
+    the caller does not have to know which model is installed and re-derive its
+    ceiling. The current checkpoint's name has no step count in it, so this
+    returns 0 and the base-model default applies, which is the intended
+    reading: silence in the filename means "use the normal step count", not
+    "use the last model's".
+    """
     name = os.path.basename(path or "").lower()
     m = re.search(r"(\d+)[-_.]?step", name)
     return int(m.group(1)) if m else 0
@@ -5055,15 +5138,33 @@ def _image_parts():
     # against the needle as given - so a mixed-case needle never matches and the
     # engine reports the weight missing when it is sitting right there
     preferred_needle = IMAGE_DIFFUSION_FILE.lower()
+    exclude = IMAGE_DIFFUSION_EXCLUDE
+    # The fallback needle has to name the UNCENSORED model specifically, and the
+    # reason is that one repository publishes both. Alongside the UC quantisations
+    # it also carries the plain, censored qwen-image-2.1-{Q4_0,Q4_K_M,Q5_K_M,
+    # Q6_K,Q8_0}.gguf. A bare "qwen-image" needle matches either family, and
+    # sorting decides between them: 'Q' is 0x51 and 'U' is 0x55, so
+    # qwen-image-2.1-Q4_0.gguf comes before qwen-image-2.1-UC-Q8_0.gguf and the
+    # censored weights would win the fallback. Naming "-uc" makes the family a
+    # requirement instead of a tiebreak.
+    #
+    # It also keeps the quantisation out of the code, which is what _find_first's
+    # own docstring asks for: swapping Q8_0 for Q4_K_M should be deleting a file,
+    # not editing a constant. The exact filename above is a fast path for the
+    # machine's actual file; this is what runs when that file is not there.
     wanted = (
         ("diffusion", diffusion,
-         (preferred_needle,) if os.path.isfile(preferred) else ("qwen-image",)),
+         (preferred_needle,) if os.path.isfile(preferred)
+         else (IMAGE_DIFFUSION_NEEDLE,)),
         ("vae", os.path.join(IMAGE_MODEL_DIR, "vae"), ("vae",)),
         ("text_encoder", os.path.join(IMAGE_MODEL_DIR, "text_encoder"),
          ("qwen3vl",)),
     )
     for key, folder, needles in wanted:
-        path = _find_first(folder, *needles)
+        # The exclusion is applied to every weight, not just the diffusion one:
+        # it is a one-line guard against picking up a leftover file whose only
+        # sin is sorting early, and there is no weight here it is valid for.
+        path = _find_first(folder, *needles, exclude=exclude)
         if path:
             found[key] = path
         else:
@@ -5146,27 +5247,39 @@ def _generate_image(args, hooks=None, direct=False):
         # aspect first, then explicit dimensions override it
         want = str(args.get("aspect") or "16:9").strip().lower()
         aw, ah = _IMG_ASPECTS.get(want, _IMG_ASPECTS["16:9"])
+        # An unrecognised ratio used to fall through to 16:9 in silence, so asking
+        # for 21:9 got you a 16:9 picture and no indication that the request had
+        # been ignored. It is still drawn - refusing outright would be worse, and
+        # "banana" is not worth failing a call over - but the substitution is
+        # reported so the caller can correct it. Absent is not a miss, so this
+        # only fires on a value that was actually supplied and not understood.
+        if want not in _IMG_ASPECTS and str(args.get("aspect") or "").strip():
+            args["aspect_unknown"] = want
         width, height = dim("width", aw, 256, 2048), dim("height", ah, 256, 2048)
         try:
-            # default and ceiling both follow the installed checkpoint: a
-            # distilled turbo model sampled at the old default of 24 is
-            # oversampled into a worse picture, and the ceiling keeps a
-            # caller from asking for 40 steps of a 6-step model
+            # Default and bounds both follow the installed checkpoint.
+            # A filename that states its own step count wins, so a distilled
+            # checkpoint dropped in later brings its budget with it. Otherwise
+            # this is the base model's documented 40.
             want = int(args.get("steps") or 0)
             if want <= 0:
                 want = (_image_named_steps(found.get("diffusion"))
                         or IMAGE_DEFAULT_STEPS)
-            # 5 is the floor, not 4: four steps was the superseded v0.1
-            # checkpoint. v0.3 has no published 4-step schedule.
-            steps = max(VIGGLE_SIGMA_FLOOR, min(IMAGE_MAX_STEPS, want))
+            # Clamped at both ends on purpose. The floor is well below the
+            # default rather than equal to it: the flow schedule the engine
+            # picks is resolution-dependent, not step-count-dependent, so a
+            # short run is a genuinely cheaper picture and not a broken one.
+            # The ceiling stops a caller from asking for an absurd count that
+            # would burn the whole timeout for no visible gain.
+            steps = max(IMAGE_MIN_STEPS, min(IMAGE_MAX_STEPS, want))
         except (TypeError, ValueError):
-            # This was a bare 24 - the old default, and double the ceiling -
-            # so a non-numeric "steps" was the one path that could still
-            # sample a 6-step distilled checkpoint 24 times over. Clamped like
-            # every other route, and the seed fallback below is the right
-            # shape to copy.
-            steps = max(VIGGLE_SIGMA_FLOOR, min(IMAGE_MAX_STEPS,
-                                                IMAGE_DEFAULT_STEPS))
+            # A non-numeric "steps" takes the same road as an absent one. The
+            # old default of 24 is deliberately not used as the fallback: it
+            # was a leftover from before the distilled checkpoint, and it is not
+            # the number this model documents. Clamped like every other route,
+            # and the seed fallback below is the right shape to copy.
+            steps = max(IMAGE_MIN_STEPS, min(IMAGE_MAX_STEPS,
+                                             IMAGE_DEFAULT_STEPS))
         try:
             seed = int(args.get("seed", -1))
         except (TypeError, ValueError):
@@ -5174,7 +5287,24 @@ def _generate_image(args, hooks=None, direct=False):
         # A long generation is normal here, so give it room - but only here.
         # Every other tool keeps its own much smaller ceiling, and this does
         # not relax any of them.
-        timeout = max(120, min(1800, int(args.get("timeout") or 600)))
+        #
+        # The ceiling moved up because the model did. The figures come from the
+        # measurements in commit 295417c, taken on the six-step checkpoint this
+        # replaced: about 95s at 1920x1088 with no preview, of which roughly 40s
+        # is reading 6 GB off the disk and only about 55s is sampling - so a
+        # step is nearer 9s than 16s, and 40 of them lands around 370s. Adding
+        # the load and eight previews puts a default run near 610s, already past
+        # the old 600s default with no output written at all. (An earlier note
+        # here said 640s of sampling and treated the load as if it scaled with
+        # the step count; it does not, and that overstated the sampling nearly
+        # twofold.)
+        #
+        # A timeout that fires mid-run is the one failure mode here that looks
+        # like the model being broken rather than like the run needing longer,
+        # so the default is set well clear of that estimate rather than just past
+        # it. 1500s leaves roughly 2x headroom on an extrapolated number, and the
+        # 2400s cap still stops a runaway from holding the slot forever.
+        timeout = max(120, min(2400, int(args.get("timeout") or 1500)))
 
         out_dir = os.path.join(WORKDIR, "out", "images")
         try:
@@ -5218,18 +5348,23 @@ def _generate_image(args, hooks=None, direct=False):
                "-p", prompt,
                "-H", str(height), "-W", str(width),
                "--steps", str(steps),
-               # The card: 6 steps "with no classifier-free guidance",
-               # true_cfg_scale=1.0. This was 6.0, left over from the 40-step
-               # base model, and guiding a no-CFG distilled model six times over
-               # pushes the sample off the conditional mean - clipped white
-               # skies, crushed black trees, over-saturated water. That is the
-               # overcooked look, and it varies by seed because it depends on
-               # where a particular sample lands.
-               "--cfg-scale", str(VIGGLE_CFG),
-               # Also from the card: pass the schedule rather than trusting the
-               # engine's default sigmas. Plain --steps without --sigmas "does
-               # not help" on this model.
-               "--sigmas", _viggle_sigmas(steps),
+               # 6.0, which is both the base model's guidance scale and the
+               # value in the engine's own Qwen-Image-2.1 text-to-image
+               # example. This was 1.0, because the checkpoint that used to be
+               # here was distilled with no classifier-free guidance - the
+               # guidance was baked into its weights, so it was sampled with
+               # CFG off. This model is not distilled and has to be told how
+               # closely to follow the text; leaving 1.0 in place would sample
+               # the unconditional branch and quietly produce a picture with no
+               # prompt in it.
+               "--cfg-scale", str(IMAGE_CFG),
+               # Deliberately no --sigmas. The engine selects a
+               # resolution-dependent flow schedule for this architecture on its
+               # own, and the node spacing depends on the pixel count, so
+               # handing it a fixed schedule here would override the one choice
+               # it is better placed to make. The checkpoint this replaced
+               # needed one spelled out because it was distilled onto a fixed
+               # six-node schedule that no resolution-dependent rule reproduces.
                "--sampling-method", "euler",
                "--offload-to-cpu", "--diffusion-fa",
                # The prefix cache holds the text's keys and values for the whole
@@ -5242,37 +5377,35 @@ def _generate_image(args, hooks=None, direct=False):
                # been denoised so far. It is the picture forming, not an
                # animation standing in for it.
                #
-               # One preview per step, whatever the step count. This used to be
-               # steps//4, and the 25/50/75/100 the page showed was never a
-               # choice - it only happened because the old checkpoint ran 24
-               # steps and 24//4 is 6. Swap the model and the same expression
-               # quietly means something else: 6//4 is 1, so a 6-step model
-               # wrote a preview every step, while 12//4 is 3 and a 12-step
-               # run wrote four. An interval of 1 is that rule stated
-               # outright, and it holds for every step count.
-               # Tiled decode, and it is what makes the per-step preview exist
-               # at all at this size. The preview decode runs while the
-               # diffusion transformer is still resident, so it has less memory
-               # to work with than the final decode does - which is why the
-               # final image comes out fine while every preview fails. Measured
-               # with --preview tae at this base: without tiling the engine logs
-               # "preview decode failed at step 1" through 6 and writes no file
-               # at all, so the card sits on its placeholder for the whole run.
-               # Tiling cuts the peak and every step previews.
-               #
-               # The cost is real: about 240s for a 6-step image at 1920x1088,
-               # roughly 28s per preview, against about 95s with no preview at
-               # all. At the old 1536x864 base tiling is about 155s with a
-               # preview every ~15s. A preview on every step was the ask, and
-               # that is what this buys.
+               # The interval is a fixed 5, so this is steps 5, 10, 15 ... and
+               # the reasoning (including why it is not derived from the step
+               # count) lives with IMAGE_PREVIEW_INTERVAL above. The short
+               # version: an interval of 1 was affordable when the model ran six
+               # steps, and is not now - 40 decodes at ~24s each is 16 minutes
+               # of drawing thumbnails, and the first four of them show the same
+               # grain anyway.
+               # Tiled decode, and it is what makes the preview exist at all at
+               # this size. The preview decode runs while the diffusion
+               # transformer is still resident, so it has less memory to work
+               # with than the final decode does - which is why the final image
+               # comes out fine while every preview fails. Measured with
+               # --preview tae at this base: without tiling the engine logs
+               # "preview decode failed at step 1" and writes no file at all,
+               # so the card sits on its placeholder for the whole run. Tiling
+               # cuts the peak and every preview succeeds.
                "--vae-tiling",
-               "--preview", "tae", "--preview-interval", "1",
+               "--preview", "tae",
+               "--preview-interval", str(IMAGE_PREVIEW_INTERVAL),
                "--preview-path", preview_path,
                "-o", out_path]
-        # A negative prompt is deliberately not passed. The card is explicit
-        # about "no CFG, no negative prompt", and at cfg 1.0 there is no
-        # negative branch to steer anyway, so sending one could only spend
-        # time encoding it for nothing.
+        # A negative prompt is deliberately not passed, and the reason is the
+        # upstream recipe rather than a limitation of this build. Qwen-Image 2.1
+        # is guidance-enabled but ships with an EMPTY negative prompt at a
+        # raised true_cfg_scale - the guidance term is the point, and there is
+        # no trained behaviour for steering away from a named term. So a
+        # caller-supplied negative prompt is reported back as ignored instead of
+        # being silently spent encoding a second text pass for an effect the
+        # model was not trained to honour.
         if args.get("negative_prompt"):
             _img_job(job_id, negative_prompt_ignored=
                      str(args["negative_prompt"])[:200])
@@ -5411,12 +5544,13 @@ def _generate_image(args, hooks=None, direct=False):
                 retry["_retried"] = 1
                 retry["width"] = max(256, int(width * 0.7) // 32 * 32)
                 retry["height"] = max(256, int(height * 0.7) // 32 * 32)
-                # VIGGLE_SIGMA_FLOOR, not a literal 4: four steps was the
-                # superseded v0.1 checkpoint and this one publishes no
-                # 4-step schedule, so a literal here would quietly ask for a
-                # run the model was never trained for.
-                retry["steps"] = max(VIGGLE_SIGMA_FLOOR,
-                                    int(steps * 0.7))
+                # 70% of the steps, floored at IMAGE_MIN_STEPS. The floor is
+                # the same constant the normal path clamps to, so the retry
+                # lands on a step count the model can actually produce a
+                # finished picture at - it is not a special case, it is the
+                # same rule applied to a smaller number.
+                retry["steps"] = max(IMAGE_MIN_STEPS,
+                                     int(steps * 0.7))
                 if on_prog:
                     on_prog({"id": job_id, "phase": "retry",
                              "percent": 0, "prompt": prompt,
@@ -5440,10 +5574,18 @@ def _generate_image(args, hooks=None, direct=False):
                "width": width, "height": height, "steps": steps,
                "seed": seed, "seconds": took, "bytes": size,
                "label": "generated image",
-               "engine": "Qwen-Image 2.1 Viggle turbo, 6-step (local, stable-diffusion.cpp)",
+               "engine": "Qwen-Image 2.1 (uncensored), %d-step "
+                         "(local, stable-diffusion.cpp)" % steps,
                "vram_released": "yes - the engine process exited, so the GPU "
                                 "is free again",
                "job": job_id}
+        # Said here, where the caller is actually looking, rather than only in
+        # the run log. The picture is 16:9 because that is what it fell back to.
+        if args.get("aspect_unknown"):
+            out["aspect_unknown"] = (
+                "%r is not a ratio this tool knows - drawn as 16:9 instead. "
+                "Use one of: %s." % (args["aspect_unknown"],
+                                      ", ".join(sorted(_IMG_ASPECTS))))
 
         # Resample to the exact delivery size. The engine could not be asked for
         # 1920x1080 directly - neither number is a multiple of 32 - which is the
@@ -6697,7 +6839,13 @@ API_CALL_TOOL = {
                 "method": {"type": "string", "enum": ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"], "description": "HTTP method. Default GET."},
                 "url": {"type": "string", "description": "Full URL, e.g. https://api.example.com/v1/users"},
                 "headers": {"type": "object", "description": "Extra request headers, e.g. {\"Authorization\": \"Bearer ...\"}"},
-                "body": {"description": "Request body. Use a dict/list for JSON or a string for raw text."},
+                # Typed as a union rather than left open. An absent "type" is legal
+                # JSON Schema and a permissive endpoint accepts it, but a strict
+                # provider rejects the property - and it rejects the whole request
+                # rather than this one tool, so every other tool goes down with it.
+                # These three are exactly what _api_call handles: a dict or list is
+                # sent as JSON, anything else is sent as a string.
+                "body": {"type": ["object", "array", "string"], "description": "Request body. Use a dict/list for JSON or a string for raw text."},
                 "content_type": {"type": "string", "description": "Content-Type header for string bodies (default 'application/json')."},
                 "timeout": {"type": "integer", "description": "Request timeout in seconds (default 20, max 120)."},
                 "insecure": {"type": "boolean", "description": "Skip TLS certificate verification (default false)."},
@@ -6719,7 +6867,11 @@ WS_TEST_TOOL = {
             "type": "object",
             "properties": {
                 "url": {"type": "string", "description": "WebSocket URL, e.g. ws://127.0.0.1:8000/ws or wss://..."},
-                "send": {"description": "Optional message to send after connecting. Dicts/lists are JSON-encoded."},
+                # Same union as api_call's body, and for the same reason: an untyped property
+                # is a whole-request rejection on a strict provider, not a local
+                # one. _ws_test JSON-encodes a dict or list and stringifies
+                # anything else.
+                "send": {"type": ["object", "array", "string"], "description": "Optional message to send after connecting. Dicts/lists are JSON-encoded."},
                 "timeout": {"type": "integer", "description": "How long to listen for replies, seconds (default 5, max 60)."}
             },
             "required": ["url"]
@@ -6779,9 +6931,11 @@ UNSCHEDULE_TOOL = _pc_tool(
 
 TTS_VOICES_TOOL = _pc_tool(
     "tts_voices",
-    "List the local Piper text-to-speech voices available on this machine "
-    "(each .onnx + .onnx.json pair in the Piper folder). Use tts_speak with "
-    "one of the returned names.",
+    "List the local Kokoro text-to-speech voices available on this machine. "
+    "English only - the model ships styles for a dozen languages but this app "
+    "offers the American and British ones (names beginning af_, am_, bf_, bm_). "
+    "Use tts_speak with one of the returned names. There is also a voice picker "
+    "on the /kokoro page at http://127.0.0.1:8081/kokoro.",
     {},
     []
 )
@@ -6789,37 +6943,45 @@ TTS_VOICES_TOOL = _pc_tool(
 IMAGE_GEN_TOOL = _pc_tool(
     "generate_image",
     "Generate an image from a text description, using a local Qwen-Image 2.1 "
-    "Viggle turbo model on this PC. The picture comes back and you can see it. "
-    "Takes about 240 seconds at the default size - the weights are read from "
-    "disk on every call, so each one pays for the load. Use it when the user "
+    "model on this PC - an uncensored fine-tune of it, which draws whatever is "
+    "asked without refusing. The picture comes back and you can see it. Expect "
+    "several minutes at the default size, not seconds: it is a full 7B model "
+    "run over the normal 40-step flow schedule, and the weights are read from "
+    "disk on every call, so each one pays for the load too. Only run one at a "
+    "time and do not re-send a request that looks slow. Use it when the user "
     "asks you to draw, make, illustrate, design or render something, or to "
     "create a picture. Describe the subject, the setting, the light and the "
     "style in the prompt - it is a text-to-image model and it only knows what "
     "you tell it. Good at rendering text inside images and following "
-    "composition. It runs with no classifier-free guidance, which means there "
-    "is no negative prompt to steer with: ask for what you want in the prompt "
-    "itself. The sample count and the sampler are fixed by the checkpoint and "
-    "cannot be steered from here - asking for more steps makes the picture "
-    "worse, not better, so if a result is wrong, reword the prompt and go "
-    "again. Note this loads a second large model, so any local language model "
-    "is unloaded first - use it while an API model is the active one.",
+    "composition. Leave the step count alone unless the user asks for a "
+    "specific one: the default is what the model documents, and unlike a "
+    "distilled model more steps here genuinely refines the result, so going up "
+    "to around 60 is a legitimate way to spend time on a picture the user cares "
+    "about. If a result is simply wrong, reword the prompt first - that fixes "
+    "far more than more steps will. Note this loads a second large model, so "
+    "any local language model is unloaded first - use it while an API model is "
+    "the active one.",
     {
         "prompt": {"type": "string",
                    "description": "What to draw. Be specific: subject, "
                                   "setting, lighting, style, mood."},
         "negative_prompt": {"type": "string",
-                            "description": "Ignored. This model is distilled "
-                                           "to run with no classifier-free "
-                                           "guidance and no negative prompt, "
-                                           "so there is nothing for one to "
-                                           "steer. Say what you do not want "
-                                           "in the prompt instead."},
+                            "description": "Ignored. This model runs with "
+                                           "guidance on but an empty negative "
+                                           "prompt, which is what it was "
+                                           "trained that way - there is no "
+                                           "behaviour for steering away from a "
+                                           "named term. Say what you do not "
+                                           "want in the prompt instead."},
         "aspect": {"type": "string",
                    "description": "Shape of the picture: '16:9' (default), "
-                                  "'9:16' for a phone-shaped one, '1:1', '4:3' "
-                                  "or '3:4'. Use this rather than width and "
-                                  "height - the sizes are chosen so the shape "
-                                  "comes out right."},
+                                  "'9:16' for a phone-shaped one, '1:1', '4:3', "
+                                  "'3:4', '3:2' or '2:3'. The plain words "
+                                  "'widescreen', 'portrait' and 'square' work "
+                                  "too. Use this rather than width and height - "
+                                  "the sizes are chosen so the shape comes out "
+                                  "right. An unrecognised ratio still draws, but "
+                                  "as 16:9, and the result says so."},
         "width": {"type": "integer",
                   "description": "Exact width in pixels. Only if you need a "
                                  "specific size; prefer aspect."},
@@ -6827,16 +6989,20 @@ IMAGE_GEN_TOOL = _pc_tool(
                    "description": "Exact height in pixels. Only if you need a "
                                   "specific size; prefer aspect."},
         "upscale": {"type": "boolean",
-                    "description": "True (default) to also save a 1920x1080 "
-                                   "version, resampled with Lanczos - no AI, "
-                                   "no extra model, instant."},
+                    "description": "True (default) to deliver the picture "
+                                   "resampled to 1440p on its short edge - a "
+                                   "16:9 one arrives as 2541x1440. Lanczos, so "
+                                   "no AI and no extra model; it enlarges, it "
+                                   "does not add detail. False keeps the size "
+                                   "the engine generated at."},
         "steps": {"type": "integer",
-                  "description": "Denoising steps, 4-12, default 6 - and 6 is "
-                                 "what this distilled turbo model was trained "
-                                 "for, so leave it out unless the user asks "
-                                 "for a specific number. Asking for more "
-                                 "oversamples the model and gives a worse "
-                                 "picture, not a better one."},
+                  "description": "Denoising steps, 10-80, default 40. Leave it "
+                                 "out unless the user asks for a specific "
+                                 "number - 40 is what this model documents. "
+                                 "Going above the default is a real way to buy a "
+                                 "more refined picture, at proportionally more "
+                                 "minutes; it is not a fix for a prompt that "
+                                 "asked for the wrong thing."},
         "seed": {"type": "integer",
                  "description": "Random seed (default -1, meaning pick one). "
                                 "Reuse a seed to get the same picture again."},
@@ -6847,18 +7013,35 @@ TTS_SPEAK_TOOL = {
     "type": "function",
     "function": {
         "name": "tts_speak",
-        "description": "Speak text aloud using the local neural Piper TTS "
+        "description": "Speak text aloud using the local Kokoro neural TTS "
                        "engine (no cloud, no built-in system voices). It plays "
                        "straight away - there is nothing to switch on first, so "
                        "just call it, do not go looking for a TTS button. Also "
                        "saves the speech as a WAV file in the workspace. Use "
                        "this to give the user spoken feedback, alerts or TTS "
-                       "output.",
+                       "output. English only.",
         "parameters": {
             "type": "object",
             "properties": {
-                "text": {"type": "string", "description": "The text to speak."},
-                "voice": {"type": "string", "description": "Piper voice name, default 'en_US-lessac-medium'. Romanian: 'ro_RO-mihai-medium'. List with tts_voices."}
+                "text": {"type": "string", "description": "The text to speak. "
+                                                          "Write it to be heard: "
+                                                          "abbreviations and "
+                                                          "symbols are read out "
+                                                          "as words, so spell "
+                                                          "out things like "
+                                                          "'Dr' or 'kg'."},
+                "voice": {"type": "string",
+                          "description": "Kokoro voice name, default 'af_sarah'. "
+                                         "American: af_* or am_*. British: "
+                                         "bf_* or bm_*. Try am_michael, "
+                                         "bf_emma, af_bella. List them all "
+                                         "with tts_voices."},
+                "speed": {"type": "number",
+                          "description": "Speaking rate, 0.5 to 2.0, default 1.0. "
+                                         "Above 1 is faster and below 1 slower. "
+                                         "Use it for urgency (1.3) or for "
+                                         "something dense that needs slowing "
+                                         "down (0.85)."}
             },
             "required": ["text"]
         }
@@ -11974,21 +12157,199 @@ def _archive(args):
     return {"error": "action must be 'extract' or 'create'"}
 
 
-# ---------------- Local neural TTS (Piper) ----------------
+# ---------------- Local neural TTS (Kokoro) ----------------
+#
+# Replaces Piper. Three things are genuinely better and one is worse, and the
+# worse one is a real loss rather than a preference:
+#
+#   better - 82M parameters instead of ~60M in a much wider net, so it is
+#            smaller on disk AND sounds better; 24 kHz output against Piper's
+#            22.05k; and speed is a first-class parameter (0.5x to 2x) rather
+#            than a length-scale hack baked into each voice.
+#   worse  - NO ROMANIAN. The Piper folder carried nine ro_RO-* voices and
+#            Kokoro publishes no ro_ styles at all, so this drops that language
+#            entirely. Everything here is English.
+#
+# The model is loaded once and kept. Loading costs a second or two and ~310 MB,
+# and tts_speak is called per reply, so re-loading it every time was the single
+# most wasteful thing the old implementation could have done (it did not - Piper
+# re-loaded per call too, which is part of why it felt slow).
 
-def _piper_voices():
-    if not os.path.isdir(PIPER_DIR):
-        return {"error": f"Piper voices folder not found at {PIPER_DIR} "
-                         "(set PC_PIPER_DIR or run python piper\\download_voices.py)"}
-    voices = []
-    for f in sorted(os.listdir(PIPER_DIR)):
-        if f.endswith(".onnx"):
-            base = f[:-5]
-            if os.path.exists(os.path.join(PIPER_DIR, base + ".onnx.json")):
-                voices.append(base)
-    if not voices:
-        return {"error": f"no Piper voices (.onnx + .onnx.json) found in {PIPER_DIR}"}
-    return {"result": "ok", "folder": PIPER_DIR, "voices": voices}
+_KOKORO = {"model": None, "checked": 0.0}
+_KOKORO_LOCK = threading.Lock()
+
+# Voice-name prefixes, and what they mean. af/am American female/male, bf/bm
+# British. The first two letters are the only naming convention the voices file
+# has, so this is the honest way to filter it - get_voices() returns every style
+# in the release and hardcoding 28 names would rot the first time one is added.
+_KOKORO_LANG_PREFIX = {"af": "American female", "am": "American male",
+                       "bf": "British female", "bm": "British male"}
+KOKORO_DEFAULT_VOICE = "af_sarah"
+
+
+def _kokoro_paths():
+    """(model_path, voices_path, missing) - missing names what is absent."""
+    model = os.path.join(KOKORO_DIR, KOKORO_MODEL)
+    voices = os.path.join(KOKORO_DIR, KOKORO_VOICES_FILE)
+    missing = [n for n, p in (("model (" + KOKORO_MODEL + ")", model),
+                              ("voices (" + KOKORO_VOICES_FILE + ")", voices))
+               if not os.path.exists(p)]
+    return model, voices, missing
+
+
+def _kokoro_engine():
+    """The loaded Kokoro instance, or an error dict.
+
+    Cached on the module. The cache is keyed on nothing but the paths, so
+    changing PC_KOKORO_MODEL mid-process would not be picked up - which is fine,
+    because the alternative is re-reading 310 MB off the disk on every reply.
+    """
+    model, voices, missing = _kokoro_paths()
+    if missing:
+        return {"error": "Kokoro is not fully installed - missing %s in %s "
+                         "(run: python kokoro\\download_model.py)"
+                         % (", ".join(missing), KOKORO_DIR)}
+    with _KOKORO_LOCK:
+        if _KOKORO["model"] is not None:
+            return _KOKORO["model"]
+        try:
+            from kokoro_onnx import Kokoro
+        except Exception as exc:
+            return {"error": "kokoro-onnx is not installed: "
+                             "pip install kokoro-onnx (%s)" % exc}
+        try:
+            _KOKORO["model"] = Kokoro(model, voices)
+        except Exception as exc:
+            return {"error": "Kokoro failed to load %s: %s" % (KOKORO_MODEL, exc)}
+        return _KOKORO["model"]
+
+
+def _kokoro_voice_list(engine):
+    """English voice names, prettiest-first, with their accent/sex labels."""
+    names = []
+    for name in engine.get_voices():
+        prefix = str(name).split("_", 1)[0].lower()
+        if prefix in _KOKORO_LANG_PREFIX:
+            names.append(name)
+    if KOKORO_DEFAULT_VOICE in names:
+        names.remove(KOKORO_DEFAULT_VOICE)
+        names.insert(0, KOKORO_DEFAULT_VOICE)
+    return names
+
+
+def _kokoro_voices():
+    """The English voices, for the tts_voices tool and the /kokoro page."""
+    if not os.path.isdir(KOKORO_DIR):
+        return {"error": "Kokoro folder not found at %s (run: "
+                         "python kokoro\\download_model.py)" % KOKORO_DIR}
+    engine = _kokoro_engine()
+    if isinstance(engine, dict):
+        return engine
+    names = _kokoro_voice_list(engine)
+    if not names:
+        return {"error": "no English voices in %s - expected styles beginning "
+                         "af_/am_/bf_/bm_" % KOKORO_VOICES_FILE}
+    return {"result": "ok", "engine": "Kokoro-82M v1.0",
+            "model": KOKORO_MODEL, "folder": KOKORO_DIR,
+            "languages": "English only",
+            "sample_rate": KOKORO_SAMPLE_RATE,
+            "voices": names,
+            "voices_labelled": [
+                {"name": n,
+                 "accent": _KOKORO_LANG_PREFIX.get(n.split("_", 1)[0].lower(),
+                                                   "?"),
+                 "default": n == KOKORO_DEFAULT_VOICE}
+                for n in names]}
+
+
+def _kokoro_speak_wav(text, voice, speed, out_path):
+    """Synthesise to a 16-bit mono wav. Returns (duration, sample_rate) or raises.
+
+    The wav is written with the standard library rather than soundfile: Kokoro
+    hands back float samples, and converting to int16 by hand is four lines,
+    which is cheaper than making every user install another package. Clipped
+    rather than wrapped on the way - a wrap turns a peak into a tick, and
+    clipping is the distortion you can hear least.
+    """
+    import wave as wave_mod
+    import numpy as np
+    engine = _kokoro_engine()
+    if isinstance(engine, dict):
+        raise RuntimeError(engine["error"])
+    samples, rate = engine.create(text, voice=voice, speed=speed,
+                                  lang="en-us")
+    samples = np.asarray(samples, dtype=np.float32).reshape(-1)
+    if samples.size == 0:
+        raise RuntimeError("Kokoro produced no audio for that text")
+    peak = float(np.max(np.abs(samples))) or 1.0
+    # Normalise to just under full scale so a quiet voice is still audible
+    # without the peak itself clipping.
+    gain = min(1.0, 0.97 / peak)
+    pcm = np.clip(samples * gain * 32767.0, -32768, 32767).astype(np.int16)
+    with wave_mod.open(out_path, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(int(rate))
+        wf.writeframes(pcm.tobytes())
+    return round(pcm.size / float(rate), 2), int(rate)
+
+
+def _tts_speak(args):
+    text = str(args.get("text") or "").strip()
+    if not text:
+        return {"error": "text is required"}
+    engine = _kokoro_engine()
+    if isinstance(engine, dict):
+        return engine
+    available = _kokoro_voice_list(engine)
+    voice = str(args.get("voice") or KOKORO_DEFAULT_VOICE).strip()
+    if voice.endswith(".onnx"):                 # a Piper-era name
+        voice = voice[:-5]
+    if voice not in available:
+        return {"error": "voice %r is not an English Kokoro voice. List them "
+                         "with tts_voices." % voice,
+                "voices": available}
+    try:
+        speed = float(args.get("speed") or 1.0)
+    except (TypeError, ValueError):
+        speed = 1.0
+    speed = max(0.5, min(2.0, speed))
+    out_dir = os.path.join(WORKDIR, "out", "tts")
+    for candidate in (out_dir, os.path.join(WORKDIR, "out"), WORKDIR):
+        try:
+            os.makedirs(candidate, exist_ok=True)
+            out_dir = candidate
+            break
+        except OSError:
+            continue
+    wav_path = os.path.join(
+        out_dir, "tts_" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        + "_" + voice + ".wav")
+    try:
+        duration, rate = _kokoro_speak_wav(text, voice, speed, wav_path)
+    except Exception as exc:
+        return {"error": "Kokoro synthesis failed: %s" % exc}
+    # The /kokoro page passes play=False because the browser plays it itself, and
+    # doing both would talk over the click that asked for it. Default stays True
+    # so the tool and the header toggle behave exactly as they always did.
+    if args.get("play") is False:
+        played = None
+    else:
+        played = _play_wav(wav_path)
+    out = {"result": "ok", "engine": "Kokoro-82M v1.0", "voice": voice,
+           "speed": speed, "text": text[:200],
+           "wav": wav_path.replace("\\", "/"),
+           "bytes": os.path.getsize(wav_path),
+           "duration_seconds": duration, "sample_rate": rate,
+           "played": played is not False}
+    if played is False:
+        # Say so. The audio file is real and on disk, so the honest result is
+        # "written but nobody could play it", with the way out.
+        out["warning"] = (
+            "the speech was generated and saved, but nothing on this machine "
+            "could play it - no sounddevice, and no paplay, aplay or ffplay. "
+            "On Linux install one: sudo apt install pulseaudio-utils")
+    return out
 
 
 def _play_wav(path):
@@ -12036,63 +12397,6 @@ def _play_wav(path):
             except Exception:
                 continue
         return False
-
-
-def _tts_speak(args):
-    import wave as wave_mod
-    text = str(args.get("text") or "").strip()
-    if not text:
-        return {"error": "text is required"}
-    voice = str(args.get("voice") or "en_US-lessac-medium").strip()
-    voice = voice[:-5] if voice.endswith(".onnx") else voice
-    model = os.path.join(PIPER_DIR, voice + ".onnx")
-    conf = os.path.join(PIPER_DIR, voice + ".onnx.json")
-    if not (os.path.exists(model) and os.path.exists(conf)):
-        return {"error": f"voice '{voice}' not found in {PIPER_DIR} "
-                         "(run tts_voices to list the available voices)"}
-    try:
-        import piper
-    except Exception as exc:
-        return {"error": f"piper-tts is not installed: pip install piper-tts onnxruntime ({exc})"}
-    out_dir = os.path.join(WORKDIR, "out", "tts")
-    try:
-        os.makedirs(out_dir, exist_ok=True)
-    except Exception:
-        out_dir = os.path.join(WORKDIR, "out")
-        try:
-            os.makedirs(out_dir, exist_ok=True)
-        except Exception:
-            out_dir = WORKDIR
-    wav_path = os.path.join(out_dir,
-                            "tts_" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                            + ".wav")
-    try:
-        v = piper.PiperVoice.load(model, conf)
-        with open(wav_path, "wb") as wf:
-            v.synthesize_wav(text, wave_mod.Wave_write(wf))
-    except Exception as exc:
-        return {"error": f"piper synthesis failed: {exc}"}
-    duration = None
-    try:
-        import wave as wave_mod2
-        with wave_mod2.open(wav_path, "rb") as wv:
-            duration = round(wv.getnframes() / max(1, wv.getframerate()), 2)
-    except Exception:
-        pass
-    played = _play_wav(wav_path)
-    out = {"result": "ok", "voice": voice, "text": text[:200],
-           "wav": wav_path.replace("\\", "/"),
-           "bytes": os.path.getsize(wav_path),
-           "duration_seconds": duration,
-           "played": played is not False}
-    if played is False:
-        # Say so. The audio file is real and on disk, so the honest result is
-        # "written but nobody could play it", with the way out.
-        out["warning"] = (
-            "the speech was generated and saved, but nothing on this machine "
-            "could play it - no sounddevice, and no paplay, aplay or ffplay. "
-            "On Linux install one: sudo apt install pulseaudio-utils")
-    return out
 
 
 # ---------------- Window management ----------------
@@ -13095,7 +13399,7 @@ def _execute_tool_call(name, args, tc, hooks, image_uri):
     elif name == "unschedule_task":
         raw_result = _unschedule_task(args)
     elif name == "tts_voices":
-        raw_result = _piper_voices()
+        raw_result = _kokoro_voices()
     elif name == "tts_speak":
         # Not gated on the header toggle. That toggle gates nothing else - it
         # never made replies speak by themselves - so all it did was stop the
@@ -13960,6 +14264,232 @@ def handle_chat(messages, on_reason=None, on_delta=None, on_tool=None,
         raise
 
 
+# ---------------- The /kokoro page ----------------
+#
+# A standalone page rather than another panel in the main UI, because the main
+# UI is a chat client and this is a text box with a play button - the two have
+# almost nothing in common, and bolting it on would have meant a second layout
+# inside a layout that already works.
+#
+# It talks to three routes and nothing else: GET /api/kokoro/voices for the
+# list, POST /api/kokoro/speak to synthesise, and GET /ttswav/<name> to play the
+# result back. The wav route exists because the file is written into the
+# workspace, which the browser cannot reach on its own.
+#
+# The colours are copied from the main page's variables so this does not look
+# like a different application, including the light/dark switch - it follows the
+# system by default and remembers a click, same as the chat does.
+KOKORO_PAGE = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kokoro TTS - Bonsai</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #ffffff; --bg2: #f7f7f9; --bg3: #ededf0; --bd: #e3e3e7;
+    --bd2: #cfcfd8;
+    --txt: #111214; --mut: #71717a; --acc: #19191c; --acc-txt: #fafafa;
+    --bad: #b42318; --good: #067647;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #212121; --bg2: #171717; --bg3: #2f2f2f; --bd: #303030;
+      --bd2: #424242;
+      --txt: #ececec; --mut: #9b9ba3; --acc: #e4e4e7; --acc-txt: #18181b;
+      --bad: #f97066; --good: #47cd89;
+    }
+  }
+  html, body { height: 100%; margin: 0; }
+  body { font-family: "Segoe UI", system-ui, sans-serif; background: var(--bg);
+         color: var(--txt); }
+  .wrap { max-width: 780px; margin: 0 auto; padding: 28px 20px 60px; }
+  header { display: flex; align-items: baseline; gap: 12px; margin-bottom: 4px; }
+  h1 { font-size: 20px; margin: 0; font-weight: 650; }
+  .sub { color: var(--mut); font-size: 13px; }
+  .card { background: var(--bg2); border: 1px solid var(--bd);
+          border-radius: 12px; padding: 16px; margin-top: 18px; }
+  label { display: block; font-size: 12px; color: var(--mut);
+          margin: 0 0 6px; text-transform: uppercase; letter-spacing: .05em; }
+  textarea, select, input[type=range] { width: 100%; font: inherit;
+          color: var(--txt); background: var(--bg); border: 1px solid var(--bd);
+          border-radius: 9px; padding: 10px 12px; }
+  textarea { min-height: 130px; resize: vertical; line-height: 1.5; }
+  textarea:focus, select:focus { outline: 2px solid var(--acc); outline-offset: -1px; }
+  .row { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-top: 14px; }
+  @media (max-width: 560px) { .row { grid-template-columns: 1fr; } }
+  .speedrow { display: flex; align-items: center; gap: 12px; }
+  .speedrow input[type=range] { flex: 1; padding: 0; }
+  .speedval { font-variant-numeric: tabular-nums; color: var(--mut);
+              min-width: 3.2em; text-align: right; }
+  button { font: inherit; font-weight: 600; cursor: pointer; border-radius: 9px;
+           border: 1px solid var(--bd); background: var(--acc);
+           color: var(--acc-txt); padding: 11px 20px; }
+  button:disabled { opacity: .55; cursor: default; }
+  .ghost { background: var(--bg3); color: var(--txt); }
+  .ghost:hover { border-color: var(--bd2); }
+  .bar { display: flex; gap: 10px; align-items: center; margin-top: 16px; }
+  .bar .grow { flex: 1; }
+  audio { width: 100%; margin-top: 6px; }
+  .msg { margin-top: 14px; font-size: 14px; line-height: 1.55; }
+  .err { color: var(--bad); }
+  .ok { color: var(--mut); }
+  .warn { background: var(--bg3); border: 1px solid var(--bd2); border-radius: 9px;
+          padding: 12px 14px; font-size: 14px; line-height: 1.55; }
+  code { background: var(--bg3); padding: 2px 6px; border-radius: 5px;
+         font-size: 13px; }
+  a { color: inherit; }
+  .voices { font-size: 13px; color: var(--mut); line-height: 1.7; }
+  .voices b { color: var(--txt); font-weight: 600; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Kokoro TTS</h1>
+    <span class="sub">82M parameters, running on this machine</span>
+  </header>
+  <p class="sub" id="statusline">Looking for the model&hellip;</p>
+
+  <div class="card" id="form" hidden>
+    <label for="text">Text</label>
+    <textarea id="text" placeholder="Type something to hear it said."></textarea>
+    <div class="row">
+      <div>
+        <label for="voice">Voice</label>
+        <select id="voice"></select>
+      </div>
+      <div>
+        <label for="speed">Speed</label>
+        <div class="speedrow">
+          <input type="range" id="speed" min="0.5" max="2" step="0.05" value="1">
+          <span class="speedval" id="speedval">1.00&times;</span>
+        </div>
+      </div>
+    </div>
+    <div class="bar">
+      <button id="go">Speak</button>
+      <button class="ghost grow" id="stop" disabled>Stop</button>
+    </div>
+    <div class="msg" id="msg"></div>
+    <div id="out"></div>
+  </div>
+
+  <div class="card">
+    <label>English voices</label>
+    <div class="voices" id="vlist">loading&hellip;</div>
+  </div>
+
+  <p class="sub" style="margin-top:22px">
+    <a href="/">&larr; back to the chat</a>
+  </p>
+</div>
+
+<script>
+const $ = function (id) { return document.getElementById(id); };
+let current = null;
+
+function setStatus(text, bad) {
+  const el = $('statusline');
+  el.textContent = text;
+  el.className = bad ? 'sub err' : 'sub';
+}
+
+$('speed').addEventListener('input', function () {
+  $('speedval').textContent = Number(this.value).toFixed(2) + '\\u00d7';
+});
+
+async function loadVoices() {
+  let data;
+  try {
+    const r = await fetch('/api/kokoro/voices');
+    data = await r.json();
+  } catch (e) {
+    setStatus('Could not reach Bonsai on this port.', true);
+    return;
+  }
+  if (data.error) { setStatus(data.error, true); return; }
+
+  const sel = $('voice');
+  sel.textContent = '';
+  for (const v of data.voices_labelled) {
+    const o = document.createElement('option');
+    o.value = v.name;
+    o.textContent = v.name.replace(/_/g, ' ') +
+      (v.default ? '  (default)' : '') + '  \\u00b7 ' + v.accent;
+    sel.appendChild(o);
+  }
+
+  // Grouped by accent so the list reads as four families rather than 28 names.
+  const byAccent = {};
+  for (const v of data.voices_labelled) {
+    (byAccent[v.accent] = byAccent[v.accent] || []).push(v.name.replace(/_/g, ' '));
+  }
+  $('vlist').innerHTML = Object.keys(byAccent).map(function (a) {
+    return '<div><b>' + a + '</b> \\u2014 ' + byAccent[a].join(', ') + '</div>';
+  }).join('');
+
+  setStatus(data.engine + ' \\u00b7 ' + data.model + ' \\u00b7 English only');
+  $('form').hidden = false;
+}
+
+$('go').onclick = async function () {
+  const text = $('text').value.trim();
+  if (!text) { $('msg').innerHTML = '<span class="err">Type something first.</span>'; return; }
+  const btn = this;
+  btn.disabled = true; btn.textContent = 'Working\\u2026';
+  $('msg').innerHTML = '';
+  $('stop').disabled = false;
+  const t0 = Date.now();
+  try {
+    const r = await fetch('/api/kokoro/speak', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        text: text, voice: $('voice').value, speed: Number($('speed').value)
+      })
+    });
+    const data = await r.json();
+    if (data.error) throw new Error(data.error);
+    const secs = ((Date.now() - t0) / 1000).toFixed(1);
+    $('msg').innerHTML = '<span class="ok">' + data.duration_seconds +
+      's of audio, made in ' + secs + 's \\u00b7 ' +
+      (data.bytes / 1024).toFixed(0) + ' KB \\u00b7 ' + data.sample_rate + ' Hz</span>';
+    $('out').innerHTML = '';
+    const a = document.createElement('audio');
+    a.controls = true;
+    a.src = data.wav_url;
+    a.play().catch(function () {});
+    $('out').appendChild(a);
+    const link = document.createElement('a');
+    link.href = data.wav_url;
+    link.download = '';
+    link.textContent = '  download the wav';
+    link.style.fontSize = '13px';
+    $('out').appendChild(link);
+    if (current) { current.pause(); }
+    current = a;
+    a.onplay = function () { $('stop').disabled = false; };
+    a.onended = function () { $('stop').disabled = true; };
+  } catch (e) {
+    $('msg').innerHTML = '<span class="err">' + e.message + '</span>';
+  }
+  btn.disabled = false; btn.textContent = 'Speak';
+};
+
+$('stop').onclick = function () {
+  if (current) { current.pause(); current.currentTime = 0; }
+  this.disabled = true;
+};
+
+loadVoices();
+</script>
+</body>
+</html>
+"""
+
+
 PAGE = """<!doctype html>
 <html lang="en">
 <head>
@@ -14571,7 +15101,7 @@ PAGE = """<!doctype html>
       <div class="scopelist" id="scopelist"></div>
       <button class="btn-ghost scopeclear" id="scopeclear" title="Forget every approved and denied path">CLEAR APPROVALS</button>
       <div class="foot-row rail">
-        <button class="ibtn" id="ttsbtn" aria-label="Text to speech" title="Text-to-speech (Piper) - speak replies aloud. Off by default."><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9v6h4l5 4V5L8 9H4z"/><path d="M17 8.5a5 5 0 0 1 0 7"/><path d="M19.5 6a8.5 8.5 0 0 1 0 12"/></svg></button>
+        <button class="ibtn" id="ttsbtn" aria-label="Text to speech" title="Text-to-speech (Kokoro) - speak replies aloud. Off by default."><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9v6h4l5 4V5L8 9H4z"/><path d="M17 8.5a5 5 0 0 1 0 7"/><path d="M19.5 6a8.5 8.5 0 0 1 0 12"/></svg></button>
         <button class="ibtn" id="detailbtn" aria-label="Detail level" title="Show each step in the chat as one collapsed line, or fully expanded"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h10"/></svg></button>
         <button class="ibtn" id="themebtn" aria-label="Toggle theme" title="Switch between the light and dark theme"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4.2"/><path d="M12 2.6v2.2M12 19.2v2.2M2.6 12h2.2M19.2 12h2.2M5.4 5.4l1.6 1.6M17 17l1.6 1.6M18.6 5.4L17 7M7 17l-1.6 1.6"/></svg></button>
         <button class="ibtn warn" id="ejectbtn" aria-label="Eject the model" title="Stop the model server now and free its RAM/VRAM (it restarts automatically on the next message)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3.5v8"/><path d="M6.6 7.2a7.5 7.5 0 1 0 10.8 0"/></svg></button>
@@ -17367,7 +17897,7 @@ document.getElementById('ejectbtn').onclick = function () {
       setTimeout(function () { btn.textContent = 'EJECT'; btn.disabled = false; btn.style.opacity = '1'; }, 2500);
     });
 };
-/* ---------- TTS toggle (Piper) ---------- */
+/* ---------- TTS toggle (Kokoro) ---------- */
 function renderTtsBtn(j) {
   const el = document.getElementById('ttsbtn');
   if (!el) return;
@@ -17376,7 +17906,7 @@ function renderTtsBtn(j) {
   const on = !!j.enabled;
   el.classList.toggle('on', on);
   const what = on ? 'speech is on' : 'speech is off';
-  el.title = 'Text-to-speech (Piper) - ' + what + ', click to change';
+  el.title = 'Text-to-speech (Kokoro) - ' + what + ', click to change';
   el.setAttribute('aria-label', 'Text to speech (' + what + ')');
 }
 function refreshTts() {
@@ -19795,6 +20325,50 @@ class Handler(BaseHTTPRequestHandler):
             out.pop("image_data_full", None)
             emit("done", out)
 
+    def _serve_tts_wav(self, name):
+        """Serve a synthesised wav so the /kokoro page can play it.
+
+        Only files this app wrote to the tts output folder are servable, and
+        only by bare filename. That is deliberately stricter than _safe_path:
+        _safe_path asks the user to approve anything outside the workspace,
+        while this route has no approval step, so the folder itself is the
+        boundary. A name carrying a path separator is rejected outright rather
+        than normalised - there is no legitimate case for one here, and quietly
+        resolving "../.." is how that class of bug starts.
+        """
+        name = urllib.parse.unquote(name or "")
+        if not name or "/" in name or "\\" in name or name.startswith("."):
+            self._send(400, "bad wav name", "text/plain")
+            return
+        if not name.lower().endswith(".wav"):
+            self._send(415, "only .wav is served here", "text/plain")
+            return
+        folder = os.path.join(WORKDIR, "out", "tts")
+        try:
+            real = os.path.realpath(os.path.join(folder, name))
+            base = os.path.realpath(folder)
+        except OSError:
+            self._send(404, "not found", "text/plain")
+            return
+        # Belt and braces: the separator check above already rules this out.
+        if os.path.commonpath([real, base]) != base:
+            self._send(400, "bad wav name", "text/plain")
+            return
+        if not os.path.isfile(real):
+            self._send(404, "no such wav", "text/plain")
+            return
+        try:
+            with open(real, "rb") as fh:
+                data = fh.read()
+        except OSError as exc:
+            self._send(500, "could not read the wav: %s" % exc, "text/plain")
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "audio/wav")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
     def _serve_preview_asset(self, rel):
         """Serve a non-HTML file from the workspace for a previewed page."""
         rel = urllib.parse.unquote(rel or "").lstrip("/")
@@ -19831,6 +20405,12 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?")[0]
         if path == "/":
             self._send(200, PAGE, "text/html; charset=utf-8")
+        elif path == "/kokoro":
+            self._send(200, KOKORO_PAGE, "text/html; charset=utf-8")
+        elif path == "/api/kokoro/voices":
+            self._send(200, json.dumps(_kokoro_voices(), default=str))
+        elif path.startswith("/ttswav/"):
+            self._serve_tts_wav(path[len("/ttswav/"):])
         elif path == "/chat":
             # There is one page now. The old /chat link still works -
             # bookmarks and anything saved from an older transcript
@@ -19897,8 +20477,16 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/cheatengine":
             self._send(200, json.dumps(_cheat_engine_status_payload(), default=str))
         elif path == "/api/tts":
-            self._send(200, json.dumps({"enabled": tts_enabled(),
-                                        "folder": PIPER_DIR}))
+            # Reports whether Kokoro is actually installed rather than just
+            # where the folder would be. The toggle used to look fine with no
+            # model on disk and then fail on the first reply to speak, which is
+            # the worst moment to discover it.
+            _model, _voices, missing = _kokoro_paths()
+            self._send(200, json.dumps({
+                "enabled": tts_enabled(), "engine": "Kokoro-82M v1.0",
+                "folder": KOKORO_DIR, "model": KOKORO_MODEL,
+                "installed": not missing, "missing": missing,
+                "languages": "English only"}))
         elif path == "/api/models":
             payload = _public_models()
             # The thinking menu belongs to the active model, so it travels with
@@ -19955,6 +20543,7 @@ class Handler(BaseHTTPRequestHandler):
                             "/api/pick_workdir", "/api/chats",
                             "/api/answer", "/api/effort", "/api/eject",
                             "/api/tts", "/api/models", "/api/pick_model",
+                            "/api/kokoro/speak",
                             "/api/ctx", "/api/revert", "/api/forget_changes",
                             "/api/compact", "/api/attach", "/api/image",
                             "/api/fetch_image",
@@ -20083,6 +20672,18 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/tts":
                 enabled = set_tts_enabled(body.get("enabled"))
                 self._send(200, json.dumps({"ok": True, "enabled": enabled}))
+                return
+            if path == "/api/kokoro/speak":
+                # Reuses _tts_speak rather than reimplementing it, so the page
+                # and the tool cannot drift apart. play=False because the browser
+                # is about to play it itself - playing here too would talk over
+                # the user's own click.
+                out = _tts_speak(dict(body, play=False))
+                if out.get("error"):
+                    self._send(200, json.dumps(out, default=str))
+                    return
+                out["wav_url"] = "/ttswav/" + os.path.basename(out["wav"])
+                self._send(200, json.dumps(out, default=str))
                 return
             if path == "/api/models":
                 action = str(body.get("action") or "select").strip().lower()

@@ -29,7 +29,11 @@ mcp-for-blender
 # a one-off `playwright install chromium` as well.
 playwright
 
-# Local neural TTS                   -> tts_speak, tts_voices (Piper + playback)
-piper-tts
+# Local neural TTS                   -> tts_speak, tts_voices, /kokoro (Kokoro-82M)
+# kokoro-onnx pulls espeakng-loader and phonemizer, which it needs to turn text
+# into the phonemes the model was trained on. The weights are separate and are
+# NOT here: run `python kokoro\download_model.py` once (~340 MB).
+kokoro-onnx
 onnxruntime
+numpy
 sounddevice

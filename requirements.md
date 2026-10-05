@@ -36,21 +36,30 @@ system-level optionals (Docker, WSL2, Blender MCP).
 | `websocket-client` | WebSocket client | `ws_test` |
 | `beautifulsoup4` | page parsing | `tools/scraper.py` |
 | `pytesseract` | OCR | `tools/ocr.py`, plus the `click_text` and `wait_for(kind=screen_text)` tools *(engine too: Tesseract OCR, see below)* |
-| `piper-tts` + `onnxruntime` | local neural speech synthesis (Piper engine) | `tts_speak`, `tts_voices` |
+| `kokoro-onnx` + `onnxruntime` | local neural speech synthesis (Kokoro-82M v1.0) | `tts_speak`, `tts_voices`, the `/kokoro` page |
 | `sounddevice` | plays the synthesized WAV straight to the speakers (bundled PortAudio - no media player involved) | playback half of `tts_speak`; falls back to `winsound` on Windows and `paplay`/`aplay`/`ffplay` on Linux |
 
 Install everything with: `pip install -r requirements.txt -r tools\requirements.txt`
 (pywin32 in `requirements.txt` is marked Windows-only with a PEP 508 marker, so
 `pip` on Linux skips it automatically).
 
-> **Piper voices**: the pack lives in `piper\` (inside the project). The
-> `.onnx` + `.onnx.json` model files are **not** committed (too large) - fetch
-> them once with `python piper\download_voices.py` (English + Romanian). Drop
-> any other `<voice>.onnx` pair in `piper\` and use it via the `voice`
-> parameter. Point elsewhere with the `PC_PIPER_DIR` environment variable.
+> **Kokoro weights**: they live in `kokoro\` (inside the project) and are **not**
+> committed — `kokoro-v1.0.onnx` is 310 MB and `voices-v1.0.bin` is 27 MB. Fetch
+> them once with `python kokoro\download_model.py`. Pass `--model int8` for a
+> 109 MB quantised model instead, or `--model fp16` for 156 MB. Point elsewhere
+> with `PC_KOKORO_DIR`, and choose the file with `PC_KOKORO_MODEL`.
 >
-> TTS is **off by default**: the model only speaks after you click the
-> **TTS** button in the header (state is per-run, resets on restart).
+> `kokoro-onnx` brings `espeakng-loader` and `phonemizer` with it; those are the
+> text-to-phoneme step and are not optional extras.
+>
+> **English only.** The voices file carries styles for a dozen languages, but
+> this app offers the American and British ones (`af_*`, `am_*`, `bf_*`, `bm_*`).
+> Kokoro publishes no Romanian styles, so the Piper `ro_RO-*` voices that used to
+> ship with the project are gone with no replacement.
+>
+> TTS in the chat is **off by default**: replies only speak after you click the
+> **TTS** button in the header (state is per-run, resets on restart). The
+> `/kokoro` page always plays in the browser and ignores that toggle.
 
 | Package | Powers |
 |---|---|
@@ -76,8 +85,9 @@ OPTIONALS.cmd        installs Docker/WSL2/Blender-MCP system optionals (Windows)
 requirements.md      this file
 requirements.txt     optional Python packages (see table above)
 tools/               helper scripts (screenshot, clipboard, scraper, ocr)
-piper/               Piper TTS: tts.py + download_voices.py (voice models are
-                     git-ignored - run `python piper\download_voices.py` once)
+kokoro/               Kokoro TTS: download_model.py (the .onnx model and the
+                     voices file are git-ignored - run
+                     `python kokoro\download_model.py` once)
 tools.json           machine-readable tool reference (auto-generated from code)
 instructions.txt     what BONSAI knows about itself
 README.md            the full manual

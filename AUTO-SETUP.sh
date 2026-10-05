@@ -229,13 +229,13 @@ step_modelsjson() {
 
 step_voices() {
     need_py || return
-    say ""; say "== Piper TTS voices =="
-    if ls piper/*.onnx >/dev/null 2>&1; then
-        ok "voices already present in ./piper"
+    say ""; say "== Kokoro TTS model =="
+    if [ -f kokoro/voices-v1.0.bin ]; then
+        ok "model already present in ./kokoro"
         return
     fi
-    say "  Downloading one small voice..."
-    "$PY" piper/download_voices.py || warn "download_voices.py failed - run it again later."
+    say "  Downloading the model (~340 MB, once)..."
+    "$PY" kokoro/download_model.py || warn "download_model.py failed - run it again later."
 }
 
 step_verify() {
@@ -253,8 +253,8 @@ step_verify() {
         || warn "tkinter missing - folder pickers will do nothing"
     "$PY" -c "import pytesseract" >/dev/null 2>&1 && ok "pytesseract" \
         || warn "pytesseract missing - click_text / screen_text unavailable"
-    "$PY" -c "import piper, onnxruntime, sounddevice" >/dev/null 2>&1 && ok "piper + onnxruntime (local TTS)" \
-        || warn "local TTS not installed - Piper voices will not play"
+    "$PY" -c "import kokoro_onnx, onnxruntime, sounddevice" >/dev/null 2>&1 && ok "kokoro-onnx + onnxruntime (local TTS)" \
+        || warn "local TTS not installed - Kokoro will not speak"
     command -v tesseract >/dev/null 2>&1 && ok "tesseract binary" \
         || warn "tesseract binary missing - install tesseract-ocr"
     say ""
@@ -317,7 +317,7 @@ menu() {
     say "    7  Check the model files are here   .gguf"
     say "    8  Create API KEYS.txt              secrets"
     say "    9  Create models.json               model list"
-    say "    v  Piper TTS voices                 ./piper"
+    say "    v  Kokoro TTS model                 ./kokoro"
     say ""
     say "  OTHER"
     say "    a  Run everything recommended      ($ALL)"

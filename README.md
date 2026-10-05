@@ -276,7 +276,7 @@ what you will use.
 | 3 | Docker Desktop | ~600 MB | needs item 4, and a reboot |
 | 4 | WSL2 + VM Platform | — | Docker's backend; reboot required |
 | 5 | Windows stability | — | long paths, a 48–96 GB page file |
-| 6 | Local image generation | ~13 GB | Qwen-Image 2.1 weights |
+| 6 | Local image generation | ~17 GB | Qwen-Image 2.1 weights |
 | 7 | Browser engine | small | Playwright, for screenshots of web pages |
 
 ```
@@ -289,7 +289,7 @@ what you will use.
     3  Docker Desktop             docker_* tools         ~600 MB (needs 4)
     4  WSL2 + VM Platform         Docker's backend       reboot
     5  Windows stability          long paths, page file  admin
-    6  Local image generation     Qwen-Image 2.1         ~13 GB
+    6  Local image generation     Qwen-Image 2.1         ~17 GB
     7  Browser engine             page screenshots       small
     a  Run everything that is missing
     x  Quit
@@ -298,6 +298,39 @@ what you will use.
 On Linux, steps 1–7 of `AUTO-SETUP.sh` cover the same ground with the system
 package manager, including `grim` for screenshots on Wayland — which `scrot` and
 ImageMagick cannot do.
+
+### Text to speech — Kokoro
+
+Speech is [Kokoro-82M v1.0](https://github.com/hexgrad/kokoro) running locally
+through `kokoro-onnx`. Two parts, like the image model:
+
+```bash
+pip install kokoro-onnx          # code; pulls espeakng-loader + phonemizer
+python kokoro\download_model.py  # weights, ~340 MB, once
+```
+
+`--model int8` fetches a 109 MB quantised model instead of the 310 MB fp32 one,
+`--model fp16` a 156 MB one. The engine loads once and stays resident, so the
+second reply to speak costs about a second rather than a reload.
+
+**English only.** The voices file ships styles for a dozen languages; this app
+offers the 28 American and British ones (`af_*`, `am_*`, `bf_*`, `bm_*`).
+**There is no Romanian** — Kokoro publishes no `ro_` styles, so the `ro_RO-*`
+voices that used to ship with the project are gone with no replacement.
+
+| | |
+|---|---|
+| **Output** | 24 kHz mono WAV, written to `out\tts\` |
+| **Voices** | `tts_voices` lists them; default `af_sarah` |
+| **Speed** | `tts_speak` takes `speed` from 0.5× to 2× |
+| **Playback** | `sounddevice`, falling back to `winsound` / `paplay` / `aplay` / `ffplay` |
+
+**A page for trying voices.** <http://127.0.0.1:8081/kokoro> — type something,
+pick a voice, drag the speed, hear it. It always plays in the browser and so
+ignores the header TTS toggle.
+
+Speech in the chat is **off by default**: replies only speak after you click the
+**TTS** button in the header, and that state resets on restart.
 
 ---
 
@@ -335,39 +368,49 @@ this file).
 
 ## 9. Image generation
 
-Text to image, locally, through stable-diffusion.cpp with a distilled
-few-step checkpoint (Qwen-Image 2.1 Viggle turbo).
+Text to image, locally, through stable-diffusion.cpp with the **uncensored**
+Qwen-Image 2.1 (`UC` in the filename means uncensored).
 
 ```bash
-python tools/fetch_image_model.py     # ~13 GB, once
+python tools/fetch_image_model.py     # ~17 GB, once
 ```
 
-**How it is configured, and why.** This model is distilled: it runs in 6 steps
-with **no classifier-free guidance**. Two things follow from that, and both matter:
+**How it is configured, and why.** This is the full 7B model, not a distilled
+few-step one, so the settings are the ordinary ones:
 
-- `cfg-scale` is **1.0**. The old value of 6.0 was left over from the 40-step base
-  model and made every picture look overcooked — clipped skies, crushed shadows,
-  water pushed to neon.
-- The **sigma schedule is passed explicitly**. The engine's default is evenly
-  spaced; this model was distilled against a schedule with the nodes bunched at
-  the low-noise end. It ends in `0.0` — n+1 values for n steps. Leaving that off
-  makes the engine sample one step short and produce noise rather than a picture.
+- **40 steps by default** (`IMAGE_DEFAULT_STEPS`), clamped to 10–80. That is the
+  step count the model documents. On a base model, unlike a distilled one, more
+  steps genuinely refines the picture rather than oversampling it — so raising
+  it is a real option if you want to spend the time.
+- **`cfg-scale` is 6.0** (`IMAGE_CFG`). The checkpoint that used to be the
+  default was distilled with no classifier-free guidance and wanted 1.0; this one
+  does not, and sampling it at 1.0 would quietly ignore your prompt.
+- **No explicit sigma schedule.** The engine picks a resolution-dependent flow
+  schedule itself for this architecture, and the spacing depends on the pixel
+  count. Passing a schedule overrides the one choice it is better placed to make.
 
-**Live preview.** Every sampling step writes a preview, so you watch the picture
-form. This needs a tiled decode (`--vae-tiling`): the preview decode runs while
-the diffusion model is still resident, so it has less memory than the final decode
-and fails without tiling at anything above about 1.3 megapixels.
+A **negative prompt is still ignored** — not because guidance is off, but because
+the model's own recipe leaves it empty. Say what you don't want in the prompt.
 
-**Cost.** At the 1920×1088 base that is roughly **240 s per image** with a preview
-every ~28 s. If you would rather have ~155 s and a preview every ~15 s, set the
-base back to 1536×864.
+**Live preview.** A preview is written every 5th step, so a 40-step run shows
+steps 5, 10, 15 … 40. This needs a tiled decode (`--vae-tiling`): the preview
+decode runs while the diffusion model is still resident, so it has less memory
+than the final decode and fails without tiling at anything above about 1.3
+megapixels.
+
+**Cost.** At the 1920×1088 base that is roughly **10 minutes per image** —
+about 40 s to read the weights, ~9 s a sampling step, and ~24 s per preview
+decode. If you would rather have roughly half that, set the base frame to
+1536×864; the preview decode is what dominates, and it scales with pixel count.
 
 **Output.** One file per generation, delivered at 1440p on the short edge — so
 16:9 lands at 2541×1440, and a 16:9 source that is not a whole number of 32-pixel
 steps is 0.7% narrow. The engine's raw output is not kept beside it.
 
-**VRAM.** At 2.09 megapixels this wants the whole card. A game holding 11 GB will
-stop it. Close other GPU work before generating.
+**VRAM.** At 2.09 megapixels this wants the whole card, and the Q8_0 diffusion
+weights are 7.07 GiB on their own. A game holding 11 GB will stop it. Close other
+GPU work before generating. Dropping the diffusion model to Q4_0 in
+`tools/fetch_image_model.py` saves 3.2 GiB at some cost in quality.
 
 ---
 
@@ -442,6 +485,18 @@ Check whether it says DuckDuckGo is rate limiting. If so, wait — it clears its
 **Windows says the path is too long.**
 `OPTIONALS` item 5. Long paths need a sign-out to take effect.
 
+**Nothing speaks.**
+Speech is off until you click the **TTS** button in the header, and that resets on
+restart. If the toggle is on and it is still silent, check `GET /api/tts` — it
+reports `installed` and what is `missing`. Two separate installs are involved and
+people usually only do the first: `pip install kokoro-onnx` for the code, then
+`python kokoro\download_model.py` for the 340 MB of weights.
+
+**A voice name is rejected.**
+Kokoro names are like `af_sarah`, not Piper's `en_US-lessac-medium`, and only
+English styles exist here. `tts_voices` lists them. A Piper-era name is stripped
+of its `.onnx` and then reported as unknown rather than silently accepted.
+
 ---
 
 ## 13. Repository layout
@@ -461,8 +516,8 @@ BonsaiAsistent/
 ├── models.example.json        template - committed, no paths or keys
 │
 ├── tools/                     helper scripts and their requirements
-├── piper/                     Piper TTS voices (downloaded)
-├── image_models/              Qwen-Image weights (downloaded, ~13 GB)
+├── kokoro/                    Kokoro TTS (downloaded, ~340 MB)
+├── image_models/              Qwen-Image weights (downloaded, ~17 GB)
 ├── sd.cpp/                    stable-diffusion.cpp (downloaded)
 │
 ├── requirements.txt           every optional Python package
@@ -474,10 +529,10 @@ BonsaiAsistent/
 ```
 
 **Not in the repo, by design:** model weights (6–7 GB each), image model weights
-(~13 GB), the llama.cpp binaries, the inference engine, `API KEYS.txt`,
-`models.json`, chat history, and generated images. The `.gitignore` is explicit
-about each, and the `.example` files exist so the *shape* of the two config files
-is versioned without their contents.
+(~17 GB), the Kokoro TTS weights (~340 MB), the llama.cpp binaries, the inference
+engine, `API KEYS.txt`, `models.json`, chat history, and generated images. The
+`.gitignore` is explicit about each, and the `.example` files exist so the
+*shape* of the two config files is versioned without their contents.
 
 ---
 
@@ -503,5 +558,13 @@ the handful of tools that say so.
 ## 15. License
 
 See `LICENSE`. The local model, the image model and the engine each carry their
-own licences — note in particular that Qwen-Image derivatives are
-**non-commercial, research use only**.
+own licences, and for image generation the terms belong to the checkpoint rather
+than to upstream.
+
+The diffusion weights fetched by `tools/fetch_image_model.py` are
+`abenzerps/Qwen-Image-2.1-Uncensored-GGUF` — a third-party uncensored fine-tune
+of `Qwen/Qwen-Image-2.1`, published under a custom licence (`license: other`),
+not the upstream one. Treat it as **not cleared for commercial use** and read the
+model card before you rely on it for anything; an "uncensored" checkpoint carries
+extra obligations of its own on top of whatever the base model requires. The text
+encoder and VAE are Qwen's own and carry Qwen's terms.

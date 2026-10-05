@@ -793,7 +793,7 @@
       <div class="scopelist" id="scopelist"></div>
       <button class="btn-ghost scopeclear" id="scopeclear" title="Forget every approved and denied path">CLEAR APPROVALS</button>
       <div class="foot-row rail">
-        <button class="ibtn" id="ttsbtn" aria-label="Text to speech" title="Text-to-speech (Piper) - speak replies aloud. Off by default."><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9v6h4l5 4V5L8 9H4z"/><path d="M17 8.5a5 5 0 0 1 0 7"/><path d="M19.5 6a8.5 8.5 0 0 1 0 12"/></svg></button>
+        <button class="ibtn" id="ttsbtn" aria-label="Text to speech" title="Text-to-speech (Kokoro) - speak replies aloud. Off by default."><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9v6h4l5 4V5L8 9H4z"/><path d="M17 8.5a5 5 0 0 1 0 7"/><path d="M19.5 6a8.5 8.5 0 0 1 0 12"/></svg></button>
         <button class="ibtn" id="detailbtn" aria-label="Detail level" title="Show each step in the chat as one collapsed line, or fully expanded"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h10"/></svg></button>
         <button class="ibtn" id="themebtn" aria-label="Toggle theme" title="Switch between the light and dark theme"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4.2"/><path d="M12 2.6v2.2M12 19.2v2.2M2.6 12h2.2M19.2 12h2.2M5.4 5.4l1.6 1.6M17 17l1.6 1.6M18.6 5.4L17 7M7 17l-1.6 1.6"/></svg></button>
         <button class="ibtn warn" id="ejectbtn" aria-label="Eject the model" title="Stop the model server now and free its RAM/VRAM (it restarts automatically on the next message)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3.5v8"/><path d="M6.6 7.2a7.5 7.5 0 1 0 10.8 0"/></svg></button>
@@ -3588,7 +3588,7 @@ document.getElementById('ejectbtn').onclick = function () {
       setTimeout(function () { btn.textContent = 'EJECT'; btn.disabled = false; btn.style.opacity = '1'; }, 2500);
     });
 };
-/* ---------- TTS toggle (Piper) ---------- */
+/* ---------- TTS toggle (Kokoro) ---------- */
 function renderTtsBtn(j) {
   const el = document.getElementById('ttsbtn');
   if (!el) return;
@@ -3597,7 +3597,7 @@ function renderTtsBtn(j) {
   const on = !!j.enabled;
   el.classList.toggle('on', on);
   const what = on ? 'speech is on' : 'speech is off';
-  el.title = 'Text-to-speech (Piper) - ' + what + ', click to change';
+  el.title = 'Text-to-speech (Kokoro) - ' + what + ', click to change';
   el.setAttribute('aria-label', 'Text to speech (' + what + ')');
 }
 function refreshTts() {

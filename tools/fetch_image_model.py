@@ -2,12 +2,27 @@
 
 Three files, not one. Qwen-Image 2.1 is a diffusion transformer plus a
 Qwen3-VL-8B text encoder plus its own VAE, and all three have to be present or
-nothing runs. The text encoder is 8.71 GB of the 13.2 GB total, which surprises
+nothing runs. The text encoder is 8.71 GiB of the 15.6 GiB total, which surprises
 people who expect a "4 GB model".
 
     python tools\\fetch_image_model.py
 
 Resumable: an interrupted transfer continues rather than starting over.
+
+QUANTISATION. The diffusion model is fetched at Q8_0, which is what
+IMAGE_DIFFUSION_FILE in bonsai_web.py names as the default - so a fresh install
+ends up with the same file this repository already documents as the one in use.
+The same repository publishes Q4_0, Q4_K_M, Q5_K_M and Q6_K of the same
+uncensored model, and the app will run any of them: it matches on
+"qwen-image-2.1-uc" and ignores the quantisation, so trading quality for disk
+or VRAM is a one-line change to FILES below rather than a code change. Q4_0 is
+3.87 GiB against Q8_0's 7.07, which is worth knowing on a small card.
+
+NOTE the two families in that repository. It carries the uncensored
+qwen-image-2.1-UC-*.gguf AND the plain qwen-image-2.1-*.gguf. This fetches the
+UC ones deliberately - they are the point - and the plain ones are not fetched
+at all, so there is no risk of the app picking up censored weights that happen
+to sort first.
 """
 import os
 import sys
@@ -21,7 +36,7 @@ DEST = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
 
 # (path in the repo, subfolder here, expected size in bytes)
 FILES = [
-    ("qwen-image-2.1-UC-Q4_0.gguf", "diffusion", 4156276736),
+    ("qwen-image-2.1-UC-Q8_0.gguf", "diffusion", 7591557920),
     ("vae/qwen_image_2.1_vae_bf16.safetensors", "vae", 676331008),
     ("text_encoders/qwen3vl_8b_int8_convrot.safetensors", "text_encoder",
      9353002496),
