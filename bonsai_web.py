@@ -7042,10 +7042,13 @@ TTS_SPEAK_TOOL = {
                                                           "'Dr' or 'kg'."},
                 "voice": {"type": "string",
                           "description": "Kokoro voice name, default 'af_sarah'. "
-                                         "American: af_* or am_*. British: "
-                                         "bf_* or bm_*. Try am_michael, "
-                                         "bf_emma, af_bella. List them all "
-                                         "with tts_voices."},
+                                         "The ones worth trying first are "
+                                         "bf_lily, af_nova, af_sky and "
+                                         "af_heart - reach for those before "
+                                         "picking anything else. American: "
+                                         "af_* or am_*. British: bf_* or bm_*. "
+                                         "All 28 English voices are available; "
+                                         "list them with tts_voices."},
                 "speed": {"type": "number",
                           "description": "Speaking rate, 0.5 to 2.0, default 1.0. "
                                          "Above 1 is faster and below 1 slower. "
@@ -12249,6 +12252,16 @@ def _kokoro_start_reaper():
 _KOKORO_LANG_PREFIX = {"af": "American female", "am": "American male",
                        "bf": "British female", "bm": "British male"}
 KOKORO_DEFAULT_VOICE = "af_sarah"
+# Voices to put in front of the user. All 28 are installed and reachable either
+# way - this only decides what is offered first and what the model is told to
+# try - so it is a preference, not a restriction. Ordered as given rather than
+# alphabetised, because the order is the recommendation.
+#
+# Filtered against the installed set at use, not trusted blindly: a name here
+# that the voices file does not carry would otherwise be advertised to the model
+# and then refused at synthesis time, which is the worst way for a shortcut to
+# fail. _kokoro_voice_list drops any that are missing.
+KOKORO_FAVOURITES = ("bf_lily", "af_nova", "af_sky", "af_heart")
 
 
 def _env_seconds(name, default):
@@ -12337,16 +12350,22 @@ def _kokoro_engine():
 
 
 def _kokoro_voice_list(engine):
-    """English voice names, prettiest-first, with their accent/sex labels."""
+    """English voice names: default first, then the favourites, then the rest.
+
+    Only the English af/am/bf/bm styles - see _KOKORO_LANG_PREFIX for why that
+    filter exists rather than trusting a fixed list of 28.
+    """
     names = []
     for name in engine.get_voices():
         prefix = str(name).split("_", 1)[0].lower()
         if prefix in _KOKORO_LANG_PREFIX:
             names.append(name)
-    if KOKORO_DEFAULT_VOICE in names:
-        names.remove(KOKORO_DEFAULT_VOICE)
-        names.insert(0, KOKORO_DEFAULT_VOICE)
-    return names
+    favs = [f for f in KOKORO_FAVOURITES if f in names]
+    rest = sorted(n for n in names
+                  if n not in favs and n != KOKORO_DEFAULT_VOICE)
+    ordered = ([KOKORO_DEFAULT_VOICE] if KOKORO_DEFAULT_VOICE in names
+               else []) + favs + rest
+    return ordered
 
 
 def _kokoro_voices():
@@ -12373,10 +12392,13 @@ def _kokoro_voices():
             "languages": "English only",
             "sample_rate": KOKORO_SAMPLE_RATE,
             "voices": names,
+            "default_voice": KOKORO_DEFAULT_VOICE,
+            "favourites": [f for f in KOKORO_FAVOURITES if f in names],
             "voices_labelled": [
                 {"name": n,
                  "accent": _KOKORO_LANG_PREFIX.get(n.split("_", 1)[0].lower(),
                                                    "?"),
+                 "favourite": n in KOKORO_FAVOURITES,
                  "default": n == KOKORO_DEFAULT_VOICE}
                 for n in names]}
 
@@ -14549,23 +14571,31 @@ async function loadVoices() {
   }
   if (data.error) { setStatus(data.error, true); return; }
 
-  const sel = $('voice');
+const sel = $('voice');
   sel.textContent = '';
   for (const v of data.voices_labelled) {
     const o = document.createElement('option');
+    /* Favourites are starred rather than moved: the picker is already ordered
+       default-first-then-favourites by the server, so a star here just explains
+       why the top of the list is the top of the list. */
+    let label = v.name.replace(/_/g, ' ') +
+      (v.default ? '  (default)' : '') + (v.favourite ? '  \\u2605' : '') +
+      '  \\u00b7 ' + v.accent;
     o.value = v.name;
-    o.textContent = v.name.replace(/_/g, ' ') +
-      (v.default ? '  (default)' : '') + '  \\u00b7 ' + v.accent;
+    o.textContent = label;
     sel.appendChild(o);
   }
 
-  // Grouped by accent so the list reads as four families rather than 28 names.
+  /* Grouped by accent so the list reads as four families rather than 28 names. */
   const byAccent = {};
   for (const v of data.voices_labelled) {
-    (byAccent[v.accent] = byAccent[v.accent] || []).push(v.name.replace(/_/g, ' '));
+    (byAccent[v.accent] = byAccent[v.accent] || []).push(v);
   }
   $('vlist').innerHTML = Object.keys(byAccent).map(function (a) {
-    return '<div><b>' + a + '</b> \\u2014 ' + byAccent[a].join(', ') + '</div>';
+    const names = byAccent[a].map(function (v) {
+      return v.name.replace(/_/g, ' ') + (v.favourite ? ' \\u2605' : '');
+    });
+    return '<div><b>' + a + '</b> \\u2014 ' + names.join(', ') + '</div>';
   }).join('');
 
   setStatus(data.engine + ' \\u00b7 ' + data.model + ' \\u00b7 English only');
