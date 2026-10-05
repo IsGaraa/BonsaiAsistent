@@ -1,5 +1,5 @@
 <!-- GPT UI (PAGE_GPT) - the page served at /chat, copied verbatim from a
-     running bonsai_web.py at commit dc19fe2.
+     running bonsai_web.py at commit c741f27.
 
      bonsai_web.py is the source of truth. This file is a read-only copy so
      the UI can be opened in an editor without wading through the Python;
@@ -1998,7 +1998,13 @@ function callImageList(c) {
   if (!c) return [];
   const r = c.result || {};
   const many = c.previews || r.previews;
-  if (Array.isArray(many) && many.length) return many.filter(imgSrcAllowed);
+  /* Only take the list when something in it survives the filter. Returning an
+     emptied filter as the answer meant a previews array of unusable entries
+     silently hid the one good source on the call itself. */
+  if (Array.isArray(many) && many.length) {
+    const ok = many.filter(imgSrcAllowed);
+    if (ok.length) return ok;
+  }
   const one = callImageSrc(c);
   return one && imgSrcAllowed(one) ? [one] : [];
 }
@@ -2054,8 +2060,19 @@ function addToolLog(container, calls) {
   const shots = document.createElement('div'); shots.className = 'shots';
   let shotCount = 0;
   (calls).forEach(function (c) {
-    if (!callImageSrc(c)) return;
-    shots.appendChild(shotCardDom(c));
+    /* Ask the producer, not a cheaper question about the same data. The gate used
+       to be callImageSrc(c), which is only the FIRST way an image can be named:
+       anything truthy opened the gate, then shotCardDom ran its own list and
+       returned null for a source imgSrcAllowed rejects. That null went into
+       appendChild unguarded, so the TypeError unwound out of addAsst and every
+       later step of the reply row was skipped - including placeSpokenBlocks,
+       which is why a saved tts_speak showed no spoken block at all until some
+       later turn happened to redraw the row. A saved download_file carried
+       {"audio":{"sample_rate":22050}...} in result.preview and did exactly that.
+       shotCardDom's own verdict is the only one that cannot disagree with it. */
+    const card = shotCardDom(c);
+    if (!card) return;
+    shots.appendChild(card);
     shotCount++;
   });
   if (shotCount) container.insertBefore(shots, d);
@@ -2340,19 +2357,21 @@ function queueSpoken(calls) {
   while (_pendingSpoken.length > 8) _pendingSpoken.shift();
 }
 function drainSpoken(bubble) {
-  if (!bubble || !bubble.parentNode) return;
-  /* The queue first, then the turn's own calls as a reconciliation. The queue
-     is the intent - "this speech is waiting for a home" - but on the first call
-     of a turn it could be emptied by whatever claimed the row first, and the
-     text then went nowhere while everything else looked healthy. liveCalls is
-     this turn's authoritative list, so if the queue is dry and this bubble has
-     prose with no block in it yet, the calls are simply read again and drawn.
+  if (!bubble || !bubble.parentNode || !_pendingSpoken.length) return;
+  /* ONLY the queue. It used to fall back to liveCalls when the queue was dry,
+     as a reconciliation for the first call of a turn - and that was wrong in a
+     way nothing caught. liveCalls is every call of the whole turn, so a second
+     reply row drained it and drew the FIRST speech again: two bubbles, the same
+     sentence in both, the same duration, the wrong text attributed to the
+     second turn. It also reached into history, where liveCalls still held the
+     previous conversation's calls and painted those over a loaded chat.
 
-     Per-bubble dedupe means reconciling costs nothing and cannot double up. */
-  let source = _pendingSpoken;
-  if (!source.length) source = (typeof liveCalls !== 'undefined' && liveCalls) || [];
-  if (!source.length) return;
-  placeSpokenBlocks(source, bubble);
+     Per-bubble dedupe cannot help: a wrong call id has never been seen in that
+     bubble, so it is not a duplicate by the only measure available. The queue is
+     the sole live source, and a saved chat's blocks come from addAsst reading
+     that message's OWN calls - which is the only place a row's text can be
+     known to belong to it. */
+  placeSpokenBlocks(_pendingSpoken, bubble);
   _pendingSpoken.length = 0;
 }
 
@@ -2366,9 +2385,19 @@ function addAsst(text, calls, reason, stats, entry) {
   const b = document.createElement('div'); b.className = 'bbub';
   if (reason) addReasonBox(b, reason, false);
   if (calls && calls.length) {
-    const pills = document.createElement('div'); pills.className = 'toolsline';
-    renderLivePills(pills, calls); b.appendChild(pills);
-    addToolLog(b, calls);
+    /* The tool log is a collapsed diagnostic panel, not the reply. It must not be
+       able to take the reply down with it, and it kept doing exactly that: any
+       throw inside it unwound out of addAsst before the row was even in the
+       document, so the text, the spoken block and the speak button all vanished
+       together and looked like a model that had answered nothing. Caught here,
+       loudly, rather than papered over - the console keeps the stack. */
+    try {
+      const pills = document.createElement('div'); pills.className = 'toolsline';
+      renderLivePills(pills, calls); b.appendChild(pills);
+      addToolLog(b, calls);
+    } catch (err) {
+      console.error('bonsai: tool log failed to render, reply kept', err);
+    }
   }
   const inner = document.createElement('div'); inner.className = 'abody'; inner.innerHTML = fmt(text) || '';
   b.appendChild(inner);
