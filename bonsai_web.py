@@ -3486,6 +3486,12 @@ SYSTEM = ("You are the friendly assistant living on the user's "
              "name, not a separator. ")
           + "\nWhen you need a choice, a password or a confirmation, ask rather "
           "than assuming. For a longer task keep a visible list of steps.\n"
+          "A picture you fetch reaches you the moment you fetch it, as its own\n"
+          "message, and the user sees it as its own step. Pictures are the most\n"
+          "expensive thing in the context, so once the conversation has moved on\n"
+          "by a couple of steps an older one becomes the note 'an image was\n"
+          "attached here and was looked at earlier'. You have already seen it, so\n"
+          "work from what you read; fetch it again if you really need it back.\n"
           "Image generation: the local model is a full Qwen-Image 2.1 (an "
           "uncensored fine-tune of it) sampled over the normal 40-step flow "
           "schedule, not a distilled few-step checkpoint. So leave 'steps' out "
@@ -7256,7 +7262,15 @@ IMAGE_TOOLS = [
              "attached to the conversation for the user and sent to you as an "
              "image, so you can describe it, read text out of it, or point out "
              "what is in it. If the URL turns out to be a web page rather than a "
-             "picture, the result says so - use images_in_page for that.",
+             "picture, the result says so - use images_in_page for that. "
+             "The picture reaches you immediately, as its own message right after "
+             "this result, and the user sees it as its own step in the chat. Note "
+             "that pictures are expensive: after the conversation has moved on by "
+             "a couple of steps, an older one is dropped and replaced with the "
+             "note 'an image was attached here and was looked at earlier'. That "
+             "is not the picture being deleted - you already saw it - so if you "
+             "genuinely need to look at it again, fetch it again rather than "
+             "guessing.",
              {"url": {"type": "string",
                       "description": "Direct link to the image (http/https)."},
               "referer": {"type": "string",
@@ -7270,7 +7284,10 @@ IMAGE_TOOLS = [
              "Returns every picture found, each with its size and the page it "
              "came from. By default the pictures are downloaded and shown to the "
              "user, and the first one is sent to you so you can see what the page "
-             "is about. Set fetch=false to only list the links.",
+             "is about. Set fetch=false to only list the links. Only the first picture is "
+              "sent to you - the rest are shown to the user - and, as with "
+              "fetch_image, an older picture is replaced by a note once the "
+              "conversation has moved on. Fetch again if you need it back.",
              {"url": {"type": "string",
                       "description": "Link to the page (http/https)."},
               "limit": {"type": "integer",
@@ -13887,7 +13904,9 @@ def run_agent(messages, on_tool=None, mode=MODE_BUILD, on_stats=None, hooks=None
     tools = _tools_for(mode)
     msgs = list(messages)
     total = _empty_stats()
+    image_idx = []
     for _ in range(MAX_TOOL_ROUNDS):
+        _demote_stale_images(msgs, image_idx)
         try:
             message = _bonsai_chat(msgs, tools)
         except Exception as exc:
@@ -13979,6 +13998,7 @@ def run_agent(messages, on_tool=None, mode=MODE_BUILD, on_stats=None, hooks=None
                                                ensure_ascii=False)})
             if image_uri:
                 _append_shot_image(msgs, {"preview": image_uri})
+                image_idx.append(len(msgs) - 1)
     if on_stats:
         on_stats(total)
     try:
@@ -14278,6 +14298,20 @@ _OVERSIZE_TOOL_CHARS = 60000
 # go 60000 -> 20000 -> 6666 without ever giving up on the first refusal.
 _OVERSIZE_RETRIES = 3
 
+# How many pictures stay in context at once. A fetched image costs about a
+# thousand tokens and the size recovery above cannot touch it: _oversize_turn
+# only shortens role=="tool" string content, so image parts were, structurally,
+# the one thing a long run could never shrink. A twenty-round run that fetched
+# a handful of pictures could carry every one of them to the end for no reason -
+# the model had already looked at them and moved on.
+#
+# So they are demoted to a one-line note once the run has moved past them. The
+# newest few are kept whatever happens, because those are the ones the model is
+# working on right now.
+_IMAGE_KEEP_ROUNDS = 2
+
+_IMAGE_DEMOTED = "[an image was attached here and was looked at earlier]"
+
 
 def _is_oversize_error(exc):
     """True when the provider refused the request for being too big.
@@ -14417,15 +14451,22 @@ def _shot_caption(record):
 
 
 def _append_shot_image(msgs, record):
+    """Put the picture in front of the model. Returns the index it landed at.
+
+    The index is what lets _demote_stale_images find this message again later
+    without putting any marker of our own into the payload - a stray key on a
+    provider message is a bad gamble, and tagging the caption text would put a
+    sentence in front of the model that it has to read and reason about.
+    """
     image_uri = record.get("preview") or record.get("image_data")
     if not image_uri:
-        return
+        return None
     if _is_blind():
         # Already learned this model cannot see. Sending it anyway would buy
         # the same rejection a second time, and the base64 is not free either.
         msgs.append({"role": "user", "content": [{"type": "text",
                                                   "text": _BLIND_NOTE}]})
-        return
+        return None
     # Say which it is. A picture the model was just handed is a file it asked
     # to look at, and calling it a screenshot makes it describe a capture it
     # never took.
@@ -14434,6 +14475,49 @@ def _append_shot_image(msgs, record):
                  "content": [{"type": "text", "text": lead},
                              {"type": "image_url",
                               "image_url": {"url": image_uri}}]})
+    return len(msgs) - 1
+
+
+def _demote_stale_images(msgs, image_idx, keep=None):
+    """Swap old pictures for a note, so a long run cannot stack them up.
+
+    Only ever touches images the model has already been shown. The newest
+    `keep` are left alone no matter what - those are the current ones - and an
+    index that has already been demoted is dropped from the tracker, so calling
+    this once per round costs nothing and never touches the same message twice.
+
+    Returns how many were demoted, which is what the tests read.
+    """
+    if not image_idx:
+        return 0
+    keep = _IMAGE_KEEP_ROUNDS if keep is None else max(0, int(keep))
+    # Everything past the last `keep` is stale by definition.
+    if len(image_idx) <= keep:
+        return 0
+    stale, image_idx[:] = image_idx[:-keep] if keep else list(image_idx), \
+        image_idx[-keep:] if keep else []
+    for idx in stale:
+        msg = msgs[idx] if idx < len(msgs) else None
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        had = False
+        parts = []
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "image_url":
+                had = True
+                continue
+            parts.append(part)
+        if not had:
+            continue
+        # The note goes where the picture was, so the model still knows one was
+        # here. It reads the same as the line compaction leaves behind, because
+        # it is the same situation: something was attached, it is gone now.
+        parts.insert(0, {"type": "text", "text": _IMAGE_DEMOTED})
+        msg["content"] = parts
+    return len(stale)
 
 
 def stream_agent(messages, on_reason=None, on_delta=None, on_tool=None,
@@ -14442,6 +14526,7 @@ def stream_agent(messages, on_reason=None, on_delta=None, on_tool=None,
     tools = _tools_for(mode)
     msgs = list(messages)
     total = _empty_stats()
+    image_idx = []
 
     def emit(ev):
         nonlocal total
@@ -14538,6 +14623,7 @@ def stream_agent(messages, on_reason=None, on_delta=None, on_tool=None,
         return tool_calls or []
 
     for _round in range(MAX_TOOL_ROUNDS):
+        _demote_stale_images(msgs, image_idx)
         tool_calls = one_round(tools)
         if not tool_calls:
             return {"calls": calls, "_stats": total}
@@ -14556,9 +14642,12 @@ def stream_agent(messages, on_reason=None, on_delta=None, on_tool=None,
             msgs.append({"role": "tool", "tool_call_id": record["tool_call_id"],
                          "content": json.dumps(record["full_result"],
                                                ensure_ascii=False)})
-            _append_shot_image(msgs, record)
+            at = _append_shot_image(msgs, record)
+            if at is not None:
+                image_idx.append(at)
     # Tool budget exhausted but the model still wants tools - force a plain,
     # tool-free closing answer so the run never ends in silence.
+    _demote_stale_images(msgs, image_idx)
     one_round([])
     return {"calls": calls, "_stats": total}
 
@@ -15108,6 +15197,15 @@ PAGE = """<!doctype html>
   .mdlbox .row { display: flex; gap: 8px; }
   .mdlbox input { flex: 1; min-width: 0; background: transparent; border: 1px solid var(--bd); border-radius: 10px; padding: 10px; color: var(--txt); font-size: 13px; outline: none; }
   .mdlbox input:focus { border-color: var(--mut); }
+  .mdlbox.notesbox { width: min(660px, 92vw); max-height: 84vh; overflow-y: auto; }
+  .notesbox .note { font-size: 13px; line-height: 1.62; color: var(--txt); }
+  .notesbox .note h5 { margin: 18px 0 6px; font-size: 11px; letter-spacing: 1.2px; text-transform: uppercase; color: var(--mut); font-weight: 600; }
+  .notesbox .note h5:first-child { margin-top: 0; }
+  .notesbox .note p { margin: 0 0 8px; }
+  .notesbox .note ul { margin: 0 0 8px; padding-left: 18px; }
+  .notesbox .note li { margin-bottom: 5px; }
+  .notesbox .note code { background: var(--bg3); border-radius: 5px; padding: 1px 5px; font-size: 12px; }
+  .notesbox .note .lede { color: var(--mut); }
   .mdlbox select { flex: 1; min-width: 0; background: transparent; border: 1px solid var(--bd); border-radius: 10px; padding: 10px; color: var(--txt); font-size: 13px; outline: none; }
   .mdlbox select option { background: #17171a; color: var(--txt); }
   .mdlbox .hint { color: var(--mut); font-size: 11.5px; margin-top: 8px; }
@@ -15552,11 +15650,20 @@ PAGE = """<!doctype html>
         <span class="grp">
           <button class="ibtn" id="addmodelbtn" aria-label="Add a model" title="Add a model (local .gguf file or an external API endpoint)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5.5v13M5.5 12h13"/></svg></button>
           <button class="ibtn" id="cfgbtn" aria-label="Model settings" title="Model settings - context size, temperature, GPU layers"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3.1"/><path d="M12 3.2v2.1M12 18.7v2.1M20.8 12h-2.1M5.3 12H3.2M18.2 5.8l-1.5 1.5M7.3 16.7l-1.5 1.5M18.2 18.2l-1.5-1.5M7.3 7.3L5.8 5.8"/></svg></button>
+          <button class="ibtn" id="notesbtn" aria-label="Notes" title="Notes - how steps, pictures and the context window work"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4.5h9.5L19 9v10.5H5z"/><path d="M14.5 4.5V9H19"/><path d="M8 13h8M8 16h5"/></svg></button>
         </span>
         <select class="pill" id="effort-sel" title="Thinking effort - filled from the active model, see renderEffortSel()"></select>
         <span class="state" id="state-label">READY</span>
       </div>
     </header>
+
+    <div class="mdl" id="notesmdl">
+      <div class="mdlbox notesbox">
+        <h4>NOTES</h4>
+        <div class="note" id="notesbody"></div>
+        <div class="close" id="notesmdl-close">Close</div>
+      </div>
+    </div>
 
     <div class="mdl" id="addmdl">
       <div class="mdlbox">
@@ -19010,6 +19117,61 @@ document.getElementById('modelsel').onchange = function () {
 /* ---------- ADD MODEL modal (native file / folder browser) ---------- */
 function openAddMdl() { const m = document.getElementById('addmdl'); if (m) m.classList.add('on'); }
 function closeAddMdl() { const m = document.getElementById('addmdl'); if (m) m.classList.remove('on'); }
+
+/* ---------- NOTES modal: how steps, pictures and context actually work ----------
+   Built from one array of [heading, html] so the sections cannot drift apart,
+   and written with textContent-safe static markup only - no model output ever
+   reaches this panel, but it is still all fixed strings. */
+const NOTES = [
+  ['Steps', '<p>Everything Bonsai does on your behalf becomes a step: one collapsed line with its own icon - '
+    + 'Read, Write, Edit, Shell, Fetch, Image, Ask, Todo. A run of steps stays grouped together as one block; '
+    + 'the moment Bonsai says something in prose, that closes the group and starts a new one. That grouping is '
+    + 'why a long job reads as a handful of blocks rather than forty loose lines.</p>'
+    + '<p>The list button in the header switches every step between collapsed and fully expanded. Your choice is '
+    + 'remembered.</p>'],
+  ['Pictures', '<p>A picture Bonsai fetches gets <strong>its own step</strong>, separate from the text step that '
+    + 'fetched it, and the picture is drawn inside that step.</p>'
+    + '<p>Bonsai is given the picture the instant it arrives, so it can act on it immediately. Pictures are also '
+    + 'the most expensive thing in the context window - roughly a thousand tokens each - and the mechanism that '
+    + 'shrinks an over-large tool result cannot touch them at all.</p>'
+    + '<p>So once the conversation has moved on by a couple of steps, an older picture is dropped and replaced with '
+    + 'a one-line note. That keeps a long run from carrying ten pictures it has already looked at. The picture is '
+    + '<em>not</em> deleted: it stays on disk and stays drawn in the chat, only the copy sent to the model is '
+    + 'released. If Bonsai needs to look at it again it fetches it again.</p>'],
+  ['When the model cannot see', '<p>A model with no vision projector - a local model with no <code>mmproj</code>, '
+    + 'or a hosted one that rejects pictures - answers with an error when handed an image. That is not a failure of '
+    + 'the picture.</p>'
+    + '<p>Bonsai retries the turn once with the picture untouched, in case the provider merely hiccuped, and only '
+    + 'teaches itself that this model is text-only after a refusal survives that retry. A single unlucky refusal '
+    + 'never costs a working model its sight. Once it is known, pictures are shown in the chat and described in '
+    + 'text instead of being sent, and the model is told so plainly rather than being left to guess.</p>'],
+  ['Long conversations', '<p>When the context fills up, Bonsai folds the oldest part of the chat into a short '
+    + 'summary - what the goal is, what was decided, where things stand, what is still open - and keeps the last few '
+    + 'turns verbatim. The fold line in the chat is reversible: you can always bring the full history back.</p>'
+    + '<p>Pictures and tool output inside the folded part are replaced by short notes. Nothing is lost from the '
+    + 'chat itself; only the copy sent to the model is shortened.</p>']
+];
+
+function openNotesMdl() {
+  const m = document.getElementById('notesmdl');
+  if (!m) return;
+  const body = document.getElementById('notesbody');
+  if (body && !body.childElementCount) {
+    NOTES.forEach(function (sec) {
+      const h = document.createElement('h5');
+      h.textContent = sec[0];
+      const d = document.createElement('div');
+      d.innerHTML = sec[1];
+      body.appendChild(h);
+      body.appendChild(d);
+    });
+  }
+  m.classList.add('on');
+}
+function closeNotesMdl() {
+  const m = document.getElementById('notesmdl');
+  if (m) m.classList.remove('on');
+}
 function afterAdd(j, what) {
   if (j.cancelled) return;
   if (!j.ok) { alert('Could not add the model:\\n' + (j.error || 'unknown error')); return; }
@@ -19163,6 +19325,11 @@ const _mdlClose = document.getElementById('addmdl-close');
 if (_mdlClose) _mdlClose.onclick = closeAddMdl;
 const _mdl = document.getElementById('addmdl');
 if (_mdl) _mdl.onclick = function (ev) { if (ev.target === _mdl) closeAddMdl(); };
+document.getElementById('notesbtn').onclick = openNotesMdl;
+const _notesClose = document.getElementById('notesmdl-close');
+if (_notesClose) _notesClose.onclick = closeNotesMdl;
+const _notesMdl = document.getElementById('notesmdl');
+if (_notesMdl) _notesMdl.onclick = function (ev) { if (ev.target === _notesMdl) closeNotesMdl(); };
 /* fail-fast: a remote model with no resolvable key must never reach a chat.
    Reads the payload renderModels() already cached rather than asking again -
    /api/models costs a round trip and a readiness probe, which is real time
@@ -19716,25 +19883,26 @@ _OC_JS = (
     '\n'
     '  /* the verb a reader cares about, not the JSON tool name */\n'
     '  var KINDS = {\n'
-    "    read:     { g: '→', n: 'Read',   edit: false },\n"
-    "    write:    { g: '✎', n: 'Write',  edit: true },\n"
-    "    edit:     { g: '✎', n: 'Edit',   edit: true },\n"
-    "    patch:    { g: '✎', n: 'Patch',  edit: true },\n"
-    "    multiedit:{ g: '✎', n: 'Edit',   edit: true },\n"
+    "    read:     { g: '📖', n: 'Read',   edit: false },\n"
+    "    write:    { g: '✒️', n: 'Write',  edit: true },\n"
+    "    edit:     { g: '✏️', n: 'Edit',   edit: true },\n"
+    "    patch:    { g: '🔧', n: 'Patch',  edit: true },\n"
+    "    multiedit:{ g: '📝✨', n: 'Edit',   edit: true },\n"
     "    grep:     { g: '✱', n: 'Grep',   edit: false },\n"
     "    glob:     { g: '✱', n: 'Glob',   edit: false },\n"
-    "    list:     { g: '→', n: 'List',   edit: false },\n"
-    "    ls:       { g: '→', n: 'List',   edit: false },\n"
-    "    search:   { g: '✱', n: 'Search', edit: false },\n"
-    "    shell:    { g: '⚡', n: 'Shell',  edit: false },\n"
-    "    exec:     { g: '⚡', n: 'Shell',  edit: false },\n"
-    "    web:      { g: '→', n: 'Fetch',  edit: false },\n"
-    "    fetch:    { g: '→', n: 'Fetch',  edit: false },\n"
-    "    ask:      { g: '?', n: 'Ask',    edit: false },\n"
-    "    todo:     { g: '☑', n: 'Todo',   edit: false },\n"
-    "    launch:   { g: '⚡', n: 'Open',   edit: false },\n"
-    "    speak:    { g: '♪', n: 'Speak',  edit: false },\n"
-    "    shot:     { g: '◎', n: 'Shot',   edit: false },\n"
+    "    list:     { g: '📌', n: 'List',   edit: false },\n"
+    "    ls:       { g: '📌', n: 'List',   edit: false },\n"
+    "    search:   { g: '🔎', n: 'Search', edit: false },\n"
+    "    shell:    { g: '📟', n: 'Shell',  edit: false },\n"
+    "    exec:     { g: '📟', n: 'Shell',  edit: false },\n"
+    "    web:      { g: '🌐', n: 'Fetch',  edit: false },\n"
+    "    fetch:    { g: '📥', n: 'Fetch',  edit: false },\n"
+    "    ask:      { g: '❓', n: 'Ask',    edit: false },\n"
+    "    todo:     { g: '📝', n: 'Todo',   edit: false },\n"
+    "    launch:   { g: '📟', n: 'Open',   edit: false },\n"
+    "    speak:    { g: '🗣️', n: 'Speak',  edit: false },\n"
+    "    shot:     { g: '📸', n: 'Shot',   edit: false },\n"
+    "    pic:      { g: '🖼', n: 'Image',  edit: false },\n"
     "    task:     { g: '✱', n: 'Task',   edit: false }\n"
     '  };\n'
     '  var ALIASES = {\n'
@@ -19755,6 +19923,7 @@ _OC_JS = (
     "    launch_or_open: 'launch', open_application: 'launch',\n"
     "    tts_speak: 'speak', speak_text: 'speak',\n"
     "    screenshot: 'shot', screen_capture: 'shot', capture_screen: 'shot',\n"
+    "    fetch_image: 'pic', images_in_page: 'pic', generate_image: 'pic',\n"
     "    tts: 'speak', task: 'task', agent: 'task'\n"
     '  };\n'
     '\n'
@@ -19837,6 +20006,8 @@ _OC_JS = (
     "      n = 'Speak ' + firstLine(a.text || '');\n"
     "    } else if (k === 'shot') {\n"
     "      n = 'Screenshot';\n"
+    "    } else if (k === 'pic') {\n"
+    "      n = 'Image ' + firstLine(a.url || a.path || a.prompt || '');\n"
     "    } else if (k === 'task') {\n"
     "      n = 'Task ' + firstLine(a.description || a.prompt || a.task || '');\n"
     '    } else {\n'

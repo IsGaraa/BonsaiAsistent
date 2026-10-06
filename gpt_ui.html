@@ -1,5 +1,5 @@
 <!-- GPT UI (PAGE_GPT) - the page served at /chat, copied verbatim from a
-     running bonsai_web.py at commit ff183d2.
+     running bonsai_web.py at commit 7fb0c85.
 
      bonsai_web.py is the source of truth. This file is a read-only copy so
      the UI can be opened in an editor without wading through the Python;
@@ -236,6 +236,15 @@
   .mdlbox .row { display: flex; gap: 8px; }
   .mdlbox input { flex: 1; min-width: 0; background: transparent; border: 1px solid var(--bd); border-radius: 10px; padding: 10px; color: var(--txt); font-size: 13px; outline: none; }
   .mdlbox input:focus { border-color: var(--mut); }
+  .mdlbox.notesbox { width: min(660px, 92vw); max-height: 84vh; overflow-y: auto; }
+  .notesbox .note { font-size: 13px; line-height: 1.62; color: var(--txt); }
+  .notesbox .note h5 { margin: 18px 0 6px; font-size: 11px; letter-spacing: 1.2px; text-transform: uppercase; color: var(--mut); font-weight: 600; }
+  .notesbox .note h5:first-child { margin-top: 0; }
+  .notesbox .note p { margin: 0 0 8px; }
+  .notesbox .note ul { margin: 0 0 8px; padding-left: 18px; }
+  .notesbox .note li { margin-bottom: 5px; }
+  .notesbox .note code { background: var(--bg3); border-radius: 5px; padding: 1px 5px; font-size: 12px; }
+  .notesbox .note .lede { color: var(--mut); }
   .mdlbox select { flex: 1; min-width: 0; background: transparent; border: 1px solid var(--bd); border-radius: 10px; padding: 10px; color: var(--txt); font-size: 13px; outline: none; }
   .mdlbox select option { background: #17171a; color: var(--txt); }
   .mdlbox .hint { color: var(--mut); font-size: 11.5px; margin-top: 8px; }
@@ -854,11 +863,20 @@
         <span class="grp">
           <button class="ibtn" id="addmodelbtn" aria-label="Add a model" title="Add a model (local .gguf file or an external API endpoint)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5.5v13M5.5 12h13"/></svg></button>
           <button class="ibtn" id="cfgbtn" aria-label="Model settings" title="Model settings - context size, temperature, GPU layers"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3.1"/><path d="M12 3.2v2.1M12 18.7v2.1M20.8 12h-2.1M5.3 12H3.2M18.2 5.8l-1.5 1.5M7.3 16.7l-1.5 1.5M18.2 18.2l-1.5-1.5M7.3 7.3L5.8 5.8"/></svg></button>
+          <button class="ibtn" id="notesbtn" aria-label="Notes" title="Notes - how steps, pictures and the context window work"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4.5h9.5L19 9v10.5H5z"/><path d="M14.5 4.5V9H19"/><path d="M8 13h8M8 16h5"/></svg></button>
         </span>
         <select class="pill" id="effort-sel" title="Thinking effort - filled from the active model, see renderEffortSel()"></select>
         <span class="state" id="state-label">READY</span>
       </div>
     </header>
+
+    <div class="mdl" id="notesmdl">
+      <div class="mdlbox notesbox">
+        <h4>NOTES</h4>
+        <div class="note" id="notesbody"></div>
+        <div class="close" id="notesmdl-close">Close</div>
+      </div>
+    </div>
 
     <div class="mdl" id="addmdl">
       <div class="mdlbox">
@@ -4312,6 +4330,61 @@ document.getElementById('modelsel').onchange = function () {
 /* ---------- ADD MODEL modal (native file / folder browser) ---------- */
 function openAddMdl() { const m = document.getElementById('addmdl'); if (m) m.classList.add('on'); }
 function closeAddMdl() { const m = document.getElementById('addmdl'); if (m) m.classList.remove('on'); }
+
+/* ---------- NOTES modal: how steps, pictures and context actually work ----------
+   Built from one array of [heading, html] so the sections cannot drift apart,
+   and written with textContent-safe static markup only - no model output ever
+   reaches this panel, but it is still all fixed strings. */
+const NOTES = [
+  ['Steps', '<p>Everything Bonsai does on your behalf becomes a step: one collapsed line with its own icon - '
+    + 'Read, Write, Edit, Shell, Fetch, Image, Ask, Todo. A run of steps stays grouped together as one block; '
+    + 'the moment Bonsai says something in prose, that closes the group and starts a new one. That grouping is '
+    + 'why a long job reads as a handful of blocks rather than forty loose lines.</p>'
+    + '<p>The list button in the header switches every step between collapsed and fully expanded. Your choice is '
+    + 'remembered.</p>'],
+  ['Pictures', '<p>A picture Bonsai fetches gets <strong>its own step</strong>, separate from the text step that '
+    + 'fetched it, and the picture is drawn inside that step.</p>'
+    + '<p>Bonsai is given the picture the instant it arrives, so it can act on it immediately. Pictures are also '
+    + 'the most expensive thing in the context window - roughly a thousand tokens each - and the mechanism that '
+    + 'shrinks an over-large tool result cannot touch them at all.</p>'
+    + '<p>So once the conversation has moved on by a couple of steps, an older picture is dropped and replaced with '
+    + 'a one-line note. That keeps a long run from carrying ten pictures it has already looked at. The picture is '
+    + '<em>not</em> deleted: it stays on disk and stays drawn in the chat, only the copy sent to the model is '
+    + 'released. If Bonsai needs to look at it again it fetches it again.</p>'],
+  ['When the model cannot see', '<p>A model with no vision projector - a local model with no <code>mmproj</code>, '
+    + 'or a hosted one that rejects pictures - answers with an error when handed an image. That is not a failure of '
+    + 'the picture.</p>'
+    + '<p>Bonsai retries the turn once with the picture untouched, in case the provider merely hiccuped, and only '
+    + 'teaches itself that this model is text-only after a refusal survives that retry. A single unlucky refusal '
+    + 'never costs a working model its sight. Once it is known, pictures are shown in the chat and described in '
+    + 'text instead of being sent, and the model is told so plainly rather than being left to guess.</p>'],
+  ['Long conversations', '<p>When the context fills up, Bonsai folds the oldest part of the chat into a short '
+    + 'summary - what the goal is, what was decided, where things stand, what is still open - and keeps the last few '
+    + 'turns verbatim. The fold line in the chat is reversible: you can always bring the full history back.</p>'
+    + '<p>Pictures and tool output inside the folded part are replaced by short notes. Nothing is lost from the '
+    + 'chat itself; only the copy sent to the model is shortened.</p>']
+];
+
+function openNotesMdl() {
+  const m = document.getElementById('notesmdl');
+  if (!m) return;
+  const body = document.getElementById('notesbody');
+  if (body && !body.childElementCount) {
+    NOTES.forEach(function (sec) {
+      const h = document.createElement('h5');
+      h.textContent = sec[0];
+      const d = document.createElement('div');
+      d.innerHTML = sec[1];
+      body.appendChild(h);
+      body.appendChild(d);
+    });
+  }
+  m.classList.add('on');
+}
+function closeNotesMdl() {
+  const m = document.getElementById('notesmdl');
+  if (m) m.classList.remove('on');
+}
 function afterAdd(j, what) {
   if (j.cancelled) return;
   if (!j.ok) { alert('Could not add the model:\n' + (j.error || 'unknown error')); return; }
@@ -4465,6 +4538,11 @@ const _mdlClose = document.getElementById('addmdl-close');
 if (_mdlClose) _mdlClose.onclick = closeAddMdl;
 const _mdl = document.getElementById('addmdl');
 if (_mdl) _mdl.onclick = function (ev) { if (ev.target === _mdl) closeAddMdl(); };
+document.getElementById('notesbtn').onclick = openNotesMdl;
+const _notesClose = document.getElementById('notesmdl-close');
+if (_notesClose) _notesClose.onclick = closeNotesMdl;
+const _notesMdl = document.getElementById('notesmdl');
+if (_notesMdl) _notesMdl.onclick = function (ev) { if (ev.target === _notesMdl) closeNotesMdl(); };
 /* fail-fast: a remote model with no resolvable key must never reach a chat.
    Reads the payload renderModels() already cached rather than asking again -
    /api/models costs a round trip and a readiness probe, which is real time
@@ -4840,25 +4918,26 @@ init();
 
   /* the verb a reader cares about, not the JSON tool name */
   var KINDS = {
-    read:     { g: '→', n: 'Read',   edit: false },
-    write:    { g: '✎', n: 'Write',  edit: true },
-    edit:     { g: '✎', n: 'Edit',   edit: true },
-    patch:    { g: '✎', n: 'Patch',  edit: true },
-    multiedit:{ g: '✎', n: 'Edit',   edit: true },
+    read:     { g: '📖', n: 'Read',   edit: false },
+    write:    { g: '✒️', n: 'Write',  edit: true },
+    edit:     { g: '✏️', n: 'Edit',   edit: true },
+    patch:    { g: '🔧', n: 'Patch',  edit: true },
+    multiedit:{ g: '📝✨', n: 'Edit',   edit: true },
     grep:     { g: '✱', n: 'Grep',   edit: false },
     glob:     { g: '✱', n: 'Glob',   edit: false },
-    list:     { g: '→', n: 'List',   edit: false },
-    ls:       { g: '→', n: 'List',   edit: false },
-    search:   { g: '✱', n: 'Search', edit: false },
-    shell:    { g: '⚡', n: 'Shell',  edit: false },
-    exec:     { g: '⚡', n: 'Shell',  edit: false },
-    web:      { g: '→', n: 'Fetch',  edit: false },
-    fetch:    { g: '→', n: 'Fetch',  edit: false },
-    ask:      { g: '?', n: 'Ask',    edit: false },
-    todo:     { g: '☑', n: 'Todo',   edit: false },
-    launch:   { g: '⚡', n: 'Open',   edit: false },
-    speak:    { g: '♪', n: 'Speak',  edit: false },
-    shot:     { g: '◎', n: 'Shot',   edit: false },
+    list:     { g: '📌', n: 'List',   edit: false },
+    ls:       { g: '📌', n: 'List',   edit: false },
+    search:   { g: '🔎', n: 'Search', edit: false },
+    shell:    { g: '📟', n: 'Shell',  edit: false },
+    exec:     { g: '📟', n: 'Shell',  edit: false },
+    web:      { g: '🌐', n: 'Fetch',  edit: false },
+    fetch:    { g: '📥', n: 'Fetch',  edit: false },
+    ask:      { g: '❓', n: 'Ask',    edit: false },
+    todo:     { g: '📝', n: 'Todo',   edit: false },
+    launch:   { g: '📟', n: 'Open',   edit: false },
+    speak:    { g: '🗣️', n: 'Speak',  edit: false },
+    shot:     { g: '📸', n: 'Shot',   edit: false },
+    pic:      { g: '🖼', n: 'Image',  edit: false },
     task:     { g: '✱', n: 'Task',   edit: false }
   };
   var ALIASES = {
@@ -4879,6 +4958,7 @@ init();
     launch_or_open: 'launch', open_application: 'launch',
     tts_speak: 'speak', speak_text: 'speak',
     screenshot: 'shot', screen_capture: 'shot', capture_screen: 'shot',
+    fetch_image: 'pic', images_in_page: 'pic', generate_image: 'pic',
     tts: 'speak', task: 'task', agent: 'task'
   };
 
@@ -4961,6 +5041,8 @@ init();
       n = 'Speak ' + firstLine(a.text || '');
     } else if (k === 'shot') {
       n = 'Screenshot';
+    } else if (k === 'pic') {
+      n = 'Image ' + firstLine(a.url || a.path || a.prompt || '');
     } else if (k === 'task') {
       n = 'Task ' + firstLine(a.description || a.prompt || a.task || '');
     } else {
