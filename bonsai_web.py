@@ -14065,10 +14065,28 @@ def _vision_state_load():
 
 
 def _vision_state_save():
+    """Write the learned blindness down, merging with what is already on disk.
+
+    It used to dump the in-memory set outright, which meant any code path that
+    cleared _BLIND_MODELS - a test, a reload that lost the set, anything - could
+    silently erase everything that had been learned, and a later save would then
+    persist that empty result. That is how the two genuinely blind local models
+    came off this list while a model that does have vision went onto it: one
+    run saved a set that had been emptied on purpose. A record of what has been
+    learned must never shrink because some caller happened to hold less of it,
+    so this takes the union.
+    """
     try:
+        keep = set()
+        if os.path.exists(_VISION_STATE_FILE):
+            with open(_VISION_STATE_FILE, "r", encoding="utf-8") as fh:
+                ids = json.load(fh).get("blind")
+            if isinstance(ids, list):
+                keep = {str(x) for x in ids if x}
+        merged = sorted(keep | _BLIND_MODELS)
         tmp = _VISION_STATE_FILE + ".part"
         with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump({"blind": sorted(_BLIND_MODELS)}, fh)
+            json.dump({"blind": merged}, fh)
         os.replace(tmp, _VISION_STATE_FILE)
     except OSError:
         pass
@@ -14088,6 +14106,37 @@ def _remember_blind(entry=None):
     if mid and mid not in _BLIND_MODELS:
         _BLIND_MODELS.add(mid)
         _vision_state_save()
+
+
+def _forget_blind(entry=None):
+    """Undo a learned blindness.
+
+    Learned blindness is a one-way door otherwise: once a model is on the list
+    it can never be taken off it without editing the file by hand, so a single
+    wrong refusal - a provider hiccuping, a test that provoked one on purpose -
+    silently blinds a model that sees perfectly well for the rest of its life.
+    The picture is still drawn in the chat either way; this only decides whether
+    the model is sent the pixels.
+    """
+    entry = entry if entry is not None else _active_model()
+    mid = str((entry or {}).get("id") or "")
+    if mid and mid in _BLIND_MODELS:
+        _BLIND_MODELS.discard(mid)
+        try:
+            keep = set()
+            if os.path.exists(_VISION_STATE_FILE):
+                with open(_VISION_STATE_FILE, "r", encoding="utf-8") as fh:
+                    ids = json.load(fh).get("blind")
+                if isinstance(ids, list):
+                    keep = {str(x) for x in ids if x}
+            tmp = _VISION_STATE_FILE + ".part"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump({"blind": sorted(keep - {mid})}, fh)
+            os.replace(tmp, _VISION_STATE_FILE)
+        except OSError:
+            pass
+        return True
+    return False
 
 
 def _entry_vision(entry):
@@ -14425,6 +14474,25 @@ def stream_agent(messages, on_reason=None, on_delta=None, on_tool=None,
             if not _is_blind():
                 fixed = _blind_turn(msgs, exc)
                 if fixed is not None:
+                    # Retry the turn EXACTLY as it was before touching the
+                    # picture. A provider that refused an image once may simply
+                    # have hiccuped, and the cost of being wrong here is the
+                    # model losing its eyes for the rest of the conversation -
+                    # every later picture becomes a sentence saying it cannot
+                    # see. So: try again untouched first, and only give up the
+                    # pixels if that fails too.
+                    for _attempt in range(_OVERSIZE_RETRIES):
+                        try:
+                            for ev in _bonsai_stream(msgs, tools_for_round):
+                                if ev["kind"] == "end":
+                                    tool_calls = ev["tool_calls"]
+                                emit(ev)
+                            return tool_calls or []
+                        except Exception as retry_exc:
+                            exc = retry_exc
+                    # Still refusing with the picture in place. Now it is a real
+                    # answer, and the model is better off finishing the turn
+                    # without the pixels than not finishing it at all.
                     _remember_blind()
                     msgs[:] = fixed
                     if on_tool:
@@ -14437,15 +14505,6 @@ def stream_agent(messages, on_reason=None, on_delta=None, on_tool=None,
                                 emit(ev)
                             return tool_calls or []
                         except Exception as retry_exc:
-                            # Bounded, like the size recovery below and like
-                            # run_agent's copy of this. One attempt was not
-                            # enough: a provider that refuses the request twice
-                            # raised straight out of one_round, out of the round
-                            # loop and out of the run, so the model stopped dead
-                            # immediately after fetching an image - no error, no
-                            # closing words, the picture left on disk unused.
-                            # That is the fault that ate the turn, and
-                            # stream_agent was the only copy that had it.
                             exc = retry_exc
             # Same bounded loop as run_agent above, for the same reason: a
             # single unguarded retry turned a second refusal into a dead turn.
