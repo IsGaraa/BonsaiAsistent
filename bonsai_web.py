@@ -14766,8 +14766,8 @@ KOKORO_PAGE = """<!doctype html>
   }
   @media (prefers-color-scheme: dark) {
     :root {
-      --bg: #212121; --bg2: #171717; --bg3: #2f2f2f; --bd: #303030;
-      --bd2: #424242;
+      --bg: #0d0d0f; --bg2: #070709; --bg3: #1a1a1e; --bd: #232329;
+      --bd2: #36363e;
       --txt: #ececec; --mut: #9b9ba3; --acc: #e4e4e7; --acc-txt: #18181b;
       --bad: #f97066; --good: #47cd89;
     }
@@ -14989,9 +14989,9 @@ PAGE = """<!doctype html>
   }
   html.dark {
     color-scheme: dark;
-    --bg: #212121; --bg2: #171717; --bg3: #2f2f2f; --bd: #303030;
-    --bg4: #3a3a3a; --bd2: #424242;
-    --bub: #2c2440; --bub-bd: #3d3358;
+    --bg: #0d0d0f; --bg2: #070709; --bg3: #1a1a1e; --bd: #232329;
+    --bg4: #24242a; --bd2: #36363e;
+    --bub: #221b36; --bub-bd: #322a4e;
     --txt: #ececec; --mut: #9b9ba3; --acc: #e4e4e7; --acc-txt: #18181b;
     --txt2: #c9c9d1; --dim: #76767e;
     --violet: #a78bfa; --violet-soft: rgba(167,139,250,.08);
