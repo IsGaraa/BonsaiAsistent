@@ -14429,11 +14429,24 @@ def stream_agent(messages, on_reason=None, on_delta=None, on_tool=None,
                     msgs[:] = fixed
                     if on_tool:
                         on_tool(_blind_record())
-                    for ev in _bonsai_stream(msgs, tools_for_round):
-                        if ev["kind"] == "end":
-                            tool_calls = ev["tool_calls"]
-                        emit(ev)
-                    return tool_calls or []
+                    for _attempt in range(_OVERSIZE_RETRIES):
+                        try:
+                            for ev in _bonsai_stream(msgs, tools_for_round):
+                                if ev["kind"] == "end":
+                                    tool_calls = ev["tool_calls"]
+                                emit(ev)
+                            return tool_calls or []
+                        except Exception as retry_exc:
+                            # Bounded, like the size recovery below and like
+                            # run_agent's copy of this. One attempt was not
+                            # enough: a provider that refuses the request twice
+                            # raised straight out of one_round, out of the round
+                            # loop and out of the run, so the model stopped dead
+                            # immediately after fetching an image - no error, no
+                            # closing words, the picture left on disk unused.
+                            # That is the fault that ate the turn, and
+                            # stream_agent was the only copy that had it.
+                            exc = retry_exc
             # Same bounded loop as run_agent above, for the same reason: a
             # single unguarded retry turned a second refusal into a dead turn.
             budget = _OVERSIZE_TOOL_CHARS
