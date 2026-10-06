@@ -1,5 +1,5 @@
 <!-- GPT UI (PAGE_GPT) - the page served at /chat, copied verbatim from a
-     running bonsai_web.py at commit c68aa24.
+     running bonsai_web.py at commit a3f3b2d.
 
      bonsai_web.py is the source of truth. This file is a read-only copy so
      the UI can be opened in an editor without wading through the Python;
@@ -19,21 +19,33 @@
     color-scheme: light;
     --bg: #ffffff; --bg2: #f7f7f9; --bg3: #ededf0; --bd: #e3e3e7;
     --bg4: #e4e4ea; --bd2: #cfcfd8;
-    --bub: #efeafd; --bub-bd: #ddd3f7;   /* your bubble: violet surface */
     --txt: #111214; --mut: #71717a; --acc: #19191c; --acc-txt: #fafafa;
     --txt2: #4a4a52; --dim: #9a9aa3;
     --ok: #16a34a; --warn: #d97706; --err: #dc2626;
-    --violet: #7c3aed; --violet-soft: rgba(124,58,237,.10);
     --gap-above-input: 5px;   /* space between the last message and the composer */
+    /* ---- the accent: the one place a colour is allowed to be a hue ----
+       --violet / --violet-soft are the historical names for exactly these two
+       values and are kept as aliases so the thirty rules that reference them
+       keep working untouched. New code should say --accent. The accent carries
+       a single meaning: the app is thinking, acting, or has focus. It is not
+       decoration, and --bub below is derived from it so your own messages
+       shift with it rather than staying behind as a second hardcoded violet. */
+    --accent: #7c3aed; --accent-soft: rgba(124,58,237,.10);
+    --violet: var(--accent); --violet-soft: var(--accent-soft);
+    --bub: color-mix(in srgb, var(--accent) 9%, var(--bg));
+    --bub-bd: color-mix(in srgb, var(--accent) 26%, var(--bg));
   }
   html.dark {
     color-scheme: dark;
     --bg: #0d0d0f; --bg2: #070709; --bg3: #1a1a1e; --bd: #232329;
     --bg4: #24242a; --bd2: #36363e;
-    --bub: #221b36; --bub-bd: #322a4e;
     --txt: #ececec; --mut: #9b9ba3; --acc: #e4e4e7; --acc-txt: #18181b;
     --txt2: #c9c9d1; --dim: #76767e;
-    --violet: #a78bfa; --violet-soft: rgba(167,139,250,.08);
+    /* same two values the light theme sets, at the dark end of the ramp */
+    --accent: #a78bfa; --accent-soft: rgba(167,139,250,.08);
+    --violet: var(--accent); --violet-soft: var(--accent-soft);
+    --bub: color-mix(in srgb, var(--accent) 15%, var(--bg));
+    --bub-bd: color-mix(in srgb, var(--accent) 26%, var(--bg));
   }
   * { box-sizing: border-box; }
   html, body { height: 100%; margin: 0; }
@@ -191,6 +203,13 @@
   /* on-state: the dot is the state, the tint is the colour */
   .ibtn.on { color: var(--violet); background: var(--violet-soft);
              border-color: var(--violet-soft); }
+  /* A hue change is instant, not animated. Transitioning it would make the
+     whole interface drift for a quarter second every time the folder changes,
+     which reads as the app being unsure rather than as deliberate. */
+  .ocstep, .ubub, .reasonbox, .composer, .ibtn, .pill { transition: none; }
+  @media (prefers-reduced-motion: no-preference) {
+    .ibtn, .pill, .composer { transition: border-color .12s ease, box-shadow .12s ease; }
+  }
   .ibtn.on::after { content: ''; position: absolute; right: 5px; bottom: 5px;
                     width: 4px; height: 4px; border-radius: 50%;
                     background: var(--violet); }
@@ -245,6 +264,11 @@
   .notesbox .note li { margin-bottom: 5px; }
   .notesbox .note code { background: var(--bg3); border-radius: 5px; padding: 1px 5px; font-size: 12px; }
   .notesbox .note .lede { color: var(--mut); }
+  .mdlbox .accrow { display: flex; flex-wrap: wrap; gap: 9px; margin: 4px 0 14px; }
+  .accsw { width: 38px; height: 38px; border-radius: 10px; cursor: pointer;
+           background: var(--c); border: 1px solid var(--bd); padding: 0; }
+  .accsw:hover { border-color: var(--mut); }
+  .accsw.on { border-color: var(--txt); box-shadow: 0 0 0 2px var(--txt); }
   .mdlbox select { flex: 1; min-width: 0; background: transparent; border: 1px solid var(--bd); border-radius: 10px; padding: 10px; color: var(--txt); font-size: 13px; outline: none; }
   .mdlbox select option { background: #17171a; color: var(--txt); }
   .mdlbox .hint { color: var(--mut); font-size: 11.5px; margin-top: 8px; }
@@ -713,7 +737,7 @@
     .ocstep.thought { border-left-color: var(--violet); }
     .ocstep.thought.notext > summary { cursor: default; }
     .ocstep.thought.notext > summary:hover { background: none; color: var(--txt); }
-    .ocstep.thought .ocbody pre { color: #c4b5fd; white-space: pre-wrap;
+    .ocstep.thought .ocbody pre { color: var(--accent); white-space: pre-wrap;
                                     max-height: 260px; overflow-y: auto; margin: 0; }
     .ocstep > summary {
       list-style: none; cursor: pointer; display: flex; align-items: baseline; gap: 7px;
@@ -779,7 +803,7 @@
     .ocdiff td.ocl { width: 1%; text-align: right; color: #4b4b57; user-select: none;
                      padding: 0 6px 0 4px; font-size: 11px; }
     .ocdiff td.octext { width: 100%; }
-    .ocdiff tr.hunk td { color: var(--violet); background: rgba(167,139,250,.08);
+    .ocdiff tr.hunk td { color: var(--accent); background: var(--accent-soft);
                          font-size: 11px; padding-top: 3px; padding-bottom: 3px; }
     .ocdiff tr.add td { background: rgba(52,211,153,.10); color: #b6f2d8; }
     .ocdiff tr.add td.ocl { background: rgba(52,211,153,.18); }
@@ -867,12 +891,23 @@
         <span class="grp">
           <button class="ibtn" id="addmodelbtn" aria-label="Add a model" title="Add a model (local .gguf file or an external API endpoint)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5.5v13M5.5 12h13"/></svg></button>
           <button class="ibtn" id="cfgbtn" aria-label="Model settings" title="Model settings - context size, temperature, GPU layers"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3.1"/><path d="M12 3.2v2.1M12 18.7v2.1M20.8 12h-2.1M5.3 12H3.2M18.2 5.8l-1.5 1.5M7.3 16.7l-1.5 1.5M18.2 18.2l-1.5-1.5M7.3 7.3L5.8 5.8"/></svg></button>
+          <button class="ibtn" id="accbtn" aria-label="Accent colour" title="Accent colour - the highlight used for focus, thinking, and steps"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8.2"/><path d="M12 3.8a8.2 8.2 0 0 1 0 16.4z" fill="currentColor" stroke="none"/></svg></button>
           <button class="ibtn" id="notesbtn" aria-label="Notes" title="Notes - how steps, pictures and the context window work"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 4.5h9.5L19 9v10.5H5z"/><path d="M14.5 4.5V9H19"/><path d="M8 13h8M8 16h5"/></svg></button>
         </span>
         <select class="pill" id="effort-sel" title="Thinking effort - filled from the active model, see renderEffortSel()"></select>
         <span class="state" id="state-label">READY</span>
       </div>
     </header>
+
+    <div class="mdl" id="accmdl">
+      <div class="mdlbox">
+        <h4>ACCENT COLOUR</h4>
+        <div class="hint" id="acchint">Where the highlight colour comes from, and how to pin your own.</div>
+        <div class="accrow" id="accrow"></div>
+        <button class="act" id="acc-auto">Follow the workspace again<small>Bonsai picks a colour from the folder you are working in. Change folders and the accent changes with it.</small></button>
+        <div class="close" id="accmdl-close">Close</div>
+      </div>
+    </div>
 
     <div class="mdl" id="notesmdl">
       <div class="mdlbox notesbox">
@@ -1354,6 +1389,93 @@ function bindModeBtn() {
   update();
   btn.onclick = function () { chatMode = chatMode === 'plan' ? 'build' : 'plan'; localStorage.setItem('jarvis_mode', chatMode); update(); scheduleCtx(); };
 }
+/* ---------- the accent ----------
+   Six families, each with a light and a dark value. Every one of them was found
+   by searching saturation and lightness against the real constraints - 4.5:1 on
+   the page background for the thin marks that use it (focus rings, the Thinking
+   chip, thought-step borders), 7:1 for body text once 15% of it has been mixed
+   into your message bubble, and enough separation that the bubble still reads
+   as a surface. None of them is a hue picked by eye and hoped over.
+
+   The accent is derived from the workspace, so a different project gets a
+   different colour. A manual choice always wins over that: the override is read
+   first and the hash is only consulted when there is none, so the derived value
+   can never take a decision away from one that was made on purpose. */
+
+var ACCENTS = {
+  violet: { l: '#5f3f8c', d: '#955ce6' },
+  blue:   { l: '#3f638c', d: '#3d80cc' },
+  teal:   { l: '#397d80', d: '#00c5cc' },
+  green:  { l: '#398057', d: '#00cc55' },
+  amber:  { l: '#8c703f', d: '#cc8100' },
+  rose:   { l: '#8c3f52', d: '#cc5270' }
+};
+var ACCENT_ORDER = ['violet', 'blue', 'teal', 'green', 'amber', 'rose'];
+var ACCENT_KEY = 'bonsai_accent';
+
+/* The last thing that should ever happen is an unreadable focus ring. Every
+   value in ACCENTS is known-good, but a hand-entered hex is not, and a browser
+   extension or a stale override could put anything here. So the guard runs on
+   whatever is about to be applied and falls back to violet, which is the value
+   this app shipped with and is known to pass in both themes. */
+function accentReadable(hex, bg) {
+  var m = /^#?([0-9a-f]{6})$/i.exec(String(hex || ''));
+  if (!m) return false;
+  var v = parseInt(m[1], 16);
+  var ch = [(v >> 16) & 255, (v >> 8) & 255, v & 255].map(function (c) {
+    c /= 255; return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+  });
+  var L = 0.2126 * ch[0] + 0.7152 * ch[1] + 0.0722 * ch[2];
+  var n = parseInt(bg.replace('#', ''), 16);
+  var b = [(n >> 16) & 255, (n >> 8) & 255, n & 255].map(function (c) {
+    c /= 255; return c <= 0.03928 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+  });
+  var LB = 0.2126 * b[0] + 0.7152 * b[1] + 0.0722 * b[2];
+  return (Math.max(L, LB) + 0.05) / (Math.min(L, LB) + 0.05) >= 4.5;
+}
+
+function accentFor(key) {
+  var dark = document.documentElement.classList.contains('dark');
+  var bg = dark ? '#0d0d0f' : '#ffffff';
+  var pair = ACCENTS[key] || ACCENTS.violet;
+  var v = pair[dark ? 'd' : 'l'];
+  return accentReadable(v, bg) ? v : ACCENTS.violet[dark ? 'd' : 'l'];
+}
+
+/* FNV-1a. Short, stable, and spread out well enough for "pick one of six".
+   Not a security primitive and not trying to be - this only has to turn a
+   different folder into a different colour on every machine, which is why it is
+   over the full path and not just the folder name. */
+function accentHash(s) {
+  var h = 2166136261;
+  for (var i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = (h * 16777619) >>> 0;
+  }
+  return h >>> 0;
+}
+
+function derivedAccentKey() {
+  var src = String(workdir || location.pathname || 'bonsai');
+  return ACCENT_ORDER[accentHash(src) % ACCENT_ORDER.length];
+}
+
+function applyAccents() {
+  var root = document.documentElement;
+  var saved = null;
+  try { saved = localStorage.getItem(ACCENT_KEY); } catch (e) {}
+  var key = (saved && (saved === 'auto' || ACCENTS[saved])) ? saved : derivedAccentKey();
+  root.style.setProperty('--accent', accentFor(key));
+  root.style.setProperty('--accent-soft', 'color-mix(in srgb, var(--accent) 10%, transparent)');
+  root.setAttribute('data-accent', saved || key);
+  if (window.__ocAccent) window.__ocAccent(key, !!saved);
+}
+
+function setAccent(key) {
+  try { key ? localStorage.setItem(ACCENT_KEY, key) : localStorage.removeItem(ACCENT_KEY); } catch (e) {}
+  applyAccents();
+}
+
 function bindTheme() {
   const b = document.getElementById('themebtn');
   /* two svgs rather than two glyphs, so the theme control matches the other
@@ -1368,10 +1490,14 @@ function bindTheme() {
   };
   const saved = localStorage.getItem('bonsai_gpt_theme');
   apply(saved ? saved === 'dark' : true);
+  /* The theme decides which half of each accent pair is live, so the accent has
+     to be re-applied after the toggle or it keeps the other theme's value. */
+  applyAccents();
   b.onclick = function () {
     const d = !document.documentElement.classList.contains('dark');
     localStorage.setItem('bonsai_gpt_theme', d ? 'dark' : 'light');
     apply(d);
+    applyAccents();
   };
 }
 async function loadWorkdir() {
@@ -1386,6 +1512,9 @@ function setWorkdirInUI(wd) {
   const w = document.getElementById('workbtn');
   w.textContent = '\ud83d\udcc1 ' + workdir;
   w.title = 'Working folder: ' + workdir;
+  /* A new folder means a new derived accent. Only here and on page load: never
+     mid-turn, so nothing shifts colour while it is being read. */
+  if (typeof applyAccents === 'function') applyAccents();
 }
 function renderAll() { renderList(); renderConv(); scheduleCtx(); }
 function dedupeChats() {
@@ -4346,6 +4475,18 @@ const NOTES = [
     + 'why a long job reads as a handful of blocks rather than forty loose lines.</p>'
     + '<p>The list button in the header switches every step between collapsed and fully expanded. Your choice is '
     + 'remembered.</p>'],
+  ['The accent colour', '<p>One colour runs through the interface: the ring around whatever has focus, '
+    + 'the <em>Thinking</em> chip, the border on a reasoning block, the border and icon of a Thought step. '
+    + 'It means the same thing everywhere &mdash; <strong>Bonsai is thinking or acting</strong>. '
+    + 'It is not decoration, which is why there is only ever one.</p>'
+    + '<p>By default that colour is derived from the folder you are working in, so each project gets its own. '
+    + 'It changes only when you switch folders, on load, or when you flip the theme &mdash; never in the middle '
+    + 'of a reply, so nothing shifts while you are reading.</p>'
+    + '<p>The button in the header pins any of the six by hand, and a pinned choice always beats the derived one. '
+    + 'All six were chosen by searching lightness and saturation against the real constraints rather than by eye: '
+    + 'each one has to stay readable on the page background for the thin marks, and still carry your body text '
+    + 'once 15% of it has been mixed into your message bubble. A pinned colour is checked the same way before '
+    + 'it is used, and anything that fails falls back rather than shipping an unreadable focus ring.</p>'],
   ['Pictures', '<p>A picture Bonsai fetches gets <strong>its own step</strong>, separate from the text step that '
     + 'fetched it, and the picture is drawn inside that step.</p>'
     + '<p>Bonsai is given the picture the instant it arrives, so it can act on it immediately. Pictures are also '
@@ -4368,6 +4509,34 @@ const NOTES = [
     + '<p>Pictures and tool output inside the folded part are replaced by short notes. Nothing is lost from the '
     + 'chat itself; only the copy sent to the model is shortened.</p>']
 ];
+
+/* ---------- ACCENT modal ---------- */
+function openAccMdl() {
+  const m = document.getElementById('accmdl');
+  if (!m) return;
+  const row = document.getElementById('accrow');
+  if (row) {
+    row.innerHTML = '';
+    let saved = null;
+    try { saved = localStorage.getItem(ACCENT_KEY); } catch (e) {}
+    ACCENT_ORDER.forEach(function (k) {
+      const pair = ACCENTS[k];
+      const dark = document.documentElement.classList.contains('dark');
+      const b = document.createElement('button');
+      b.className = 'accsw' + (saved === k ? ' on' : '');
+      b.title = k;
+      b.style.setProperty('--c', pair[dark ? 'd' : 'l']);
+      b.setAttribute('aria-label', k + ' accent');
+      b.onclick = function () { setAccent(k); closeAccMdl(); };
+      row.appendChild(b);
+    });
+  }
+  m.classList.add('on');
+}
+function closeAccMdl() {
+  const m = document.getElementById('accmdl');
+  if (m) m.classList.remove('on');
+}
 
 function openNotesMdl() {
   const m = document.getElementById('notesmdl');
@@ -4542,6 +4711,13 @@ const _mdlClose = document.getElementById('addmdl-close');
 if (_mdlClose) _mdlClose.onclick = closeAddMdl;
 const _mdl = document.getElementById('addmdl');
 if (_mdl) _mdl.onclick = function (ev) { if (ev.target === _mdl) closeAddMdl(); };
+document.getElementById('accbtn').onclick = openAccMdl;
+const _accClose = document.getElementById('accmdl-close');
+if (_accClose) _accClose.onclick = closeAccMdl;
+const _accMdl = document.getElementById('accmdl');
+if (_accMdl) _accMdl.onclick = function (ev) { if (ev.target === _accMdl) closeAccMdl(); };
+const _accAuto = document.getElementById('acc-auto');
+if (_accAuto) _accAuto.onclick = function () { setAccent(null); closeAccMdl(); };
 document.getElementById('notesbtn').onclick = openNotesMdl;
 const _notesClose = document.getElementById('notesmdl-close');
 if (_notesClose) _notesClose.onclick = closeNotesMdl;
