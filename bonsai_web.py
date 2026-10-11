@@ -2990,12 +2990,39 @@ _BLENDER_FLAG_LOCK = threading.Lock()
 # Off by default, like Blender. Starting a subprocess that opens files and can
 # launch browsers is not something to do unasked, and 139 tool schemas is a
 # large slice of the context window to spend on a server that may not be wanted.
-# PC_REA_HOME points at a rea checkout. Without it, look beside the project
-# rather than at a path belonging to whoever committed this file, so a clone
-# on another machine is not pointed at the author's directory layout.
-REA_HOME = (os.environ.get("PC_REA_HOME")
-            or os.path.join(os.path.dirname(os.path.abspath(__file__)), "rea"))
+# PC_REA_HOME points at a rea checkout, and it always wins. Failing that, look
+# through an ordered list of places a checkout is actually found to live, and
+# take the first one that really contains scripts/rea.mjs.
+#
+# This list exists because both of the obvious one-line defaults are wrong.
+# Hardcoding the author's Desktop path sends every other clone to a folder that
+# is not theirs; pointing at a sibling "rea" next to this file sends everyone
+# whose checkout is not colocated to a folder that does not exist. That second
+# one is not hypothetical - it is what this file shipped briefly, and it
+# silently turned the bridge off with a status that said only "off".
 REA_ENTRY = os.path.join("scripts", "rea.mjs")
+
+
+def _find_rea_home():
+    """(path, tried) - the first candidate that holds a rea entry point."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    home = os.path.expanduser("~")
+    override = str(os.environ.get("PC_REA_HOME") or "").strip()
+    if override:
+        # An explicit override is taken as given, even if it looks wrong. Say so
+        # later rather than silently searching somewhere the user did not ask
+        # for.
+        return os.path.abspath(override), [override]
+    candidates = [os.path.join(here, "rea"),
+                  os.path.join(home, "rea"),
+                  os.path.join(home, "Desktop", "rea")]
+    for cand in candidates:
+        if os.path.isfile(os.path.join(cand, REA_ENTRY)):
+            return cand, candidates[:candidates.index(cand) + 1]
+    return candidates[0], candidates
+
+
+REA_HOME, _REA_TRIED = _find_rea_home()
 # rea ships read, shell, grep, edit, search and several others that mean exactly
 # what Bonsai's own tools mean. Two functions of one name in a single tools[]
 # array is something providers reject, so every rea tool is namespaced.
@@ -3585,7 +3612,9 @@ class _ReaMcp:
         entry = os.path.join(REA_HOME, REA_ENTRY)
         if not os.path.isfile(entry):
             raise FileNotFoundError(
-                "no rea entry point at %s - set PC_REA_HOME to the checkout" % entry)
+                "no rea entry point. Looked for %s in: %s. Point PC_REA_HOME "
+                "at the checkout."
+                % (REA_ENTRY, ", ".join(_REA_TRIED)))
         env = dict(os.environ)
         env.setdefault("NO_COLOR", "1")
         env["DISABLE_TELEMETRY"] = "1"
@@ -3812,7 +3841,9 @@ def _rea_status_payload():
     entry = os.path.join(REA_HOME, REA_ENTRY)
     if not os.path.isfile(entry):
         return {"ok": False, "state": "missing", "enabled": True, "tool_count": 0,
-                "detail": "no rea entry point at %s" % entry}
+                "detail": "no rea entry point. Looked for %s in: %s. Point "
+                          "PC_REA_HOME at the checkout."
+                          % (REA_ENTRY, ", ".join(_REA_TRIED))}
     bridge = _rea_mcp_bridge()
     try:
         started = bridge.ensure(timeout=45)
