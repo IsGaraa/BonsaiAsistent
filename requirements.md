@@ -41,6 +41,7 @@ system-level optionals (Docker, WSL2, Blender MCP).
 | `sounddevice` | plays the synthesized WAV straight to the speakers (bundled PortAudio - no media player involved) | playback half of `tts_speak`; falls back to `winsound` on Windows and `paplay`/`aplay`/`ffplay` on Linux |
 | `playwright` | headless Chromium, to render a page as a picture | `web_resolve` with `render:true` — **also needs a one-off `playwright install chromium`**, without which the tool reports no browser available |
 | `yt-dlp` | the `download_media` tool (video, audio-only as mp3, subtitles, thumbnails) | `download_media` |
+| `pypdf` | pure-Python PDF text extraction - the read tool pulls the text layer out of a `.pdf`, a page range at a time | `read` (and the file picker, which uploads an attached PDF so it can be read back) |
 | `huggingface_hub` | downloads the Qwen-Image weights | `tools/fetch_image_model.py` |
 
 Install everything with: `pip install -r requirements.txt -r tools\requirements.txt`

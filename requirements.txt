@@ -29,6 +29,11 @@ mcp-for-blender
 # a one-off `playwright install chromium` as well.
 playwright
 
+# PDF text extraction                                -> read() on a .pdf
+# Pure Python, no system dependencies. Without it a PDF is binary and the read
+# tool can only say so.
+pypdf
+
 # Media download                                   -> download_media
 # Was documented in requirements.md as a dependency of download_media but was
 # in neither requirements file, so following the setup left that tool dead.

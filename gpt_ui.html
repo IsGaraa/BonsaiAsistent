@@ -1,5 +1,5 @@
 <!-- GPT UI (PAGE_GPT) - the page served at /chat, copied verbatim from a
-     running bonsai_web.py at commit 1a756e5.
+     running bonsai_web.py at commit 5d82896.
 
      bonsai_web.py is the source of truth. This file is a read-only copy so
      the UI can be opened in an editor without wading through the Python;
@@ -3931,6 +3931,38 @@ function addFiles(files) {
           ATT_DATA[url] = dataUrl;
           a.stored = url;
           a.src = url;
+          renderPreview();
+        });
+      };
+      r.readAsDataURL(f);
+    } else if (/\.pdf$/i.test(f.name) || f.type === 'application/pdf') {
+      /* A PDF is not text and never was: reading one with readAsText produced
+         either nothing or the raw %PDF plumbing, and the 200 KB ceiling below
+         turned anything bigger into the placeholder string "[file too large for
+         direct read]" without the bytes ever leaving the browser. So a PDF is
+         uploaded and kept as a real file, and the model is handed the /att/
+         reference to read it back with. The ceiling matches the server's own
+         limit on a stored attachment, so the two cannot disagree about what
+         fits. */
+      const MAXPDF = 12 * 1024 * 1024;
+      if (f.size > MAXPDF) {
+        pendingAtt.push({ type: 'file', name: f.name,
+          text: 'This PDF is ' + (f.size / 1048576).toFixed(1) + ' MB, over the 12 MB attachment limit, so it was not attached. Save it somewhere in the workspace and read it from there instead.' });
+        renderPreview(); return;
+      }
+      const r = new FileReader();
+      r.onload = function () {
+        const a = { type: 'file', name: f.name, text: 'attached PDF: ' + f.name + ' - saving it, then read it from the path given below.' };
+        pendingAtt.push(a);
+        renderPreview();
+        storeAtt(String(r.result || '')).then(function (url) {
+          if (!url) {
+            a.text = 'This PDF could not be stored, so it was not attached. Copy it into the workspace and read it from there instead.';
+            renderPreview();
+            return;
+          }
+          a.path = url;
+          a.text = 'attached PDF: ' + f.name + '\nSaved at ' + url + '\nRead it with the read tool using that path. offset is the first page and limit is how many pages, so read a few pages at a time rather than the whole document. If it comes back saying the pages have no text layer it is a scan, and the way to read it is to open it and take_screenshot the window.';
           renderPreview();
         });
       };

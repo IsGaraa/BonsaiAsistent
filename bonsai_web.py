@@ -105,8 +105,15 @@ ATTACH_DIR = os.environ.get("BONSAI_ATTACH_DIR") or os.path.join(
 _ATTACH_EXT = {"image/png": ".png", "image/jpeg": ".jpg",
                "image/webp": ".webp", "image/gif": ".gif",
                "image/bmp": ".bmp", "image/avif": ".avif",
-               "image/svg+xml": ".svg"}
-_ATTACH_RE = re.compile(r"^[0-9a-f]{64}\.(png|jpg|webp|gif|bmp|avif|svg)$")
+               "image/svg+xml": ".svg",
+               # A PDF is not a picture, but it arrives by the same route and is
+               # kept for the same reason: so a document you attached is still
+               # on disk and readable after a reload. It is served as a
+               # download rather than rendered, and read by the read tool via
+               # _pdf_text rather than handed to the vision model.
+               "application/pdf": ".pdf"}
+_ATTACH_RE = re.compile(
+    r"^[0-9a-f]{64}\.(png|jpg|webp|gif|bmp|avif|svg|pdf)$")
 # The two formats added for fetched pictures, and what each one costs us.
 #
 # AVIF is only a display format here. Browsers render it and the /att/ route
@@ -2586,18 +2593,126 @@ def _attach_downloaded_image(dest, record):
     return True
 
 
+def _pdf_text(file_path, offset=None, limit=None):
+    """Text out of a PDF, a page range at a time.
+
+    offset is the first page and limit the page count, both 1-indexed, so the
+    same two arguments the read tool already documents page a long document
+    instead of the model having to learn a second convention.
+
+    Two failure modes are reported rather than papered over. A scanned PDF has
+    no text layer at all, and a text extractor returns empty pages for it -
+    which reads to the model as "this page is blank" and invites it to
+    conclude the document is mostly empty. When pages come back with no text
+    at all it is told plainly that the document is image-only and that
+    opening it and screenshotting the window is the way to read it. A locked
+    PDF is likewise named as locked rather than reported as unreadable.
+    """
+    try:
+        from pypdf import PdfReader
+        from pypdf.errors import PdfReadError
+    except Exception:
+        return {"error": "reading PDFs needs the pypdf package - run "
+                         "'pip install pypdf' and try again"}
+    try:
+        reader = PdfReader(file_path)
+        if getattr(reader, "is_encrypted", False):
+            # Most "protected" PDFs are only owner-restricted and open with an
+            # empty password; a genuinely locked one fails right here.
+            try:
+                if reader.decrypt("") == 0:
+                    return {"error": "this PDF is password-protected, and there is "
+                                     "no way to read it without the password. Ask "
+                                     "the user for a copy that is not locked."}
+            except Exception:
+                return {"error": "this PDF is password-protected and could not be "
+                                 "opened. Ask the user for an unlocked copy."}
+        total = len(reader.pages)
+    except PdfReadError as exc:
+        return {"error": "this file has a .pdf name but is not a readable PDF "
+                         "(%s)" % exc}
+    except Exception as exc:
+        return {"error": "could not open the PDF: %s" % exc}
+    if total == 0:
+        return {"error": "this PDF has no pages."}
+    try:
+        first = max(1, int(offset or 1))
+    except (TypeError, ValueError):
+        first = 1
+    try:
+        count = int(limit) if limit else 10
+    except (TypeError, ValueError):
+        count = 10
+    count = max(1, min(count, total))
+    last = min(total, first + count - 1)
+
+    chunks, empty_pages = [], 0
+    for pageno in range(first, last + 1):
+        try:
+            text = reader.pages[pageno - 1].extract_text() or ""
+        except Exception as exc:
+            text = "(page %d could not be extracted: %s)" % (pageno, exc)
+        text = _strip_control_chars(text).strip()
+        if not text:
+            empty_pages += 1
+            text = "(no text on this page)"
+        chunks.append("--- page %d ---\n%s" % (pageno, text))
+
+    body = "\n\n".join(chunks)
+    scanned = empty_pages == len(chunks)
+    header = ["<path>%s</path>" % file_path, "<type>pdf</type>",
+              "<pages total=\"%d\" showing=\"%d-%d\"/>" % (total, first, last)]
+    if scanned:
+        # Say this loudly and say what to do instead. Silence here is what
+        # makes a model report that a scanned document is blank.
+        header.append(
+            "<note>These pages carry no text layer, so this is almost certainly a "
+            "scanned or image-only PDF and there is nothing here to extract. To "
+            "read it, open it (launch_or_open with the path) and take_screenshot "
+            "the window - the vision model can read the page that way.</note>")
+    elif empty_pages:
+        header.append("<note>%d of the %d pages shown have no text and are "
+                      "probably images.</note>" % (empty_pages, len(chunks)))
+    if last < total:
+        header.append("<note>More pages follow. Read them with offset=%d.</note>"
+                      % (last + 1))
+    header.extend(["<content>", body, "</content>"])
+    return {"result": "ok", "output": "\n".join(header), "type": "pdf",
+            "totalPages": total, "pageStart": first, "pageEnd": last,
+            "truncated": last < total, "scanned": scanned}
+
+
 def _read_oc(file_path, offset=None, limit=None):
     if not file_path:
         return {"error": "filePath is required"}
+    # An attachment is served at /att/<sha>.pdf, which is a URL and not a path
+    # the workspace policy knows anything about. Resolve it here, through the
+    # same strict _ATTACH_RE check every /att/ request uses, so an attached
+    # document can be read back by name without opening a hole in _safe_path.
+    text = str(file_path)
+    from_attachment = False
+    if text.startswith("/att/"):
+        real = _attach_path(text[len("/att/"):].split("?")[0])
+        if not real or not os.path.exists(real):
+            return {"error": "no such attachment: %s" % text}
+        file_path = real
+        # The attachment directory is outside the workspace by design, so the
+        # path policy below would refuse a file the app itself just wrote and
+        # the user just handed over. It is trusted by construction: the name had
+        # to match _ATTACH_RE, and every byte in there was put there by
+        # _store_attachment after a mime check. The policy still governs every
+        # other path this tool is given.
+        from_attachment = True
     # The model-facing tools went around the guard their siblings use, so the
     # SCOPE setting was enforced on tools the model never called. _safe_path is
     # the same one _read_file uses. A refusal comes back as this tool's own
     # error rather than a raise: the model has to be able to read it and pick a
     # different file, and a traceback tells it nothing.
-    try:
-        file_path = _safe_path(file_path)
-    except PermissionError as exc:
-        return {"error": str(exc)}
+    if not from_attachment:
+        try:
+            file_path = _safe_path(file_path)
+        except PermissionError as exc:
+            return {"error": str(exc)}
     if not os.path.exists(file_path):
         # Suggest similar files
         parent = os.path.dirname(file_path)
@@ -2640,6 +2755,11 @@ def _read_oc(file_path, offset=None, limit=None):
     ext = os.path.splitext(file_path)[1].lower()
     if _is_image_file(file_path):
         return _read_image_attachment(file_path)
+    # Before the binary check, because a PDF is binary and the binary check is
+    # right about it - the file genuinely is not text. It just has text inside
+    # it, which is what the next line knows how to reach.
+    if ext == ".pdf":
+        return _pdf_text(file_path, offset, limit)
     if _looks_binary(sample, ext):
         return {"error": f"Cannot read binary file: {file_path} - it is not "
                          f"text, so there is nothing to show the model. Use an "
@@ -6524,7 +6644,13 @@ READ_TOOL = {
         "description": "Read file contents (text, images, PDFs). Supports "
                        "offset/limit for partial reads and binary detection. "
                        "Images are returned as base64 attachments the model can "
-                       "see. PDFs are extracted. Use offset and limit to page "
+                       "see. PDFs are extracted: offset and limit are PAGES "
+                       "(offset is the first page, 1-indexed; limit defaults to "
+                       "10), and the result says how many pages the document "
+                       "has. A scanned or image-only PDF returns a note saying "
+                       "so - for those, open the file and take_screenshot the "
+                       "window instead. An attached file can be read back with "
+                       "its /att/<name> reference. Use offset and limit to page "
                        "through large files.",
         "parameters": {
             "type": "object",
@@ -19258,6 +19384,38 @@ function addFiles(files) {
         });
       };
       r.readAsDataURL(f);
+    } else if (/\\.pdf$/i.test(f.name) || f.type === 'application/pdf') {
+      /* A PDF is not text and never was: reading one with readAsText produced
+         either nothing or the raw %PDF plumbing, and the 200 KB ceiling below
+         turned anything bigger into the placeholder string "[file too large for
+         direct read]" without the bytes ever leaving the browser. So a PDF is
+         uploaded and kept as a real file, and the model is handed the /att/
+         reference to read it back with. The ceiling matches the server's own
+         limit on a stored attachment, so the two cannot disagree about what
+         fits. */
+      const MAXPDF = 12 * 1024 * 1024;
+      if (f.size > MAXPDF) {
+        pendingAtt.push({ type: 'file', name: f.name,
+          text: 'This PDF is ' + (f.size / 1048576).toFixed(1) + ' MB, over the 12 MB attachment limit, so it was not attached. Save it somewhere in the workspace and read it from there instead.' });
+        renderPreview(); return;
+      }
+      const r = new FileReader();
+      r.onload = function () {
+        const a = { type: 'file', name: f.name, text: 'attached PDF: ' + f.name + ' - saving it, then read it from the path given below.' };
+        pendingAtt.push(a);
+        renderPreview();
+        storeAtt(String(r.result || '')).then(function (url) {
+          if (!url) {
+            a.text = 'This PDF could not be stored, so it was not attached. Copy it into the workspace and read it from there instead.';
+            renderPreview();
+            return;
+          }
+          a.path = url;
+          a.text = 'attached PDF: ' + f.name + '\\nSaved at ' + url + '\\nRead it with the read tool using that path. offset is the first page and limit is how many pages, so read a few pages at a time rather than the whole document. If it comes back saying the pages have no text layer it is a scan, and the way to read it is to open it and take_screenshot the window.';
+          renderPreview();
+        });
+      };
+      r.readAsDataURL(f);
     } else {
       if (f.size > 200 * 1024) { pendingAtt.push({ type: 'file', name: f.name, text: '[file too large for direct read]' }); renderPreview(); return; }
       const r = new FileReader();
@@ -22338,7 +22496,8 @@ class Handler(BaseHTTPRequestHandler):
             mime = {".png": "image/png", ".jpg": "image/jpeg",
                     ".webp": "image/webp", ".gif": "image/gif",
                     ".bmp": "image/bmp", ".avif": "image/avif",
-                    ".svg": "image/svg+xml"}.get(ext, "application/octet-stream")
+                    ".svg": "image/svg+xml",
+                    ".pdf": "application/pdf"}.get(ext, "application/octet-stream")
             try:
                 with open(real, "rb") as fh:
                     data = fh.read()
@@ -22364,6 +22523,18 @@ class Handler(BaseHTTPRequestHandler):
                                  "default-src 'none'; style-src 'unsafe-inline'; "
                                  "sandbox; base-uri 'none'; form-action 'none'")
                 self.send_header("Content-Disposition", "inline")
+            if ext == ".pdf":
+                # A PDF can carry JavaScript, and this one is being served from
+                # the app's own origin to the same browser that holds the
+                # assistant's chats. It is sent as a download rather than
+                # rendered inline, which is also the honest answer to what this
+                # route is for: getting the bytes back so the read tool can
+                # extract them, not putting a document viewer on the page.
+                self.send_header("Content-Security-Policy",
+                                 "default-src 'none'; sandbox; "
+                                 "base-uri 'none'; form-action 'none'")
+                self.send_header("Content-Disposition",
+                                 'attachment; filename="%s"' % name)
             # The name is the content hash, so the bytes at this URL can never
             # change. Saying so keeps a reload from re-downloading every photo
             # in every conversation you have open.

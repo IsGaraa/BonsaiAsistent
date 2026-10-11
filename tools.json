@@ -1360,7 +1360,7 @@
     "type": "function",
     "function": {
       "name": "read",
-      "description": "Read file contents (text, images, PDFs). Supports offset/limit for partial reads and binary detection. Images are returned as base64 attachments the model can see. PDFs are extracted. Use offset and limit to page through large files.",
+      "description": "Read file contents (text, images, PDFs). Supports offset/limit for partial reads and binary detection. Images are returned as base64 attachments the model can see. PDFs are extracted: offset and limit are PAGES (offset is the first page, 1-indexed; limit defaults to 10), and the result says how many pages the document has. A scanned or image-only PDF returns a note saying so - for those, open the file and take_screenshot the window instead. An attached file can be read back with its /att/<name> reference. Use offset and limit to page through large files.",
       "parameters": {
         "type": "object",
         "properties": {
