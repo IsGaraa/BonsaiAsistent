@@ -13987,6 +13987,7 @@ def run_agent(messages, on_tool=None, mode=MODE_BUILD, on_stats=None, hooks=None
                                      "type": "function",
                                      "function": tc.get("function")}
                                     for tc in tool_calls]})
+        held = []
         for tc in tool_calls:
             record = execute_tool_call(tc, hooks=hooks)
             image_uri = record.pop("image_data", None)
@@ -13997,8 +13998,27 @@ def run_agent(messages, on_tool=None, mode=MODE_BUILD, on_stats=None, hooks=None
                          "content": json.dumps(record["full_result"],
                                                ensure_ascii=False)})
             if image_uri:
-                _append_shot_image(msgs, {"preview": image_uri})
-                image_idx.append(len(msgs) - 1)
+                held.append({"preview": image_uri})
+        # Every tool result has to be in the list before anything else goes in.
+        # A picture used to be appended here, inside the loop, which put it
+        # between two results of the same assistant turn:
+        #
+        #     assistant tool_calls=[a, b]
+        #     tool      a
+        #     user      [the picture]      <- interleaved
+        #     tool      b                   <- orphaned
+        #
+        # A tool message must directly follow the assistant turn that asked for
+        # it. Once the picture is in between, the second result has nothing in
+        # front of it, and the next request is refused before a token is
+        # generated - which is the whole conversation stopping dead after a turn
+        # that looked completely normal on screen. Holding them and flushing
+        # after the loop keeps every result contiguous, and only then adds the
+        # pictures as the user turn that follows them.
+        for pic in held:
+            at = _append_shot_image(msgs, pic)
+            if at is not None:
+                image_idx.append(at)
     if on_stats:
         on_stats(total)
     try:
@@ -14632,6 +14652,7 @@ def stream_agent(messages, on_reason=None, on_delta=None, on_tool=None,
                                      "type": "function",
                                      "function": tc.get("function")}
                                     for tc in tool_calls]})
+        held = []
         for tc in tool_calls:
             record = execute_tool_call(tc, hooks=hooks)
             if record.get("image_data"):
@@ -14642,7 +14663,16 @@ def stream_agent(messages, on_reason=None, on_delta=None, on_tool=None,
             msgs.append({"role": "tool", "tool_call_id": record["tool_call_id"],
                          "content": json.dumps(record["full_result"],
                                                ensure_ascii=False)})
-            at = _append_shot_image(msgs, record)
+            # Held, not appended: a tool message must directly follow the
+            # assistant turn that asked for it, and dropping a picture in here
+            # puts it between two results of the same turn. The second result
+            # would then be orphaned and the next request refused outright -
+            # the conversation stopping dead after a turn that looked fine on
+            # screen. Flushed after the loop, once every result is in place.
+            if record.get("preview") or record.get("image_data"):
+                held.append(record)
+        for pic in held:
+            at = _append_shot_image(msgs, pic)
             if at is not None:
                 image_idx.append(at)
     # Tool budget exhausted but the model still wants tools - force a plain,
