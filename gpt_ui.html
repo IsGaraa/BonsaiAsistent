@@ -1,5 +1,5 @@
 <!-- GPT UI (PAGE_GPT) - the page served at /chat, copied verbatim from a
-     running bonsai_web.py at commit 4d0a10b.
+     running bonsai_web.py at commit ac7da2c.
 
      bonsai_web.py is the source of truth. This file is a read-only copy so
      the UI can be opened in an editor without wading through the Python;
@@ -234,11 +234,14 @@
   .blrow.ok b { background: var(--ok); }
   .blrow.mid b { background: var(--warn); }
   .blrow.off b { background: var(--err); }
-  .blrow .blicon { width: 14px; height: 14px; flex: none; }
-  .blrow .bldot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--mut); }
-  .blrow .bldot.on { background: var(--ok); }
-  .blrow .bldot.mid { background: var(--warn); }
-  .blrow .bldot.off { background: var(--err); }
+  /* The status dot sits beside the switch rather than inside a status row, so
+     the rules are on the element itself. Scoped to .blrow they matched nothing. */
+  .bldot { display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+           background: var(--mut); flex: none; vertical-align: middle; }
+  .bldot.on { background: var(--ok); }
+  .bldot.mid { background: var(--warn); }
+  .bldot.off { background: var(--err); }
+  .bldot.down { background: var(--err); }
   .btn-ghost { border: 1px solid var(--bd); background: transparent; color: var(--txt); border-radius: 8px; padding: 7px 10px; cursor: pointer; font-size: 12px; }
   .btn-ghost.on { background: rgba(74,222,128,.15); border-color: #4ade80; color: #86efac; }
   .btn-ghost.on:hover { background: rgba(74,222,128,.3); }
@@ -871,8 +874,8 @@
       <button class="btn-ghost blswitch" id="reaswitch" title="REA MCP bridge. Off means its tools are not in the tool list and no rea process is started. Click to switch on.">REA: OFF</button>
       <span class="bldot" id="readot"></span>
       <button class="btn-ghost blswitch" id="blswitch" title="Blender MCP bridge. Off means its tools are not in the model's tool list and no Blender process is started. Click to switch on.">BLENDER: OFF</button>
+      <span class="bldot" id="bldot"></span>
       <button class="btn-ghost blswitch" id="ceswitch" title="Cheat Engine bridge. Off means its tools are not in the model's tool list and Bonsai does not connect to Cheat Engine at all. ON GIVES AN ASSISTANT THE ABILITY TO READ AND WRITE THE MEMORY OF ANY PROCESS YOU CAN OPEN - that is arbitrary code injection into anything you run, available to any other program running as you. Copy tools\cheatengine_bridge.lua into Cheat Engine's autorun folder first; Cheat Engine must be restarted before it can be reached.">CHEAT ENGINE: OFF</button>
-      <div class="blrow" id="blstatus" title="Blender MCP status"><svg class="blicon" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 1.6C7.4 1.6 3.7 3.9 3.7 6.9c0 1.6 1.1 3 2.8 3.9-2.1.9-3.5 2.4-3.5 4.2 0 3.2 4 5.8 9 5.8 2.4 0 4.6-.7 6.2-1.8l3.4 2.8 1.7-2-3.3-2.7c.6-.9.9-1.9.9-3 0-1.9-1-3.6-2.6-4.9.3-.5.4-1.1.4-1.7 0-3-3.7-5.3-8.3-5.3Z"/><ellipse cx="12" cy="6.9" rx="4.2" ry="2.5" fill="#18181b"/></svg><span class="bldot off" id="bldot"></span></div>
       <button class="btn-ghost wd" id="workbtn"></button>
       <button class="btn-ghost scopebtn" id="scopebtn" title="How far Bonsai may reach outside the workspace. Click to switch: WORKSPACE (hard sandbox) / ASK (ask me every time) / SYSTEM (no prompts).">SCOPE: ...</button>
       <div class="scopelist" id="scopelist"></div>
@@ -4076,15 +4079,11 @@ document.getElementById('workbtn').onclick = async function () {
   } catch (e) { alert('Could not change folder: ' + e.message); }
 };
 function renderBlenderStatus(j) {
-  const el = document.getElementById('blstatus');
-  if (!el) return;
-  /* the switch follows the state, whichever way it changed */
-  const sw = document.getElementById('blswitch');
-  if (sw) {
-    const on = !!j.enabled;
-    sw.textContent = on ? 'BLENDER: ON' : 'BLENDER: OFF';
-    sw.classList.toggle('on', on);
-  }
+  /* The icon row used to be guarded by an early return on this element, which
+     meant the switch itself stopped updating the moment the row was absent.
+     The row is gone now - the button says the same thing and the logo was a
+     second, redundant answer to the same question - so nothing may return early
+     here. The switch is the whole of this function; the dot is a detail on it. */
   const map = {
     /* off is not the same as down: down means the bridge tried and Blender was
        not there, which sends the user off to enable an addon. off means it was
@@ -4096,7 +4095,16 @@ function renderBlenderStatus(j) {
     missing: ['off', 'Blender MCP: not installed (pip install mcp-for-blender).']
   };
   const m = map[j.state || 'down'] || map.down;
-  el.className = 'blrow ' + m[0];
+  const why = j.detail ? (m[1] + ' (' + (j.detail) + ')') : m[1];
+  const sw = document.getElementById('blswitch');
+  if (sw) {
+    const on = !!j.enabled;
+    sw.textContent = on ? 'BLENDER: ON' : 'BLENDER: OFF';
+    sw.classList.toggle('on', on);
+    sw.title = (on ? 'Blender MCP bridge is on. ' : 'Blender MCP bridge. Off means its tools are not in the tool list and no Blender process is started. ') + why;
+  }
+  const el = document.getElementById('blstatus');
+  if (el) { el.className = 'blrow ' + m[0]; el.title = why; }
   const dot = document.getElementById('bldot');
   if (dot) dot.className = 'bldot ' + (j.state === 'ok' ? 'on' : m[0]);
   el.title = j.detail ? (m[1] + ' (' + j.state + ': ' + j.detail + ')') : m[1];
