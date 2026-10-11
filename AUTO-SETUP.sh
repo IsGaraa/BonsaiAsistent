@@ -100,10 +100,23 @@ step_tk() {
         ok "tkinter already works."
         return
     fi
-    "$PY" -m pip install --quiet python3-tk 2>/dev/null \
-        || "$PY" -m pip install --quiet tk 2>/dev/null \
-        || "$PY" -c "import tkinter" >/dev/null 2>&1 \
-        || warn "pip could not provide it - use your package manager (e.g. apt install python3-tk)."
+    # tkinter is a *distribution* package, not a PyPI one: `pip install
+    # python3-tk` (and `pip install tk`) can never satisfy it. The old chain
+    # tried both anyway, which only produced two resolver errors and then a
+    # warning - so the README's "setup step 3 handles it" did not hold. Use the
+    # package manager, which is how step 4 already does it.
+    if command -v apt-get >/dev/null 2>&1; then
+        sudo apt install -y python3-tk
+    elif command -v dnf >/dev/null 2>&1; then
+        sudo dnf install -y python3-tkinter
+    elif command -v pacman >/dev/null 2>&1; then
+        sudo pacman -Sy --noconfirm tk
+    else
+        warn "Install it with your package manager (apt/dnf/pacman): python3-tk."
+    fi
+    "$PY" -c "import tkinter" >/dev/null 2>&1 \
+        && ok "tkinter works." \
+        || warn "still not importable - folder pickers will do nothing."
 }
 
 step_syslibs() {
@@ -111,20 +124,27 @@ step_syslibs() {
     if command -v apt-get >/dev/null 2>&1; then
         sudo apt update
         sudo apt install -y portaudio19-dev xclip xsel wl-clipboard wmctrl \
-            scrot imagemagick x11-utils python3-tk tesseract-ocr
+            scrot imagemagick x11-utils python3-tk tesseract-ocr \
+            && ok "system libraries installed." \
+            || warn "apt install failed - run it again, or install them by hand."
     elif command -v dnf >/dev/null 2>&1; then
         sudo dnf install -y portaudio-devel xclip xsel wl-clipboard wmctrl \
-            scrot ImageMagick xorg-x11-utils python3-tkinter tesseract
+            scrot ImageMagick xorg-x11-utils python3-tkinter tesseract \
+            && ok "system libraries installed." \
+            || warn "dnf install failed - run it again, or install them by hand."
     elif command -v pacman >/dev/null 2>&1; then
         sudo pacman -Sy --noconfirm portaudio xclip xsel wl-clipboard wmctrl \
-            scrot imagemagick xorg-x11-utils tk tesseract
+            scrot imagemagick xorg-x11-utils tk tesseract \
+            && ok "system libraries installed." \
+            || warn "pacman failed - run it again, or install them by hand."
     else
         warn "Could not detect a package manager. Install by hand:"
         say "      portaudio, xclip / xsel / wl-clipboard, wmctrl,"
         say "      scrot or imagemagick, python3-tk, tesseract-ocr"
-        return
     fi
-    ok "system libraries installed."
+    # The success line used to be printed unconditionally, so a failed apt
+    # still reported "system libraries installed." It is now inside each
+    # branch, next to the command whose exit status it reflects.
 }
 
 step_wayland() {
@@ -142,7 +162,10 @@ step_wayland() {
     elif command -v pacman >/dev/null 2>&1; then sudo pacman -Sy --noconfirm grim
     else warn "Install grim yourself for screenshots on Wayland."; return
     fi
-    ok "grim installed."
+    # as in step_syslibs: report what actually happened, not that it happened
+    command -v grim >/dev/null 2>&1 \
+        && ok "grim installed." \
+        || warn "grim was not installed - Wayland screenshots will fail."
 }
 
 step_llama() {
@@ -286,6 +309,11 @@ dispatch() {
         v) step_voices ;;
         c) step_verify ;;
         r) step_run; exit 0 ;;
+        # "a" has to be handled here as well as in the menu. It used to be
+        # translated only inside menu(), so the documented one-liner
+        # "./AUTO-SETUP.sh a" reached dispatch with a literal "a" and did
+        # nothing at all beyond printing "Unknown step 'a'."
+        a|A) run_pick "$ALL" ;;
         *) warn "Unknown step '$1'." ;;
     esac
 }

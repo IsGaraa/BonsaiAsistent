@@ -1595,5 +1595,24 @@
         ]
       }
     }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "set_chat_title",
+      "description": "Name this conversation. Call it once, early, as soon as you know what the conversation is actually about - a short human title like 'Fix the login redirect' or 'Plan the Q3 budget', not a restatement of the first message and not a question. It replaces the placeholder title the app made from the opening words, and it is how the user finds this chat again in the list later.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "title": {
+            "type": "string",
+            "description": "2-6 words. Plain text, no quotes, no punctuation at the end."
+          }
+        },
+        "required": [
+          "title"
+        ]
+      }
+    }
   }
 ]

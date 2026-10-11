@@ -40,7 +40,16 @@ messages, not as text descriptions.
 across the PC, running commands, driving the mouse and keyboard, managing
 windows, using the clipboard, fetching and scraping web pages, calling HTTP APIs,
 speaking aloud with local neural TTS, talking to Docker, editing Blender scenes,
-and generating images.
+generating images, and running reverse-engineering sessions through the **REA**
+MCP bridge (native binaries, managed assemblies, APKs, web builds, browser and
+Electron targets).
+
+> **The Cheat Engine bridge is the sharpest tool here, and it is off by
+> default.** Turning it on lets the assistant **read and write the memory of
+> any process you can open** — that is arbitrary code injection into anything
+> you run. It sits outside the path-scope approvals described in §8 and does
+> not consult them. Leave it off unless you specifically want that, and only on
+> a machine where you are happy for the model to do it.
 
 **Two ways to reach it.** A browser UI at `http://127.0.0.1:8081`, and a plain
 HTTP API.
@@ -466,8 +475,21 @@ Attachment names are a hash of the file's bytes, so the same image attached twic
 is stored once. The chat stores the short `/att/...` reference, never megabytes of
 base64 — which is why pictures survive a reload.
 
-Environment variables: `PC_WORKDIR`, `PC_LLAMA_SERVER`, `PC_SD_DIR`,
-`BONSAI_CHATS_FILE`, `PC_IMG_PROVIDER`.
+Environment variables:
+
+| variable | what it does |
+|---|---|
+| `PC_WORKDIR` | the workspace folder; defaults to `~/bonsai_workspace` |
+| `PC_LLAMA_SERVER` | path to the local `llama-server` binary |
+| `PC_SD_DIR` | where the stable-diffusion.cpp build lives |
+| `PC_IMAGE_MODEL_DIR` | where the Qwen-Image weights live |
+| `PC_REA_HOME` | the rea checkout the REA bridge runs |
+| `PC_KOKORO_IDLE_UNLOAD` | seconds the TTS engine stays warm; `0` keeps it resident |
+| `BONSAI_CHATS_FILE` | full path to the chat history file |
+| `BONSAI_DIR` | state directory (chat path is derived from it unless the file above is set) |
+| `BONSAI_MAX_TOOL_ROUNDS` | hard ceiling on tool rounds in one turn |
+| `IMAGE_DEFAULT_STEPS` | sampling steps for image generation, clamped 10–80 |
+| `IMAGE_CFG` | classifier-free guidance scale, 6.0 by default |
 
 ---
 
@@ -529,7 +551,7 @@ BonsaiAsistent/
 ├── AUTO-SETUP.sh              Linux setup menu
 ├── OPTIONALS.cmd              Windows optional extras menu
 ├── run.bat / run.sh           launch
-├── stop.cmd / stop.sh         stop
+├── stop.cmd / stop.sh         stop the model server (8080) and the UI (8081)
 │
 ├── API KEYS.example.txt       template - committed, no values
 ├── models.example.json        template - committed, no paths or keys

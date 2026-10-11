@@ -140,9 +140,13 @@ DOWNLOAD_CHUNK = 256 * 1024
 _DOWNLOAD_FLOOR_BYTES = 64 * 1024 * 1024
 MODE_BUILD = "build"
 MODE_PLAN = "plan"
-_DEF_WORKDIR = (r"C:\Users\drago\Desktop\workspace" if IS_WINDOWS
-                else os.path.expanduser("~/bonsai_workspace"))
-WORKDIR = os.path.realpath(os.environ.get("PC_WORKDIR", _DEF_WORKDIR))
+# The default workspace is a folder named for the app inside the user's own
+# home, not a path belonging to whoever committed this file. The previous
+# default was the author's own Desktop, so every other clone - and every other
+# user account on this machine - inherited a workspace that either does not
+# exist or is not theirs. PC_WORKDIR still overrides it.
+_DEF_WORKDIR = os.path.join(os.path.expanduser("~"), "bonsai_workspace")
+WORKDIR = os.path.realpath(os.environ.get("PC_WORKDIR") or _DEF_WORKDIR)
 KOKORO_DIR = os.environ.get("PC_KOKORO_DIR", os.path.join(BONSAI_DIR, "kokoro"))
 # The three model exports kokoro-onnx's release publishes. fp32 is the default:
 # it is the reference export, and 310 MB is not a cost worth optimising away for
@@ -2285,10 +2289,24 @@ def _run_code(language, code, timeout=_CODE_TIMEOUT):
 
 
 def _clip_result(res):
-    if isinstance(res, dict) and res.get("content") and isinstance(res["content"], str):
-        if len(res["content"]) > 12000:
+    """Keep one oversized tool result from costing the whole context.
+
+    Both text keys are handled, not just one. 'content' is the web tools' shape
+    and 'result' is what the Blender and REA bridges actually produce, so a
+    clip that only knew 'content' let every bridge result through untouched -
+    which is the case most likely to be large, since a list_strings or a
+    batch_decompile on a real binary runs to hundreds of kilobytes."""
+    if not isinstance(res, dict):
+        return res
+    budget = _OVERSIZE_TOOL_CHARS
+    for key in ("content", "result"):
+        val = res.get(key)
+        if isinstance(val, str) and len(val) > budget:
             res = dict(res)
-            res["content"] = res["content"][:12000] + "\n[... response content truncated ...]"
+            res[key] = (val[:budget] + "\n[... truncated, %d of %d characters "
+                        "shown - ask again for a narrower slice ...]"
+                        % (budget, len(val)))
+            break
     return res
 
 
@@ -2972,7 +2990,11 @@ _BLENDER_FLAG_LOCK = threading.Lock()
 # Off by default, like Blender. Starting a subprocess that opens files and can
 # launch browsers is not something to do unasked, and 139 tool schemas is a
 # large slice of the context window to spend on a server that may not be wanted.
-REA_HOME = os.environ.get("PC_REA_HOME") or r"C:\Users\drago\Desktop\rea"
+# PC_REA_HOME points at a rea checkout. Without it, look beside the project
+# rather than at a path belonging to whoever committed this file, so a clone
+# on another machine is not pointed at the author's directory layout.
+REA_HOME = (os.environ.get("PC_REA_HOME")
+            or os.path.join(os.path.dirname(os.path.abspath(__file__)), "rea"))
 REA_ENTRY = os.path.join("scripts", "rea.mjs")
 # rea ships read, shell, grep, edit, search and several others that mean exactly
 # what Bonsai's own tools mean. Two functions of one name in a single tools[]
@@ -3303,11 +3325,7 @@ def set_blender_enabled(value):
         threading.Thread(target=_blender_kickoff, daemon=True).start()
     else:
         try:
-            bridge = _blender_mcp_bridge()
-            with bridge._lock:
-                loop = bridge._loop
-            if loop is not None and loop.is_running():
-                loop.call_soon_threadsafe(loop.stop)
+            _blender_mcp_bridge().stop()
         except Exception:
             pass
     return _blender_enabled()
@@ -3321,7 +3339,31 @@ class _BlenderMcp:
         self._tools = {}
         self._error = None
         self._settled = threading.Event()
+        self._stop = threading.Event()
         self._restart_at = 0.0
+
+    def stop(self):
+        """Ask the supervisor to finish, so the child is actually reaped.
+
+        loop.stop() was used here and it leaked: it ends run_until_complete
+        from under the coroutine, so the `async with stdio_client(...)` never
+        unwinds and its cleanup - which is the only thing that terminates the
+        subprocess - never runs. Every off/on toggle left another live MCP
+        server behind. Setting the flag lets _supervise return normally, take
+        the normal path out of both context managers, and reap the child.
+
+        _session is dropped here as well. Leaving it set made ensure() short
+        circuit on "already connected" and answer True against a session
+        whose process had just been reaped, so switching back on looked like
+        it worked while the bridge was dead."""
+        self._stop.set()
+        with self._lock:
+            loop = self._loop
+            self._session = None
+        if loop is not None and loop.is_running():
+            # the supervisor wakes on its own within half a second; nudging it
+            # just makes the shutdown feel immediate
+            loop.call_soon_threadsafe(lambda: None)
 
     def ensure(self, timeout=40):
         with self._lock:
@@ -3332,6 +3374,7 @@ class _BlenderMcp:
             if self._loop is None or not self._loop.is_running():
                 self._error = None
                 self._tools = {}
+                self._stop.clear()
                 loop = asyncio.new_event_loop()
                 self._loop = loop
                 self._settled.clear()
@@ -3345,7 +3388,7 @@ class _BlenderMcp:
         try:
             loop.run_until_complete(self._supervise())
         except Exception as exc:
-            self._fail(f"bridge crashed: {exc}")
+            self._fail("bridge crashed: %s" % exc)
         finally:
             try:
                 loop.close()
@@ -3368,7 +3411,9 @@ class _BlenderMcp:
                     self._tools = {t.name: t for t in tools.tools
                                    if t.name in BLENDER_MCP_ALLOW}
                 self._settled.set()
-                while True:
+                # exits on stop() rather than being torn down from outside, so
+                # the two context managers above unwind and reap the subprocess
+                while not self._stop.is_set():
                     await asyncio.sleep(0.5)
 
     def _fail(self, msg):
@@ -3390,6 +3435,14 @@ class _BlenderMcp:
                 session.call_tool(name, args or {}), loop)
             res = fut.result(timeout=600)
         except Exception as exc:
+            # cancel() matters: result() only stops *waiting*. Without it the
+            # coroutine keeps running on the bridge loop, so every timed-out
+            # round left another live call competing for the same stdout pipe,
+            # and the tool loop allows up to MAX_TOOL_ROUNDS of them.
+            try:
+                fut.cancel()
+            except Exception:
+                pass
             return {"error": f"blender tool '{name}' failed: {exc}"}
         if getattr(res, "isError", False):
             text = "".join(getattr(p, "text", "") or "" for p in res.content)
@@ -3494,6 +3547,7 @@ class _ReaMcp:
         self._tools = {}
         self._error = None
         self._settled = threading.Event()
+        self._stop = threading.Event()
         self._restart_at = 0.0
 
     def ensure(self, timeout=40):
@@ -3505,6 +3559,7 @@ class _ReaMcp:
             if self._loop is None or not self._loop.is_running():
                 self._error = None
                 self._tools = {}
+                self._stop.clear()
                 loop = asyncio.new_event_loop()
                 self._loop = loop
                 self._settled.clear()
@@ -3546,7 +3601,9 @@ class _ReaMcp:
                     self._session = session
                     self._tools = {t.name: t for t in listed.tools}
                 self._settled.set()
-                while True:
+                # exits on stop() rather than being torn down from outside, so
+                # the two context managers above unwind and reap the subprocess
+                while not self._stop.is_set():
                     await asyncio.sleep(0.5)
 
     def _fail(self, msg):
@@ -3554,7 +3611,24 @@ class _ReaMcp:
         with self._lock:
             self._error = msg
             self._session = None
-            self._tools = {}
+            # _tools is deliberately kept. Clearing it made every rea_* call
+            # miss the bridge and fall through to the file tools, which answer
+            # "unknown tool rea_open_binary" - a message that tells the model
+            # the tool was removed when the truth is that REA went away. The
+            # names staying put routes the call back here, where call() can
+            # report REA_OFFLINE_MSG and say what actually happened.
+
+    def stop(self):
+        """Ask the supervisor to finish, so the child is actually reaped.
+
+        See _BlenderMcp.stop for why loop.stop() cannot be used here, and
+        why _session is cleared as well."""
+        self._stop.set()
+        with self._lock:
+            loop = self._loop
+            self._session = None
+        if loop is not None and loop.is_running():
+            loop.call_soon_threadsafe(lambda: None)
 
     def call(self, name, args):
         with self._lock:
@@ -3566,6 +3640,12 @@ class _ReaMcp:
                 session.call_tool(name, args or {}), loop)
             res = fut.result(timeout=900)
         except Exception as exc:
+            # see the matching note in _BlenderMcp.call - cancelling is what
+            # stops the abandoned call from piling up on the bridge loop
+            try:
+                fut.cancel()
+            except Exception:
+                pass
             return {"error": "rea tool '%s' failed: %s" % (name, exc)}
         if getattr(res, "isError", False):
             return {"error": _rea_error_text(name, res)}
@@ -3713,11 +3793,7 @@ def set_rea_enabled(value):
         threading.Thread(target=_rea_kickoff, daemon=True).start()
     else:
         try:
-            bridge = _rea_mcp_bridge()
-            with bridge._lock:
-                loop = bridge._loop
-            if loop is not None and loop.is_running():
-                loop.call_soon_threadsafe(loop.stop)
+            _rea_mcp_bridge().stop()
         except Exception:
             pass
     return _rea_enabled()
@@ -4115,9 +4191,14 @@ def _entry_cfg(entry):
 
 
 _KEY_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.-]*$")
-# how the big providers spell a credential, for telling a name from a secret
-_SECRETISH_RE = re.compile(r"^(sk[-_]|sk-or[-_]|hf_|gsk_|xai[-_]|api[-_]?key|"
-                           r"AIza|bearer\s)", re.I)
+# how the providers spell a credential, for telling a name from a secret.
+# This list has to cover the shapes that are short enough and name-shaped
+# enough to slip through as an identifier - ghp_/glpat- were accepted as a
+# "name" before, and a credential that is accepted as a name gets written to
+# models.json and echoed back by /api/models.
+_SECRETISH_RE = re.compile(r"^(sk[-_]|sk-or[-_]|sk-ant[-_]|hf_|gsk_|xai[-_]|"
+                           r"gh[pousr]_|glpat-|github_pat_|oc_sk_|"
+                           r"api[-_]?key|AIza|bearer\s|xox[baprs]-)", re.I)
 # a credential quoted back inside free text. A provider that rejects a key
 # likes to repeat it in the body ("invalid api key: sk-or-v1-..."), and that
 # body is about to be rendered into the chat, so scrub it on the way through.
@@ -4171,8 +4252,14 @@ def _sanitise_key_ref(raw):
                     "models.json stores the NAME - put the key in API KEYS.txt "
                     "under a name like OPENROUTER_API_KEY, and enter that name here")
     if " " in ref or not _KEY_NAME_RE.match(ref):
-        return "", ("'%s' is not a usable name. Use letters, digits, dot, dash "
-                    "or underscore, starting with a letter" % ref[:40])
+        # the value is not quoted back. It is whatever the user just typed,
+        # into a page on their own machine, so it is not a disclosure to
+        # them - but a rejected value is very often the credential itself,
+        # and it would then be sitting in the page, in a screenshot, and in
+        # whatever logged the response. Saying what is wrong is enough.
+        return "", ("that is not a usable name. Use letters, digits, dot, dash "
+                    "or underscore, starting with a letter - for example "
+                    "OPENROUTER_API_KEY")
     return ref, None
 
 
@@ -4773,51 +4860,70 @@ def _pair_mmproj(entry):
     return False
 
 
+def _public_model_entry(m):
+    """One model as the browser is allowed to see it.
+
+    A field-by-field rebuild, never the entry itself. That is what keeps
+    api_key out of every response: only the boolean, the state and - for a
+    name, which is not a secret - the name are ever included."""
+    mtype = m.get("type") or "local"
+    item = {"id": m["id"], "label": m.get("label") or m["id"],
+            "type": mtype}
+    # Every model, hosted ones included: the picker draws the window beside
+    # the name, and a hosted entry that reported none was drawn as a blank,
+    # which read as "unknown" when in fact the number was simply never sent.
+    item["ctx"], item["ctx_verified"] = _entry_ctx(m)
+    if mtype == "local":
+        item["path"] = m.get("path")
+        item["available"] = bool(m.get("path") and os.path.exists(m["path"]))
+        item["cfg"] = _entry_cfg(m)
+        item["mmproj"] = m.get("mmproj") or ""
+        item["vision"] = _entry_vision(m)
+    else:
+        item["base_url"] = m.get("base_url")
+        item["model"] = m.get("model")
+        item["wire"] = _api_wire(m)
+        # A hosted model is assumed able to see until proven otherwise.
+        # Without this the picker showed every API model as text-only, which
+        # is both wrong for multimodal ones and useless as a warning.
+        item["vision"] = _entry_vision(m)
+        # only ever report *that* a key is configured, never the value
+        if m.get("omit"):
+            item["omit"] = m["omit"]
+        kstate = _api_key_state(m.get("api_key"))[0]
+        item["api_key_set"] = _api_key_present(m.get("api_key"))
+        item["api_key_state"] = kstate
+        # A *name* is not a secret, and it has to reach the gear dialog or
+        # there is no way to see or correct it short of deleting the model.
+        # A literal key IS a secret, and those are legacy entries: report the
+        # state and let the hint explain the fix, but never send the value to
+        # the browser. Clearing the field and typing a name migrates it.
+        #
+        # Tested against _KEY_NAME_RE rather than trusting api_key_state to
+        # have classified it. That classification is a prefix-and-length
+        # heuristic over hand-edited json, and a real credential it failed to
+        # recognise used to be classified "missing" - at which point this
+        # field is the thing that ships the secret to the browser. A value
+        # that cannot be a name is simply not reported as one.
+        raw_ref = str(m.get("api_key") or "")
+        item["api_key_name"] = (
+            raw_ref if (kstate != "literal" and len(raw_ref) <= 48
+                        and _KEY_NAME_RE.match(raw_ref)
+                        and not _SECRETISH_RE.match(raw_ref)) else "")
+        # a remote endpoint cannot answer anything without one, and the
+        # only symptom used to be a 401 in the middle of a conversation
+        item["needs_key"] = bool(mtype == "api" and not item["api_key_set"]
+                                 and not _is_loopback(m))
+    return item
+
+
 def _public_models():
     entry = _active_model()
     out = []
     with _MODELS_LOCK:
         models = [dict(m) for m in _MODELS]
     for m in models:
-        mtype = m.get("type") or "local"
-        item = {"id": m["id"], "label": m.get("label") or m["id"],
-                "type": mtype}
-        # Every model, hosted ones included: the picker draws the window beside
-        # the name, and a hosted entry that reported none was drawn as a blank,
-        # which read as "unknown" when in fact the number was simply never sent.
-        item["ctx"], item["ctx_verified"] = _entry_ctx(m)
-        if mtype == "local":
-            item["path"] = m.get("path")
-            item["available"] = bool(m.get("path") and os.path.exists(m["path"]))
-            item["cfg"] = _entry_cfg(m)
-            item["mmproj"] = m.get("mmproj") or ""
-            item["vision"] = _entry_vision(m)
-        else:
-            item["base_url"] = m.get("base_url")
-            item["model"] = m.get("model")
-            item["wire"] = _api_wire(m)
-            # A hosted model is assumed able to see until proven otherwise.
-            # Without this the picker showed every API model as text-only, which
-            # is both wrong for multimodal ones and useless as a warning.
-            item["vision"] = _entry_vision(m)
-            # only ever report *that* a key is configured, never the value
-            if m.get("omit"):
-                item["omit"] = m["omit"]
-            kstate = _api_key_state(m.get("api_key"))[0]
-            item["api_key_set"] = _api_key_present(m.get("api_key"))
-            item["api_key_state"] = kstate
-            # A *name* is not a secret, and it has to reach the gear dialog or
-            # there is no way to see or correct it short of deleting the model.
-            # A literal key IS a secret, and those are legacy entries: report the
-            # state and let the hint explain the fix, but never send the value to
-            # the browser. Clearing the field and typing a name migrates it.
-            item["api_key_name"] = ("" if kstate == "literal"
-                                    else str(m.get("api_key") or ""))
-            # a remote endpoint cannot answer anything without one, and the
-            # only symptom used to be a 401 in the middle of a conversation
-            item["needs_key"] = bool(mtype == "api" and not item["api_key_set"]
-                                     and not _is_loopback(m))
-        out.append(item)
+        out.append(_public_model_entry(m))
     ready = _bonsai_ready()
     active_ctx, active_ctx_verified = _entry_ctx(entry)
     return {"active": entry["id"] if entry else None,
@@ -5084,7 +5190,11 @@ def _add_model(body):
             return {"ok": False, "error": "a model with id '%s' already exists" % mid}
         _MODELS.append(entry)
     _save_models()
-    res = {"ok": True, "added": entry, **_public_models()}
+    # The saved entry, not the live dict. Every other model endpoint hands back
+    # the projection from _public_models(), which never carries api_key; this
+    # one used to return the object itself, so whatever the sanitiser let
+    # through came straight back to the browser. Project it the same way.
+    res = {"ok": True, "added": _public_model_entry(entry), **_public_models()}
     # adding a hosted model with no usable key is allowed - it can be filled in
     # afterwards - but the user should hear about it now, not from a 401 later
     if entry.get("type") == "api" and not _api_key_present(entry.get("api_key")) \
@@ -11897,6 +12007,26 @@ def _redact_secrets(args):
     return clean
 
 
+def _maybe_redact_args(args):
+    """Redact a tool's arguments when they carry a credential.
+
+    Driven by the data rather than by the tool's name. Gating this on one
+    literal name - which is what it used to do, for download_authed only -
+    meant every other tool that accepts headers went unredacted, so a cookie
+    pasted into web_resolve, download_file or download_batch was written
+    verbatim into chats.json and into the browser's localStorage. Anything
+    without a credential-shaped argument is passed through untouched, so
+    ordinary arguments still read normally in the tool card."""
+    args = args or {}
+    if not isinstance(args, dict):
+        return args
+    interesting = any(
+        (str(k).lower() == "headers" and isinstance(v, dict))
+        or any(s in str(k).lower() for s in _SECRET_KEYS)
+        for k, v in args.items())
+    return _redact_secrets(args) if interesting else args
+
+
 def _auth_headers(args):
     headers = {}
     for k, v in (args.get("headers") or {}).items():
@@ -13866,7 +13996,11 @@ def execute_tool_call(tc, hooks=None):
         # back to the model so it can correct the arguments and continue.
         _take_last_change()
         err = {"error": f"{type(exc).__name__}: {exc}"}
-        record = {"name": name, "arguments": args, "result": public_result(err),
+        # redacted on the failure path too: the tools that take a header are
+        # exactly the ones that raise on network trouble, which is how a
+        # credential reached the saved chat in the first place
+        record = {"name": name, "arguments": _maybe_redact_args(args),
+                  "result": public_result(err),
                   "full_result": err,
                   "tool_call_id": tc.get("id") or "call_" + str(len(name))}
         record["ms"] = int((time.time() - started) * 1000)
@@ -14160,7 +14294,7 @@ def _execute_tool_call(name, args, tc, hooks, image_uri):
         raw_result = _exec_file_tool(name, args)
     result = public_result(_clip_result(raw_result))
     full = _clip_result(raw_result)
-    shown_args = _redact_secrets(args) if name == "download_authed" else args
+    shown_args = _maybe_redact_args(args)
     record = {"name": name, "arguments": shown_args, "result": result,
               "full_result": full,
               "tool_call_id": tc.get("id") or "call_" + str(len(name))}
@@ -21706,6 +21840,48 @@ def _strip_full(record):
 CLIENT_GONE = (BrokenPipeError, ConnectionAbortedError, ConnectionResetError)
 
 
+def _cross_site_post(handler):
+    """True when a POST must be refused because it came from another site.
+
+    Binding to 127.0.0.1 keeps the network out of it, but it does not keep the
+    browser out: every page the user has open can reach this port, and a
+    "simple" cross-origin request - one the browser delivers without asking -
+    is enough to drive the JSON API. That matters here more than it would in
+    most local apps, because /api/models resolves a real credential out of
+    API KEYS.txt and puts it in an Authorization header aimed at whatever base
+    URL the request asked for. A hostile page could not read the reply; it
+    does not have to, because the key arrives at its own server instead.
+
+    Two independent checks, because either alone has a hole. Sec-Fetch-Site and
+    Origin are the browser telling us who it is, and a client that is not a
+    browser simply does not send them - so a request carrying neither is
+    allowed, which keeps curl and the tools working. The content type is the
+    part a browser cannot fake: text/plain is a simple type that skips the
+    preflight, while application/json forces one, and a cross-origin page
+    cannot pass a preflight here because no CORS headers are ever sent. It is
+    only required when a body is actually present, so the handful of bodiless
+    POSTs the page makes still work.
+    """
+    site = str(handler.headers.get("Sec-Fetch-Site") or "").strip().lower()
+    if site and site not in ("same-origin", "none"):
+        return True
+    origin = str(handler.headers.get("Origin") or "").strip()
+    if origin and origin != "null":
+        host = str(handler.headers.get("Host") or "").strip()
+        if origin not in ("http://" + host, "https://" + host):
+            return True
+    try:
+        length = int(handler.headers.get("Content-Length", 0) or 0)
+    except (TypeError, ValueError):
+        length = 0
+    if length > 0:
+        ctype = str(handler.headers.get("Content-Type") or "")
+        ctype = ctype.split(";")[0].strip().lower()
+        if ctype != "application/json":
+            return True
+    return False
+
+
 def sse(handler, event, obj):
     data = json.dumps(obj, ensure_ascii=False)
     try:
@@ -21948,7 +22124,31 @@ class Handler(BaseHTTPRequestHandler):
             data = text.encode("utf-8")
         except Exception:
             pass
-        self._send(200, data, "text/html; charset=utf-8")
+        # A workspace .html file is served from the app's own origin, so a script
+        # inside it would be same-origin with /api/chats and every other
+        # endpoint. The attachment route already sandboxes the SVG it serves
+        # for exactly this reason; this is the same protection for the page
+        # preview. It is applied here rather than in _send because the chat and
+        # /kokoro pages are also text/html and genuinely need their scripts.
+        # No 'sandbox' directive - that would make the document opaque and
+        # break the /previewfile/ images it exists to show - so script
+        # execution is switched off by name instead.
+        data = data if isinstance(data, bytes) else data.encode("utf-8")
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header("Content-Security-Policy",
+                             "default-src 'none'; img-src 'self' data:; "
+                             "style-src 'unsafe-inline'; font-src 'self' data:; "
+                             "script-src 'none'; object-src 'none'; "
+                             "base-uri 'self'; form-action 'none'")
+            self.end_headers()
+            self.wfile.write(data)
+        except CLIENT_GONE:
+            self.close_connection = True
 
     def _image_stream(self, body):
         """SSE for the IMAGE button: same worker, same events, no model.
@@ -22228,6 +22428,11 @@ class Handler(BaseHTTPRequestHandler):
                             "/api/dl_resume", "/api/dl_cancel",
                             "/api/dl_retry", "/api/dl_clear"):
                 self._send(404, "not found", "text/plain")
+                return
+            if _cross_site_post(self):
+                # Answered as though it were not ours. A 403 tells a hostile
+                # page it was blocked; silence keeps it from probing for one.
+                self._send(403, "cross-site request refused", "text/plain")
                 return
             length = int(self.headers.get("Content-Length", 0) or 0)
             if length > MAX_REQUEST_BYTES:
@@ -22722,8 +22927,11 @@ class BonsaiServer(ThreadingHTTPServer):
 
 def _gen_tools_json(path=None):
     """Write the tool catalogue to tools.json so the docs cannot drift."""
+    # CHAT_TITLE_TOOL is in this list because _tools_for() offers it on every
+    # request. Leaving it out made tools.json describe a model that can never
+    # be called, which is the same drift the file exists to prevent.
     tools = ([TOOL_SPEC] + list(FILE_TOOLS.values()) + WEB_SPECS +
-             PC_TOOLS)
+             PC_TOOLS + [CHAT_TITLE_TOOL])
     seen = set()
     out = []
     for tool in tools:
@@ -22771,11 +22979,23 @@ def main():
     # a few hundred MB, so it is reaped on the way out
     import atexit
     atexit.register(_resolve_pw_stop)
+    # the bridges too. Their MCP servers are child processes, and a daemon
+    # thread being killed at interpreter shutdown does not reap them, so
+    # without this a quit can leave a node/python MCP server running.
+    def _stop_bridges():
+        for stop in (lambda: _rea_mcp_bridge().stop(),
+                     lambda: _blender_mcp_bridge().stop()):
+            try:
+                stop()
+            except Exception:
+                pass
+    atexit.register(_stop_bridges)
     try:
         BonsaiServer((HOST, PORT), Handler).serve_forever()
     except KeyboardInterrupt:
         print("shutting down", flush=True)
     finally:
+        _stop_bridges()
         _resolve_pw_stop()
 
 

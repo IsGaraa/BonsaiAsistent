@@ -49,6 +49,15 @@ sd.cpp/
 models.json
 models.json.bak
 
+# Chats. The default location is %APPDATA%\BonsaiAsistent, outside the repo,
+# but BONSAI_DIR can put it in here - and a chat file can contain tool
+# arguments (a pasted cookie or bearer token) and whatever the model said
+# back. Never commit it.
+chats.json
+chats.json.bak
+chats.json.tmp
+chats.deleted.json
+
 # API keys - plaintext secrets, never commit these.
 # API KEYS.example.txt IS committed; it is all comments and placeholders.
 API KEYS.txt

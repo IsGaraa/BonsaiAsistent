@@ -29,6 +29,16 @@ mcp-for-blender
 # a one-off `playwright install chromium` as well.
 playwright
 
+# Media download                                   -> download_media
+# Was documented in requirements.md as a dependency of download_media but was
+# in neither requirements file, so following the setup left that tool dead.
+yt-dlp
+
+# Image-model weights fetcher                       -> tools/fetch_image_model.py
+# That script hard-imports huggingface_hub; without it OPTIONALS item 6 fails
+# immediately, after the user has already agreed to a ~17 GB download.
+huggingface_hub
+
 # Local neural TTS                   -> tts_speak, tts_voices, /kokoro (Kokoro-82M)
 # kokoro-onnx pulls espeakng-loader and phonemizer, which it needs to turn text
 # into the phonemes the model was trained on. The weights are separate and are

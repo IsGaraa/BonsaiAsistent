@@ -128,14 +128,21 @@ reg query "HKLM\SYSTEM\CurrentControlSet\Control\FileSystem" /v LongPathsEnabled
 if not errorlevel 1 (
     echo   [ok] long paths already enabled
 ) else (
-    echo   Enabling long path support...
-    reg add "HKLM\SYSTEM\CurrentControlSet\Control\FileSystem" /v LongPathsEnabled /t REG_DWORD /d 1 /f >nul 2>&1 \
-        && echo   [ok] enabled - a reboot or sign-out is needed \
-        || echo   [!] could not write the registry - try as Administrator.
+echo   Enabling long path support...
+    rem cmd.exe has no backslash line-continuation - that is shell syntax.
+    rem It used to be written here anyway: reg was handed a stray backslash,
+    rem the next line began with an AND-OR chain, and cmd aborted the whole
+    rem batch file on the syntax error. One command per line here instead.
+    reg add "HKLM\SYSTEM\CurrentControlSet\Control\FileSystem" /v LongPathsEnabled /t REG_DWORD /d 1 /f >nul 2>&1
+    if errorlevel 1 (
+        echo   [!] could not write the registry - try as Administrator.
+    ) else (
+        echo   [ok] enabled - a reboot or sign-out is needed
+    )
 )
 echo.
 echo   Making the page file large enough for a 7 GB model (admin)...
-powershell -NoProfile -Command "Start-Process powershell -Verb RunAs -Wait -ArgumentList '-NoProfile','-Command','$c=Get-CimInstance Win32_ComputerSystem; if($c.AutomaticManagedPagework -ne $true){ Set-CimInstance -InputObject $c -Property @{AutomaticManagedPagework=$false}; $p=Get-CimInstance Win32_PageFileSetting; if($p){ Set-CimInstance -InputObject $p -Property @{InitialSize=49152;MaximumSize=98304} } else { Set-CimInstance -InputObject $c -Property @{AutomaticManagedPagework=$false} | Out-Null; New-CimInstance -ClassName Win32_PageFileSetting -Property @{Name=\"C:\\\\pagefile.sys\";InitialSize=49152;MaximumSize=98304} | Out-Null }; Write-Host \"  [ok] page file set to 48-96 GB\"'"
+powershell -NoProfile -Command "Start-Process powershell -Verb RunAs -Wait -ArgumentList '-NoProfile','-Command','$c=Get-CimInstance Win32_ComputerSystem; if($c.AutomaticManagedPagefile -ne $true){ Set-CimInstance -InputObject $c -Property @{AutomaticManagedPagefile=$false}; $p=Get-CimInstance Win32_PageFileSetting; if($p){ Set-CimInstance -InputObject $p -Property @{InitialSize=49152;MaximumSize=98304} } else { New-CimInstance -ClassName Win32_PageFileSetting -Property @{Name=\"C:\\\\pagefile.sys\";InitialSize=49152;MaximumSize=98304} | Out-Null }; Write-Host \"  [ok] page file set to 48-96 GB\"'"
 goto :after
 
 :o_images
@@ -153,15 +160,14 @@ if not exist "tools\fetch_image_model.py" (
 set "q="
 set /p "q=  Download them now? About 17 GB. [y/N]: "
 if /i not "%q%"=="y" goto :after
-python tools\fetch_image_model.py
+%PYEXE% tools\fetch_image_model.py
 if errorlevel 1 (
     echo   [!] download failed - run it again when you have a better connection.
 ) else (
     echo   [ok] done.
     echo   Note: this is the full uncensored 7B model at 40 steps, so a picture
-echo   takes ~10 minutes at 1920x1088. The engine also needs the whole
- echo card. Close anything
-    echo   else holding VRAM - a game alone will use ~11 GB.
+    echo   takes ~10 minutes at 1920x1088. The engine also needs the whole
+    echo   card. Close anything else holding VRAM first.
 )
 goto :after
 

@@ -81,6 +81,12 @@ rem ----------------------------------------------------------------------------
 :s_python
 echo.
 echo == Python ==
+rem Finding Python is a one-shot run at startup. If the user answered [b]
+rem there, %PYEXE% was never set, and reaching this step used to expand to a
+rem bare "--version", which cmd tries to run as a program - so step 1 quietly
+rem did nothing at all on a machine with no Python, which is precisely the
+rem machine step 1 exists for. Search again before reporting on it.
+if not "%CANRUN%"=="1" goto :find_python
 %PYEXE% --version
 %PYEXE% -m pip --version
 echo   %OK% Python %PYEXE% works and pip is available.
@@ -322,6 +328,13 @@ if "%~1"=="" goto :menu
 goto :done
 
 :dispatch
+rem "a" has to work in argument mode, not only from the menu. It used to be
+rem translated only by menu(), so the documented AUTO-SETUP.cmd a reached here
+rem as a literal a and printed Unknown step.
+if /i "%~1"=="a" (
+    for %%S in (1 2 4 5 8) do call :dispatch %%S
+    goto :eof
+)
 if "%~1"=="1" goto :s_python
 if "%~1"=="2" if not "%CANRUN%"=="1" goto :no_python
 if "%~1"=="2" goto :s_packages

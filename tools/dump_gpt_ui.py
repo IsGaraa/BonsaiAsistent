@@ -18,7 +18,10 @@ import time
 import urllib.request
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-REPO = r"C:\Users\drago\Desktop\BonsaiAsistent"
+# Derived from this file, not hardcoded. It used to carry one developer's
+# absolute path, which made the script fail outright for anyone who cloned
+# the repo anywhere else.
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PORT = "8217"
 APPDIR = tempfile.mkdtemp(prefix="bonsai_snap_")
 open(os.path.join(APPDIR, "chats.json"), "w").write("[]")
@@ -54,8 +57,13 @@ finally:
 commit = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=REPO,
                         capture_output=True, text=True).stdout.strip()
 
-# a copy of the page must never carry a key with it
-leaks = [p for p in ("sk-or-v1-", "oc_sk_", "BIG_PICKLE")
+# a copy of the page must never carry a key with it. This list used to hold
+# three prefixes; it now covers the shapes the app itself recognises in
+# _SECRETISH_RE, because a check that misses a provider's format is not a
+# check.
+leaks = [p for p in ("sk-or-v1-", "sk-proj-", "sk-ant-", "oc_sk_", "ghp_",
+                     "gho_", "ghu_", "ghs_", "ghr_", "glpat-", "github_pat_",
+                     "gsk_", "hf_", "AIza", "xai-", "BIG_PICKLE")
          if p in html]
 if leaks:
     print("ABORT: the page contains %s" % ", ".join(leaks))
@@ -69,16 +77,15 @@ banner = (
     "     the UI can be opened in an editor without wading through the Python;\n"
     "     editing it changes nothing.\n"
     "\n"
-    "     To refresh after changing the page, run:  python - tools/dump_gpt_ui.py\n"
-    "     (or just:  curl -s http://127.0.0.1:8080/chat > gpt_ui.html)\n"
+    "     To refresh after changing the page, run:  python tools/dump_gpt_ui.py\n"
     "-->\n" % commit)
 
-out = banner + html
 path = os.path.join(REPO, "gpt_ui.html")
+old_len = len(io.open(path, encoding="utf-8").read()) if os.path.exists(path) else 0
+out = banner + html
 io.open(path, "w", encoding="utf-8", newline="\n").write(out)
 
-old = len(io.open(path, encoding="utf-8").read())
-print("gpt_ui.html written: %d chars (was 96402)" % len(out))
+print("gpt_ui.html written: %d chars (was %d)" % (len(out), old_len))
 print("commit stamped    :", commit)
 print("html body matches the served page:",
       out[len(banner):] == html)

@@ -23,7 +23,7 @@ system-level optionals (Docker, WSL2, Blender MCP).
 > No `.gguf` or binaries are bundled in this repo. The setup scripts check for
 > them and print where to drop them / how to get prism-llama.
 
-## Optional - Python packages (all included in `requirements.txt`)
+## Optional - Python packages
 
 | Package | Powers | Tool(s) |
 |---|---|---|
@@ -37,7 +37,11 @@ system-level optionals (Docker, WSL2, Blender MCP).
 | `beautifulsoup4` | page parsing | `tools/scraper.py` |
 | `pytesseract` | OCR | `tools/ocr.py`, plus the `click_text` and `wait_for(kind=screen_text)` tools *(engine too: Tesseract OCR, see below)* |
 | `kokoro-onnx` + `onnxruntime` | local neural speech synthesis (Kokoro-82M v1.0) | `tts_speak`, `tts_voices`, the `/kokoro` page |
+| `numpy` | array maths the Kokoro ONNX path needs | `tts_speak`, `tts_voices` |
 | `sounddevice` | plays the synthesized WAV straight to the speakers (bundled PortAudio - no media player involved) | playback half of `tts_speak`; falls back to `winsound` on Windows and `paplay`/`aplay`/`ffplay` on Linux |
+| `playwright` | headless Chromium, to render a page as a picture | `web_resolve` with `render:true` — **also needs a one-off `playwright install chromium`**, without which the tool reports no browser available |
+| `yt-dlp` | the `download_media` tool (video, audio-only as mp3, subtitles, thumbnails) | `download_media` |
+| `huggingface_hub` | downloads the Qwen-Image weights | `tools/fetch_image_model.py` |
 
 Install everything with: `pip install -r requirements.txt -r tools\requirements.txt`
 (pywin32 in `requirements.txt` is marked Windows-only with a PEP 508 marker, so
@@ -64,7 +68,7 @@ Install everything with: `pip install -r requirements.txt -r tools\requirements.
 | Package | Powers |
 |---|---|
 | `mcp-for-blender` | lets BONSAI drive Blender (scenes, meshes, materials, viewport screenshots) when Blender + the "MCP for Blender" addon are running |
-| `yt-dlp` | the `download_media` tool (video, audio-only as mp3, subtitles, thumbnails) |
+| `mcp` + a **REA** checkout | the reverse-engineering bridge (`REA_HOME`, override with `PC_REA_HOME`). Bonsai starts `node <rea>/scripts/rea.mjs mcp` as a child process. |
 
 ## Optional - system level
 
@@ -79,7 +83,7 @@ Install everything with: `pip install -r requirements.txt -r tools\requirements.
 ```
 bonsai_web.py        the whole assistant (server + UI + tools)
 run.bat / run.sh     one-click launcher (opens the UI at http://127.0.0.1:8081)
-stop.cmd / stop.sh   stops the model server (port 8080)
+stop.cmd / stop.sh   stops the model server (8080) and the web UI (8081)
 AUTO-SETUP.cmd/.sh   installs Python deps + verifies required files (Win/Linux)
 OPTIONALS.cmd        installs Docker/WSL2/Blender-MCP system optionals (Windows)
 requirements.md      this file
