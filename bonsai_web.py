@@ -2959,6 +2959,63 @@ _BLENDER_ENABLED = str(os.environ.get("PC_BLENDER") or "").strip().lower() in (
 _BLENDER_FLAG_LOCK = threading.Lock()
 
 
+# ---- REA MCP bridge (stdio server -> Bonsai's tool loop) ----
+#
+# Same shape as the Blender bridge above, and for the same reason: a stdio MCP
+# server wants one long-lived subprocess with a session on it, called from
+# whichever thread happens to be handling a tool call. REA is
+# rea-agents@6.1.0, run as `node scripts/rea.mjs mcp`, and it advertises 139
+# tools - far too many to send all of them on every request, so the schemas are
+# filtered to a working set and the rest are still callable by name if the model
+# reaches for one.
+#
+# Off by default, like Blender. Starting a subprocess that opens files and can
+# launch browsers is not something to do unasked, and 139 tool schemas is a
+# large slice of the context window to spend on a server that may not be wanted.
+REA_HOME = os.environ.get("PC_REA_HOME") or r"C:\Users\drago\Desktop\rea"
+REA_ENTRY = os.path.join("scripts", "rea.mjs")
+# rea ships read, shell, grep, edit, search and several others that mean exactly
+# what Bonsai's own tools mean. Two functions of one name in a single tools[]
+# array is something providers reject, so every rea tool is namespaced.
+REA_PREFIX = "rea_"
+# The working set. These are the ones an assistant reaches for: open and
+# describe a target, read a function or a string, list what it found. The
+# capture/compare/verify family stays out because each one launches a browser or
+# drives a process, and offering 139 tools means the model picks at random.
+REA_TOOL_ALLOW = frozenset((
+    "open_binary", "close_binary", "binary_overview", "list_documents",
+    "list_segments", "list_procedures", "list_names", "list_strings",
+    "search_procedures", "search_strings", "procedure_info", "procedure_assembly",
+    "procedure_pseudo_code", "procedure_callers", "procedure_callees",
+    "procedure_references", "procedure_address", "analyze_function",
+    "batch_decompile", "address_name", "address_to_file_offset",
+    "xrefs", "find_xrefs_to_name", "trace_call_path", "trace_feature",
+    "trace_native_values", "inspect_address_context", "inspect_native_instruction",
+    "inspect_native_api", "inspect_native_data_type", "inspect_native_dispatch_metadata",
+    "inspect_native_load_image", "inspect_binary_layout", "inspect_macho",
+    "inspect_signature", "inspect_plist", "inspect_artifact", "extract_artifact",
+    "inspect_managed_artifact", "inspect_managed_members",
+    "inspect_managed_native_boundaries", "project_managed_application_graph",
+    "inspect_android_package", "search_android_classes", "inspect_android_class",
+    "inspect_android_method", "trace_android_references", "project_android_application_graph",
+    "analyze_javascript_application", "recover_javascript_sources",
+    "inspect_firmware_regions", "extract_firmware", "demangle_swift",
+    "analyze_swift_types", "get_objc_classes", "get_objc_protocols",
+    "prev_address", "next_address", "goto_address", "get_navigation_context",
+    "current_procedure", "current_address", "current_document",
+    "list_architectures", "list_bookmarks", "read_bytes", "read_function_instructions",
+    "trace_native_ui_action", "inspect_evm_interface",
+))
+REA_OFFLINE_MSG = ("REA is not reachable. Check that node is installed and that "
+                   "PC_REA_HOME points at the rea checkout (%s)." % REA_HOME)
+_REA_MCP = None
+_REA_GUARD = threading.Lock()
+# Off unless asked. PC_REA=1 turns it on from the start.
+_REA_ENABLED = str(os.environ.get("PC_REA") or "").strip().lower() in (
+    "1", "on", "true", "yes")
+_REA_FLAG_LOCK = threading.Lock()
+
+
 # ---------------------------------------------------------------------------
 # Cheat Engine.
 #
@@ -3418,6 +3475,282 @@ def _blender_kickoff():
         _blender_mcp_bridge().ensure(timeout=60)
     except Exception as exc:
         print(f"WARN: blender bridge start failed: {exc}", flush=True)
+
+
+class _ReaMcp:
+    """One long-lived stdio session to the rea MCP server.
+
+    Identical lifecycle to _BlenderMcp and deliberately so: a background thread
+    owns the event loop, ensure() blocks until the handshake is done or the
+    attempt has timed out, and call() hops back onto that loop from whatever
+    thread is running the tool. The one difference is the command - node rather
+    than python, and a script path rather than a module.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._loop = None
+        self._session = None
+        self._tools = {}
+        self._error = None
+        self._settled = threading.Event()
+        self._restart_at = 0.0
+
+    def ensure(self, timeout=40):
+        with self._lock:
+            if self._session is not None:
+                return True
+            if self._error is not None and time.time() < self._restart_at:
+                return False
+            if self._loop is None or not self._loop.is_running():
+                self._error = None
+                self._tools = {}
+                loop = asyncio.new_event_loop()
+                self._loop = loop
+                self._settled.clear()
+                threading.Thread(target=self._run, args=(loop,), daemon=True).start()
+        self._settled.wait(timeout)
+        with self._lock:
+            return self._session is not None
+
+    def _run(self, loop):
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(self._supervise())
+        except Exception as exc:
+            self._fail("bridge crashed: %s" % exc)
+        finally:
+            try:
+                loop.close()
+            except Exception:
+                pass
+            self._settled.set()
+
+    async def _supervise(self):
+        entry = os.path.join(REA_HOME, REA_ENTRY)
+        if not os.path.isfile(entry):
+            raise FileNotFoundError(
+                "no rea entry point at %s - set PC_REA_HOME to the checkout" % entry)
+        env = dict(os.environ)
+        env.setdefault("NO_COLOR", "1")
+        env["DISABLE_TELEMETRY"] = "1"
+        # 'npx' is what server.json declares; a local checkout is preferred so
+        # the version on disk is the version that runs, and no network is
+        # touched on the first request.
+        params = StdioServerParameters(command="node", args=[entry, "mcp"], env=env)
+        async with stdio_client(params) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                listed = await session.list_tools()
+                with self._lock:
+                    self._session = session
+                    self._tools = {t.name: t for t in listed.tools}
+                self._settled.set()
+                while True:
+                    await asyncio.sleep(0.5)
+
+    def _fail(self, msg):
+        self._restart_at = time.time() + 5
+        with self._lock:
+            self._error = msg
+            self._session = None
+            self._tools = {}
+
+    def call(self, name, args):
+        with self._lock:
+            session, loop = self._session, self._loop
+        if session is None or loop is None:
+            return {"error": REA_OFFLINE_MSG}
+        try:
+            fut = asyncio.run_coroutine_threadsafe(
+                session.call_tool(name, args or {}), loop)
+            res = fut.result(timeout=900)
+        except Exception as exc:
+            return {"error": "rea tool '%s' failed: %s" % (name, exc)}
+        if getattr(res, "isError", False):
+            return {"error": _rea_error_text(name, res)}
+        text, image = [], None
+        for p in res.content:
+            typ = getattr(p, "type", "")
+            if typ == "text":
+                text.append(getattr(p, "text", "") or "")
+            elif typ == "image":
+                data = getattr(p, "data", None) or ""
+                mime = getattr(p, "mimeType", "") or "image/png"
+                if isinstance(data, (bytes, bytearray)):
+                    data = base64.b64encode(bytes(data)).decode("ascii")
+                elif isinstance(data, str):
+                    data = data.strip()
+                    if data.startswith("data:") and "," in data:
+                        data = data.split(",", 1)[1]
+                if data and image is None:
+                    image = "data:" + mime + ";base64," + "".join(data.split())
+            elif getattr(p, "text", None):
+                text.append(str(p.text))
+        out = {}
+        body = "\n".join(t for t in text if t.strip()).strip()
+        if body:
+            out["result"] = body
+        if image:
+            out["image_data"] = image
+        if not body and not image:
+            out["result"] = "ok"
+        return out
+
+
+def _rea_error_text(name, res):
+    """Turn rea's failure into something worth reading.
+
+    rea answers a refusal with a structured envelope - a code, a category, a
+    message and often a remediation - as a JSON object in the text block. Handed
+    over raw, the model is asked to parse
+    {"error":{"code":"target_unavailable","message":"No app is open...","remediation":"..."}}
+    to find the one sentence that tells it what to do next. That is work the
+    model should not have to do on a routine "no target yet" refusal, which is
+    the single most common one. So the message is lifted out and the
+    remediation appended, and the code kept as a prefix for anything that needs
+    to match on it.
+    """
+    raw = "".join(getattr(p, "text", "") or "" for p in getattr(res, "content", []))
+    raw = raw.strip()
+    if not raw:
+        return "rea tool '%s' returned an error" % name
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        return raw
+    err = parsed.get("error") if isinstance(parsed, dict) else None
+    if not isinstance(err, dict):
+        return raw
+    msg = err.get("message") or err.get("msg") or raw
+    code = err.get("code") or ""
+    fix = err.get("remediation") or err.get("hint") or ""
+    out = ("rea tool '%s' failed" % name)
+    if code:
+        out += " [%s]" % code
+    out += ": " + str(msg)
+    if fix:
+        out += " Next: " + str(fix)
+    return out
+
+
+def _rea_mcp_bridge():
+    global _REA_MCP
+    with _REA_GUARD:
+        if _REA_MCP is None:
+            _REA_MCP = _ReaMcp()
+        return _REA_MCP
+
+
+def _rea_tool_schemas():
+    """Schemas for the allowed set only, prefixed so they cannot collide.
+
+    The prefix is not decoration: rea ships a dozen names that mean the same as
+    tools Bonsai already has (read, shell, grep, edit), and a duplicate name in
+    one tools[] array is a request the provider may reject outright. Namespacing
+    keeps both, and tells the model which is which.
+    """
+    if not MCP_AVAILABLE or not _rea_enabled():
+        return []
+    bridge = _rea_mcp_bridge()
+    with bridge._lock:
+        items = list(bridge._tools.values())
+    out = []
+    for tool in items:
+        if REA_TOOL_ALLOW and tool.name not in REA_TOOL_ALLOW:
+            continue
+        out.append({"type": "function",
+                    "function": {
+                        "name": REA_PREFIX + tool.name,
+                        "description": ("REA (reverse engineering): "
+                                        + (getattr(tool, "description", "") or "")),
+                        "parameters": getattr(tool, "inputSchema", None)
+                                      or {"type": "object", "properties": {}}}})
+    return out
+
+
+def _rea_tool_names():
+    if not MCP_AVAILABLE or not _rea_enabled():
+        return set()
+    bridge = _rea_mcp_bridge()
+    with bridge._lock:
+        return {REA_PREFIX + n for n in bridge._tools
+                if not REA_TOOL_ALLOW or n in REA_TOOL_ALLOW}
+
+
+def _rea_tool_call(name, args):
+    if not _rea_enabled():
+        return {"error": "the REA bridge is switched off. Turn it on in the "
+                         "sidebar to use rea tools."}
+    try:
+        bridge = _rea_mcp_bridge()
+        if not bridge.ensure(timeout=60):
+            return None
+        return bridge.call(name[len(REA_PREFIX):], args)
+    except Exception as exc:
+        return {"error": "rea tool '%s' failed: %s" % (name, exc)}
+
+
+def _rea_kickoff():
+    try:
+        _rea_mcp_bridge().ensure(timeout=90)
+    except Exception as exc:
+        print("WARN: rea bridge start failed: %s" % exc, flush=True)
+
+
+def _rea_enabled():
+    return _REA_ENABLED
+
+
+def set_rea_enabled(value):
+    global _REA_ENABLED
+    want = value if isinstance(value, bool) else str(
+        value or "").strip().lower() in ("1", "on", "true", "yes", "enable",
+                                         "enabled")
+    with _REA_FLAG_LOCK:
+        _REA_ENABLED = want
+    if want:
+        threading.Thread(target=_rea_kickoff, daemon=True).start()
+    else:
+        try:
+            bridge = _rea_mcp_bridge()
+            with bridge._lock:
+                loop = bridge._loop
+            if loop is not None and loop.is_running():
+                loop.call_soon_threadsafe(loop.stop)
+        except Exception:
+            pass
+    return _rea_enabled()
+
+
+def _rea_status_payload():
+    if not _rea_enabled():
+        # answered without touching the bridge: probing would start the
+        # subprocess just to draw a dot
+        return {"ok": False, "state": "off", "enabled": False, "tool_count": 0,
+                "detail": "off - REA is not running and its tools are not in "
+                          "the model's tool list"}
+    if not MCP_AVAILABLE:
+        return {"ok": False, "state": "missing", "enabled": True, "tool_count": 0,
+                "detail": "the Python 'mcp' package is not installed"}
+    entry = os.path.join(REA_HOME, REA_ENTRY)
+    if not os.path.isfile(entry):
+        return {"ok": False, "state": "missing", "enabled": True, "tool_count": 0,
+                "detail": "no rea entry point at %s" % entry}
+    bridge = _rea_mcp_bridge()
+    try:
+        started = bridge.ensure(timeout=45)
+    except Exception:
+        started = False
+    with bridge._lock:
+        err = bridge._error
+        allowed = sum(1 for n in bridge._tools if n in REA_TOOL_ALLOW)
+        total = len(bridge._tools)
+    if started:
+        return {"ok": True, "state": "ready", "enabled": True,
+                "tool_count": allowed, "tool_total": total, "detail": ""}
+    return {"ok": False, "state": "error", "enabled": True, "tool_count": 0,
+            "detail": err or "the rea server did not answer in time"}
 
 
 def _blender_status_payload():
@@ -7336,8 +7669,8 @@ def _tools_for(mode):
         return [FILE_TOOLS["list_dir"],
                 FILE_TOOLS["grep"]] + WEB_SPECS + [CHAT_TITLE_TOOL]
     return ([TOOL_SPEC] + list(FILE_TOOLS.values()) + WEB_SPECS +
-            PC_TOOLS + _blender_tool_schemas() + _cheat_engine_tool_schemas() +
-            [CHAT_TITLE_TOOL])
+            PC_TOOLS + _blender_tool_schemas() + _rea_tool_schemas() +
+            _cheat_engine_tool_schemas() + [CHAT_TITLE_TOOL])
 
 
 def system_prompt(mode):
@@ -13792,6 +14125,17 @@ def _execute_tool_call(name, args, tc, hooks, image_uri):
         raw_result = _skill_load(args.get("name", ""))
     elif name == "execute":
         raw_result = _execute_js(args.get("code", ""), args.get("timeout"))
+    elif name in _rea_tool_names():
+        if not MCP_AVAILABLE:
+            raw_result = {"error": "the Python 'mcp' package is not installed"}
+        else:
+            res = _rea_tool_call(name, args)
+            if res is None:
+                raw_result = {"error": REA_OFFLINE_MSG}
+            else:
+                if res.get("image_data"):
+                    image_uri = res["image_data"]
+                raw_result = res
     elif name in _blender_tool_names():
         if not MCP_AVAILABLE:
             raw_result = {"error": "Blender MCP is not installed (pip install mcp-for-blender)"}
@@ -15681,6 +16025,8 @@ PAGE = """<!doctype html>
       <button class="dlclear danger" id="dlclearall" title="Cancel anything still running and remove every download from the list">CLEAR ALL</button>
     </div>
     <div class="side-foot">
+      <button class="btn-ghost blswitch" id="reaswitch" title="REA MCP bridge. Off means its tools are not in the tool list and no rea process is started. Click to switch on.">REA: OFF</button>
+      <span class="bldot" id="readot"></span>
       <button class="btn-ghost blswitch" id="blswitch" title="Blender MCP bridge. Off means its tools are not in the model's tool list and no Blender process is started. Click to switch on.">BLENDER: OFF</button>
       <button class="btn-ghost blswitch" id="ceswitch" title="Cheat Engine bridge. Off means its tools are not in the model's tool list and Bonsai does not connect to Cheat Engine at all. ON GIVES AN ASSISTANT THE ABILITY TO READ AND WRITE THE MEMORY OF ANY PROCESS YOU CAN OPEN - that is arbitrary code injection into anything you run, available to any other program running as you. Copy tools\\cheatengine_bridge.lua into Cheat Engine's autorun folder first; Cheat Engine must be restarted before it can be reached.">CHEAT ENGINE: OFF</button>
       <div class="blrow" id="blstatus" title="Blender MCP status"><svg class="blicon" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 1.6C7.4 1.6 3.7 3.9 3.7 6.9c0 1.6 1.1 3 2.8 3.9-2.1.9-3.5 2.4-3.5 4.2 0 3.2 4 5.8 9 5.8 2.4 0 4.6-.7 6.2-1.8l3.4 2.8 1.7-2-3.3-2.7c.6-.9.9-1.9.9-3 0-1.9-1-3.6-2.6-4.9.3-.5.4-1.1.4-1.7 0-3-3.7-5.3-8.3-5.3Z"/><ellipse cx="12" cy="6.9" rx="4.2" ry="2.5" fill="#18181b"/></svg><span class="bldot off" id="bldot"></span></div>
@@ -18917,7 +19263,42 @@ function refreshBlender() {
     .then(renderBlenderStatus)
     .catch(function () { renderBlenderStatus({ state: 'down' }); });
   refreshCe();
+  refreshRea();
 }
+/* REA. Same shape as the Blender switch. It is off until asked, because turning
+   it on starts a subprocess that can open binaries and read files, and the
+   status row answers without touching the bridge so a dot on screen never
+   causes a launch. */
+function renderReaStatus(j) {
+  const btn = document.getElementById('reaswitch');
+  const el = document.getElementById('readot');
+  if (!btn) return;
+  const on = !!j.enabled;
+  btn.className = 'btn-ghost blswitch' + (on ? ' on' : '');
+  btn.textContent = on ? ('REA: ' + (j.state === 'ready' ? j.tool_count + ' TOOLS' : (j.state || 'ON').toUpperCase())) : 'REA: OFF';
+  var tip = on ? ('REA MCP bridge (' + (j.state || 'on') + ')' +
+      (j.tool_count ? ' - ' + j.tool_count + ' of ' + (j.tool_total || '?') + ' tools exposed' : '') +
+      (j.detail ? ' - ' + j.detail : ''))
+    : "REA MCP bridge. Off means its tools are not in the tool list and no rea process is started. Click to switch on.";
+  btn.title = tip;
+  if (el) el.className = 'bldot ' + (j.state === 'ready' ? 'on' : (j.state === 'off' ? '' : 'down'));
+}
+function refreshRea() {
+  fetch('/api/rea').then(function (r) { return r.json(); })
+    .then(renderReaStatus)
+    .catch(function () { renderReaStatus({ state: 'down', enabled: false }); });
+}
+const _reSwitch = document.getElementById('reaswitch');
+if (_reSwitch) _reSwitch.onclick = function () {
+  const want = !(_reSwitch.className.indexOf('on') >= 0);
+  _reSwitch.textContent = want ? 'REA: \u2026' : 'REA: OFF';
+  fetch('/api/rea', { method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ enabled: want }) })
+    .then(function (r) { return r.json(); })
+    .then(renderReaStatus)
+    .catch(function () { renderReaStatus({ state: 'down', enabled: false }); });
+};
 const _blSwitch = document.getElementById('blswitch');
 if (_blSwitch) _blSwitch.onclick = function () {
   const want = !(_blSwitch.className.indexOf('on') >= 0);
@@ -21758,6 +22139,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, json.dumps(_changes_snapshot(), default=str))
         elif path == "/api/blender":
             self._send(200, json.dumps(_blender_status_payload()))
+        elif path == "/api/rea":
+            self._send(200, json.dumps(_rea_status_payload()))
         elif path == "/api/cheatengine":
             self._send(200, json.dumps(_cheat_engine_status_payload(), default=str))
         elif path == "/api/tts":
@@ -21831,7 +22214,7 @@ class Handler(BaseHTTPRequestHandler):
                             "/api/ctx", "/api/revert", "/api/forget_changes",
                             "/api/compact", "/api/attach", "/api/image",
                             "/api/fetch_image",
-                            "/api/path_policy", "/api/blender",
+                            "/api/path_policy", "/api/blender", "/api/rea",
                             "/api/cheatengine",
                             "/api/dl_pause",
                             "/api/dl_resume", "/api/dl_cancel",
@@ -21871,6 +22254,11 @@ class Handler(BaseHTTPRequestHandler):
                 # the whole payload rather than a bare flag, so the page
                 # learns the state from the same call that changed it
                 self._send(200, json.dumps(dict(_blender_status_payload(),
+                                                enabled=on), default=str))
+                return
+            if path == "/api/rea":
+                on = set_rea_enabled(body.get("enabled", True))
+                self._send(200, json.dumps(dict(_rea_status_payload(),
                                                 enabled=on), default=str))
                 return
             if path == "/api/attach":

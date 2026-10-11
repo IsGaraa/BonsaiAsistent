@@ -1,5 +1,5 @@
 <!-- GPT UI (PAGE_GPT) - the page served at /chat, copied verbatim from a
-     running bonsai_web.py at commit a3f3b2d.
+     running bonsai_web.py at commit 4d0a10b.
 
      bonsai_web.py is the source of truth. This file is a read-only copy so
      the UI can be opened in an editor without wading through the Python;
@@ -868,6 +868,8 @@
       <button class="dlclear danger" id="dlclearall" title="Cancel anything still running and remove every download from the list">CLEAR ALL</button>
     </div>
     <div class="side-foot">
+      <button class="btn-ghost blswitch" id="reaswitch" title="REA MCP bridge. Off means its tools are not in the tool list and no rea process is started. Click to switch on.">REA: OFF</button>
+      <span class="bldot" id="readot"></span>
       <button class="btn-ghost blswitch" id="blswitch" title="Blender MCP bridge. Off means its tools are not in the model's tool list and no Blender process is started. Click to switch on.">BLENDER: OFF</button>
       <button class="btn-ghost blswitch" id="ceswitch" title="Cheat Engine bridge. Off means its tools are not in the model's tool list and Bonsai does not connect to Cheat Engine at all. ON GIVES AN ASSISTANT THE ABILITY TO READ AND WRITE THE MEMORY OF ANY PROCESS YOU CAN OPEN - that is arbitrary code injection into anything you run, available to any other program running as you. Copy tools\cheatengine_bridge.lua into Cheat Engine's autorun folder first; Cheat Engine must be restarted before it can be reached.">CHEAT ENGINE: OFF</button>
       <div class="blrow" id="blstatus" title="Blender MCP status"><svg class="blicon" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 1.6C7.4 1.6 3.7 3.9 3.7 6.9c0 1.6 1.1 3 2.8 3.9-2.1.9-3.5 2.4-3.5 4.2 0 3.2 4 5.8 9 5.8 2.4 0 4.6-.7 6.2-1.8l3.4 2.8 1.7-2-3.3-2.7c.6-.9.9-1.9.9-3 0-1.9-1-3.6-2.6-4.9.3-.5.4-1.1.4-1.7 0-3-3.7-5.3-8.3-5.3Z"/><ellipse cx="12" cy="6.9" rx="4.2" ry="2.5" fill="#18181b"/></svg><span class="bldot off" id="bldot"></span></div>
@@ -4104,7 +4106,42 @@ function refreshBlender() {
     .then(renderBlenderStatus)
     .catch(function () { renderBlenderStatus({ state: 'down' }); });
   refreshCe();
+  refreshRea();
 }
+/* REA. Same shape as the Blender switch. It is off until asked, because turning
+   it on starts a subprocess that can open binaries and read files, and the
+   status row answers without touching the bridge so a dot on screen never
+   causes a launch. */
+function renderReaStatus(j) {
+  const btn = document.getElementById('reaswitch');
+  const el = document.getElementById('readot');
+  if (!btn) return;
+  const on = !!j.enabled;
+  btn.className = 'btn-ghost blswitch' + (on ? ' on' : '');
+  btn.textContent = on ? ('REA: ' + (j.state === 'ready' ? j.tool_count + ' TOOLS' : (j.state || 'ON').toUpperCase())) : 'REA: OFF';
+  var tip = on ? ('REA MCP bridge (' + (j.state || 'on') + ')' +
+      (j.tool_count ? ' - ' + j.tool_count + ' of ' + (j.tool_total || '?') + ' tools exposed' : '') +
+      (j.detail ? ' - ' + j.detail : ''))
+    : "REA MCP bridge. Off means its tools are not in the tool list and no rea process is started. Click to switch on.";
+  btn.title = tip;
+  if (el) el.className = 'bldot ' + (j.state === 'ready' ? 'on' : (j.state === 'off' ? '' : 'down'));
+}
+function refreshRea() {
+  fetch('/api/rea').then(function (r) { return r.json(); })
+    .then(renderReaStatus)
+    .catch(function () { renderReaStatus({ state: 'down', enabled: false }); });
+}
+const _reSwitch = document.getElementById('reaswitch');
+if (_reSwitch) _reSwitch.onclick = function () {
+  const want = !(_reSwitch.className.indexOf('on') >= 0);
+  _reSwitch.textContent = want ? 'REA: …' : 'REA: OFF';
+  fetch('/api/rea', { method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ enabled: want }) })
+    .then(function (r) { return r.json(); })
+    .then(renderReaStatus)
+    .catch(function () { renderReaStatus({ state: 'down', enabled: false }); });
+};
 const _blSwitch = document.getElementById('blswitch');
 if (_blSwitch) _blSwitch.onclick = function () {
   const want = !(_blSwitch.className.indexOf('on') >= 0);
